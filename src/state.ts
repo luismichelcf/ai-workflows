@@ -3,6 +3,7 @@ import {
   StaleVersion,
   type EffectRecord,
   type JournalEntry,
+  type JsonValue,
   type PieceId,
   type PieceStatus,
   type Reservation,
@@ -28,6 +29,35 @@ interface StoredStatus {
 }
 
 /**
+ * A round trip through JSON, the exact journey a result makes over the remote store, which
+ * keeps it as text. The memory store must make the same trip: otherwise a `Date` stays a
+ * `Date` here and only comes back a string on a resume in production, the one path nobody
+ * exercises by hand. Cloning on the way out also keeps a caller from mutating what is stored.
+ */
+const throughJson = <T extends JsonValue>(value: T): T =>
+  JSON.parse(JSON.stringify(value)) as T;
+
+/** Freezes a JSON value recursively, so nested evidence is as immutable as the entry holding it. */
+const deepFreeze = (value: JsonValue): void => {
+  if (value === null || typeof value !== 'object') return;
+  const nested = Array.isArray(value) ? value : Object.values(value);
+  for (const item of nested) deepFreeze(item);
+  Object.freeze(value);
+};
+
+/**
+ * Stores an entry with its evidence deep-frozen. Freezing the entries — not only the array
+ * `journal` hands out — is what stops a caller rewriting a `rejected` into a `passed` inside
+ * the store; execution-record gates are checked against this history.
+ */
+const freezeEntry = (entry: JournalEntry): JournalEntry => {
+  if (entry.evidence === undefined) return Object.freeze({ ...entry });
+  const evidence = throughJson(entry.evidence);
+  deepFreeze(evidence);
+  return Object.freeze({ ...entry, evidence });
+};
+
+/**
  * In-memory reference implementation of `Store`.
  *
  * It is deliberately the model for the GitHub-backed store to come, so it never relies on
@@ -44,6 +74,9 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): Store {
   const nextVersion = (): Version => `v${(counter += 1)}`;
 
   const leases = new Map<PieceId, HeldLease>();
+  // Zones are shared resources, not pieces, so they get their own lease table: a piece and
+  // a zone that happen to share a name must not be able to lock each other out.
+  const zoneLeases = new Map<string, HeldLease>();
   const statuses = new Map<PieceId, StoredStatus>();
   const journals = new Map<PieceId, JournalEntry[]>();
   const effects = new Map<PieceId, Map<string, EffectRecord>>();
@@ -61,8 +94,10 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): Store {
     return bucket;
   };
 
-  const confirmed = (result: unknown): EffectRecord =>
-    result === undefined ? { state: 'confirmed' } : { state: 'confirmed', result };
+  const confirmed = (result: JsonValue): EffectRecord => ({
+    state: 'confirmed',
+    result: throughJson(result),
+  });
 
   return {
     async reserve(piece, runId, leaseMs): Promise<Reservation> {
@@ -80,13 +115,13 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): Store {
 
     async renew(piece, runId, leaseMs): Promise<Reservation> {
       const held = leases.get(piece);
-      // Only the holder extends its own lease; anyone else is told who to wait for.
-      if (held === undefined || held.runId !== runId) {
-        return {
-          ok: false,
-          heldBy: held?.runId ?? runId,
-          expiresAt: held?.expiresAt ?? now(),
-        };
+      // Only the holder extends its own lease. A free piece has no holder, so we must not
+      // name the caller: reporting them as the owner would be a lie about who holds it.
+      if (held === undefined) {
+        return { ok: false, heldBy: '', expiresAt: now() };
+      }
+      if (held.runId !== runId) {
+        return { ok: false, heldBy: held.runId, expiresAt: held.expiresAt };
       }
       const expiresAt = now() + leaseMs;
       leases.set(piece, { runId, expiresAt });
@@ -123,9 +158,10 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): Store {
     },
 
     async append(piece, entry): Promise<void> {
+      const frozen = freezeEntry(entry);
       const entries = journals.get(piece);
-      if (entries === undefined) journals.set(piece, [entry]);
-      else entries.push(entry);
+      if (entries === undefined) journals.set(piece, [frozen]);
+      else entries.push(frozen);
     },
 
     async journal(piece): Promise<readonly JournalEntry[]> {
@@ -134,11 +170,26 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): Store {
       return Object.freeze([...(journals.get(piece) ?? [])]);
     },
 
-    async getEffect(piece, operationId): Promise<EffectRecord | undefined> {
-      return effects.get(piece)?.get(operationId);
+    async forget(piece, stage): Promise<void> {
+      // Retiring a stage must not leave a piece wedged on evidence for a stage the pipeline
+      // no longer has. Dropping just that stage's entries lets it resume by what remains.
+      const entries = journals.get(piece);
+      if (entries === undefined) return;
+      const remaining = entries.filter((entry) => entry.stage !== stage);
+      if (remaining.length === 0) journals.delete(piece);
+      else journals.set(piece, remaining);
     },
 
-    async runEffect<T>(
+    async getEffect(piece, operationId): Promise<EffectRecord | undefined> {
+      const record = effects.get(piece)?.get(operationId);
+      if (record === undefined || record.state !== 'confirmed' || record.result === undefined) {
+        return record;
+      }
+      // Clone the result too: a caller must not be able to edit what is stored through it.
+      return { state: 'confirmed', result: throughJson(record.result as JsonValue) };
+    },
+
+    async runEffect<T extends JsonValue>(
       piece: PieceId,
       operationId: string,
       effect: () => Promise<T>,
@@ -150,14 +201,14 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): Store {
       let bucketFlights = inFlight.get(piece);
       const existing = bucketFlights?.get(operationId);
       if (existing !== undefined) {
-        return existing as Promise<T>;
+        return existing.then((value) => throughJson(value as T));
       }
 
       const record = bucket.get(operationId);
       if (record !== undefined) {
         if (record.state === 'confirmed') {
           // Already reached the outside world once; return that result without repeating it.
-          return record.result as T;
+          return throughJson(record.result as T);
         }
         // Pending or uncertain: whether the effect landed is unknown. Blindly retrying is
         // how a second pull request gets opened, so report instead.
@@ -193,11 +244,48 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): Store {
         inFlight.set(piece, bucketFlights);
       }
       bucketFlights.set(operationId, flight);
-      return flight;
+      return flight.then((value) => throughJson(value));
     },
 
-    async reconcileEffect(piece, operationId, result): Promise<void> {
-      effectBucket(piece).set(operationId, confirmed(result));
+    async reconcileEffect(piece, operationId, outcome): Promise<void> {
+      // The contract has two explicit outcomes. A bare value is also accepted because a
+      // caller written against the previous single-result signature still passes one; the
+      // wrapper is the only unambiguous way to confirm a value shaped like `didNotHappen`.
+      if (typeof outcome === 'object' && outcome !== null && 'didNotHappen' in outcome) {
+        // Checked against the outside world and found absent: drop the record so the next
+        // `runEffect` genuinely runs again. The alternative is inventing a result to move on.
+        const bucket = effects.get(piece);
+        if (bucket === undefined) return;
+        bucket.delete(operationId);
+        if (bucket.size === 0) effects.delete(piece);
+        return;
+      }
+      const value: JsonValue =
+        typeof outcome === 'object' && outcome !== null && 'confirmed' in outcome
+          ? outcome.confirmed
+          : (outcome as JsonValue);
+      effectBucket(piece).set(operationId, confirmed(value));
+    },
+
+    async reserveZone(zone, _piece, runId, leaseMs): Promise<Reservation> {
+      const held = zoneLeases.get(zone);
+      const current = now();
+      // Same lease semantics as a piece: a live lease held by someone else wins, an expired
+      // one is taken over so a zone never stays locked by a dead controller.
+      if (held !== undefined && held.runId !== runId && held.expiresAt > current) {
+        return { ok: false, heldBy: held.runId, expiresAt: held.expiresAt };
+      }
+      const version = nextVersion();
+      zoneLeases.set(zone, { runId, expiresAt: current + leaseMs });
+      return { ok: true, version };
+    },
+
+    async releaseZone(zone, runId): Promise<void> {
+      const held = zoneLeases.get(zone);
+      // A late release must not free a zone that another controller has since taken.
+      if (held !== undefined && held.runId === runId) {
+        zoneLeases.delete(zone);
+      }
     },
   };
 }
