@@ -194,7 +194,24 @@ function deepFreeze(value: JsonValue): void {
  */
 function freezeEntry(entry: JournalEntry): JournalEntry {
   if (entry.evidence === undefined) return Object.freeze({ ...entry });
-  const evidence = JSON.parse(JSON.stringify(entry.evidence)) as JsonValue;
+  let evidence: JsonValue;
+  try {
+    // JSON drops a function or a symbol inside an object without complaining, leaving a
+    // quietly truncated copy the store would keep as if it were the gate's answer. Refuse
+    // those too, so evidence is either stored whole or reported.
+    evidence = JSON.parse(
+      JSON.stringify(entry.evidence, (_key, nested: unknown) => {
+        if (typeof nested === 'function' || typeof nested === 'symbol') {
+          throw new TypeError(`${typeof nested} values cannot be stored as JSON`);
+        }
+        return nested;
+      }),
+    ) as JsonValue;
+  } catch (error) {
+    throw new StoreWriteFailure(
+      `the evidence of stage "${entry.stage}" cannot be stored as JSON: ${describeUnknown(error)}`,
+    );
+  }
   deepFreeze(evidence);
   return Object.freeze({ ...entry, evidence });
 }
