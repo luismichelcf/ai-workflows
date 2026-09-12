@@ -615,6 +615,12 @@ export function createEngine(options: EngineOptions): Engine {
 
       const order = orderStages(config.stages);
 
+      // A dry run cannot rehearse a stage whose gate asks for a real external effect: it
+      // must not act, so the stage is skipped. Skipping it silently and then answering
+      // `done` would call the piece ready without ever looking at that stage. The names are
+      // collected so the rehearsal can end by naming what it could not check.
+      const unchecked: string[] = [];
+
       for (const stage of order) {
         try {
           // A signal can arrive between stages. Honour it before any more work is written.
@@ -721,7 +727,9 @@ export function createEngine(options: EngineOptions): Engine {
           } catch (error) {
             if (error instanceof DryRunEffectRefused) {
               // The stage could not be evaluated without acting. A healthy pipeline in dry
-              // mode is not broken: report it as not evaluated and leave no trace.
+              // mode is not broken: note it as not evaluated, keep checking the rest, and
+              // leave no trace.
+              unchecked.push(stage.name);
               continue;
             }
             const stopped = await readStatus();
@@ -795,6 +803,18 @@ export function createEngine(options: EngineOptions): Engine {
           }
           throw error;
         }
+      }
+
+      // A rehearsal that skipped a stage it could not rehearse is incomplete, never `done`.
+      // `waiting:decision` is the non-failure state: a person must decide to run for real.
+      // The reason names every stage the rehearsal could not check.
+      if (unchecked.length > 0) {
+        const named = unchecked.map((name) => `"${name}"`).join(', ');
+        return finish({
+          piece,
+          state: 'waiting:decision',
+          reason: `dry-run could not check ${unchecked.length === 1 ? 'stage' : 'stages'} ${named} without performing external effects`,
+        });
       }
 
       return finish({ piece, state: 'done' });
