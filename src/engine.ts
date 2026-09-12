@@ -874,16 +874,40 @@ export function createEngine(options: EngineOptions): Engine {
           // Someone else's live lease: report it without reading or writing any progress.
           return { outcome: 'busy', heldBy: reservation.heldBy };
         }
+        let result: RunOutcome | undefined;
+        let releaseFailure: string | undefined;
         try {
-          return await runReserved(piece, mode, controller);
+          result = await runReserved(piece, mode, controller);
         } finally {
           try {
             await store.release(piece, leaseId);
-          } catch {
+          } catch (error) {
             // Releasing is cleanup, not the run's verdict: a store that fails to drop the
-            // lease must not replace the result the run already reached.
+            // lease must not replace the result the run reached. It must not vanish in
+            // silence either — the lease stays taken until it lapses and nobody would know.
+            // The failure is carried into the verdict's reason once the verdict is known.
+            releaseFailure = describeUnknown(error);
           }
         }
+        // A thrown run already propagated through the finally, so only a settled verdict
+        // reaches here; the guard keeps that invariant visible to the type checker.
+        if (result === undefined) {
+          throw new Error('the run settled without a verdict');
+        }
+        if (releaseFailure !== undefined && result.outcome === 'ran') {
+          const trace = `the piece could not be released: ${releaseFailure}`;
+          return {
+            outcome: 'ran',
+            status: {
+              ...result.status,
+              reason:
+                result.status.reason === undefined
+                  ? trace
+                  : `${result.status.reason} (${trace})`,
+            },
+          };
+        }
+        return result;
       })();
 
       const active: ActiveRun = { key, mode, promise };
@@ -907,12 +931,7 @@ export function createEngine(options: EngineOptions): Engine {
 
     async list(): Promise<readonly PieceStatus[]> {
       await letRunPublish();
-      // A `stop` on a piece that never ran parks it so the next run honours the brake, but
-      // it must not surface as a phantom entry: a parked status with no prior state is not a
-      // piece the engine has seen work on.
-      return (await store.listStatuses()).filter(
-        (status) => !(status.state === 'parked' && status.previous === undefined),
-      );
+      return store.listStatuses();
     },
 
     async stop(piece, reason): Promise<PieceStatus> {
@@ -925,6 +944,14 @@ export function createEngine(options: EngineOptions): Engine {
       // Re-read and retry a few times before giving up.
       for (let attempt = 1; ; attempt += 1) {
         const current = await store.loadStatus(piece);
+        if (current === undefined && active === undefined) {
+          // A stop is a fact about a piece, not a piece. Parking one the store has never
+          // seen would invent a phantom that `list` hides, `status` shows and a later run
+          // obeys — three readers, three answers, from one write that should not happen.
+          // The brake is reported; nothing is stored. A piece with a run in flight is a
+          // real piece even before its first write, so that one is parked below.
+          return { piece, state: 'parked', reason };
+        }
         const previous =
           current === undefined || current.status.state === 'parked'
             ? current?.status.previous

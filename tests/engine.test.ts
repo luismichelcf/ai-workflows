@@ -153,7 +153,10 @@ describe('two controllers', () => {
 
 describe('stopping a piece', () => {
   it('parks it, keeping the reason', async () => {
-    const { engine } = harness(chain(stage('spec'), stage('build')));
+    const { engine } = harness(
+      chain(stage('spec', { gate: reject('aun no') }), stage('build')),
+    );
+    await engine.run('997');
 
     const parked = await engine.stop('997', 'el dueno lo detuvo');
 
@@ -162,8 +165,18 @@ describe('stopping a piece', () => {
   });
 
   it('does not advance a parked piece on the next run', async () => {
+    // The piece has to exist before it can be parked: parking one the store has never seen
+    // used to invent it, and the owner decided (12-sep) that it should say it does not
+    // exist instead. So this starts the piece, parks it, and checks it stays put.
     const seen = recorder();
-    const { engine } = harness(chain(stage('spec', { gate: seen.gateFor('spec') })));
+    const { engine } = harness(
+      chain(
+        stage('spec', { gate: seen.gateFor('spec', reject('aun no')) }),
+        stage('build', { gate: seen.gateFor('build') }),
+      ),
+    );
+    await engine.run('997');
+    seen.seen.length = 0;
     await engine.stop('997', 'el dueno lo detuvo');
 
     const result = await engine.run('997');
