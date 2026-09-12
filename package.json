@@ -1,0 +1,29 @@
+{
+  "name": "ai-workflows",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Deterministic stage engine for coding agents: configurable pipelines whose transitions are verified by code, not by prompt.",
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "ai-workflows": "./dist/cli.js"
+  },
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "check": "tsc --noEmit && vitest run"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}
