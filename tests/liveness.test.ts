@@ -124,6 +124,10 @@ describe('a stage that outlives its lease', () => {
   });
 
   it('does not write its verdict if it lost the piece anyway', async () => {
+    // Rewritten: the first version stole the piece BEFORE the run reserved it, so the run
+    // returned `busy` and never reached the gate — it passed without exercising anything.
+    // The theft has to happen while the gate is running.
+    const inGate = held();
     const slow = held();
     const clock = fakeClock();
     const store = createMemoryStore({ now: clock.now });
@@ -131,6 +135,7 @@ describe('a stage that outlives its lease', () => {
       chain(
         stage('suite', {
           gate: async () => {
+            inGate.release();
             await slow.promise;
             return { ok: true };
           },
@@ -140,9 +145,9 @@ describe('a stage that outlives its lease', () => {
     const engine = createEngine({ config, store, now: clock.now, runId: 'A', leaseMs: 10 });
 
     const running = engine.run('997');
-    await Promise.resolve();
-    // Someone else took over and already recorded a verdict of their own.
-    await store.release('997', 'A');
+    await inGate.promise;
+    // Now, with the gate in flight, someone else takes over and records their own verdict.
+    clock.advance(1000);
     await store.reserve('997', 'B', 60_000);
     await store.saveStatus(
       { piece: '997', stage: 'suite', state: 'blocked:rejected', reason: 'la suite quedo roja' },
@@ -152,6 +157,37 @@ describe('a stage that outlives its lease', () => {
     await running;
 
     expect((await engine.status('997'))?.state).toBe('blocked:rejected');
+  });
+
+  it('does not write to the journal either once it lost the piece', async () => {
+    // Protecting only the status is not enough: the journal is what resume-by-evidence
+    // reads, so an entry written by a controller that no longer holds the piece can finish
+    // it with evidence nobody produced.
+    const inGate = held();
+    const slow = held();
+    const clock = fakeClock();
+    const store = createMemoryStore({ now: clock.now });
+    const config = pipeline(
+      chain(
+        stage('suite', {
+          gate: async () => {
+            inGate.release();
+            await slow.promise;
+            return { ok: true, evidence: { by: 'el que perdio la pieza' } };
+          },
+        }),
+      ),
+    );
+    const engine = createEngine({ config, store, now: clock.now, runId: 'A', leaseMs: 10 });
+
+    const running = engine.run('997');
+    await inGate.promise;
+    clock.advance(1000);
+    await store.reserve('997', 'B', 60_000);
+    slow.release();
+    await running;
+
+    expect(await store.journal('997')).toEqual([]);
   });
 });
 
@@ -206,19 +242,35 @@ describe('two runs of the same controller', () => {
 });
 
 describe('stopping is not best-effort', () => {
-  it('parks the piece even when someone else wrote in between', async () => {
-    // `stop` read, then wrote with the version it read. Over a remote those are two round
-    // trips, and a write in between made `stop` throw — the owner's brake silently lost.
+  it('parks the piece even when someone else writes between its read and its write', async () => {
+    // Rewritten: the first version wrote BEFORE calling stop, so stop read a fresh version
+    // and succeeded on the first try — the retry loop it claimed to cover never ran.
+    // The competing write has to land inside stop's own read-then-write window.
     const store = createMemoryStore();
-    const { engine } = harness(chain(stage('spec')), { store });
+    let interference = 2;
+    const racy: typeof store = {
+      ...store,
+      loadStatus: async (piece) => {
+        const current = await store.loadStatus(piece);
+        if (interference > 0) {
+          interference -= 1;
+          // Someone else writes right after stop read, invalidating the version it holds.
+          await store.saveStatus(
+            { piece, state: 'running', stage: 'spec' },
+            (await store.loadStatus(piece))?.version,
+          );
+        }
+        return current;
+      },
+    };
+    const config = pipeline(chain(stage('spec')));
+    const engine = createEngine({ config, store: racy });
     await store.saveStatus({ piece: '997', state: 'running' }, undefined);
-    const stale = await store.loadStatus('997');
-    await store.saveStatus({ piece: '997', state: 'running', stage: 'spec' }, stale?.version);
 
     const parked = await engine.stop('997', 'el dueno lo detuvo');
 
     expect(parked.state).toBe('parked');
-    expect((await engine.status('997'))?.state).toBe('parked');
+    expect((await store.loadStatus('997'))?.status.state).toBe('parked');
   });
 });
 
