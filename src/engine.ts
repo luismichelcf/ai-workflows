@@ -349,12 +349,42 @@ export function createEngine(options: EngineOptions): Engine {
       }
     };
 
-    // An abort has no verdict: the caller's signal stopped the run, so nothing is written —
-    // least of all `done`, which would claim the piece finished when it did not.
-    const abortedOutcome = (): RunOutcome => ({
-      outcome: 'ran',
-      status: { piece, state: 'running' },
-    });
+    // Why the keepalive gave up on the lease. It is recorded before aborting so the abort
+    // can be translated honestly: an abort and a theft are not the same answer. `undefined`
+    // means no theft was seen, so an abort, if any, came from the caller's signal.
+    type LeaseLoss =
+      | { readonly kind: 'taken'; readonly heldBy: string }
+      | { readonly kind: 'lapsed' }
+      | { readonly kind: 'unconfirmed' };
+    let leaseLoss: LeaseLoss | undefined;
+
+    // A failed renewal with a named holder means another controller has the piece. Anything
+    // else — a lease nobody took, or a store that cannot answer — is a technical block, never
+    // `busy`: `busy` promises the caller someone else owns the piece, and a caller may wait on
+    // that controller to finish.
+    const lostOutcome = (loss: LeaseLoss): RunOutcome => {
+      if (loss.kind === 'taken') return { outcome: 'busy', heldBy: loss.heldBy };
+      return {
+        outcome: 'ran',
+        status: blockedStatus(
+          undefined,
+          loss.kind === 'lapsed'
+            ? 'the lease of the piece lapsed and no controller holds it'
+            : 'the lease of the piece could not be confirmed',
+        ),
+      };
+    };
+    const lostByHolder = (heldBy: string): RunOutcome =>
+      lostOutcome(heldBy.length > 0 ? { kind: 'taken', heldBy } : { kind: 'lapsed' });
+
+    // An abort with no recorded lease loss is the caller's signal: nothing is written —
+    // least of all `done`, which would claim the piece finished when it did not — and the
+    // status stays as the run last stored it. When the keepalive did lose the lease, the
+    // abort is reported as the loss it was, never as a `running` status nobody stored.
+    const abortedOutcome = (): RunOutcome =>
+      leaseLoss === undefined
+        ? { outcome: 'ran', status: { piece, state: 'running' } }
+        : lostOutcome(leaseLoss);
 
     try {
       // A stop that happened before this run began still wins over any progress.
@@ -374,7 +404,7 @@ export function createEngine(options: EngineOptions): Engine {
 
         const held = await renewLease();
         if (!held.ok) {
-          return { outcome: 'busy', heldBy: held.heldBy };
+          return lostByHolder(held.heldBy);
         }
 
         const latest = await readStatus();
@@ -562,10 +592,19 @@ export function createEngine(options: EngineOptions): Engine {
         const timer = setInterval(() => {
           store.renew(piece, leaseId, requestedLeaseMs).then(
             (renewed) => {
-              if (!renewed.ok) controller.abort();
+              if (!renewed.ok) {
+                // Record who took it before aborting: the abort is translated to `busy`
+                // with a holder, not to a `running` status the store never saw.
+                leaseLoss =
+                  renewed.heldBy.length > 0
+                    ? { kind: 'taken', heldBy: renewed.heldBy }
+                    : { kind: 'lapsed' };
+                controller.abort();
+              }
             },
             () => {
               // The lease could not be confirmed. Unknown is not held, so stop touching it.
+              leaseLoss = { kind: 'unconfirmed' };
               controller.abort();
             },
           );
@@ -590,8 +629,9 @@ export function createEngine(options: EngineOptions): Engine {
           // Keep the piece through a stage slower than the lease.
           const held = await renewLease();
           if (!held.ok) {
-            // The piece is someone else's now. Their run's verdict is the one that counts.
-            return { outcome: 'busy', heldBy: held.heldBy };
+            // The piece is someone else's now, or nobody's at all. Each is its own answer;
+            // neither is the `running` status this run would otherwise invent.
+            return lostByHolder(held.heldBy);
           }
 
           let context: GateContext;
@@ -748,9 +788,10 @@ export function createEngine(options: EngineOptions): Engine {
             return finish(blockedStatus(stage.name, error.message));
           }
           if (error instanceof LeaseLost) {
-            // Another controller owns the piece now. Its verdict is the one that counts, so
-            // this run writes neither the journal nor the status.
-            return { outcome: 'busy', heldBy: error.heldBy };
+            // The lease is gone. A named holder means another controller owns the piece and
+            // its verdict is the one that counts; a lapsed one is a technical block. Either
+            // way this run writes neither the journal nor the status.
+            return lostByHolder(error.heldBy);
           }
           throw error;
         }
