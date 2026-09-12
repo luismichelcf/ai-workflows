@@ -268,3 +268,148 @@ describe('external effects', () => {
     expect(await store.getEffect('998', 'open-pr')).toBeUndefined();
   });
 });
+
+describe('effects travel as JSON', () => {
+  it('gives back the same shape after the result was stored', async () => {
+    // Over a remote store the result is text, so a Date comes back as a string. The memory
+    // store must make the same round trip, or the difference only shows up on a resume in
+    // production — the one path nobody exercises by hand.
+    const store = createMemoryStore();
+    const stamp = '2026-09-12T10:00:00.000Z';
+
+    await store.runEffect('997', 'open-pr', async () => ({ pr: 1, createdAt: stamp }));
+    const again = await store.runEffect('997', 'open-pr', async () => ({ pr: 2, createdAt: stamp }));
+
+    expect(again).toEqual({ pr: 1, createdAt: stamp });
+  });
+
+  it('does not hand back a live object a caller could mutate', async () => {
+    const store = createMemoryStore();
+    const first = await store.runEffect('997', 'open-pr', async () => ({ pr: 1 }));
+    (first as { pr: number }).pr = 99;
+
+    expect(await store.runEffect('997', 'open-pr', async () => ({ pr: 2 }))).toEqual({ pr: 1 });
+  });
+});
+
+describe('reconciling an effect', () => {
+  it('lets a verifier say it never happened, so it can be retried', async () => {
+    // Without this, whoever checks GitHub and finds no such PR would have to invent a
+    // result to move on: fabricating evidence.
+    const store = createMemoryStore();
+    await store
+      .runEffect('997', 'open-pr', async () => {
+        throw new Error('la red se cayo');
+      })
+      .catch(() => undefined);
+
+    await store.reconcileEffect('997', 'open-pr', { didNotHappen: true });
+
+    expect(await store.runEffect('997', 'open-pr', async () => ({ pr: 7 }))).toEqual({ pr: 7 });
+  });
+
+  it('lets a verifier confirm what actually happened', async () => {
+    const store = createMemoryStore();
+    await store
+      .runEffect('997', 'open-pr', async () => {
+        throw new Error('la red se cayo');
+      })
+      .catch(() => undefined);
+
+    await store.reconcileEffect('997', 'open-pr', { confirmed: { pr: 77 } });
+
+    expect(await store.runEffect('997', 'open-pr', async () => ({ pr: 99 }))).toEqual({ pr: 77 });
+  });
+});
+
+describe('the journal is append-only', () => {
+  const anEntry = {
+    stage: 'spec',
+    outcome: 'rejected' as const,
+    at: 1,
+    runId: 'run-a',
+    pipeline: 'fp',
+  };
+
+  it('refuses an edit to an entry it handed out', async () => {
+    const store = createMemoryStore();
+    await store.append('997', anEntry);
+    const journal = await store.journal('997');
+
+    expect(() => {
+      (journal[0] as { outcome: string }).outcome = 'passed';
+    }).toThrow();
+  });
+
+  it('keeps the stored entry intact even if a caller tried', async () => {
+    const store = createMemoryStore();
+    await store.append('997', anEntry);
+    try {
+      (((await store.journal('997'))[0]) as { outcome: string }).outcome = 'passed';
+    } catch {
+      // expected
+    }
+
+    expect((await store.journal('997'))[0]?.outcome).toBe('rejected');
+  });
+
+  it('drops one stage entries when asked to forget them', async () => {
+    const store = createMemoryStore();
+    await store.append('997', anEntry);
+    await store.append('997', { ...anEntry, stage: 'vieja' });
+
+    await store.forget('997', 'vieja');
+
+    expect((await store.journal('997')).map((entry) => entry.stage)).toEqual(['spec']);
+  });
+});
+
+describe('zones', () => {
+  it('lets one piece take a zone', async () => {
+    const store = createMemoryStore();
+
+    expect((await store.reserveZone('nomina', '997', 'run-a', 30_000)).ok).toBe(true);
+  });
+
+  it('keeps a second piece out of a taken zone', async () => {
+    const store = createMemoryStore();
+    await store.reserveZone('nomina', '997', 'run-a', 30_000);
+
+    expect((await store.reserveZone('nomina', '998', 'run-b', 30_000)).ok).toBe(false);
+  });
+
+  it('does not confuse one zone with another', async () => {
+    const store = createMemoryStore();
+    await store.reserveZone('nomina', '997', 'run-a', 30_000);
+
+    expect((await store.reserveZone('tiempo', '998', 'run-b', 30_000)).ok).toBe(true);
+  });
+
+  it('frees the zone when its holder releases it', async () => {
+    const store = createMemoryStore();
+    await store.reserveZone('nomina', '997', 'run-a', 30_000);
+    await store.releaseZone('nomina', 'run-a');
+
+    expect((await store.reserveZone('nomina', '998', 'run-b', 30_000)).ok).toBe(true);
+  });
+
+  it('hands a lapsed zone to the next piece', async () => {
+    const clock = fakeClock();
+    const store = createMemoryStore({ now: clock.now });
+    await store.reserveZone('nomina', '997', 'run-a', 30_000);
+
+    clock.advance(30_001);
+
+    expect((await store.reserveZone('nomina', '998', 'run-b', 30_000)).ok).toBe(true);
+  });
+});
+
+describe('renew on a free piece', () => {
+  it('does not name the caller as the holder of a piece nobody holds', async () => {
+    const store = createMemoryStore();
+
+    const result = await store.renew('997', 'run-a', 30_000);
+
+    expect(result.ok === false && result.heldBy).not.toBe('run-a');
+  });
+});

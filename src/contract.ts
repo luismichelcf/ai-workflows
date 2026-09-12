@@ -47,8 +47,27 @@ export type GateNature =
   /** A human or model judgement, published as an authenticated event. */
   | 'attest';
 
+/** Anything that survives a round trip through JSON, which is where evidence ends up. */
+export type JsonValue =
+  | string
+  | number
+  | boolean
+  | null
+  | readonly JsonValue[]
+  | { readonly [key: string]: JsonValue };
+
 export type GateResult =
-  | { readonly ok: true; readonly note?: string }
+  | {
+      readonly ok: true;
+      /**
+       * What this stage observed, kept in the journal. This is the material an
+       * `execution-record` gate checks later: the red test's assertion, the builder's
+       * execution identity, the SHA the review was given. Without it a stage that passes
+       * leaves no trace, and a gate that must ask "what happened before?" has nothing to
+       * read.
+       */
+      readonly evidence?: JsonValue;
+    }
   | { readonly ok: false; readonly reason: string }
   /**
    * The stage does not apply to this change. Never the same as passing: it is recorded as
@@ -87,10 +106,17 @@ export interface GateContext {
    * that opens a PR, asks for a queue turn or posts a verdict goes through here, so
    * resuming after a crash reconciles instead of repeating.
    */
-  runEffect<T>(operationId: string, effect: () => Promise<T>): Promise<T>;
+  runEffect<T extends JsonValue>(operationId: string, effect: () => Promise<T>): Promise<T>;
 }
 
 export type Gate = (context: GateContext) => GateResult | Promise<GateResult>;
+
+/**
+ * Whether a stage applies at all. `true` runs it; `false` skips it with a generic motive;
+ * `{skip}` skips it saying exactly why, which is what the lane matrix needs ("no red test
+ * on a purely visual change, per ADR 0110" reads very differently from "does not apply").
+ */
+export type Applicability = boolean | { readonly skip: string };
 
 export interface StageConfig {
   /** Unique within the pipeline. */
@@ -98,11 +124,24 @@ export interface StageConfig {
   /** The stage that must pass before this one. Omitted only by the first stage. */
   readonly after?: string;
   readonly nature: GateNature;
+  /** Omitted means "always applies". A malformed answer blocks; it never exempts. */
+  readonly appliesWhen?: (context: GateContext) => Applicability | Promise<Applicability>;
   /**
-   * Whether this stage applies to this change at all. Returning false records a skip with
-   * its motive; it never counts as a pass. Omitted means "always applies".
+   * Whether what this stage recorded earlier is still evidence. This is how a stage keeps
+   * its own rule for going stale: the flock survives a clean update with `main`, while QA
+   * and the owner's sign-off expire the moment the SHA moves.
+   *
+   * Omitted means evidence never goes stale on its own. It still stops counting if the
+   * stage disappears from the pipeline.
+   *
+   * Note what is deliberately NOT here: the engine does not invalidate everything whenever
+   * the pipeline's shape changes. Adding a stage must not force a piece to redo the review
+   * and ask the owner again for a sign-off they already gave.
    */
-  readonly appliesWhen?: (context: GateContext) => boolean | Promise<boolean>;
+  readonly stillValid?: (
+    entry: JournalEntry,
+    context: GateContext,
+  ) => boolean | Promise<boolean>;
   /**
    * A stage only a person can satisfy. Its gate saying no is not a failure — it is pending
    * (`waiting:decision`).
@@ -141,13 +180,12 @@ export interface JournalEntry {
   readonly stage: string;
   readonly outcome: StageOutcome;
   readonly reason?: string;
+  /** What the stage observed, from its `GateResult`. The material of later gates. */
+  readonly evidence?: JsonValue;
   /** Milliseconds since the epoch, supplied by the caller so runs stay reproducible. */
   readonly at: number;
   readonly runId: RunId;
-  /**
-   * Fingerprint of the pipeline this entry was produced under. An entry whose fingerprint
-   * no longer matches is not evidence that the current stage passed.
-   */
+  /** Fingerprint of the pipeline's shape when this was written. Informational. */
   readonly pipeline: string;
 }
 
@@ -161,13 +199,20 @@ export type PieceState =
 
 export interface PieceStatus {
   readonly piece: PieceId;
-  /** Stage the piece stopped at. Absent once every applicable stage was resolved. */
+  /** Stage the piece stopped at, or is inside right now. */
   readonly stage?: string;
   readonly state: PieceState;
   /** Why it stopped, in the gate's own words. */
   readonly reason?: string;
   /** What the piece was before it was parked, so parking never erases a diagnosis. */
   readonly previous?: { readonly state: PieceState; readonly reason?: string };
+  /**
+   * When the current stage started. Written before the gate runs, not after, so `status`
+   * from another terminal can say what is happening now — and so a piece whose controller
+   * died mid-stage is not mistaken for one that never ran.
+   */
+  readonly startedAt?: number;
+  readonly updatedAt?: number;
 }
 
 // ---------------------------------------------------------------------------------------
@@ -249,16 +294,43 @@ export interface Store {
 
   append(piece: PieceId, entry: JournalEntry): Promise<void>;
   journal(piece: PieceId): Promise<readonly JournalEntry[]>;
+  /** Drops a stage's entries, so a piece stuck on evidence of a retired stage can move. */
+  forget(piece: PieceId, stage: string): Promise<void>;
 
   getEffect(piece: PieceId, operationId: string): Promise<EffectRecord | undefined>;
   /**
    * Runs an external effect at most once. A confirmed effect returns its first result
    * without running again. One left `pending` or `uncertain` by a crash throws
    * `EffectNeedsReconciliation` — it is never retried blindly.
+   *
+   * The result must survive JSON: over a remote store it travels as text, so a `Date` comes
+   * back as a string. Constraining it here means the memory store's tests catch what the
+   * GitHub-backed one would do, instead of the difference surfacing on a resume in
+   * production — the one path nobody exercises by hand.
    */
-  runEffect<T>(piece: PieceId, operationId: string, effect: () => Promise<T>): Promise<T>;
-  /** Resolves an effect a person or a reconciler determined the outcome of. */
-  reconcileEffect(piece: PieceId, operationId: string, result: unknown): Promise<void>;
+  runEffect<T extends JsonValue>(
+    piece: PieceId,
+    operationId: string,
+    effect: () => Promise<T>,
+  ): Promise<T>;
+  /**
+   * Resolves an effect whose outcome someone determined by checking the outside world.
+   * `didNotHappen` puts it back to never-ran so it can be retried — without it, whoever
+   * verifies that the PR was never opened would have to invent a result to move on, which
+   * is fabricating evidence.
+   */
+  reconcileEffect(
+    piece: PieceId,
+    operationId: string,
+    outcome: { readonly confirmed: JsonValue } | { readonly didNotHappen: true },
+  ): Promise<void>;
+
+  /**
+   * Takes a shared resource — a board zone, the main checkout for packaging — so two
+   * pieces cannot work on it at once. Same lease semantics as `reserve`.
+   */
+  reserveZone(zone: string, piece: PieceId, runId: RunId, leaseMs: number): Promise<Reservation>;
+  releaseZone(zone: string, runId: RunId): Promise<void>;
 }
 
 // ---------------------------------------------------------------------------------------
