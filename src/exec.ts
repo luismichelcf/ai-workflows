@@ -51,10 +51,13 @@ const FORBIDDEN_LAUNCHERS =
 
 // An 8.3 short name such as POWERS~1 hides which program it really points at, so it is never
 // used. Where it is looked for depends on who wrote the path: a shim's target is checked in
-// every segment, because a short folder name in the middle (`NODE_M~1\tool\cli.js`) hides the
-// real program just as well as a short file name. A PATH entry or a directly requested absolute
-// path, on the other hand, is what the caller named: `C:\PROGRA~1\nodejs` is that folder, and
-// only a short name for the file itself (`RIPGRE~1.EXE`) hides which program runs.
+// every segment, but only in the part the shim itself wrote after `%dp0%`, because a short
+// folder name in the middle (`NODE_M~1\tool\cli.js`) hides the real program just as well as a
+// short file name, while the short form of the PATH folder that `%dp0%` stands for
+// (`C:\PROGRA~1\npm`) is the caller's own folder and must not refuse the shim. A PATH entry or
+// a directly requested absolute path, on the other hand, is what the caller named:
+// `C:\PROGRA~1\nodejs` is that folder, and only a short name for the file itself
+// (`RIPGRE~1.EXE`) hides which program runs.
 const SHORT_NAME = /~\d/;
 
 // The exact line every npm shim ends with before it forwards the arguments. Only the two
@@ -98,6 +101,13 @@ function hasShortName(file: string): boolean {
 // file name decides: the folders named by the caller are trusted as they are written.
 function hasShortNameInFileName(file: string): boolean {
   return SHORT_NAME.test(baseName(file));
+}
+
+// A shim's target is inspected for a short name in the part the shim actually wrote, with the
+// `%dp0%` token set aside: `%dp0%` expands to the PATH folder the caller named, whose short form
+// must not refuse the shim, whereas a short name the shim wrote after it still hides the program.
+function hasShortNameInShimTarget(target: string): boolean {
+  return hasShortName(target.replace(/%dp0%/gi, ''));
 }
 
 function extensionOf(file: string): string {
@@ -217,7 +227,7 @@ function resolveShim(dir: string, content: string, env: ExecutableEnvironment): 
   if (shim === undefined) return undefined;
 
   const target = substituteDp0(shim.target, dir);
-  if (!env.exists(target) || hasShortName(target)) return undefined;
+  if (!env.exists(target) || hasShortNameInShimTarget(shim.target)) return undefined;
   if (shim.kind === 'exe' && isForbiddenLauncher(target)) return undefined;
 
   if (shim.kind === 'script') {
