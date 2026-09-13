@@ -39,20 +39,6 @@ const TREE_CACHE_LIMIT = 16;
 const UPDATE_REFS_MUTATION =
   'mutation UpdateRefs($input: UpdateRefsInput!) { updateRefs(input: $input) { clientMutationId } }';
 
-// Lists one page of refs under a prefix. `refPrefix` is the full `refs/...` path; the node `name`
-// GitHub returns is relative to it, so the caller rebuilds the state name from the prefix it
-// asked for. The variables travel as JSON on stdin, so no ref text is ever an argument.
-const REFS_QUERY = [
-  'query Refs($owner: String!, $name: String!, $refPrefix: String!, $cursor: String) {',
-  '  repository(owner: $owner, name: $name) {',
-  '    refs(refPrefix: $refPrefix, first: 100, after: $cursor) {',
-  '      nodes { name target { oid } }',
-  '      pageInfo { hasNextPage endCursor }',
-  '    }',
-  '  }',
-  '}',
-].join('\n');
-
 type TreeChange =
   | { readonly path: string; readonly mode: '100644'; readonly type: 'blob'; readonly content: string }
   | { readonly path: string; readonly mode: '100644'; readonly type: 'blob'; readonly sha: null };
@@ -132,15 +118,6 @@ function failureOf(result: GhRun): GhFailure {
   return { status: statusOf(result), message };
 }
 
-// A GraphQL reply can exit 0 and still carry an `errors` array, so the exit code alone is not
-// enough to call a write landed.
-function hasGraphQlErrors(stdout: string): boolean {
-  const parsed = tryParse(stdout);
-  if (!isRecord(parsed)) return false;
-  const errors = parsed['errors'];
-  return Array.isArray(errors) && errors.length > 0;
-}
-
 // The single success shape of `updateRefs`: an exit 0, no GraphQL errors, and a `data.updateRefs`
 // object. A reply missing that object is a failed write, never a landed one.
 function updateRefsLanded(stdout: string): boolean {
@@ -200,6 +177,27 @@ function validateStateName(name: string): void {
     throw new Error(
       `The state name "${name}" is not valid: use slash-separated segments of letters, digits, ` +
         'underscore or hyphen, with no empty, "." or ".." segment.',
+    );
+  }
+}
+
+// A listing prefix like `pieces/`: one or more slash-separated segments of letters, digits,
+// underscore or hyphen, terminated by a slash. The trailing slash keeps the match on a segment
+// boundary (`pieces/` never matches `piecesX/`), and the character set keeps the prefix from
+// escaping the namespace path once it is pasted into a REST URL. Thrown before any call.
+function validateRefPrefix(prefix: string): void {
+  if (!prefix.endsWith('/')) {
+    throw new Error(
+      `The prefix "${prefix}" is not valid: use one or more slash-separated segments of letters, ` +
+        'digits, underscore or hyphen, and end it with a slash.',
+    );
+  }
+  // The trailing slash leaves one empty segment, which is the terminator, not a name.
+  const segments = prefix.split('/').slice(0, -1);
+  if (segments.length === 0 || segments.some((segment) => !STATE_SEGMENT_PATTERN.test(segment))) {
+    throw new Error(
+      `The prefix "${prefix}" is not valid: use one or more slash-separated segments of letters, ` +
+        'digits, underscore or hyphen, and end it with a slash.',
     );
   }
 }
@@ -339,59 +337,35 @@ export function createGitHubStatePort(options: GitHubStatePortOptions): StatePor
     return Buffer.from(content.replace(/\s+/g, ''), 'base64').toString('utf8');
   }
 
-  // Reads the `repository` object of a GraphQL reply, refusing any reply that carries errors or
-  // does not name the repository. An unreadable reply must never look like «no refs».
-  function requireRepository(result: GhRun): Record<string, unknown> {
-    if (result.exitCode !== 0) throw new Error(failureOf(result).message);
-    const parsed = parseJson(result.stdout);
-    if (!isRecord(parsed)) throw new Error('gh returned an unexpected GraphQL reply.');
-    if (hasGraphQlErrors(result.stdout)) throw new Error(failureOf(result).message);
-    const data = parsed['data'];
-    const repository = isRecord(data) ? data['repository'] : undefined;
-    if (!isRecord(repository)) {
-      throw new Error(`gh did not report the repository ${owner}/${repo}.`);
-    }
-    return repository;
-  }
-
   async function refs(prefix: string): Promise<readonly StateRef[]> {
-    const refPrefix = `${namespace}/${prefix}`;
+    validateRefPrefix(prefix);
+    const listingPrefix = `${namespace}/${prefix}`;
+    // GraphQL `refs(refPrefix:)` lists only branches and tags, so it answered `totalCount: 0`
+    // for state refs even with two in place (measured on 13-sep-2026). REST `git/matching-refs`
+    // does list them and answers `[]` when none match; `--paginate` follows every page and joins
+    // them into a single JSON array.
+    const result = await run([
+      'api',
+      '--paginate',
+      `${base}/git/matching-refs/${namespacePath}/${prefix}`,
+    ]);
+    const parsed = ensureOk(result);
+    if (!Array.isArray(parsed)) {
+      throw new Error(`gh did not report a list of refs under ${listingPrefix}.`);
+    }
     const listed: StateRef[] = [];
-    let cursor: string | null = null;
-    // `refs` is paginated: each page carries at most 100 nodes plus the cursor of the next one,
-    // so a long list is followed page by page until GitHub says there is no next page.
-    for (;;) {
-      const result = await graphqlApi({
-        query: REFS_QUERY,
-        variables: { owner, name: repo, refPrefix, cursor },
-      });
-      const repository = requireRepository(result);
-      const refsNode = repository['refs'];
-      if (!isRecord(refsNode)) {
-        throw new Error(`gh did not report the refs under ${refPrefix}.`);
+    for (const item of parsed) {
+      const ref = stringField(item, 'ref');
+      const object = isRecord(item) ? item['object'] : undefined;
+      const commit = stringField(object, 'sha');
+      if (ref === undefined || commit === undefined) {
+        throw new Error(`gh returned a ref under ${listingPrefix} without a name and commit.`);
       }
-      const nodes = refsNode['nodes'];
-      if (!Array.isArray(nodes)) {
-        throw new Error(`gh did not report the list of refs under ${refPrefix}.`);
-      }
-      for (const node of nodes) {
-        const shortName = stringField(node, 'name');
-        const target = isRecord(node) ? node['target'] : undefined;
-        const oid = stringField(target, 'oid');
-        if (shortName === undefined || oid === undefined) {
-          throw new Error(`gh returned a ref under ${refPrefix} without a name and commit.`);
-        }
-        // GitHub names each node relative to `refPrefix`; the caller wants the state name it
-        // asked for, so the prefix it passed is put back in front.
-        listed.push({ name: `${prefix}${shortName}`, commit: oid });
-      }
-      const pageInfo = refsNode['pageInfo'];
-      if (!isRecord(pageInfo) || pageInfo['hasNextPage'] !== true) break;
-      const endCursor = stringField(pageInfo, 'endCursor');
-      if (endCursor === undefined) {
-        throw new Error(`gh did not report the cursor of the next page of refs under ${refPrefix}.`);
-      }
-      cursor = endCursor;
+      // `matching-refs` matches on a segment boundary, so a shorter prefix would also answer
+      // sibling prefixes; keeping only the exact prefix the caller asked for avoids reading
+      // another kind of state.
+      if (!ref.startsWith(listingPrefix)) continue;
+      listed.push({ name: ref.slice(`${namespace}/`.length), commit });
     }
     return listed;
   }
