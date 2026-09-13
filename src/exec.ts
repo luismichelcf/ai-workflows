@@ -39,14 +39,19 @@ export type ResolvedExecutable =
 
 // Launchers that re-read their own arguments are never a valid answer. Handing one back would
 // recreate the shell hop this module exists to avoid: `wsl` without `--exec` delegates to the
-// Linux shell, and wscript, cscript, mshta and conhost run whatever they are given. Matched on
-// the base name with its extension stripped, case insensitively, so `CMD.EXE`, `cmd.com` and a
-// shim pointing at `wsl.exe` all trip it. The refusal names the command that was asked for.
+// Linux shell, and wscript, cscript, mshta and conhost run whatever they are given. `forfiles`
+// spawns cmd by itself, `rundll32` runs an exported routine, `env` misses the Windows contract,
+// and `mintty`/`git-bash` open another shell. Matched on the base name with its extension
+// stripped, case insensitively, so `CMD.EXE`, `cmd.com` and a shim pointing at `wsl.exe` all
+// trip it. The rule only applies to the program that would be launched, never to the script a
+// Node shim hands to node — that is data, and a file called `dash.js` is legitimate. The refusal
+// names the command that was asked for.
 const FORBIDDEN_LAUNCHERS =
-  /^(?:cmd|powershell|pwsh|bash|sh|zsh|dash|ksh|csh|tcsh|fish|wsl|wscript|cscript|mshta|conhost)$/i;
+  /^(?:cmd|powershell|pwsh|bash|sh|zsh|dash|ksh|csh|tcsh|fish|wsl|wscript|cscript|mshta|conhost|env|forfiles|rundll32|mintty|git-bash)$/i;
 
 // An 8.3 short name such as POWERS~1 hides which program it really points at, so it is never
-// used. The rule looks at the last segment only, matching the way a program name is written.
+// used. It is looked for in every segment of the path: a short folder name in the middle
+// (`NODE_M~1\tool\cli.js`) hides the real directory just as well as a short file name.
 const SHORT_NAME = /~\d/;
 
 // The exact line every npm shim ends with before it forwards the arguments. Only the two
@@ -55,8 +60,16 @@ const SHORT_NAME = /~\d/;
 const SHIM_PREFIX = 'endLocal & goto #_undefined_# 2>NUL \\|\\| title %COMSPEC% & ';
 const EXE_DIRECT_SHAPE = new RegExp(`^(?:${SHIM_PREFIX})?"(%dp0%[\\\\/][^"]+\\.exe)"\\s+%\\*$`, 'i');
 const SCRIPT_CALL_SHAPE = new RegExp(`^(?:${SHIM_PREFIX})?"%_prog%"\\s+"(%dp0%[\\\\/][^"]+\\.(?:cjs|mjs|js))"\\s+%\\*$`, 'i');
-const PROG_ASSIGNMENT = /^\s*SET\s+"_prog=([^"]*)"\s*$/i;
-const NODE_OPTIONS_ASSIGNMENT = /^\s*SET\s+NODE_OPTIONS=/i;
+
+// The only two `_prog` assignments an npm Node shim may contain, exactly as the real files
+// write them (indented, quoted). Any other mention of `_prog=` — unquoted, or folded onto the
+// IF line — is a shape nobody verified and is refused instead of being silently ignored.
+const ALLOWED_PROG_ASSIGNMENT = /^\s+SET\s+"_prog=(?:%dp0%\\node\.exe|node)"\s*$/i;
+
+// A shim that imposes NODE_OPTIONS would change how node runs the script, and that change would
+// be lost once we call node ourselves, so any mention at all (quoted or not) refuses the shim.
+const NODE_OPTIONS_MENTION = /NODE_OPTIONS/i;
+const PROG_MENTION = /_prog=/i;
 
 function baseName(file: string): string {
   return file.split(/[\\/]/).pop() ?? file;
@@ -72,7 +85,10 @@ function isForbiddenLauncher(file: string): boolean {
 }
 
 function hasShortName(file: string): boolean {
-  return SHORT_NAME.test(baseName(file));
+  return file
+    .replace(/\//g, '\\')
+    .split('\\')
+    .some((segment) => segment.length > 0 && SHORT_NAME.test(segment));
 }
 
 function extensionOf(file: string): string {
@@ -84,26 +100,35 @@ function isWindowsAbsolutePath(file: string): boolean {
   return /^[A-Za-z]:[\\/]/.test(file) || file.startsWith('\\\\');
 }
 
-function isAllowedProg(value: string): boolean {
-  const normalized = value.trim().toLowerCase();
-  return normalized === '%dp0%\\node.exe' || normalized === 'node';
-}
-
 function splitPath(value: string, separator: string): string[] {
   return value.split(separator).filter((entry) => entry.length > 0);
 }
 
 // Windows writes PATH entries quoted when they contain spaces, and occasionally relative. A
 // relative entry could never produce an absolute command, so it is dropped instead of being
-// joined. Empty entries are dropped the same way.
+// joined. Empty entries are dropped the same way. Quotes are honoured while scanning so that a
+// `;` inside a quoted folder (`"C:\a;b";C:\tools`) does not split one entry into two.
 function windowsPathEntries(value: string): string[] {
   const entries: string[] = [];
-  for (const raw of value.split(';')) {
-    const entry = raw.trim().replace(/^"|"$/g, '');
-    if (entry.length === 0 || !isWindowsAbsolutePath(entry)) continue;
-    entries.push(entry);
+  let current = '';
+  let quoted = false;
+  for (const character of value) {
+    if (character === '"') {
+      quoted = !quoted;
+      continue;
+    }
+    if (character === ';' && !quoted) {
+      entries.push(current);
+      current = '';
+      continue;
+    }
+    current += character;
   }
-  return entries;
+  entries.push(current);
+
+  return entries
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0 && isWindowsAbsolutePath(entry));
 }
 
 function joinPath(dir: string, child: string, separator: string): string {
@@ -136,19 +161,16 @@ function windowsDirName(file: string): string {
   return index === -1 ? '' : normalized.slice(0, index);
 }
 
-// A verified shim is one whose `%*` line matches exactly one of the two npm shapes. The
-// interpreter for a script shim must be node, and `_prog` may only have been set to the local
-// node.exe or the bare `node` the shim falls back to; any other value means an interpreter this
-// module did not verify (bun, for one), so the shim is skipped and the PATH search continues.
+// A verified shim is one whose `%*` line matches exactly one of the two npm shapes. A script
+// shim must set `_prog` at least once and only through the two verified assignments, so an
+// unquoted `SET _prog=…bun.exe` or one folded onto the IF line is refused rather than ignored.
 function inspectCmdShim(content: string): { readonly kind: 'exe' | 'script'; readonly target: string } | undefined {
-  for (const line of content.split(/\r?\n/)) {
-    if (NODE_OPTIONS_ASSIGNMENT.test(line)) return undefined;
+  const lines = content.split(/\r?\n/);
+  for (const line of lines) {
+    if (NODE_OPTIONS_MENTION.test(line)) return undefined;
   }
 
-  const invocationLines = content
-    .split(/\r?\n/)
-    .filter((line) => line.trimEnd().endsWith('%*'))
-    .map((line) => line.trim());
+  const invocationLines = lines.filter((line) => line.trimEnd().endsWith('%*')).map((line) => line.trim());
   if (invocationLines.length !== 1) return undefined;
   const line = invocationLines[0];
   if (line === undefined) return undefined;
@@ -163,13 +185,13 @@ function inspectCmdShim(content: string): { readonly kind: 'exe' | 'script'; rea
   if (script !== null) {
     const target = script[1];
     if (target === undefined) return undefined;
-    const progs: string[] = [];
-    for (const sourceLine of content.split(/\r?\n/)) {
-      const assignment = PROG_ASSIGNMENT.exec(sourceLine);
-      const value = assignment?.[1];
-      if (value !== undefined) progs.push(value);
+    let assignments = 0;
+    for (const sourceLine of lines) {
+      if (!PROG_MENTION.test(sourceLine)) continue;
+      if (!ALLOWED_PROG_ASSIGNMENT.test(sourceLine)) return undefined;
+      assignments += 1;
     }
-    if (progs.length === 0 || !progs.every(isAllowedProg)) return undefined;
+    if (assignments === 0) return undefined;
     return { kind: 'script', target };
   }
 
@@ -177,13 +199,17 @@ function inspectCmdShim(content: string): { readonly kind: 'exe' | 'script'; rea
 }
 
 // Turns a verified shim into the program it really runs. Returns undefined when the target does
-// not exist, is itself a forbidden launcher, or hides behind an 8.3 name.
+// not exist, hides behind an 8.3 name, or — when the shim launches an .exe — is itself a
+// forbidden launcher. The forbidden-launcher rule is not applied to a script shim: the script is
+// an argument to node, not the program being launched, so `dash.js` must not be mistaken for the
+// `dash` shell.
 function resolveShim(dir: string, content: string, env: ExecutableEnvironment): ResolvedExecutable | undefined {
   const shim = inspectCmdShim(content);
   if (shim === undefined) return undefined;
 
   const target = substituteDp0(shim.target, dir);
-  if (!env.exists(target) || isForbiddenLauncher(target) || hasShortName(target)) return undefined;
+  if (!env.exists(target) || hasShortName(target)) return undefined;
+  if (shim.kind === 'exe' && isForbiddenLauncher(target)) return undefined;
 
   if (shim.kind === 'script') {
     const localNode = joinPath(dir, 'node.exe', '\\');
@@ -225,15 +251,18 @@ function resolveWindows(name: string, env: ExecutableEnvironment): ResolvedExecu
 }
 
 // An absolute path gets exactly the same treatment as a name: a real `.exe`/`.com` is used, a
-// `.cmd` is read as a shim, and everything else (`.bat`, `.ps1`, no extension, missing, or a
-// forbidden launcher such as cmd.exe) is refused without ever walking the PATH.
+// `.cmd` is read as a shim, and everything else (`.bat`, `.ps1`, no extension, missing) is
+// refused without ever walking the PATH. The forbidden-launcher rule only applies to the program
+// being launched, so it is checked for `.exe`/`.com` (cmd.exe, git-bash.exe) but not for the
+// `.cmd` shim file itself, whose contents are inspected instead.
 function resolveWindowsAbsolute(file: string, env: ExecutableEnvironment): ResolvedExecutable {
-  if (isForbiddenLauncher(file) || hasShortName(file)) {
+  if (hasShortName(file)) {
     return { ok: false, reason: reasonFor(file) };
   }
 
   const extension = extensionOf(file);
   if (extension === '.exe' || extension === '.com') {
+    if (isForbiddenLauncher(file)) return { ok: false, reason: reasonFor(file) };
     return env.exists(file)
       ? { ok: true, command: file, prefixArgs: [] }
       : { ok: false, reason: reasonFor(file) };
