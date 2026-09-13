@@ -56,9 +56,28 @@ function windowsPath(drive: string, rest: string): PathReading {
   // A `:` after the drive names an NTFS alternate data stream, not a file in the folder: it is
   // either a different file or the same one read another way, and we cannot tell which.
   if (rest.includes(':')) return unreadable('una ruta con dos puntos después de la unidad (un flujo NTFS)');
-  // An 8.3 short name `SOCIAL~1` is another spelling of the same folder, but expanding it means
-  // asking the filesystem. Never guess.
-  if (/~[0-9]/.test(rest)) return unreadable('un nombre corto 8.3 que no se puede expandir sin preguntar al sistema');
+
+  const segments = rest.split('/');
+  for (let index = 0; index < segments.length; index += 1) {
+    const segment = segments[index] ?? '';
+    // Empty pieces (from a leading, trailing or doubled separator) and the `.`/`..` names are not
+    // folder names of their own, so the two rules below do not apply to them.
+    if (segment === '' || segment === '.' || segment === '..') continue;
+
+    // Windows strips a trailing dot or space from every name it writes, so `Socialabs.` and
+    // `Socialabs ` both name the folder `Socialabs`. We cannot know which folder the caller meant,
+    // so we refuse instead of collapsing the two ourselves.
+    if (/[. ]$/.test(segment)) {
+      return unreadable('un segmento que termina en punto o espacio (Windows lo recortaría y cambiaría de carpeta)');
+    }
+
+    // An 8.3 short name `SOCIAL~1` is another spelling of the same folder, but expanding it means
+    // asking the filesystem. Never guess. Only a folder can hide behind a short name: in the last
+    // segment (`docs/notas~1.md`) there is nothing below it, so a file name may pass.
+    if (index !== segments.length - 1 && /~[0-9]/.test(segment)) {
+      return unreadable('un nombre corto 8.3 que no se puede expandir sin preguntar al sistema');
+    }
+  }
 
   // Anchor the rest at the drive root before resolving `..`: Windows resolves `C:\..` to `C:\`,
   // while normalising `c:/../x` as a whole drops the drive and reads as a relative path.
@@ -103,6 +122,18 @@ export function readAbsolute(value: string): PathReading {
  */
 export function readAgainst(value: string, cwd: string): PathReading {
   const forward = toPosix(value);
+
+  // A path with exactly one leading separator and no drive (a `\x` or a `/x`) is rooted at the
+  // current drive on Windows: Windows fills the drive in and writes inside the project, not on a
+  // POSIX disk. When the base is a Windows path, anchor the spelling to that drive. With a POSIX
+  // base, `/x` is already absolute and keeps its POSIX meaning.
+  if (forward.startsWith('/') && !forward.startsWith('//')) {
+    const base = readAbsolute(cwd);
+    const drive = base.ok && base.path.windows ? /^([A-Za-z]):/.exec(base.path.display)?.[1] : undefined;
+    if (drive) return readAbsolute(`${drive}:${forward}`);
+    return readAbsolute(forward);
+  }
+
   if (isAbsolutePath(forward)) return readAbsolute(forward);
 
   const base = readAbsolute(cwd);
