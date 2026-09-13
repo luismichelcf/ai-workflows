@@ -72,11 +72,12 @@ describe('which branch a ruleset really covers', () => {
     expect(verifyProtections([detail(refs(['refs/heads/ma*']))], requirement).ok).toBe(true);
   });
 
-  it('a single * stops at a slash; ** does not', () => {
+  it('a single * stops at a slash; **/ does not', () => {
+    // Ruby's fnmatch with FNM_PATHNAME: `**` crosses folders only when followed by `/`.
     const nested = { ...requirement, defaultBranch: 'release/main' };
 
     expect(verifyProtections([detail(refs(['refs/heads/*']))], nested).ok).toBe(false);
-    expect(verifyProtections([detail(refs(['refs/heads/**']))], nested).ok).toBe(true);
+    expect(verifyProtections([detail(refs(['refs/heads/**/*']))], nested).ok).toBe(true);
   });
 
   it('refs/heads/*/main does not cover main', () => {
