@@ -521,8 +521,30 @@ describe('the git store over a remote', () => {
       'open-pr': { state: 'confirmed', result: { pr: 1004 } },
     });
     expect(parse(piece['lease.json'])).toMatchObject({ runId: 'run-a' });
+    expect(parse(piece['ref.json'])).toEqual({ kind: 'piece', id: '997' });
     const zone = remote.refNames().find((name) => name.startsWith('zones/'));
     expect(zone).toMatch(/^zones\/[A-Za-z0-9_-]+$/);
     expect(parse(remote.files(zone ?? '')['lease.json'])).toMatchObject({ runId: 'run-a', piece: '997' });
+    expect(parse(remote.files(zone ?? '')['ref.json'])).toEqual({ kind: 'zone', id: 'Plataforma y CI' });
+  });
+
+  it('never leaves a ref without files, which GitHub refuses: releasing keeps who the ref is for', async () => {
+    // Measured on 13-sep-2026: releasing a zone (its ref held only the lease) failed with 404 on
+    // real GitHub, and the zone stayed taken until its lease ran out.
+    const remote = fakeRemote();
+    const store = session(remote);
+    await store.reserve('997', 'run-a', LEASE);
+    await store.release('997', 'run-a');
+    await store.reserveZone('Plataforma y CI', '997', 'run-a', LEASE);
+    await store.releaseZone('Plataforma y CI', 'run-a');
+
+    const parse = (text: string | undefined): unknown => JSON.parse(text ?? 'null');
+    expect(remote.files('pieces/997')['lease.json']).toBeUndefined();
+    expect(parse(remote.files('pieces/997')['ref.json'])).toEqual({ kind: 'piece', id: '997' });
+    const zone = remote.refNames().find((name) => name.startsWith('zones/')) ?? '';
+    expect(remote.files(zone)['lease.json']).toBeUndefined();
+    expect(parse(remote.files(zone)['ref.json'])).toEqual({ kind: 'zone', id: 'Plataforma y CI' });
+    expect((await session(remote).reserve('997', 'run-b', LEASE)).ok).toBe(true);
+    expect((await session(remote).reserveZone('Plataforma y CI', '998', 'run-b', LEASE)).ok).toBe(true);
   });
 });

@@ -40,6 +40,9 @@ export function fakeRemote() {
       if (content === null) files.delete(path);
       else files.set(path, content);
     }
+    // Like GitHub (measured on 13-sep-2026): deleting the only file of a tree answers 404 and an
+    // empty tree 422, so a write that would leave a ref with no files fails.
+    if (files.size === 0) throw new Error('Not Found: GitHub refuses a tree with no files');
     counter += 1;
     const sha = counter.toString(16).padStart(40, '0');
     commits.set(sha, files);
