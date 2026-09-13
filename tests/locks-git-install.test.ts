@@ -67,27 +67,22 @@ describe('pre-push', () => {
 });
 
 describe('the git hook script', () => {
+  const lock = ['npx', 'ai-workflows', 'lock'];
+
   for (const kind of ['pre-commit', 'pre-push'] as const) {
     it(`${kind}: is a POSIX shell script`, () => {
-      expect(renderGitHook(kind, 'npx ai-workflows lock')).toMatch(/^#!\/bin\/sh\n/);
+      expect(renderGitHook(kind, lock)).toMatch(/^#!\/bin\/sh\n/);
     });
 
     it(`${kind}: has no carriage return anywhere`, () => {
       // Measured in this house: a CR at the end of the shebang line breaks the script on
       // the machines that run it, and nothing says why.
-      expect(renderGitHook(kind, 'npx ai-workflows lock')).not.toContain('\r');
+      expect(renderGitHook(kind, lock)).not.toContain('\r');
     });
 
-    it(`${kind}: hands control to the lock command, passing git s arguments along`, () => {
-      const script = renderGitHook(kind, 'npx ai-workflows lock');
-
-      expect(script).toContain('npx ai-workflows lock');
-      expect(script).toContain('"$@"');
-      expect(script).toContain('exec');
-    });
-
-    it(`${kind}: tells the command which hook it is`, () => {
-      expect(renderGitHook(kind, 'npx ai-workflows lock')).toContain(kind);
+    it(`${kind}: hands control to the lock command, telling it which hook it is and passing git s arguments along`, () => {
+      // One exact line: a mention of the kind in a comment would not tell the command anything.
+      expect(renderGitHook(kind, lock).split('\n')).toContain(`exec 'npx' 'ai-workflows' 'lock' '${kind}' "$@"`);
     });
   }
 });

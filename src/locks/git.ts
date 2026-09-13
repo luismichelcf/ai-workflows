@@ -83,10 +83,33 @@ export function decidePrePush(input: PrePushInput): LockDecision {
   };
 }
 
+/**
+ * The arguments for `git` that list what is staged in a form `parseStagedPaths` reads: NUL
+ * separated, so names are never quoted, and with renames split into both sides, so moving code
+ * into a paper folder still shows the code it removes.
+ */
+export const STAGED_PATHS_GIT_ARGS: readonly string[] = [];
+
+/** The staged paths from the output of `git` with `STAGED_PATHS_GIT_ARGS`. */
+export function parseStagedPaths(_output: string): readonly string[] {
+  throw new Error('parseStagedPaths: not implemented');
+}
+
+/**
+ * The remote refs git is about to update, read from the lines it sends to pre-push on stdin:
+ * `<local ref> <local sha> <remote ref> <remote sha>`. A line in any other shape is refused.
+ */
+export function parsePrePushStdin(
+  _stdin: string,
+): { readonly ok: true; readonly remoteRefs: readonly string[] } | { readonly ok: false; readonly reason: string } {
+  throw new Error('parsePrePushStdin: not implemented');
+}
+
 export type GitHookKind = 'pre-commit' | 'pre-push';
 
 /** The script git runs. POSIX sh, LF only: a CR in the first line breaks it. */
-export function renderGitHook(kind: GitHookKind, command: string): string {
+export function renderGitHook(kind: GitHookKind, argv: readonly string[]): string {
+  const command = argv.join(' ');
   // The body is assembled from LF-joined lines so no `\r` can slip in; a CR at the end of
   // the shebang makes the kernel look for an interpreter named `/bin/sh\r` and fail with a
   // message that never points at the cause.
