@@ -477,7 +477,8 @@ export function createEngine(options: EngineOptions): Engine {
       // resumes by what remains.
       const gone = journal.find((entry) => !knownStages.has(entry.stage));
       if (gone !== undefined) {
-        return finish(
+        // await: a store failure inside finish() must reach the outer catch, not reject run().
+        return await finish(
           blockedStatus(
             gone.stage,
             `journal mentions stage "${gone.stage}", which is not part of the current pipeline`,
@@ -649,7 +650,8 @@ export function createEngine(options: EngineOptions): Engine {
                 ? error.message
                 : `building the context of stage "${stage.name}" failed: ${describeUnknown(error)}`;
             await record(stage.name, 'failed', reason);
-            return finish(blockedStatus(stage.name, reason));
+            return await finish(blockedStatus(stage.name, reason)); // await: a store failure in finish() must reach this stage's catch
+
           }
 
           const prior = latestEntry(stage.name);
@@ -668,7 +670,8 @@ export function createEngine(options: EngineOptions): Engine {
               } catch (error) {
                 const reason = `stillValid of stage "${stage.name}" failed: ${describeUnknown(error)}`;
                 await record(stage.name, 'failed', reason);
-                return finish(blockedStatus(stage.name, reason));
+                return await finish(blockedStatus(stage.name, reason)); // await: a store failure in finish() must reach this stage's catch
+
               }
               // `stillValid` is external input, exactly like `appliesWhen`: a forgotten
               // comparison returning an entry shape, a truthy string or `{}` must not keep
@@ -678,7 +681,8 @@ export function createEngine(options: EngineOptions): Engine {
                   `stillValid of stage "${stage.name}" returned ${describeValue(answer)} ` +
                   'instead of a boolean';
                 await record(stage.name, 'failed', reason);
-                return finish(blockedStatus(stage.name, reason));
+                return await finish(blockedStatus(stage.name, reason)); // await: a store failure in finish() must reach this stage's catch
+
               }
               stillValid = answer;
             }
@@ -692,7 +696,7 @@ export function createEngine(options: EngineOptions): Engine {
               applicability = await evaluateApplicability(stage, context);
               if (applicability.kind === 'malformed') {
                 await record(stage.name, 'failed', applicability.reason);
-                return finish(blockedStatus(stage.name, applicability.reason));
+                return await finish(blockedStatus(stage.name, applicability.reason)); // await: a store failure in finish() must reach this stage's catch
               }
               if (applicability.kind === 'skip' || stage.appliesWhen === undefined) {
                 if (stage.appliesWhen !== undefined) {
@@ -708,7 +712,7 @@ export function createEngine(options: EngineOptions): Engine {
             applicability = await evaluateApplicability(stage, context);
             if (applicability.kind === 'malformed') {
               await record(stage.name, 'failed', applicability.reason);
-              return finish(blockedStatus(stage.name, applicability.reason));
+              return await finish(blockedStatus(stage.name, applicability.reason)); // await: a store failure in finish() must reach this stage's catch
             }
             if (applicability.kind === 'skip') {
               // A skip is its own answer with its own motive: it must never read as a pass.
@@ -739,7 +743,8 @@ export function createEngine(options: EngineOptions): Engine {
             if (controller.signal.aborted) return abortedOutcome();
             const reason = describeUnknown(error);
             await record(stage.name, 'failed', reason);
-            return finish(
+            // await: a store failure in finish() must reach this stage's catch, not reject run().
+            return await finish(
               blockedStatus(stage.name, `gate of stage "${stage.name}" threw: ${reason}`),
             );
           } finally {
@@ -770,7 +775,8 @@ export function createEngine(options: EngineOptions): Engine {
             if (stage.needsHuman === true) {
               // A person has not answered yet; that is pending, not a failure.
               await record(stage.name, 'waiting', verdict.reason);
-              return finish({
+              // await: a store failure in finish() must reach this stage's catch, not reject run().
+              return await finish({
                 piece,
                 stage: stage.name,
                 state: 'waiting:decision',
@@ -778,7 +784,8 @@ export function createEngine(options: EngineOptions): Engine {
               });
             }
             await record(stage.name, 'rejected', verdict.reason);
-            return finish({
+            // await: a store failure in finish() must reach this stage's catch, not reject run().
+            return await finish({
               piece,
               stage: stage.name,
               state: 'blocked:rejected',
@@ -788,12 +795,14 @@ export function createEngine(options: EngineOptions): Engine {
 
           // Malformed: the gate could not be trusted, so it is a technical block, never a pass.
           await record(stage.name, 'failed', verdict.reason);
-          return finish(blockedStatus(stage.name, verdict.reason));
+          // await: a store failure in finish() must reach this stage's catch, not reject run().
+          return await finish(blockedStatus(stage.name, verdict.reason));
         } catch (error) {
           if (error instanceof StoreWriteFailure || error instanceof StoreReadFailure) {
             // The store failed mid-stage. Report it as a technical block; do not let the raw
             // store exception escape run() with no state and no diagnosis.
-            return finish(blockedStatus(stage.name, error.message));
+            // await: this catch has already run, so a failure here must reach the outer catch.
+            return await finish(blockedStatus(stage.name, error.message));
           }
           if (error instanceof LeaseLost) {
             // The lease is gone. A named holder means another controller owns the piece and
@@ -810,14 +819,16 @@ export function createEngine(options: EngineOptions): Engine {
       // The reason names every stage the rehearsal could not check.
       if (unchecked.length > 0) {
         const named = unchecked.map((name) => `"${name}"`).join(', ');
-        return finish({
+        // await: a store failure inside finish() must reach the outer catch, not reject run().
+        return await finish({
           piece,
           state: 'waiting:decision',
           reason: `dry-run could not check ${unchecked.length === 1 ? 'stage' : 'stages'} ${named} without performing external effects`,
         });
       }
 
-      return finish({ piece, state: 'done' });
+      // await: a store failure inside finish() must reach the outer catch, not reject run().
+      return await finish({ piece, state: 'done' });
     } catch (error) {
       if (error instanceof StoreReadFailure) {
         // A read failed before or around a write. We cannot consult the store to report the
