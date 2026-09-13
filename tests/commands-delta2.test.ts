@@ -35,6 +35,17 @@ describe('reading what a command printed cannot freeze the engine', () => {
     expect(Date.now() - started).toBeLessThan(8000);
   }, 60_000);
 
+  it('does not swallow the text after a title escape that ends with BEL', async () => {
+    const result = await runGateCommand({
+      command: node,
+      args: ['-e', "process.stdout.write('\\u001b]0;titulo\\u0007FALLO VISIBLE\\n'); process.exit(1)"],
+      timeoutMs: 10_000,
+    });
+
+    expect(result.ok === false && result.reason).toContain('FALLO VISIBLE');
+    expect(result.ok === false && result.reason).not.toContain('titulo');
+  });
+
   it('keeps a huge output without copying it again on every chunk', async () => {
     const started = Date.now();
     const result = await runGateCommand({

@@ -40,8 +40,18 @@ const MAX_OUTPUT_CHARS = 32 * 1024 * 1024;
 
 const TRUNCATION_NOTE = '...[motivo recortado; se conservan el inicio y el final]...\n';
 
-/** ANSI OSC sequences (window titles, hyperlinks): ESC ] … BEL, or ESC ] … ESC backslash. */
-const ANSI_OSC = /\u001B\][^\u0007]*(?:\u0007|\u001B\\)/g;
+/** Rule 5: a gate's reader that fails without saying why still has to say something readable. */
+const EMPTY_INTERPRET_REASON = 'La compuerta fallo pero su lector no explico por que.';
+
+/**
+ * ANSI OSC sequences (window titles, hyperlinks): ESC ] … BEL, or ESC ] … ESC backslash. The
+ * character class excludes BEL and ESC, so a sequence ends at its own terminator and an
+ * unterminated one is consumed only up to the next BEL or ESC: the text after a BEL-ended
+ * title is kept. Rule 1: `[^\u0007]*` could restart inside the sequence and cost the
+ * square of the input — 256 KB of `ESC ]` froze the engine for 21.5 s, during which the
+ * timeout had already stopped being watched.
+ */
+const ANSI_OSC = /\u001B\][^\u0007\u001B]*(?:\u0007|\u001B\\)?/g;
 /** ANSI CSI sequences: the colour and cursor codes a test runner emits. */
 const ANSI_CSI = /\u001B\[[0-9;?]*[A-Za-z]/g;
 /** Any remaining two-character ANSI escape (ESC followed by a byte in 0x40–0x5F). */
@@ -96,19 +106,38 @@ export function runGateCommand(command: GateCommand): Promise<CheckResult> {
       return;
     }
 
-    // One buffer, filled in arrival order from both pipes, bounded to the tail. `setEncoding`
-    // decodes UTF-8 across chunk boundaries, so a multi-byte character split between two
-    // writes (the `ñ` case) is not mangled into a replacement character.
-    let output = '';
+    // Chunks arrive in order from both pipes and are kept in a list. `setEncoding` decodes
+    // UTF-8 across chunk boundaries, so a multi-byte character split between two writes (the
+    // `ñ` case) is not mangled into a replacement character.
+    const chunks: string[] = [];
+    let totalChars = 0;
     // Rule 1: a cut-off output may hide the failure that mattered, so the cut is remembered
     // and told to the reader; `interpret` and `parseTestRun` must never treat it as whole.
     let truncated = false;
+    // Rule 3: re-concatenating the whole buffer on every chunk is quadratic — 256 MB took
+    // 18.7 s that way. The list grows until it holds twice the cap, is trimmed once to the
+    // tail up to the cap, and is joined a single time when the command closes.
     const append = (chunk: string): void => {
-      output += chunk;
-      if (output.length > MAX_OUTPUT_CHARS) {
-        output = output.slice(output.length - MAX_OUTPUT_CHARS);
+      chunks.push(chunk);
+      totalChars += chunk.length;
+      if (totalChars > MAX_OUTPUT_CHARS * 2) {
+        const joined = chunks.join('');
+        const kept = joined.slice(joined.length - MAX_OUTPUT_CHARS);
+        chunks.length = 0;
+        chunks.push(kept);
+        totalChars = kept.length;
         truncated = true;
       }
+    };
+    const collectOutput = (): string => {
+      const joined = chunks.join('');
+      chunks.length = 0;
+      totalChars = 0;
+      if (joined.length > MAX_OUTPUT_CHARS) {
+        truncated = true;
+        return joined.slice(joined.length - MAX_OUTPUT_CHARS);
+      }
+      return joined;
     };
     child.stdout?.setEncoding('utf8');
     child.stderr?.setEncoding('utf8');
@@ -139,10 +168,14 @@ export function runGateCommand(command: GateCommand): Promise<CheckResult> {
 
     timer = setTimeout(() => {
       timedOut = true;
-      // Kill the tree only when the direct child is still alive to own the process tree. When
-      // it already ended, there is nothing of ours to kill by that number: destroy the pipes
-      // so a grandchild cannot hold the answer open, and say plainly that processes may remain.
-      if (!childExited) {
+      // Rule 4: on Windows a pid may be reused the moment the direct child exits, so an ended
+      // child's number must not be killed. On POSIX the process-group number stays reserved
+      // while any member of the group is alive, so the group is always signalled — including
+      // when the direct child already ended, which is exactly when a grandchild keeps the
+      // pipes open. Destroy the pipes in every case so a survivor cannot hold the answer open.
+      if (process.platform === 'win32') {
+        if (!childExited) killProcessTree(child);
+      } else {
         killProcessTree(child);
       }
       child.stdout?.destroy();
@@ -167,6 +200,9 @@ export function runGateCommand(command: GateCommand): Promise<CheckResult> {
         finish({ ok: false, reason: timeoutReason(command.command, timeoutMs, childExited) });
         return;
       }
+
+      // Everything has been read, so this is the one and only join of the kept chunks.
+      const output = collectOutput();
 
       // Rule: a gate that knows how to read the output decides, even when the exit code is 0.
       // A timeout or a start failure never reaches here, so it can never be interpreted away.
@@ -307,7 +343,13 @@ function normalizeInterpretAnswer(command: string, answer: unknown): CheckResult
     const record = answer as { readonly ok?: unknown; readonly reason?: unknown };
     if (record.ok === true) return { ok: true };
     if (record.ok === false && typeof record.reason === 'string') {
-      return { ok: false, reason: clip(record.reason) };
+      const reason = clip(record.reason);
+      // Rule 5: a reason made only of escape codes (or spaces) is no reason at all. The
+      // failure is still real, so it is told plainly rather than handed back as empty text.
+      if (reason.trim().length === 0) {
+        return { ok: false, reason: EMPTY_INTERPRET_REASON };
+      }
+      return { ok: false, reason };
     }
   }
   return {
@@ -327,10 +369,13 @@ function failureReason(
 ): string {
   // The two pipes are already one interleaved stream, so the reason shows what actually
   // happened, in the order it happened.
-  const detail = sanitize(output).trim();
   const status = signal ? `signal ${signal}` : `code ${code ?? 'unknown'}`;
-  const body = detail.length > 0 ? detail : '(no output)';
-  return clip(`Command "${command}" failed with ${status}:\n${body}`);
+  // Rule 2: bound the raw output to its head and tail BEFORE any cleaning regex runs. A person
+  // never sees more than a few thousand characters, so sanitizing a whole 32 MB buffer — which
+  // the old OSC pattern turned into minutes of CPU — buys nothing.
+  const body = boundForDisplay(output).trim();
+  const detail = body.length > 0 ? body : '(no output)';
+  return clip(`Command "${command}" failed with ${status}:\n${detail}`);
 }
 
 /** Removes terminal escape codes and control characters, keeping newlines and tabs. */
@@ -343,6 +388,18 @@ function sanitize(text: string): string {
 }
 
 /**
+ * Rule 2: keeps only the head and the tail of a large text before any cleaning regex touches
+ * it. Whoever reads a reason sees at most a few thousand characters, so running the
+ * escape-stripping patterns over a whole 32 MB buffer only burns CPU.
+ */
+function boundForDisplay(text: string): string {
+  if (text.length <= MAX_REASON_CHARS * 2) return text;
+  const head = text.slice(0, MAX_REASON_CHARS);
+  const tail = text.slice(text.length - MAX_REASON_CHARS);
+  return head + tail;
+}
+
+/**
  * Keeps a long message readable and honest. It keeps BOTH ends and marks the middle as cut:
  * the tail is where a command's failure lands, and the head is where an `interpret` gate names
  * in one line what went wrong — a reason that dropped the start of the author's sentence would
@@ -350,7 +407,7 @@ function sanitize(text: string): string {
  * whole.
  */
 function clip(text: string): string {
-  const clean = sanitize(text);
+  const clean = sanitize(boundForDisplay(text));
   if (clean.length <= MAX_REASON_CHARS) return clean;
   const available = MAX_REASON_CHARS - TRUNCATION_NOTE.length;
   const head = Math.floor(available / 2);
@@ -425,7 +482,9 @@ export function parseTestRun(run: TestRun): TestRunSummary {
   let failedSuite = false;
   for (const match of output.matchAll(/^[^\S\n]*FAIL\s+([^\n]+)$/gm)) {
     const detail = (match[1] ?? '').trim();
-    if (/\[[^\]]*\]\s*$/.test(detail)) {
+    // Rule 1: the bracket class excludes `[` so the match cannot restart at every opening
+    // bracket of a long run, which is what made this test quadratic.
+    if (/\[[^\[\]]*\]\s*$/.test(detail)) {
       failedSuite = true;
       continue;
     }
@@ -477,7 +536,10 @@ export function parseTestRun(run: TestRun): TestRunSummary {
 
 /** Sums `N passed` / `N failed` across every summary line. Rule 2. */
 function sumSummaryCounts(lines: readonly string[], word: 'passed' | 'failed'): number {
-  const pattern = new RegExp(`(\\d+)\\s+${word}`);
+  // Rule 1: the lookbehind makes a count start at its first digit only, so a long run of
+  // digits cannot force `\d+` to retry from every position — that retry is what made the
+  // match quadratic.
+  const pattern = new RegExp(`(?<!\\d)(\\d+)\\s+${word}`);
   return lines.reduce((total, line) => {
     const match = pattern.exec(line);
     return total + (match ? Number(match[1] ?? 0) : 0);
