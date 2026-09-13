@@ -40,7 +40,7 @@ const variant = (change: (ruleset: Ruleset) => void) => {
   return [copy];
 };
 
-const require = { requiredChecks: ['todo-verde', 'turno-fila'], requireUpToDate: true };
+const require = { requiredChecks: ['todo-verde', 'turno-fila'], requireUpToDate: true, defaultBranch: 'main' };
 
 describe('the real ruleset of Socialabs', () => {
   it('enforces what the pipeline relies on today', () => {
@@ -53,6 +53,7 @@ describe('the real ruleset of Socialabs', () => {
   it('is missing the pipeline s own check until it is added', () => {
     const report = verifyProtections([socialabs], {
       requiredChecks: ['todo-verde', 'turno-fila', 'ai-workflows'],
+      defaultBranch: 'main',
     });
 
     expect(report.ok).toBe(false);

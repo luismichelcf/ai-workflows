@@ -13,8 +13,8 @@ import {
 // them — but they see the one thing the editor hook cannot: what is actually staged,
 // including files a shell command wrote.
 
-const noPiece: LockContext = { paperPaths: ['docs'] };
-const withPiece: LockContext = { activePiece: '997', paperPaths: ['docs'] };
+const noPiece: LockContext = { projectRoot: 'C:/GitHub/Socialabs', paperPaths: ['docs'] };
+const withPiece: LockContext = { projectRoot: 'C:/GitHub/Socialabs', activePiece: '997', paperPaths: ['docs'] };
 
 describe('pre-commit', () => {
   it('refuses to commit code with no piece in the folder', () => {

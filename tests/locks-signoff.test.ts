@@ -5,6 +5,7 @@ import {
   parseSignOff,
   type ExecutionIdentity,
   type MergeCheckInput,
+  type PullRequestComment,
   type Verdict,
 } from '../src/index.js';
 
@@ -14,70 +15,73 @@ import {
 // — tied to the exact version he looked at.
 
 const head = '9f420f5c1a2b3d4e5f60718293a4b5c6d7e8f901';
+const older = '1234567aaaa0b1c2d3e4f5061728394a5b6c7d8e';
 const rules = { productOwners: ['luismichelcf'], headSha: head };
+
+const comment = (body: string, over: Partial<PullRequestComment> = {}): PullRequestComment => ({
+  body,
+  author: 'luismichelcf',
+  authorType: 'User',
+  performedViaApp: false,
+  edited: false,
+  ...over,
+});
 
 describe('reading the owner s sign-off', () => {
   it('accepts it on its own line, naming the current version', () => {
-    expect(parseSignOff({ body: '/visto-bueno 9f420f5', author: 'luismichelcf' }, rules)).toEqual({
-      ok: true,
-      sha: '9f420f5',
-    });
-  });
-
-  it('accepts the full SHA', () => {
-    expect(parseSignOff({ body: `/visto-bueno ${head}`, author: 'luismichelcf' }, rules).ok).toBe(true);
+    expect(parseSignOff(comment(`/visto-bueno ${head}`), rules)).toEqual({ ok: true, sha: head });
   });
 
   it('accepts it among other lines of the comment', () => {
-    const body = 'Se ve bien en el preview.\n/visto-bueno 9f420f5\nGracias';
+    const body = `Se ve bien en el preview.\n/visto-bueno ${head}\nGracias`;
 
-    expect(parseSignOff({ body, author: 'luismichelcf' }, rules).ok).toBe(true);
+    expect(parseSignOff(comment(body), rules).ok).toBe(true);
   });
 
   it('ignores letter case in the login and the SHA', () => {
-    expect(parseSignOff({ body: '/visto-bueno 9F420F5', author: 'LuisMichelCF' }, rules).ok).toBe(true);
+    expect(parseSignOff(comment(`/visto-bueno ${head.toUpperCase()}`, { author: 'LuisMichelCF' }), rules).ok).toBe(true);
   });
 
   it('refuses a sign-off of an older version, naming both', () => {
-    const result = parseSignOff({ body: '/visto-bueno 1234567', author: 'luismichelcf' }, rules);
+    const result = parseSignOff(comment(`/visto-bueno ${older}`), rules);
 
     expect(result.ok).toBe(false);
-    expect(result.ok === false && result.reason).toContain('1234567');
-    expect(result.ok === false && result.reason).toContain('9f420f5');
+    expect(result.ok === false && result.reason).toContain(older.slice(0, 7));
+    expect(result.ok === false && result.reason).toContain(head.slice(0, 7));
   });
 
   it('refuses a sign-off from someone who is not a product owner, naming them', () => {
-    const result = parseSignOff({ body: '/visto-bueno 9f420f5', author: 'un-agente-bot' }, rules);
+    const result = parseSignOff(comment(`/visto-bueno ${head}`, { author: 'un-agente' }), rules);
 
     expect(result.ok).toBe(false);
-    expect(result.ok === false && result.reason).toContain('un-agente-bot');
+    expect(result.ok === false && result.reason).toContain('un-agente');
   });
 
   it('refuses a SHA too short to identify one version', () => {
-    expect(parseSignOff({ body: '/visto-bueno 9f42', author: 'luismichelcf' }, rules).ok).toBe(false);
+    expect(parseSignOff(comment('/visto-bueno 9f42'), rules).ok).toBe(false);
   });
 
   it('refuses something that is not a SHA', () => {
-    expect(parseSignOff({ body: '/visto-bueno este', author: 'luismichelcf' }, rules).ok).toBe(false);
+    expect(parseSignOff(comment('/visto-bueno este'), rules).ok).toBe(false);
   });
 
   it('does not count the command inside a quote', () => {
     // Quoting someone's sign-off to discuss it is not signing off.
-    expect(parseSignOff({ body: '> /visto-bueno 9f420f5', author: 'luismichelcf' }, rules).ok).toBe(false);
+    expect(parseSignOff(comment(`> /visto-bueno ${head}`), rules).ok).toBe(false);
   });
 
   it('does not count the command inside a code block', () => {
-    const body = 'Así se escribe:\n```\n/visto-bueno 9f420f5\n```';
+    const body = `Así se escribe:\n\`\`\`\n/visto-bueno ${head}\n\`\`\``;
 
-    expect(parseSignOff({ body, author: 'luismichelcf' }, rules).ok).toBe(false);
+    expect(parseSignOff(comment(body), rules).ok).toBe(false);
   });
 
   it('does not count the command in the middle of a sentence', () => {
-    expect(parseSignOff({ body: 'cuando escribas /visto-bueno 9f420f5 se mergea', author: 'luismichelcf' }, rules).ok).toBe(false);
+    expect(parseSignOff(comment(`cuando escribas /visto-bueno ${head} se mergea`), rules).ok).toBe(false);
   });
 
   it('says there is no sign-off in a comment without one', () => {
-    const result = parseSignOff({ body: 'Me gusta', author: 'luismichelcf' }, rules);
+    const result = parseSignOff(comment('Me gusta'), rules);
 
     expect(result.ok === false && result.reason.length).toBeGreaterThan(5);
   });
@@ -93,7 +97,7 @@ describe('what the merge check concludes', () => {
     builder,
     verdicts: [approved()],
     needsSignOff: true,
-    comments: [{ body: '/visto-bueno 9f420f5', author: 'luismichelcf' }],
+    comments: [comment(`/visto-bueno ${head}`)],
     productOwners: ['luismichelcf'],
     ...over,
   });
@@ -111,19 +115,12 @@ describe('what the merge check concludes', () => {
   });
 
   it('fails when the only sign-off is for an older version', () => {
-    const result = concludeMergeCheck(input({ comments: [{ body: '/visto-bueno 1234567', author: 'luismichelcf' }] }));
-
-    expect(result.conclusion).toBe('failure');
+    expect(concludeMergeCheck(input({ comments: [comment(`/visto-bueno ${older}`)] })).conclusion).toBe('failure');
   });
 
   it('passes when an older sign-off is followed by one for the current version', () => {
     const result = concludeMergeCheck(
-      input({
-        comments: [
-          { body: '/visto-bueno 1234567', author: 'luismichelcf' },
-          { body: '/visto-bueno 9f420f5', author: 'luismichelcf' },
-        ],
-      }),
+      input({ comments: [comment(`/visto-bueno ${older}`), comment(`/visto-bueno ${head}`)] }),
     );
 
     expect(result.conclusion).toBe('success');
@@ -134,7 +131,10 @@ describe('what the merge check concludes', () => {
   });
 
   it('fails when the review is of an older version', () => {
-    expect(concludeMergeCheck(input({ verdicts: [approved({ sha: '1234567aaaa' })] })).conclusion).toBe('failure');
+    const result = concludeMergeCheck(input({ verdicts: [approved({ sha: older })] }));
+
+    expect(result.conclusion).toBe('failure');
+    expect(result.summary).toContain(older.slice(0, 7));
   });
 
   it('fails when a required angle was never reviewed', () => {
@@ -145,11 +145,11 @@ describe('what the merge check concludes', () => {
   });
 
   it('lists every reason it failed, not only the first', () => {
-    const result = concludeMergeCheck(input({ verdicts: [approved({ by: builder, sha: 'viejo1234' })], comments: [] }));
+    const result = concludeMergeCheck(input({ verdicts: [approved({ by: builder, sha: older })], comments: [] }));
 
     expect(result.conclusion).toBe('failure');
     expect(result.summary).toContain('deepseek');
-    expect(result.summary).toContain('viejo1234');
+    expect(result.summary).toContain(older.slice(0, 7));
     expect(result.summary.toLowerCase()).toContain('visto-bueno');
   });
 });

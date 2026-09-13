@@ -6,6 +6,12 @@ import type { ExecutionIdentity, Verdict } from '../identity.js';
 export interface PullRequestComment {
   readonly body: string;
   readonly author: string;
+  /** GitHub's `user.type`: `User`, `Bot` or `Organization`. */
+  readonly authorType: string;
+  /** Whether GitHub reports it as posted through an app (`performed_via_github_app`). */
+  readonly performedViaApp: boolean;
+  /** Whether it was edited after posting: anyone with write access can edit a comment. */
+  readonly edited: boolean;
 }
 
 export interface SignOffRules {
@@ -116,6 +122,8 @@ export interface MergeCheckResult {
   readonly conclusion: 'success' | 'failure';
   /** Every reason it failed, not just the first. */
   readonly summary: string;
+  /** What this check cannot prove even when it passes, said out loud. */
+  readonly limits: readonly string[];
 }
 
 /** What the server check concludes, composed from the identity and sign-off rules. */
@@ -161,8 +169,8 @@ export function concludeMergeCheck(input: MergeCheckInput): MergeCheckResult {
   }
 
   if (reasons.length === 0) {
-    return { conclusion: 'success', summary: 'Todo en orden: revisiones válidas y, si hacía falta, el visto bueno del dueño.' };
+    return { conclusion: 'success', summary: 'Todo en orden: revisiones válidas y, si hacía falta, el visto bueno del dueño.', limits: [] };
   }
 
-  return { conclusion: 'failure', summary: reasons.join(' ') };
+  return { conclusion: 'failure', summary: reasons.join(' '), limits: [] };
 }

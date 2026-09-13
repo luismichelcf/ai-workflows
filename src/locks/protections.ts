@@ -7,6 +7,8 @@ export interface ProtectionRequirement {
   readonly requiredChecks: readonly string[];
   /** Require branches to be up to date before merging. */
   readonly requireUpToDate?: boolean;
+  /** The repository's default branch as GitHub reports it, e.g. `main`. Never assumed. */
+  readonly defaultBranch: string;
 }
 
 export interface ProtectionReport {

@@ -11,6 +11,11 @@ export interface HookInput {
 }
 
 export interface LockContext {
+  /**
+   * Absolute path of the project the lock guards: the git root of the folder it is installed
+   * in. Configured, never taken from the hook's `cwd`, which moves with every `cd`.
+   */
+  readonly projectRoot: string;
   /** The piece active in this folder. Absent means no piece. */
   readonly activePiece?: string;
   /** A folder opened with `/libre`: writing is allowed, merging never is. */

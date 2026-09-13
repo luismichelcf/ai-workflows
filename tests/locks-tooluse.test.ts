@@ -21,9 +21,9 @@ import {
 // commands that write are not its surface — the git pre-commit hook catches what they stage.
 
 const cwd = 'C:/GitHub/Socialabs';
-const noPiece: LockContext = { paperPaths: ['docs'] };
-const withPiece: LockContext = { activePiece: '997', paperPaths: ['docs'] };
-const libre: LockContext = { libre: true, paperPaths: ['docs'] };
+const noPiece: LockContext = { projectRoot: cwd, paperPaths: ['docs'] };
+const withPiece: LockContext = { projectRoot: cwd, activePiece: '997', paperPaths: ['docs'] };
+const libre: LockContext = { projectRoot: cwd, libre: true, paperPaths: ['docs'] };
 
 const claudeWrite = (file: string): HookInput => ({
   toolName: 'Write',
