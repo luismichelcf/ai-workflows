@@ -86,13 +86,164 @@ export interface Capabilities {
   readonly classifyError: boolean;
 }
 
-export function capabilities(_provider: ProviderName): Capabilities {
-  throw new Error('capabilities: not implemented');
+/**
+ * The verified capability matrix. `false` is the default for anything the engine has not
+ * actually seen a provider do, because relying on an unverified capability is how a review
+ * ends up writing files or a run ends up on an unauthorised model.
+ *
+ * Every provider here can resume, recover changes and classify errors; those are read from
+ * its structured output and have all been verified. `start` is false only for muse, which the
+ * engine never spawns directly, and `readOnlyReview` is false for opencode, which has no
+ * verified read-only mode.
+ */
+const CAPABILITIES: Record<ProviderName, Capabilities> = {
+  claude: {
+    start: true,
+    identifyModel: true,
+    resume: true,
+    readOnlyReview: true,
+    recoverChanges: true,
+    classifyError: true,
+  },
+  codex: {
+    start: true,
+    identifyModel: false,
+    resume: true,
+    readOnlyReview: true,
+    recoverChanges: true,
+    classifyError: true,
+  },
+  opencode: {
+    start: true,
+    identifyModel: false,
+    resume: true,
+    readOnlyReview: false,
+    recoverChanges: true,
+    classifyError: true,
+  },
+  antigravity: {
+    start: true,
+    identifyModel: false,
+    resume: true,
+    readOnlyReview: true,
+    recoverChanges: true,
+    classifyError: true,
+  },
+  muse: {
+    start: false,
+    identifyModel: true,
+    resume: true,
+    readOnlyReview: false,
+    recoverChanges: true,
+    classifyError: true,
+  },
+};
+
+export function capabilities(provider: ProviderName): Capabilities {
+  return CAPABILITIES[provider];
 }
 
 /** Builds the command for one run. Throws when the provider cannot do what was asked. */
-export function buildInvocation(_request: RunRequest): Invocation {
-  throw new Error('buildInvocation: not implemented');
+export function buildInvocation(request: RunRequest): Invocation {
+  const promptArg = { stdin: request.prompt } as const;
+
+  if (request.provider === 'muse') {
+    // Muse is not spawned from here. It runs inside the project's own WSL jail, moved in as a
+    // git bundle and back out as a patch; that launcher belongs to the project, not the engine.
+    throw new Error(
+      'Muse is not started by the engine: use the project launcher that runs it inside its WSL jail.',
+    );
+  }
+
+  if (request.provider === 'opencode') {
+    if (request.mode === 'review') {
+      // No read-only mode has been verified for opencode. Improvising one would let a review
+      // write files, so refusing is the only honest answer.
+      throw new Error(
+        'OpenCode has no verified read-only mode, so it cannot run a review.',
+      );
+    }
+    return buildOpencodeInvocation(request, promptArg);
+  }
+
+  if (request.provider === 'claude') return buildClaudeInvocation(request, promptArg);
+  if (request.provider === 'codex') return buildCodexInvocation(request, promptArg);
+  return buildAntigravityInvocation(request, promptArg);
+}
+
+function buildClaudeInvocation(
+  request: RunRequest,
+  prompt: { readonly stdin: string },
+): Invocation {
+  const args: string[] = ['-p', '--model', request.model];
+  if (request.effort !== undefined) args.push('--effort', request.effort);
+  args.push('--output-format', 'json');
+  // Plan mode cannot write; a build is allowed to edit.
+  args.push('--permission-mode', request.mode === 'review' ? 'plan' : 'acceptEdits');
+  if (request.resumeSession !== undefined) args.push('--resume', request.resumeSession);
+  return { command: 'claude', args, cwd: request.cwd, ...prompt };
+}
+
+function buildCodexInvocation(
+  request: RunRequest,
+  prompt: { readonly stdin: string },
+): Invocation {
+  const args: string[] = ['exec'];
+  if (request.resumeSession !== undefined) args.push('resume', request.resumeSession);
+  args.push('-m', request.model);
+  if (request.effort !== undefined) {
+    // Codex takes the effort as a config override, not a dedicated flag.
+    args.push('-c', `model_reasoning_effort="${request.effort}"`);
+  }
+  if (request.mode === 'review') {
+    if (request.resumeSession !== undefined) {
+      // `codex exec resume` rejects --sandbox, so on a resumed review the read-only rule has
+      // to travel as configuration; using the flag would make the review able to write.
+      args.push('-c', 'sandbox_mode="read-only"');
+    } else {
+      args.push('--sandbox', 'read-only');
+    }
+  }
+  args.push('--json');
+  // Codex reads stdin as the prompt when `-` is its final argument.
+  args.push('-');
+  return { command: 'codex', args, cwd: request.cwd, ...prompt };
+}
+
+function buildOpencodeInvocation(
+  request: RunRequest,
+  prompt: { readonly stdin: string },
+): Invocation {
+  const args: string[] = ['run', '-m', request.model, '--dir', request.cwd];
+  if (request.effort !== undefined) args.push('--variant', request.effort);
+  args.push('--format', 'json');
+  if (request.mode === 'build') args.push('--auto');
+  if (request.resumeSession !== undefined) args.push('-s', request.resumeSession);
+  return { command: 'opencode', args, cwd: request.cwd, ...prompt };
+}
+
+function buildAntigravityInvocation(
+  request: RunRequest,
+  prompt: { readonly stdin: string },
+): Invocation {
+  // Antigravity reports the effort inside the model name, so there is no separate flag.
+  const args: string[] = [
+    '-p',
+    '--model',
+    request.model,
+    '--add-dir',
+    request.cwd,
+    '--output-format',
+    'json',
+  ];
+  if (request.mode === 'review') {
+    // Plan mode reviews without permission to write; a build may skip permission prompts.
+    args.push('--mode', 'plan');
+  } else {
+    args.push('--dangerously-skip-permissions');
+  }
+  if (request.resumeSession !== undefined) args.push('--conversation', request.resumeSession);
+  return { command: 'agy', args, cwd: request.cwd, ...prompt };
 }
 
 /** Reads what a run actually did, from the CLI's own structured output. */
