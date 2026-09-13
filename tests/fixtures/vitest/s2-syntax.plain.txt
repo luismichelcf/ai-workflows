@@ -1,0 +1,33 @@
+
+ RUN  v2.1.9 C:/GitHub/_deps/vitest-samples
+
+ ❯ t/s2-syntax.test.ts (0 test)
+
+⎯⎯⎯⎯⎯⎯ Failed Suites 1 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  t/s2-syntax.test.ts [ t/s2-syntax.test.ts ]
+Error: Transform failed with 1 error:
+C:/GitHub/_deps/vitest-samples/t/s2-syntax.test.ts:2:6: ERROR: Expected identifier but found "="
+  Plugin: vite:esbuild
+  File: C:/GitHub/_deps/vitest-samples/t/s2-syntax.test.ts:2:6
+  
+  Expected identifier but found "="
+  1  |  import { it } from 'vitest';
+  2  |  const = ;
+     |        ^
+  3  |  it('x', () => {});
+  4  |  
+  
+ ❯ failureErrorWithLog <node_modules>/.pnpm/esbuild@0.21.5/node_modules/esbuild/lib/main.js:1472:15
+ ❯ <node_modules>/.pnpm/esbuild@0.21.5/node_modules/esbuild/lib/main.js:755:50
+ ❯ responseCallbacks.<computed> <node_modules>/.pnpm/esbuild@0.21.5/node_modules/esbuild/lib/main.js:622:9
+ ❯ handleIncomingPacket <node_modules>/.pnpm/esbuild@0.21.5/node_modules/esbuild/lib/main.js:677:12
+ ❯ Socket.readFromStdout <node_modules>/.pnpm/esbuild@0.21.5/node_modules/esbuild/lib/main.js:600:7
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+
+ Test Files  1 failed (1)
+      Tests  no tests
+   Start at  10:07:36
+   Duration  362ms (transform 9ms, setup 0ms, collect 0ms, tests 0ms, environment 0ms, prepare 85ms)
+

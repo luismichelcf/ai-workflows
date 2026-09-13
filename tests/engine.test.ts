@@ -1,137 +1,285 @@
 import { describe, expect, it } from 'vitest';
 
-import { createEngine, createMemoryStore, validateConfig } from '../src/index.js';
+import { createEngine, createMemoryStore } from '../src/index.js';
 
-// PLAN-997 §5.4 and §5.6. The engine's whole reason to exist: a stage advances ONLY if its
-// gate says so, and a gate that cannot run is not the same as a gate that said no.
-//   - gate returns {ok:false}  -> blocked:rejected   (the content is wrong)
-//   - gate throws              -> blocked:technical  (the check could not run)
-// A stage that needs a person stops at waiting:decision without failing.
+import { chain, fail, harness, pipeline, recorder, reject, stage } from './helpers.js';
 
-type GateResult = { ok: true } | { ok: false; reason: string };
+// §5.4 and §5.6. The engine's reason to exist: a stage advances ONLY if its gate says so,
+// and a gate that could not run is not the same as a gate that said no.
+//   gate returns {ok:false}   -> blocked:rejected   (the content is wrong)
+//   gate throws               -> blocked:technical  (the check could not run)
+//   needsHuman and says no    -> waiting:decision   (nothing is wrong; it is pending)
 
-const ok = () => ({ ok: true }) as GateResult;
-const no = (reason: string) => () => ({ ok: false, reason }) as GateResult;
-const boom = (reason: string) => () => {
-  throw new Error(reason);
-};
-
-const pipeline = (stages: Array<Record<string, unknown>>) => ({ locale: 'es', stages });
-
-const engineFor = (stages: Array<Record<string, unknown>>) => {
-  const config = pipeline(stages);
-  expect(validateConfig(config).ok).toBe(true);
-  return createEngine({ config, store: createMemoryStore() });
-};
-
-describe('engine.run', () => {
+describe('running a piece', () => {
   it('runs every stage in order when all gates pass', async () => {
-    const seen: string[] = [];
-    const engine = engineFor([
-      { name: 'spec', gate: () => { seen.push('spec'); return ok(); } },
-      { name: 'build', after: 'spec', gate: () => { seen.push('build'); return ok(); } },
-      { name: 'gate', after: 'build', gate: () => { seen.push('gate'); return ok(); } },
-    ]);
+    const seen = recorder();
+    const { engine } = harness(
+      chain(
+        stage('spec', { gate: seen.gateFor('spec') }),
+        stage('build', { gate: seen.gateFor('build') }),
+        stage('gate', { gate: seen.gateFor('gate') }),
+      ),
+    );
 
     const result = await engine.run('997');
 
-    expect(seen).toEqual(['spec', 'build', 'gate']);
-    expect(result.state).toBe('done');
+    expect(seen.seen).toEqual(['spec', 'build', 'gate']);
+    expect(result.outcome === 'ran' && result.status.state).toBe('done');
   });
 
   it('stops at the failing stage and does not run the next one', async () => {
-    let laterRan = false;
-    const engine = engineFor([
-      { name: 'spec', gate: ok },
-      { name: 'build', after: 'spec', gate: no('falta el benchmark') },
-      { name: 'gate', after: 'build', gate: () => { laterRan = true; return ok(); } },
-    ]);
+    const seen = recorder();
+    const { engine } = harness(
+      chain(
+        stage('spec', { gate: seen.gateFor('spec') }),
+        stage('build', { gate: seen.gateFor('build', reject('falta el benchmark')) }),
+        stage('gate', { gate: seen.gateFor('gate') }),
+      ),
+    );
 
     const result = await engine.run('997');
 
-    expect(laterRan).toBe(false);
-    expect(result.stage).toBe('build');
-    expect(result.state).toBe('blocked:rejected');
+    expect(seen.seen).toEqual(['spec', 'build']);
+    expect(result.outcome === 'ran' && result.status.stage).toBe('build');
+    expect(result.outcome === 'ran' && result.status.state).toBe('blocked:rejected');
   });
 
-  it('reports the reason the gate gave, not a generic failure', async () => {
-    const engine = engineFor([{ name: 'build', gate: no('falta el benchmark') }]);
+  it('reports the reason the gate gave, word for word', async () => {
+    const { engine } = harness(chain(stage('build', { gate: reject('falta el benchmark') })));
 
     const result = await engine.run('997');
 
-    expect(result.reason).toContain('falta el benchmark');
+    expect(result.outcome === 'ran' && result.status.reason).toContain('falta el benchmark');
   });
 
   it('distinguishes a gate that could not run from a gate that said no', async () => {
-    const engine = engineFor([{ name: 'gate', gate: boom('el preview no desplego') }]);
+    const { engine } = harness(
+      chain(stage('gate', { gate: fail('el preview no desplego') })),
+    );
 
     const result = await engine.run('997');
 
-    expect(result.state).toBe('blocked:technical');
-    expect(result.stage).toBe('gate');
+    expect(result.outcome === 'ran' && result.status.state).toBe('blocked:technical');
+    expect(result.outcome === 'ran' && result.status.reason).toContain('el preview no desplego');
   });
 
-  it('stops at waiting:decision when a stage needs a person, without failing', async () => {
-    let laterRan = false;
-    const engine = engineFor([
-      { name: 'qa', gate: ok },
-      { name: 'sign-off', after: 'qa', needsHuman: true, gate: no('sin visto bueno') },
-      { name: 'queue', after: 'sign-off', gate: () => { laterRan = true; return ok(); } },
-    ]);
+  it('keeps a reason on a technical block too', async () => {
+    const { engine } = harness(chain(stage('gate', { gate: fail('sin cuota') })));
 
     const result = await engine.run('997');
 
-    expect(result.state).toBe('waiting:decision');
-    expect(result.stage).toBe('sign-off');
-    expect(laterRan).toBe(false);
+    expect(result.outcome === 'ran' && (result.status.reason ?? '')).not.toBe('');
   });
 
-  it('resumes at the stage it stopped on, without re-running the ones already passed', async () => {
-    let specRuns = 0;
-    let allow = false;
-    const engine = engineFor([
-      { name: 'spec', gate: () => { specRuns += 1; return ok(); } },
-      { name: 'build', after: 'spec', gate: () => (allow ? ok() : no('aun no')) },
-    ]);
+  it('waits instead of failing when a stage needs a person', async () => {
+    const seen = recorder();
+    const { engine } = harness(
+      chain(
+        stage('qa', { gate: seen.gateFor('qa') }),
+        stage('sign-off', {
+          needsHuman: true,
+          nature: 'attest',
+          gate: seen.gateFor('sign-off', reject('sin visto bueno')),
+        }),
+        stage('queue', { gate: seen.gateFor('queue') }),
+      ),
+    );
 
-    await engine.run('997');
-    expect(specRuns).toBe(1);
-
-    allow = true;
-    const second = await engine.run('997');
-
-    expect(specRuns).toBe(1);
-    expect(second.state).toBe('done');
-  });
-
-  it('a stopped piece keeps its work and does not advance on the next run', async () => {
-    const engine = engineFor([
-      { name: 'spec', gate: ok },
-      { name: 'build', after: 'spec', gate: ok },
-    ]);
-
-    await engine.stop('997', 'el dueno lo detuvo');
     const result = await engine.run('997');
 
-    expect(result.state).toBe('parked');
-    expect(result.reason).toContain('el dueno lo detuvo');
+    expect(result.outcome === 'ran' && result.status.state).toBe('waiting:decision');
+    expect(seen.seen).toEqual(['qa', 'sign-off']);
   });
 });
 
-describe('engine.status', () => {
+describe('two controllers', () => {
+  it('tells the loser it did not run, instead of inventing a status', async () => {
+    // The slice-1 engine returned a fabricated `running` that `status()` then denied.
+    const store = createMemoryStore();
+    await store.reserve('997', 'someone-else', 30_000);
+    const { engine } = harness(chain(stage('spec')), { store, runId: 'mine' });
+
+    const result = await engine.run('997');
+
+    expect(result.outcome).toBe('busy');
+    expect(result.outcome === 'busy' && result.heldBy).toBe('someone-else');
+  });
+
+  it('does not touch the stored state when it loses the race', async () => {
+    const store = createMemoryStore();
+    await store.reserve('997', 'someone-else', 30_000);
+    const { engine } = harness(chain(stage('spec')), { store, runId: 'mine' });
+
+    await engine.run('997');
+
+    expect(await store.loadStatus('997')).toBeUndefined();
+  });
+
+  it('does not run a single gate when it loses the race', async () => {
+    const seen = recorder();
+    const store = createMemoryStore();
+    await store.reserve('997', 'someone-else', 30_000);
+    const { engine } = harness(chain(stage('spec', { gate: seen.gateFor('spec') })), {
+      store,
+      runId: 'mine',
+    });
+
+    await engine.run('997');
+
+    expect(seen.seen).toEqual([]);
+  });
+
+  it('releases the piece when it finishes, so the next controller can take it', async () => {
+    const store = createMemoryStore();
+    const { engine } = harness(chain(stage('spec')), { store, runId: 'mine' });
+
+    await engine.run('997');
+
+    expect((await store.reserve('997', 'other', 30_000)).ok).toBe(true);
+  });
+
+  it('releases the piece even when a gate blew up', async () => {
+    const store = createMemoryStore();
+    const { engine } = harness(chain(stage('spec', { gate: fail('trueno') })), {
+      store,
+      runId: 'mine',
+    });
+
+    await engine.run('997');
+
+    expect((await store.reserve('997', 'other', 30_000)).ok).toBe(true);
+  });
+});
+
+describe('stopping a piece', () => {
+  it('parks it, keeping the reason', async () => {
+    const { engine } = harness(
+      chain(stage('spec', { gate: reject('aun no') }), stage('build')),
+    );
+    await engine.run('997');
+
+    const parked = await engine.stop('997', 'el dueno lo detuvo');
+
+    expect(parked.state).toBe('parked');
+    expect(parked.reason).toContain('el dueno lo detuvo');
+  });
+
+  it('does not advance a parked piece on the next run', async () => {
+    // The piece has to exist before it can be parked: parking one the store has never seen
+    // used to invent it, and the owner decided (12-sep) that it should say it does not
+    // exist instead. So this starts the piece, parks it, and checks it stays put.
+    const seen = recorder();
+    const { engine } = harness(
+      chain(
+        stage('spec', { gate: seen.gateFor('spec', reject('aun no')) }),
+        stage('build', { gate: seen.gateFor('build') }),
+      ),
+    );
+    await engine.run('997');
+    seen.seen.length = 0;
+    await engine.stop('997', 'el dueno lo detuvo');
+
+    const result = await engine.run('997');
+
+    expect(result.outcome).toBe('parked');
+    expect(seen.seen).toEqual([]);
+  });
+
+  it('keeps what the piece was before it was parked', async () => {
+    const { engine } = harness(chain(stage('build', { gate: reject('falta el benchmark') })));
+    await engine.run('997');
+
+    const parked = await engine.stop('997', 'lo dejamos para manana');
+
+    expect(parked.previous?.state).toBe('blocked:rejected');
+    expect(parked.previous?.reason).toContain('falta el benchmark');
+  });
+
+  it('stops a run that is already in flight, instead of being overwritten by it', async () => {
+    // The owner stopped the piece, was told it was parked, and the slow stage finished and
+    // wrote `done` on top. A stop that does not stop is worse than no stop at all.
+    const store = createMemoryStore();
+    let release: (() => void) | undefined;
+    const slow = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const seen = recorder();
+    const { engine } = harness(
+      chain(
+        stage('qa', {
+          gate: async () => {
+            await slow;
+            return { ok: true };
+          },
+        }),
+        stage('queue', { gate: seen.gateFor('queue') }),
+      ),
+      { store },
+    );
+
+    const running = engine.run('997');
+    const parked = await engine.stop('997', 'el dueno lo detuvo');
+    release?.();
+    await running;
+
+    expect(parked.state).toBe('parked');
+    expect(seen.seen).toEqual([]);
+    expect((await engine.status('997'))?.state).toBe('parked');
+  });
+
+  it('lets the piece move again once it is resumed', async () => {
+    const seen = recorder();
+    const { engine } = harness(chain(stage('spec', { gate: seen.gateFor('spec') })));
+    await engine.stop('997', 'pausa');
+
+    await engine.resume('997');
+    await engine.run('997');
+
+    expect(seen.seen).toEqual(['spec']);
+  });
+});
+
+describe('reporting', () => {
   it('reports nothing for a piece that never ran', async () => {
-    const engine = engineFor([{ name: 'spec', gate: ok }]);
+    const { engine } = harness(chain(stage('spec')));
 
     expect(await engine.status('997')).toBeUndefined();
   });
 
   it('reports the stage and state the piece stopped at', async () => {
-    const engine = engineFor([{ name: 'build', gate: no('falta el benchmark') }]);
+    const { engine } = harness(chain(stage('build', { gate: reject('falta el benchmark') })));
 
     await engine.run('997');
     const status = await engine.status('997');
 
     expect(status?.stage).toBe('build');
     expect(status?.state).toBe('blocked:rejected');
+  });
+
+  it('lists every piece it has seen', async () => {
+    const { engine } = harness(chain(stage('spec')));
+    await engine.run('997');
+    await engine.run('998');
+
+    expect((await engine.list()).map((status) => status.piece).sort()).toEqual(['997', '998']);
+  });
+});
+
+describe('an invalid pipeline', () => {
+  it('refuses to build an engine at all', () => {
+    const store = createMemoryStore();
+
+    expect(() => createEngine({ config: pipeline([]), store })).toThrow();
+  });
+
+  it('says what is wrong in a way a caller can render', () => {
+    const store = createMemoryStore();
+
+    try {
+      createEngine({ config: pipeline([]), store });
+      expect.unreachable('should have thrown');
+    } catch (error) {
+      expect((error as { errors?: readonly string[] }).errors?.length).toBeGreaterThan(0);
+    }
   });
 });

@@ -1,0 +1,18 @@
+
+ RUN  v2.1.9 C:/GitHub/_deps/vitest-samples
+
+ ❯ t/s4-missing-import.test.ts (0 test)
+
+⎯⎯⎯⎯⎯⎯ Failed Suites 1 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  t/s4-missing-import.test.ts [ t/s4-missing-import.test.ts ]
+Error: Failed to load url ../src/no-existe.js (resolved id: ../src/no-existe.js) in C:/GitHub/_deps/vitest-samples/t/s4-missing-import.test.ts. Does the file exist?
+ ❯ loadAndTransform <node_modules>/.pnpm/vite@5.4.21_@types+node@22.20.2/node_modules/vite/dist/node/chunks/dep-BK3b2jBa.js:51969:17
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+
+ Test Files  1 failed (1)
+      Tests  no tests
+   Start at  10:07:40
+   Duration  354ms (transform 19ms, setup 0ms, collect 0ms, tests 0ms, environment 0ms, prepare 82ms)
+

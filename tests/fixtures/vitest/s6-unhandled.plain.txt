@@ -1,0 +1,39 @@
+
+ RUN  v2.1.9 C:/GitHub/_deps/vitest-samples
+
+ ✓ t/s6-unhandled.test.ts (1 test) 1ms
+
+⎯⎯⎯⎯⎯⎯ Unhandled Errors ⎯⎯⎯⎯⎯⎯
+
+Vitest caught 1 unhandled error during the test run.
+This might cause false positive tests. Resolve unhandled errors to make sure your tests are not affected.
+
+⎯⎯⎯⎯ Unhandled Rejection ⎯⎯⎯⎯⎯
+Error: rechazo sin atender
+ ❯ t/s6-unhandled.test.ts:2:63
+      1| import { it, expect } from 'vitest';
+      2| it('pasa pero deja un rechazo suelto', () => { Promise.reject(new Erro…
+       |                                                               ^
+      3| 
+ ❯ <node_modules>/.pnpm/@vitest+runner@2.1.9/node_modules/@vitest/runner/dist/index.js:146:14
+ ❯ <node_modules>/.pnpm/@vitest+runner@2.1.9/node_modules/@vitest/runner/dist/index.js:533:11
+ ❯ runWithTimeout <node_modules>/.pnpm/@vitest+runner@2.1.9/node_modules/@vitest/runner/dist/index.js:39:7
+ ❯ runTest <node_modules>/.pnpm/@vitest+runner@2.1.9/node_modules/@vitest/runner/dist/index.js:1056:17
+ ❯ processTicksAndRejections node:internal/process/task_queues:104:5
+ ❯ runSuite <node_modules>/.pnpm/@vitest+runner@2.1.9/node_modules/@vitest/runner/dist/index.js:1205:15
+ ❯ runFiles <node_modules>/.pnpm/@vitest+runner@2.1.9/node_modules/@vitest/runner/dist/index.js:1262:5
+ ❯ startTests <node_modules>/.pnpm/@vitest+runner@2.1.9/node_modules/@vitest/runner/dist/index.js:1271:3
+ ❯ <node_modules>/.pnpm/vitest@2.1.9_@types+node@22.20.2/node_modules/vitest/dist/chunks/runBaseTests.3qpJUEJM.js:126:11
+
+This error originated in "t/s6-unhandled.test.ts" test file. It doesn't mean the error was thrown inside the file itself, but while it was running.
+The latest test that might've caused the error is "t/s6-unhandled.test.ts". It might mean one of the following:
+- The error was thrown, while Vitest was running this test.
+- If the error occurred after the test had been completed, this was the last documented test before it was thrown.
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯
+
+ Test Files  1 passed (1)
+      Tests  1 passed (1)
+     Errors  1 error
+   Start at  10:07:44
+   Duration  360ms (transform 18ms, setup 0ms, collect 15ms, tests 1ms, environment 0ms, prepare 83ms)
+

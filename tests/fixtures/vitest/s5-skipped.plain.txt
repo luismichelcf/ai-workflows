@@ -1,0 +1,10 @@
+
+ RUN  v2.1.9 C:/GitHub/_deps/vitest-samples
+
+ ↓ t/s5-skipped.test.ts (2 tests | 2 skipped)
+
+ Test Files  1 skipped (1)
+      Tests  1 skipped | 1 todo (2)
+   Start at  10:07:42
+   Duration  426ms (transform 19ms, setup 0ms, collect 16ms, tests 0ms, environment 0ms, prepare 94ms)
+

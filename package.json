@@ -8,9 +8,6 @@
   "engines": {
     "node": ">=20"
   },
-  "bin": {
-    "ai-workflows": "./dist/cli.js"
-  },
   "exports": {
     ".": "./dist/index.js"
   },

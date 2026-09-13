@@ -1,0 +1,33 @@
+
+[1m[7m[36m RUN [39m[27m[22m [36mv2.1.9 [39m[90mC:/GitHub/_deps/vitest-samples[39m
+
+ [31m❯[39m t/s2-syntax.test.ts [2m([22m[2m0 test[22m[2m)[22m
+
+[31m⎯⎯⎯⎯⎯⎯[1m[7m Failed Suites 1 [27m[22m⎯⎯⎯⎯⎯⎯⎯[39m
+
+[31m[1m[7m FAIL [27m[22m[39m t/s2-syntax.test.ts[2m [ t/s2-syntax.test.ts ][22m
+[31m[1mError[22m: Transform failed with 1 error:
+C:/GitHub/_deps/vitest-samples/t/s2-syntax.test.ts:2:6: ERROR: Expected identifier but found "="[39m
+  Plugin: [35mvite:esbuild[39m
+  File: [36mC:/GitHub/_deps/vitest-samples/t/s2-syntax.test.ts[39m:2:6
+[33m  
+  [33mExpected identifier but found "="[33m
+  1  |  import { it } from 'vitest';
+  2  |  const = ;
+     |        ^
+  3  |  it('x', () => {});
+  4  |  
+  [39m
+[90m [2m❯[22m failureErrorWithLog <node_modules>/.pnpm/esbuild@0.21.5/node_modules/esbuild/lib/main.js:[2m1472:15[22m[39m
+[90m [2m❯[22m <node_modules>/.pnpm/esbuild@0.21.5/node_modules/esbuild/lib/main.js:[2m755:50[22m[39m
+[90m [2m❯[22m responseCallbacks.<computed> <node_modules>/.pnpm/esbuild@0.21.5/node_modules/esbuild/lib/main.js:[2m622:9[22m[39m
+[90m [2m❯[22m handleIncomingPacket <node_modules>/.pnpm/esbuild@0.21.5/node_modules/esbuild/lib/main.js:[2m677:12[22m[39m
+[90m [2m❯[22m Socket.readFromStdout <node_modules>/.pnpm/esbuild@0.21.5/node_modules/esbuild/lib/main.js:[2m600:7[22m[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯[22m[39m
+
+[2m Test Files [22m [1m[31m1 failed[39m[22m[90m (1)[39m
+[2m      Tests [22m [2mno tests[22m
+[2m   Start at [22m 10:07:35
+[2m   Duration [22m 347ms[2m (transform 9ms, setup 0ms, collect 0ms, tests 0ms, environment 0ms, prepare 80ms)[22m
+

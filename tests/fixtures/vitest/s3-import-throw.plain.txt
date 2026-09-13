@@ -1,0 +1,22 @@
+
+ RUN  v2.1.9 C:/GitHub/_deps/vitest-samples
+
+ ❯ t/s3-import-throw.test.ts (0 test)
+
+⎯⎯⎯⎯⎯⎯ Failed Suites 1 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  t/s3-import-throw.test.ts [ t/s3-import-throw.test.ts ]
+TypeError: boom al importar
+ ❯ t/boom.js:1:7
+      1| throw new TypeError('boom al importar');
+       |       ^
+      2| 
+ ❯ t/s3-import-throw.test.ts:2:31
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+
+ Test Files  1 failed (1)
+      Tests  no tests
+   Start at  10:07:38
+   Duration  422ms (transform 20ms, setup 0ms, collect 0ms, tests 0ms, environment 0ms, prepare 88ms)
+

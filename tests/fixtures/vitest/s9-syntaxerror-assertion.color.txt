@@ -1,0 +1,30 @@
+
+[1m[7m[36m RUN [39m[27m[22m [36mv2.1.9 [39m[90mC:/GitHub/_deps/vitest-samples[39m
+
+ [31m❯[39m t/s9-syntaxerror-assertion.test.ts [2m([22m[2m1 test[22m[2m | [22m[31m1 failed[39m[2m)[22m[90m 6[2mms[22m[39m
+[31m   [31m×[31m rechaza el JSON roto con SyntaxError[90m 5[2mms[22m[31m[39m
+[31m     → expected 'SyntaxError: Expected property name o…' to be 'ok' // Object.is equality[39m
+
+[31m⎯⎯⎯⎯⎯⎯⎯[1m[7m Failed Tests 1 [27m[22m⎯⎯⎯⎯⎯⎯⎯[39m
+
+[31m[1m[7m FAIL [27m[22m[39m t/s9-syntaxerror-assertion.test.ts[2m > [22mrechaza el JSON roto con SyntaxError
+[31m[1mAssertionError[22m: expected 'SyntaxError: Expected property name o…' to be 'ok' // Object.is equality[39m
+
+Expected: [32m"ok"[39m
+Received: [31m"SyntaxError: Expected property name or '}' in JSON at position 1 (line 1 column 2)"[39m
+
+[36m [2m❯[22m t/s9-syntaxerror-assertion.test.ts:[2m5:15[22m[39m
+    [90m  3| [39m  [35mlet[39m msg [33m=[39m [32m'ok'[39m[33m;[39m
+    [90m  4| [39m  [35mtry[39m { [33mJSON[39m[33m.[39m[34mparse[39m([32m'{roto'[39m)[33m;[39m } [35mcatch[39m (e) { msg [33m=[39m [33mString[39m(e)[33m;[39m }
+    [90m  5| [39m  [34mexpect[39m(msg)[33m.[39m[34mtoBe[39m([32m'ok'[39m)[33m;[39m
+    [90m   | [39m              [31m^[39m
+    [90m  6| [39m})[33m;[39m
+    [90m  7| [39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯[22m[39m
+
+[2m Test Files [22m [1m[31m1 failed[39m[22m[90m (1)[39m
+[2m      Tests [22m [1m[31m1 failed[39m[22m[90m (1)[39m
+[2m   Start at [22m 10:07:47
+[2m   Duration [22m 399ms[2m (transform 18ms, setup 0ms, collect 16ms, tests 6ms, environment 0ms, prepare 87ms)[22m
+
