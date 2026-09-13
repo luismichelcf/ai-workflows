@@ -50,8 +50,11 @@ const FORBIDDEN_LAUNCHERS =
   /^(?:cmd|powershell|pwsh|bash|sh|zsh|dash|ksh|csh|tcsh|fish|wsl|wscript|cscript|mshta|conhost|env|forfiles|rundll32|mintty|git-bash)$/i;
 
 // An 8.3 short name such as POWERS~1 hides which program it really points at, so it is never
-// used. It is looked for in every segment of the path: a short folder name in the middle
-// (`NODE_M~1\tool\cli.js`) hides the real directory just as well as a short file name.
+// used. Where it is looked for depends on who wrote the path: a shim's target is checked in
+// every segment, because a short folder name in the middle (`NODE_M~1\tool\cli.js`) hides the
+// real program just as well as a short file name. A PATH entry or a directly requested absolute
+// path, on the other hand, is what the caller named: `C:\PROGRA~1\nodejs` is that folder, and
+// only a short name for the file itself (`RIPGRE~1.EXE`) hides which program runs.
 const SHORT_NAME = /~\d/;
 
 // The exact line every npm shim ends with before it forwards the arguments. Only the two
@@ -89,6 +92,12 @@ function hasShortName(file: string): boolean {
     .replace(/\//g, '\\')
     .split('\\')
     .some((segment) => segment.length > 0 && SHORT_NAME.test(segment));
+}
+
+// For a candidate found by walking the PATH, or a path the caller wrote out in full, only the
+// file name decides: the folders named by the caller are trusted as they are written.
+function hasShortNameInFileName(file: string): boolean {
+  return SHORT_NAME.test(baseName(file));
 }
 
 function extensionOf(file: string): string {
@@ -232,7 +241,7 @@ function resolveWindows(name: string, env: ExecutableEnvironment): ResolvedExecu
     // A real binary in the directory wins: it needs no shim at all.
     for (const extension of ['.exe', '.com']) {
       const candidate = joinPath(dir, name + extension, '\\');
-      if (env.exists(candidate) && !isForbiddenLauncher(candidate) && !hasShortName(candidate)) {
+      if (env.exists(candidate) && !isForbiddenLauncher(candidate) && !hasShortNameInFileName(candidate)) {
         return { ok: true, command: candidate, prefixArgs: [] };
       }
     }
@@ -256,7 +265,9 @@ function resolveWindows(name: string, env: ExecutableEnvironment): ResolvedExecu
 // being launched, so it is checked for `.exe`/`.com` (cmd.exe, git-bash.exe) but not for the
 // `.cmd` shim file itself, whose contents are inspected instead.
 function resolveWindowsAbsolute(file: string, env: ExecutableEnvironment): ResolvedExecutable {
-  if (hasShortName(file)) {
+  // The folders in a path the caller wrote out are taken as given; only its file name can hide
+  // behind a short name (`RIPGRE~1.EXE`).
+  if (hasShortNameInFileName(file)) {
     return { ok: false, reason: reasonFor(file) };
   }
 
