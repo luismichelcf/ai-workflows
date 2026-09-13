@@ -30,3 +30,23 @@ export function isValidBranchName(name: string): boolean {
 
   return true;
 }
+
+/**
+ * The stricter rule for the one setting that names the default branch, used both by the rulesets
+ * check and by the pre-push hook so the two can never disagree. It is `git check-ref-format
+ * --branch` (through `isValidBranchName`) plus what git treats specially in that mode:
+ *   - a name starting with `-` is read as an option, not as a branch;
+ *   - `HEAD` is git's own special ref and can never name a branch that gets checked out;
+ *   - `refs/...` and `origin/...` are not branch names. The hooks prefix `refs/heads/` themselves,
+ *     so `refs/heads/main` would build `refs/heads/refs/heads/main` and never match, switching
+ *     the lock off without a word.
+ * Kept here, once, for exactly the reason this module exists: two copies drift, and a lock that
+ * disagrees with its hook about the default branch is a lock that silently stops guarding it.
+ */
+export function isValidDefaultBranchSetting(name: string): boolean {
+  if (!isValidBranchName(name)) return false;
+  if (name.startsWith('-')) return false;
+  if (name === 'HEAD') return false;
+  if (name.startsWith('refs/') || name.startsWith('origin/')) return false;
+  return true;
+}

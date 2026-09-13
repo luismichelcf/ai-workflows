@@ -1,6 +1,6 @@
 // Server-side protections: do GitHub's rulesets really enforce what the pipeline relies on?
 
-import { isValidBranchName } from './refname.js';
+import { isValidDefaultBranchSetting } from './refname.js';
 import { isRecord } from './shared.js';
 
 export interface ProtectionRequirement {
@@ -51,7 +51,8 @@ function emptySetSource(negated: boolean): string {
  *   - `\x` inside a set is the literal `x`, so `[a\-z]` is `a`, `-` or `z` and never a range;
  *   - `]` right after `[`, `[!` or `[^` closes an empty set: `[]` matches nothing and `[!]`
  *     matches any character other than `/`;
- *   - a reversed range such as `[z-a]` matches nothing, so it contributes no member;
+ *   - a reversed range such as `[z-a]` still matches its two ends `z` and `a` (Ruby tests
+ *     each bound before comparing the order), so both become members;
  *   - a set that is never closed is unreadable, and the caller gets `undefined`.
  */
 function compileSet(pattern: string, start: number): { source: string; end: number } | undefined {
@@ -105,11 +106,15 @@ function compileSet(pattern: string, start: number): { source: string; end: numb
         to = afterDash;
         index += 2;
       }
-      // A reversed range matches nothing in Ruby, so it is dropped rather than made unreadable.
+      // Ruby matches the two ends of a reversed range before it ever compares the order
+      // (its `dir.c` tests each bound first), so `[m-a]` matches both `m` and `a`. Dropping
+      // the range would report "protected" for a branch GitHub really does not protect.
       if (member.charCodeAt(0) <= to.charCodeAt(0)) {
         body += `${escapeInSet(member)}-${escapeInSet(to)}`;
-        hasMember = true;
+      } else {
+        body += escapeInSet(member) + escapeInSet(to);
       }
+      hasMember = true;
       continue;
     }
 
@@ -214,9 +219,10 @@ function refEntryCoverage(entry: string, defaultBranch: string): RefEntryCoverag
  * A branch ruleset only counts if GitHub is told to enforce it on the default branch. An
  * entry in `include` must cover the branch and no entry in `exclude` may cover it, because
  * GitHub lets an exclusion win over an inclusion. An unreadable pattern in `exclude` counts
- * as excluding (fail closed); in `include` it does not cover. Either way its text is returned
- * so the report can name it: a rule that did not count is easier to fix when the pattern is
- * shown.
+ * as excluding (fail closed); in `include` it does not cover. A pattern is returned for the
+ * report only when it could have changed the answer: an unreadable include when nothing else
+ * covers the branch, and an unreadable exclude always. Reporting one that decided nothing would
+ * turn a green report red for no reason, and the caller could not act on it.
  */
 function appliesToDefaultBranch(ruleset: Record<string, unknown>, defaultBranch: string): BranchCoverage {
   const conditions = isRecord(ruleset.conditions) ? ruleset.conditions : undefined;
@@ -224,13 +230,14 @@ function appliesToDefaultBranch(ruleset: Record<string, unknown>, defaultBranch:
   if (!refName) return { applies: false, unreadable: [] };
   const include = Array.isArray(refName.include) ? refName.include : [];
   const exclude = Array.isArray(refName.exclude) ? refName.exclude : [];
-  const unreadable: string[] = [];
+  const unreadableInclude: string[] = [];
+  const unreadableExclude: string[] = [];
 
   let included = false;
   for (const entry of include) {
     if (typeof entry !== 'string') continue;
     const reading = refEntryCoverage(entry, defaultBranch);
-    if (reading.unreadable !== undefined) unreadable.push(reading.unreadable);
+    if (reading.unreadable !== undefined) unreadableInclude.push(reading.unreadable);
     if (reading.coverage === 'covers') included = true;
   }
 
@@ -238,11 +245,16 @@ function appliesToDefaultBranch(ruleset: Record<string, unknown>, defaultBranch:
   for (const entry of exclude) {
     if (typeof entry !== 'string') continue;
     const reading = refEntryCoverage(entry, defaultBranch);
-    if (reading.unreadable !== undefined) unreadable.push(reading.unreadable);
+    if (reading.unreadable !== undefined) unreadableExclude.push(reading.unreadable);
     // Only a pattern known not to cover leaves the branch in; "covers" and "unevaluable" both
     // exclude, because an unreadable exclusion must fail closed.
     if (reading.coverage !== 'does-not-cover') excluded = true;
   }
+
+  // An unreadable include only matters when no other entry already covered the branch; when one
+  // did, the unreadable pattern cannot change the verdict. An unreadable exclude always matters,
+  // because it is treated as excluding and so always could change it.
+  const unreadable = included ? unreadableExclude : [...unreadableInclude, ...unreadableExclude];
 
   return { applies: included && !excluded, unreadable };
 }
@@ -267,7 +279,7 @@ export function verifyProtections(
 
   // An unreadable default branch makes every verdict about "the default branch" meaningless,
   // so it is reported up front and no rule is evaluated against it.
-  if (!isValidBranchName(requirement.defaultBranch)) {
+  if (!isValidDefaultBranchSetting(requirement.defaultBranch)) {
     return {
       ok: false,
       problems: [

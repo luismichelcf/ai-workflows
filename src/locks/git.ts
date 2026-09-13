@@ -2,7 +2,7 @@
 
 import type { LockContext, LockDecision } from './editor.js';
 import { isUnder, readAbsolute, readAgainst, readPapers } from './paths.js';
-import { isValidBranchName } from './refname.js';
+import { isValidDefaultBranchSetting } from './refname.js';
 
 export interface PreCommitInput {
   /** Staged paths, relative to the repository root. */
@@ -74,14 +74,10 @@ export function decidePrePush(input: PrePushInput): LockDecision {
   // The setting is validated before any ref is looked at, and even when the push carries no
   // default ref: a defaultBranch the lock cannot name is broken configuration, not a pass, and
   // silently treating it as "nothing matched" would switch the lock off without saying so.
-  // `refs/` and `origin/` are refused explicitly: they would build `refs/heads/refs/heads/main`
-  // or `refs/heads/origin/main`, a ref that never matches and so never refuses.
+  // The rule itself lives in one place (`isValidDefaultBranchSetting`), shared with the rulesets
+  // check so both locks answer the same question with the same verdict.
   const { defaultBranch } = input;
-  const validDefaultBranch =
-    isValidBranchName(defaultBranch) &&
-    !defaultBranch.startsWith('refs/') &&
-    !defaultBranch.startsWith('origin/');
-  if (!validDefaultBranch) {
+  if (!isValidDefaultBranchSetting(defaultBranch)) {
     return {
       allow: false,
       reason:
