@@ -2,6 +2,7 @@
 
 import type { LockContext, LockDecision } from './editor.js';
 import { isUnder, readAbsolute, readAgainst, readPapers } from './paths.js';
+import { isValidBranchName } from './refname.js';
 
 export interface PreCommitInput {
   /** Staged paths, relative to the repository root. */
@@ -68,34 +69,6 @@ export interface PrePushInput {
   readonly defaultBranch: string;
 }
 
-/**
- * Whether git itself would accept a name as a ref (`git check-ref-format`), so the lock and git
- * agree on which refs exist. It is written as git's own rule, not as a closed whitelist: git
- * accepts `release+1`, `año` or `feat/ñandú`, and a whitelist would refuse those good settings;
- * and it refuses names like `ma..in` or `main.`, which would never match a real ref and would
- * turn the lock off without a word.
- */
-function isValidDefaultBranch(name: string): boolean {
-  // An empty name, or the lone `@`, names no branch at all.
-  if (name.length === 0 || name === '@') return false;
-
-  // No character from this set may appear anywhere: `..` and `@{` are parsed by git as ranges or
-  // revisions, `//` leaves an empty segment, and a control character (U+0000-U+001F, U+007F), a
-  // space or one of `~ ^ : ? * [ \` is either rejected by git or ends the name early.
-  if (/\.\.|@\{|\/\/|[ \u0000-\u001f\u007f~^:?*\[\\]/.test(name)) return false;
-
-  // A leading or trailing slash leaves an empty segment, and a trailing dot is refused by git.
-  if (name.startsWith('/') || name.endsWith('/') || name.endsWith('.')) return false;
-
-  // Each slash-separated segment must itself be a valid name: it cannot start with `.` (git keeps
-  // `.`-prefixed refs for its own files) or end with `.lock`.
-  for (const segment of name.split('/')) {
-    if (segment.startsWith('.') || segment.endsWith('.lock')) return false;
-  }
-
-  return true;
-}
-
 /** Nothing is pushed straight to the default branch: everything goes through a PR. */
 export function decidePrePush(input: PrePushInput): LockDecision {
   // The setting is validated before any ref is looked at, and even when the push carries no
@@ -105,7 +78,7 @@ export function decidePrePush(input: PrePushInput): LockDecision {
   // or `refs/heads/origin/main`, a ref that never matches and so never refuses.
   const { defaultBranch } = input;
   const validDefaultBranch =
-    isValidDefaultBranch(defaultBranch) &&
+    isValidBranchName(defaultBranch) &&
     !defaultBranch.startsWith('refs/') &&
     !defaultBranch.startsWith('origin/');
   if (!validDefaultBranch) {

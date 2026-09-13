@@ -1,5 +1,6 @@
 // Server-side protections: do GitHub's rulesets really enforce what the pipeline relies on?
 
+import { isValidBranchName } from './refname.js';
 import { isRecord } from './shared.js';
 
 export interface ProtectionRequirement {
@@ -28,75 +29,99 @@ interface RequiredCheckEntry {
 
 const BRANCH_REF_PREFIX = 'refs/heads/';
 
-/**
- * Whether a string is a branch name git would accept (`git check-ref-format --branch`). An
- * unreadable default branch makes every ruleset verdict meaningless, so it is reported before
- * looking at any rule rather than guessed at.
- */
-function isValidGitBranchName(name: string): boolean {
-  if (name.length === 0) return false;
-  // `--branch` rejects a leading dash, and a ref cannot contain a control character, a space
-  // or any of `~^:?*[\]`.
-  if (name.startsWith('-')) return false;
-  if (/[\u0000-\u001f\u007f ~^:?*\[\]\\]/.test(name)) return false;
-  if (name.includes('..') || name.includes('@{')) return false;
-  if (name === '@') return false;
-  if (name.startsWith('/') || name.endsWith('/') || name.includes('//')) return false;
-  if (name.endsWith('.')) return false;
-  return name.split('/').every((part) => !part.startsWith('.') && !part.endsWith('.lock'));
-}
-
-/** Escapes one character for the body of a JavaScript regular-expression character class. */
-function escapeInClass(char: string): string {
-  if (char === '\\' || char === ']' || char === '[' || char === '^') return `\\${char}`;
+/** Escapes one character so it is literal inside a JavaScript regular-expression set. */
+function escapeInSet(char: string): string {
+  // `\`, `]`, `^` and `-` carry meaning inside a set; escaping the dash keeps it literal even
+  // where a range would otherwise be read.
+  if (char === '\\' || char === ']' || char === '^' || char === '-') return `\\${char}`;
   return char;
 }
 
+/** The source of a set with no members: `[]` matches nothing, `[!]` any character but `/`. */
+function emptySetSource(negated: boolean): string {
+  return negated ? '[^/]' : '(?!)';
+}
+
 /**
- * Reads one `[...]` set starting at `start`, returning its regex source and the index of its
- * closing `]`. Returns `undefined` when the set is never closed, which makes the whole pattern
- * unevaluable. A `[!...]` or `[^...]` complement also excludes `/`, because under
- * `FNM_PATHNAME` a set can never match a slash.
+ * Reads one `[...]` set starting at `start` and turns it into regex source and the index of its
+ * closing `]`. Follows Ruby's `File.fnmatch` under `FNM_PATHNAME`:
+ *   - a set never matches `/`, so every set is guarded against consuming a slash, even `[/]` or
+ *     a range such as `[+-0]` that spans it;
+ *   - `[!...]` and `[^...]` are the complement, also barred from `/`;
+ *   - `\x` inside a set is the literal `x`, so `[a\-z]` is `a`, `-` or `z` and never a range;
+ *   - `]` right after `[`, `[!` or `[^` closes an empty set: `[]` matches nothing and `[!]`
+ *     matches any character other than `/`;
+ *   - a reversed range such as `[z-a]` matches nothing, so it contributes no member;
+ *   - a set that is never closed is unreadable, and the caller gets `undefined`.
  */
 function compileSet(pattern: string, start: number): { source: string; end: number } | undefined {
   let index = start + 1;
   let negated = false;
-  if (pattern[index] === '!' || pattern[index] === '^') {
+  const marker = pattern[index];
+  if (marker === '!' || marker === '^') {
     negated = true;
     index += 1;
   }
+
+  // `]` closing the set with no members is Ruby's empty set, not a literal bracket as in POSIX.
+  if (pattern[index] === ']') return { source: emptySetSource(negated), end: index };
+
   let body = '';
-  let first = true;
+  let hasMember = false;
   let closed = false;
-  let canStartRange = false;
-  for (; index < pattern.length; index += 1) {
+
+  while (index < pattern.length) {
     const char = pattern[index];
     if (char === undefined) break;
-    // A `]` right after `[` or `[!` is a literal member, as in Ruby's fnmatch.
-    if (char === ']' && !first) {
+    if (char === ']') {
       closed = true;
       break;
     }
-    first = false;
+
+    // Read one member, honoring `\x` as the literal `x`.
+    let member: string;
     if (char === '\\') {
       const escaped = pattern[index + 1];
       if (escaped === undefined) return undefined;
-      body += escapeInClass(escaped);
-      canStartRange = true;
+      member = escaped;
+      index += 2;
+    } else {
+      member = char;
       index += 1;
+    }
+
+    // A `-` after this member that is not the closing `]` opens a range. An escaped `-` was read
+    // as the member above, so it never reaches here and stays literal.
+    const dash = pattern[index];
+    const afterDash = pattern[index + 1];
+    if (dash === '-' && afterDash !== undefined && afterDash !== ']') {
+      let to: string;
+      if (afterDash === '\\') {
+        const escaped = pattern[index + 2];
+        if (escaped === undefined) return undefined;
+        to = escaped;
+        index += 3;
+      } else {
+        to = afterDash;
+        index += 2;
+      }
+      // A reversed range matches nothing in Ruby, so it is dropped rather than made unreadable.
+      if (member.charCodeAt(0) <= to.charCodeAt(0)) {
+        body += `${escapeInSet(member)}-${escapeInSet(to)}`;
+        hasMember = true;
+      }
       continue;
     }
-    // A `-` between two characters is a range; anywhere else it is literal.
-    if (char === '-' && canStartRange && pattern[index + 1] !== ']') {
-      body += '-';
-      canStartRange = false;
-      continue;
-    }
-    body += escapeInClass(char);
-    canStartRange = true;
+
+    body += escapeInSet(member);
+    hasMember = true;
   }
+
   if (!closed) return undefined;
-  const source = negated ? `[^/${body}]` : `[${body}]`;
+  if (!hasMember) return { source: emptySetSource(negated), end: index };
+  // The lookahead keeps a positive set from ever consuming `/`, which Ruby's `FNM_PATHNAME`
+  // forbids even when the set spells the slash out or a range spans it.
+  const source = negated ? `[^/${body}]` : `(?:(?!/)[${body}])`;
   return { source, end: index };
 }
 
@@ -105,30 +130,34 @@ function compileSet(pattern: string, start: number): { source: string; end: numb
  * with `File::FNM_PATHNAME` the way GitHub reads `ref_name`:
  *   - `*` matches zero or more characters other than `/`; `?` matches exactly one.
  *   - `[...]` is a set and `[!...]` or `[^...]` its complement; a set never matches `/`.
- *   - a double star followed by `/` crosses zero or more whole folders; a double star not
- *     followed by `/` is just a single star.
- *   - everything else is literal.
- * Returns `undefined` when the pattern cannot be read (for example an unclosed `[`), so the
- * caller can fail closed instead of guessing. Without this, a ruleset aimed only at
- * `refs/heads/release/*` would be read as covering `main`, and a "protected" verdict would be
- * false.
+ *   - a double star followed by a slash crosses zero or more whole folders, but only where a
+ *     segment can start: at the beginning of the pattern or right after a slash. Anywhere else
+ *     (as in `rel` followed by stars, or four stars) it is just a single star.
+ *   - `\x` outside a set is the literal `x`; everything else is literal.
+ * Returns `undefined` when the pattern cannot be read (for example an unclosed `[` or a regular
+ * expression the source could not build), so the caller can fail closed instead of guessing.
+ * Without this, a ruleset aimed only at `refs/heads/release/*` would be read as covering `main`,
+ * and a "protected" verdict would be false.
  */
 function refPatternToRegExp(pattern: string): RegExp | undefined {
   let source = '';
   for (let index = 0; index < pattern.length; index += 1) {
     const char = pattern[index];
     if (char === undefined) break;
-    if (char === '*') {
-      if (pattern[index + 1] === '*') {
-        if (pattern[index + 2] === '/') {
-          source += '(?:[^/]*/)*';
-          index += 2;
-        } else {
-          source += '[^/]*';
-          index += 1;
-        }
+    if (char === '\\') {
+      // Outside a set a backslash escapes the next character, so `\m` is the literal `m`.
+      const escaped = pattern[index + 1];
+      if (escaped === undefined) return undefined;
+      source += escaped.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      index += 1;
+    } else if (char === '*') {
+      const atSegmentStart = index === 0 || pattern[index - 1] === '/';
+      if (atSegmentStart && pattern[index + 1] === '*' && pattern[index + 2] === '/') {
+        source += '(?:[^/]*/)*';
+        index += 2;
       } else {
         source += '[^/]*';
+        if (pattern[index + 1] === '*') index += 1;
       }
     } else if (char === '?') {
       source += '[^/]';
@@ -141,10 +170,28 @@ function refPatternToRegExp(pattern: string): RegExp | undefined {
       source += char.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     }
   }
-  return new RegExp(`^${source}$`);
+  // Building the source never throws: a pattern whose regular expression cannot be built is an
+  // unreadable pattern, not a crash in the middle of a verdict.
+  try {
+    return new RegExp(`^${source}$`);
+  } catch {
+    return undefined;
+  }
 }
 
 type RefCoverage = 'covers' | 'does-not-cover' | 'unevaluable';
+
+/** One entry's verdict, with its text when it was a pattern that could not be read. */
+interface RefEntryCoverage {
+  readonly coverage: RefCoverage;
+  readonly unreadable: string | undefined;
+}
+
+/** Whether a ruleset applies to the default branch, and any patterns it could not read. */
+interface BranchCoverage {
+  readonly applies: boolean;
+  readonly unreadable: readonly string[];
+}
 
 /**
  * Whether one `ref_name` entry covers the repository's default branch. GitHub spells the
@@ -153,36 +200,51 @@ type RefCoverage = 'covers' | 'does-not-cover' | 'unevaluable';
  * tokens this code does not know) does not cover it. A pattern that cannot be read is
  * reported as `unevaluable` so the caller can fail closed.
  */
-function refEntryCoverage(entry: string, defaultBranch: string): RefCoverage {
-  if (entry === '~DEFAULT_BRANCH' || entry === '~ALL') return 'covers';
+function refEntryCoverage(entry: string, defaultBranch: string): RefEntryCoverage {
+  if (entry === '~DEFAULT_BRANCH' || entry === '~ALL') return { coverage: 'covers', unreadable: undefined };
   const defaultRef = `${BRANCH_REF_PREFIX}${defaultBranch}`;
-  if (entry === defaultRef) return 'covers';
-  if (!entry.startsWith(BRANCH_REF_PREFIX)) return 'does-not-cover';
+  if (entry === defaultRef) return { coverage: 'covers', unreadable: undefined };
+  if (!entry.startsWith(BRANCH_REF_PREFIX)) return { coverage: 'does-not-cover', unreadable: undefined };
   const pattern = refPatternToRegExp(entry);
-  if (!pattern) return 'unevaluable';
-  return pattern.test(defaultRef) ? 'covers' : 'does-not-cover';
+  if (!pattern) return { coverage: 'unevaluable', unreadable: entry };
+  return { coverage: pattern.test(defaultRef) ? 'covers' : 'does-not-cover', unreadable: undefined };
 }
 
 /**
  * A branch ruleset only counts if GitHub is told to enforce it on the default branch. An
  * entry in `include` must cover the branch and no entry in `exclude` may cover it, because
  * GitHub lets an exclusion win over an inclusion. An unreadable pattern in `exclude` counts
- * as excluding (fail closed); in `include` it does not cover.
+ * as excluding (fail closed); in `include` it does not cover. Either way its text is returned
+ * so the report can name it: a rule that did not count is easier to fix when the pattern is
+ * shown.
  */
-function appliesToDefaultBranch(ruleset: Record<string, unknown>, defaultBranch: string): boolean {
+function appliesToDefaultBranch(ruleset: Record<string, unknown>, defaultBranch: string): BranchCoverage {
   const conditions = isRecord(ruleset.conditions) ? ruleset.conditions : undefined;
   const refName = conditions && isRecord(conditions.ref_name) ? conditions.ref_name : undefined;
-  if (!refName) return false;
+  if (!refName) return { applies: false, unreadable: [] };
   const include = Array.isArray(refName.include) ? refName.include : [];
   const exclude = Array.isArray(refName.exclude) ? refName.exclude : [];
-  const included = include.some(
-    (entry) => typeof entry === 'string' && refEntryCoverage(entry, defaultBranch) === 'covers',
-  );
-  if (!included) return false;
-  const excluded = exclude.some(
-    (entry) => typeof entry === 'string' && refEntryCoverage(entry, defaultBranch) !== 'does-not-cover',
-  );
-  return !excluded;
+  const unreadable: string[] = [];
+
+  let included = false;
+  for (const entry of include) {
+    if (typeof entry !== 'string') continue;
+    const reading = refEntryCoverage(entry, defaultBranch);
+    if (reading.unreadable !== undefined) unreadable.push(reading.unreadable);
+    if (reading.coverage === 'covers') included = true;
+  }
+
+  let excluded = false;
+  for (const entry of exclude) {
+    if (typeof entry !== 'string') continue;
+    const reading = refEntryCoverage(entry, defaultBranch);
+    if (reading.unreadable !== undefined) unreadable.push(reading.unreadable);
+    // Only a pattern known not to cover leaves the branch in; "covers" and "unevaluable" both
+    // exclude, because an unreadable exclusion must fail closed.
+    if (reading.coverage !== 'does-not-cover') excluded = true;
+  }
+
+  return { applies: included && !excluded, unreadable };
 }
 
 /**
@@ -205,7 +267,7 @@ export function verifyProtections(
 
   // An unreadable default branch makes every verdict about "the default branch" meaningless,
   // so it is reported up front and no rule is evaluated against it.
-  if (!isValidGitBranchName(requirement.defaultBranch)) {
+  if (!isValidBranchName(requirement.defaultBranch)) {
     return {
       ok: false,
       problems: [
@@ -267,7 +329,15 @@ export function verifyProtections(
       continue;
     }
 
-    if (!appliesToDefaultBranch(rawRuleset, requirement.defaultBranch)) continue;
+    const branch = appliesToDefaultBranch(rawRuleset, requirement.defaultBranch);
+    // A pattern nobody can read is named so a person can fix it, instead of the rule silently
+    // failing to count with no clue why.
+    for (const pattern of branch.unreadable) {
+      problems.push(
+        `Hay un patrón de ref_name que no se pudo leer (${pattern}): puede cubrir o excluir la rama por defecto y no se cuenta como protección.`,
+      );
+    }
+    if (!branch.applies) continue;
     hasActiveApplicable = true;
 
     // `bypass_actors` is only returned when the API caller has write access to the ruleset,
