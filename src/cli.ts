@@ -256,14 +256,17 @@ function openEngine(
   store: Store,
   locale: string,
   describeChange: CommandOptions['describeChange'],
+  leaseMs: CommandOptions['leaseMs'],
 ): CommandOutput | ReturnType<typeof createEngine> {
   try {
-    // `exactOptionalPropertyTypes` forbids an explicit `undefined`, so the key is only present
-    // when the project actually supplied a way to describe its changes.
+    // `exactOptionalPropertyTypes` forbids an explicit `undefined`, so each key is only present
+    // when the project actually supplied a value. Over GitHub every renewal is a commit, so the
+    // lease the project asks for must reach the engine untouched.
     return createEngine({
       config,
       store,
       ...(describeChange === undefined ? {} : { describeChange }),
+      ...(leaseMs === undefined ? {} : { leaseMs }),
     });
   } catch (error) {
     if (error instanceof InvalidPipeline) {
@@ -317,7 +320,7 @@ export async function runCommand(argv: readonly string[], options: CommandOption
         return { ok: false, text: missingPieceText(locale) };
       }
 
-      const engine = openEngine(config, store, locale, options.describeChange);
+      const engine = openEngine(config, store, locale, options.describeChange, options.leaseMs);
       if (isOutput(engine)) return engine;
 
       const dryRun = args.includes('--dry-run');
@@ -326,7 +329,7 @@ export async function runCommand(argv: readonly string[], options: CommandOption
     }
 
     case 'status': {
-      const engine = openEngine(config, store, locale, options.describeChange);
+      const engine = openEngine(config, store, locale, options.describeChange, options.leaseMs);
       if (isOutput(engine)) return engine;
 
       const piece = args[0];
