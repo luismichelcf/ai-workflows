@@ -183,23 +183,21 @@ describe('where the state lives', () => {
 });
 
 describe('listing refs', () => {
-  const page = (nodes: Array<[string, string]>, next?: string): GhRun =>
-    ok({
-      data: {
-        repository: {
-          refs: {
-            nodes: nodes.map(([name, oid]) => ({ name, target: { oid } })),
-            pageInfo: { hasNextPage: next !== undefined, endCursor: next ?? null },
-          },
-        },
-      },
-    });
+  // Measured on 13-sep-2026, and the reason the first real run listed no pieces: GraphQL
+  // `refs(refPrefix:)` answers `totalCount: 0` for refs outside heads and tags even with two in
+  // place, while REST `git/matching-refs` lists them and answers `[]` when none match. `gh api
+  // --paginate` follows every page and joins them into one JSON array.
+  const MATCHING = `${BASE}/git/matching-refs/ai-workflows/pieces/`;
+  const matchingCall = (call: Call): boolean => call.method === 'GET' && call.endpoint === MATCHING;
+  const item = (name: string, oid: string) => ({
+    ref: `refs/ai-workflows/${name}`,
+    object: { sha: oid, type: 'commit' },
+  });
 
-  it('lists every ref under a prefix across pages, with the commit each points at', async () => {
-    const gh = fakeGh((call) => {
-      if (!refsQuery(call)) return undefined;
-      return call.input?.includes('CURSOR1') === true ? page([['1000', C2]]) : page([['997', C1]], 'CURSOR1');
-    });
+  it('lists every ref under a prefix, following every page, with the commit each points at', async () => {
+    const gh = fakeGh((call) =>
+      matchingCall(call) ? ok([item('pieces/1000', C2), item('pieces/997', C1)]) : undefined,
+    );
 
     const listed = await port(gh.run).refs('pieces/');
 
@@ -207,36 +205,45 @@ describe('listing refs', () => {
       { name: 'pieces/1000', commit: C2 },
       { name: 'pieces/997', commit: C1 },
     ]);
-    const queries = gh.calls.filter(refsQuery);
-    expect(queries).toHaveLength(2);
-    expect(queries.every((call) => call.input?.includes('refs/ai-workflows/pieces/'))).toBe(true);
+    expect(gh.calls.find(matchingCall)?.args).toContain('--paginate');
+    expect(gh.calls.some((call) => call.endpoint === 'graphql')).toBe(false);
   });
 
   it('says there are none when nothing matches', async () => {
-    const gh = fakeGh((call) => (refsQuery(call) ? page([]) : undefined));
+    const gh = fakeGh((call) => (matchingCall(call) ? ok([]) : undefined));
 
     expect(await port(gh.run).refs('pieces/')).toEqual([]);
   });
 
+  it('keeps only refs under the prefix it asked for', async () => {
+    const gh = fakeGh((call) =>
+      matchingCall(call) ? ok([item('pieces/997', C1), item('piecesX/1', C2)]) : undefined,
+    );
+
+    expect(await port(gh.run).refs('pieces/')).toEqual([{ name: 'pieces/997', commit: C1 }]);
+  });
+
   it.each<[string, GhRun]>([
-    ['a GraphQL error', { exitCode: 1, stdout: JSON.stringify({ errors: [{ message: GENERIC }] }), stderr: `gh: ${GENERIC}` }],
-    [
-      'a repository it cannot see',
-      {
-        exitCode: 1,
-        stdout: JSON.stringify({
-          data: { repository: null },
-          errors: [{ type: 'NOT_FOUND', message: "Could not resolve to a Repository with the name 'luismichelcf/ai-workflows'." }],
-        }),
-        stderr: 'gh: Could not resolve to a Repository',
-      },
-    ],
-    ['a reply without the list', ok({ data: { repository: null } })],
+    ['a failure', httpError(502, 'Bad Gateway')],
+    ['a repository it cannot see', httpError(404, 'Not Found')],
+    ['a reply that is not a list', ok({ message: 'unexpected' })],
+    ['an entry without its commit', ok([{ ref: 'refs/ai-workflows/pieces/997' }])],
   ])('reports %s instead of an empty list', async (_label, reply) => {
-    const gh = fakeGh((call) => (refsQuery(call) ? reply : undefined));
+    const gh = fakeGh((call) => (matchingCall(call) ? reply : undefined));
 
     await expect(port(gh.run).refs('pieces/')).rejects.toThrow();
   });
+
+  it.each(['', 'pieces', '../heads/', 'pieces/a b/'])(
+    'refuses a prefix the store never asks for, before any call: %j',
+    async (prefix) => {
+      const gh = fakeGh(() => undefined);
+      const statePort = port(gh.run);
+
+      await expect(attempt(() => statePort.refs(prefix))).rejects.toThrow();
+      expect(gh.calls).toHaveLength(0);
+    },
+  );
 });
 
 describe('reading files', () => {
