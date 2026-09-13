@@ -383,6 +383,12 @@ export function requireSameFiles(
   // their letters depending on who wrote them down.
   const normalize = (hash: string): string => hash.toLowerCase();
 
+  // A blank hash is not a hash. `''` and `'   '` carry no content, so two of them matching
+  // would pass exactly the case this gate exists to catch — an unrecorded or unreadable
+  // file — a green that proves nothing, the same one already refused for an empty record.
+  // A blank on either side therefore counts as a change and is named, never a match.
+  const isBlank = (hash: string): boolean => hash.trim().length === 0;
+
   const changed: string[] = [];
   const appeared: string[] = [];
   const missing: string[] = [];
@@ -390,7 +396,12 @@ export function requireSameFiles(
   for (const name of Object.keys(recorded)) {
     if (!Object.prototype.hasOwnProperty.call(current, name)) {
       missing.push(name);
-    } else if (normalize(recorded[name] ?? '') !== normalize(current[name] ?? '')) {
+      continue;
+    }
+
+    const before = recorded[name] ?? '';
+    const now = current[name] ?? '';
+    if (isBlank(before) || isBlank(now) || normalize(before) !== normalize(now)) {
       changed.push(name);
     }
   }
