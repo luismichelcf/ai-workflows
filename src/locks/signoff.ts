@@ -24,8 +24,35 @@ export interface SignOffRules {
 /** An order alone on its line: the command and exactly one token, nothing else. */
 const SIGN_OFF_LINE = /^\/visto-bueno\s+(\S+)$/;
 
-/** An opening fence: three or more backticks or three or more tildes. */
-const SIGN_OFF_FENCE = /^(`{3,}|~{3,})/;
+/**
+ * An opening fence: up to three spaces, then three or more backticks or three or more tildes.
+ * GitHub treats four or more leading spaces as an indented code block, not a fence, so the
+ * `{0,3}` is exact, not a convenience.
+ */
+const FENCE_OPEN = /^ {0,3}(`{3,}|~{3,})/;
+
+/**
+ * A closing fence: up to three spaces, the marker, and nothing but spaces after it. The
+ * "nothing else" is what GitHub needs: ```` ``` foo ```` inside a fence is content, not the
+ * fence's end, so an order written after it is still inside the code block.
+ */
+const FENCE_CLOSE = /^ {0,3}(`{3,}|~{3,})[ \t]*$/;
+
+/** The real `<details` and `<pre` tags: the name must end at a space, `>` or the line, so a
+ * word like `<preview>` is not a tag. Case matters no more in HTML than in GitHub's renderer. */
+const DETAILS_OPEN = /<details(?=[\s>]|$)/i;
+const DETAILS_CLOSE = /<\/details>/i;
+const PRE_OPEN = /<pre(?=[\s>]|$)/i;
+const PRE_CLOSE = /<\/pre>/i;
+
+/**
+ * Drops inline code spans (matched runs of backticks) from a line. A tag or comment marker
+ * written inside backticks is literal text GitHub displays as typed, not markup, so it must
+ * not open a hidden region. Fences are found separately; this only serves the tag search.
+ */
+function stripInlineCode(raw: string): string {
+  return raw.replace(/(`+)([\s\S]*?)\1/g, '');
+}
 
 /**
  * A full SHA-1 (40 hex) or SHA-256 (64 hex). Seven characters were enough for GitHub to
@@ -60,9 +87,13 @@ interface Fence {
   readonly length: number;
 }
 
-/** Whether a line would close the open fence: same marker, at least as long as the opener. */
+/**
+ * Whether a line closes the open fence: same marker character, at least as long as the
+ * opener, and nothing else on the line. A longer run closes a shorter fence, which is how
+ * GitHub nests a smaller fence inside a bigger one.
+ */
 function closesFence(raw: string, fence: Fence): boolean {
-  const marker = SIGN_OFF_FENCE.exec(raw.replace(/^ {0,3}/, ''))?.[1];
+  const marker = FENCE_CLOSE.exec(raw)?.[1];
   return marker !== undefined && marker[0] === fence.char && marker.length >= fence.length;
 }
 
@@ -80,6 +111,7 @@ function collectOrderLines(body: string): readonly OrderLine[] {
   let htmlComment = false;
   let details = false;
   let pre = false;
+  let quote = false;
 
   for (const raw of body.split(/\r?\n/)) {
     if (fence) {
@@ -91,31 +123,51 @@ function collectOrderLines(body: string): readonly OrderLine[] {
       continue;
     }
     if (details) {
-      if (raw.includes('</details>')) details = false;
+      if (DETAILS_CLOSE.test(raw)) details = false;
       continue;
     }
     if (pre) {
-      if (raw.includes('</pre>')) pre = false;
+      if (PRE_CLOSE.test(raw)) pre = false;
       continue;
     }
+
+    // A blank line ends a block quote. Without one, the line after a quote is a lazy
+    // continuation: GitHub keeps it inside the quote, so it is not the owner's own text.
+    if (raw.trim() === '') {
+      quote = false;
+      continue;
+    }
+    if (/^ {0,3}>/.test(raw)) {
+      quote = true;
+      continue;
+    }
+    if (quote) continue;
+
+    // A fence is literal from here on, so any tag or quote marker on the opener line is
+    // content, not markup. Detect it before looking for tags.
+    const openMarker = FENCE_OPEN.exec(raw)?.[1];
+    if (openMarker !== undefined) {
+      fence = { char: openMarker[0] === '~' ? '~' : '`', length: openMarker.length };
+      continue;
+    }
+
+    // Inline code is literal too: `` `<!--` `` shows the marker, it does not open one.
+    const visible = stripInlineCode(raw);
 
     // A comment that both opens and closes on one line hides only that line.
-    if (raw.includes('<!--')) {
-      if (!raw.includes('-->')) htmlComment = true;
-      continue;
-    }
-    if (raw.includes('<details')) {
-      details = true;
-      continue;
-    }
-    if (raw.includes('<pre')) {
-      pre = true;
+    if (visible.includes('<!--')) {
+      if (!visible.includes('-->')) htmlComment = true;
       continue;
     }
 
-    const opener = SIGN_OFF_FENCE.exec(raw.replace(/^ {0,3}/, ''))?.[1];
-    if (opener !== undefined) {
-      fence = { char: opener[0] === '~' ? '~' : '`', length: opener.length };
+    // <details> and <pre> hide what follows only while their tag stays open. When the closing
+    // tag is on the same line, the line is complete and does not reach the next one.
+    if (DETAILS_OPEN.test(visible)) {
+      if (!DETAILS_CLOSE.test(visible)) details = true;
+      continue;
+    }
+    if (PRE_OPEN.test(visible)) {
+      if (!PRE_CLOSE.test(visible)) pre = true;
       continue;
     }
 
@@ -123,10 +175,10 @@ function collectOrderLines(body: string): readonly OrderLine[] {
     const match = SIGN_OFF_LINE.exec(line);
     if (match?.[1] === undefined) continue;
 
-    // Four leading spaces or a tab makes an indented code block; `>` documents someone
-    // else's words. Neither is an order the owner gave.
+    // Four leading spaces or a tab makes an indented code block. Quoted lines never reach
+    // here: the quote state already consumed them above.
     const indented = raw.startsWith('    ') || raw.startsWith('\t');
-    orders.push({ sha: match[1], hidden: indented || line.startsWith('>') });
+    orders.push({ sha: match[1], hidden: indented });
   }
 
   return orders;
