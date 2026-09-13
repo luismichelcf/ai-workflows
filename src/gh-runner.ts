@@ -29,9 +29,7 @@ export interface GhRunnerOptions {
 
 export const DEFAULT_GH_TIMEOUT_MS = 60_000;
 
-// The real environment `resolveExecutable` needs. Copied from the GitHub store on purpose: that
-// file is being redesigned in parallel, so importing from it would make this runner depend on a
-// moving target and drag in the whole store as a side effect.
+// The real environment `resolveExecutable` needs, so the resolver itself stays a pure function.
 function executableEnvironment(): ExecutableEnvironment {
   const pathExt = process.env['PATHEXT'];
   return {
@@ -55,8 +53,7 @@ function executableEnvironment(): ExecutableEnvironment {
 /**
  * The environment a shim would have exported, laid over the engine's own. NODE_PATH is special:
  * the shim's value goes in front of any the engine already had, separated the way the platform
- * separates PATH entries, mirroring the shim's own `%NODE_PATH%` reference. Copied from the
- * GitHub store for the same reason as `executableEnvironment`.
+ * separates PATH entries, mirroring the shim's own `%NODE_PATH%` reference.
  */
 function mergeShimEnvironment(shimEnv: Readonly<Record<string, string>>): NodeJS.ProcessEnv {
   const separator = process.platform === 'win32' ? ';' : ':';
@@ -128,7 +125,7 @@ export function createGhRunner(options: GhRunnerOptions = {}): GhRunner {
 
       const child = spawn(executable.command, [...executable.prefixArgs, ...args], spawnOptions);
 
-      // SetEncoding decodes UTF-8 across chunk boundaries, so a multi-byte character
+      // `setEncoding` decodes UTF-8 across chunk boundaries, so a multi-byte character
       // split between two writes is not mangled into a replacement character. Output is joined
       // only once at close.
       let stdout = '';
