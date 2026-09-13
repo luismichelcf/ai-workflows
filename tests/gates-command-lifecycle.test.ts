@@ -43,8 +43,13 @@ const writeScript = (dir: string, name: string, body: string) => {
 // On Windows a Node process puts its children in a job that dies with it, so a plain Node
 // intermediate hides both bugs: its grandchild is killed for free. A grandchild started with
 // `detached: true` leaves that job, like the processes `pnpm check` starts, and reproduces
-// both on every platform. (The engine refuses cmd.exe even by absolute path, so it cannot be
-// the intermediate.)
+// both. On POSIX there is no such job, and `detached: true` would instead put the grandchild in
+// a session of its own that no process-group kill can reach — measured on the first Linux run.
+// So the grandchild is detached only on Windows. (The engine refuses cmd.exe even by absolute
+// path, so it cannot be the intermediate.)
+//
+// Children that print a lot set `process.exitCode` instead of calling `process.exit()`: on
+// POSIX, writes to a pipe are asynchronous and `process.exit()` drops what has not been flushed.
 const withGrandchild = (dir: string, mode: 'child-exits-grandchild-keeps-output' | 'child-waits-on-grandchild') => {
   const pidFile = join(dir, 'grandchild.pid');
   const grandchild = writeScript(
@@ -58,7 +63,7 @@ const withGrandchild = (dir: string, mode: 'child-exits-grandchild-keeps-output'
     'child.js',
     [
       "const { spawn } = require('node:child_process');",
-      `spawn(process.execPath, [${JSON.stringify(grandchild)}], { stdio: '${keepsOutput ? 'inherit' : 'ignore'}', detached: true });`,
+      `spawn(process.execPath, [${JSON.stringify(grandchild)}], { stdio: '${keepsOutput ? 'inherit' : 'ignore'}', detached: process.platform === 'win32' });`,
       keepsOutput ? 'setTimeout(() => process.exit(0), 300);' : 'setInterval(() => {}, 1000);',
     ].join('\n'),
   );

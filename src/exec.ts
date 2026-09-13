@@ -34,6 +34,11 @@ export type ResolvedExecutable =
       readonly command: string;
       /** Arguments that must go before the caller's, such as the script a shim runs. */
       readonly prefixArgs: readonly string[];
+      /**
+       * Environment the shim would have set before running the program, such as the NODE_PATH
+       * pnpm writes into its bins. Absent when the program needs nothing extra.
+       */
+      readonly env?: Readonly<Record<string, string>>;
     }
   | { readonly ok: false; readonly reason: string };
 
@@ -77,6 +82,35 @@ const ALLOWED_PROG_ASSIGNMENT = /^\s+SET\s+"_prog=(?:%dp0%\\node\.exe|node)"\s*$
 const NODE_OPTIONS_MENTION = /NODE_OPTIONS/i;
 const PROG_MENTION = /_prog=/i;
 
+// pnpm writes a third shape for every bin it installs (read from the real file, 13-sep-2026):
+//
+//   @SETLOCAL
+//   @IF NOT DEFINED NODE_PATH (
+//     @SET "NODE_PATH=<folders>"
+//   ) ELSE (
+//     @SET "NODE_PATH=<folders>;%NODE_PATH%"
+//   )
+//   @IF EXIST "%~dp0\node.exe" (
+//     "%~dp0\node.exe"  "%~dp0\..\pnpm\bin\pnpm.cjs" %*
+//   ) ELSE (
+//     @SET PATHEXT=%PATHEXT:;.JS;=;%
+//     node  "%~dp0\..\pnpm\bin\pnpm.cjs" %*
+//   )
+//
+// It differs from the npm shapes on three counts: it uses `%~dp0` instead of `%dp0%`, it
+// forwards `%*` from two lines (the node.exe beside the shim, or the `node` on the PATH), and it
+// exports NODE_PATH so the script finds the dependencies installed beside it. The NODE_PATH is
+// part of the accepted shape: dropping it would let the program start but not find its modules.
+const PNPM_LOCAL_NODE_SHAPE = /^"%~dp0\\node\.exe"\s+"(%~dp0[\\/][^"]+\.(?:cjs|mjs|js))"\s+%\*$/i;
+const PNPM_SYSTEM_NODE_SHAPE = /^node\s+"(%~dp0[\\/][^"]+\.(?:cjs|mjs|js))"\s+%\*$/i;
+// The assignment that sets NODE_PATH without appending an existing one is the `IF NOT DEFINED`
+// branch; the `ELSE` branch's line always mentions `%NODE_PATH%`.
+const PNPM_NODE_PATH_ASSIGNMENT = /^\s*@SET\s+"NODE_PATH=([^"]*)"\s*$/i;
+// Every other line of the shape is one of these fixed directives. Requiring them keeps a line
+// that would launch another program from riding along unnoticed.
+const PNPM_STRUCTURE_LINE =
+  /^(?:@SETLOCAL|@IF NOT DEFINED NODE_PATH \(|\)|\) ELSE \(|@IF EXIST "%~dp0\\node\.exe" \(|@SET PATHEXT=%PATHEXT:;\.JS;=;%|@SET "NODE_PATH=[^"]*")$/i;
+
 function baseName(file: string): string {
   return file.split(/[\\/]/).pop() ?? file;
 }
@@ -107,7 +141,7 @@ function hasShortNameInFileName(file: string): boolean {
 // `%dp0%` token set aside: `%dp0%` expands to the PATH folder the caller named, whose short form
 // must not refuse the shim, whereas a short name the shim wrote after it still hides the program.
 function hasShortNameInShimTarget(target: string): boolean {
-  return hasShortName(target.replace(/%dp0%/gi, ''));
+  return hasShortName(target.replace(/%dp0%|%~dp0/gi, ''));
 }
 
 function extensionOf(file: string): string {
@@ -171,7 +205,9 @@ function normalizeWindows(file: string): string {
 }
 
 function substituteDp0(token: string, dir: string): string {
-  return normalizeWindows(token.replace(/%dp0%/gi, () => dir));
+  // Both the npm token (`%dp0%`) and the pnpm token (`%~dp0`, whose tilde drops the quotes) stand
+  // for the folder the shim lives in.
+  return normalizeWindows(token.replace(/%dp0%|%~dp0/gi, () => dir));
 }
 
 function windowsDirName(file: string): string {
@@ -180,19 +216,33 @@ function windowsDirName(file: string): string {
   return index === -1 ? '' : normalized.slice(0, index);
 }
 
-// A verified shim is one whose `%*` line matches exactly one of the two npm shapes. A script
-// shim must set `_prog` at least once and only through the two verified assignments, so an
-// unquoted `SET _prog=…bun.exe` or one folded onto the IF line is refused rather than ignored.
-function inspectCmdShim(content: string): { readonly kind: 'exe' | 'script'; readonly target: string } | undefined {
+// A verified shim is one whose `%*` line matches exactly one of the two npm shapes, or whose two
+// `%*` lines match the pnpm shape. A script shim must set `_prog` at least once and only through
+// the two verified assignments, so an unquoted `SET _prog=…bun.exe` or one folded onto the IF
+// line is refused rather than ignored.
+type CmdShim =
+  | { readonly kind: 'exe'; readonly target: string }
+  | { readonly kind: 'script'; readonly target: string }
+  | { readonly kind: 'pnpm'; readonly target: string; readonly nodePath: string };
+
+function inspectCmdShim(content: string): CmdShim | undefined {
   const lines = content.split(/\r?\n/);
   for (const line of lines) {
     if (NODE_OPTIONS_MENTION.test(line)) return undefined;
   }
 
-  const invocationLines = lines.filter((line) => line.trimEnd().endsWith('%*')).map((line) => line.trim());
-  if (invocationLines.length !== 1) return undefined;
-  const line = invocationLines[0];
-  if (line === undefined) return undefined;
+  const invocationIndexes: number[] = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    if ((lines[index] ?? '').trimEnd().endsWith('%*')) invocationIndexes.push(index);
+  }
+
+  // Two `%*` lines are the pnpm shape; the npm shapes forward it from exactly one. Anything
+  // else is a shape nobody verified and is refused.
+  if (invocationIndexes.length === 2) return inspectPnpmShim(lines, invocationIndexes);
+  const onlyIndex = invocationIndexes[0];
+  if (invocationIndexes.length !== 1 || onlyIndex === undefined) return undefined;
+
+  const line = (lines[onlyIndex] ?? '').trim();
 
   const exe = EXE_DIRECT_SHAPE.exec(line);
   if (exe !== null) {
@@ -217,6 +267,41 @@ function inspectCmdShim(content: string): { readonly kind: 'exe' | 'script'; rea
   return undefined;
 }
 
+// Reads the pnpm shape whole: the two invocations must run the same script, the NODE_PATH must be
+// the one the `IF NOT DEFINED` branch sets, and every other line must be one of the shape's fixed
+// directives. A line that would launch another program therefore refuses the shim instead of
+// being ignored. `nodePath` is kept because the program needs it to find its own modules.
+function inspectPnpmShim(lines: readonly string[], invocations: readonly number[]): CmdShim | undefined {
+  const firstIndex = invocations[0];
+  const secondIndex = invocations[1];
+  if (firstIndex === undefined || secondIndex === undefined) return undefined;
+  const first = PNPM_LOCAL_NODE_SHAPE.exec((lines[firstIndex] ?? '').trim());
+  const second = PNPM_SYSTEM_NODE_SHAPE.exec((lines[secondIndex] ?? '').trim());
+  if (first === null || second === null) return undefined;
+  const target = first[1];
+  if (target === undefined || target !== second[1]) return undefined;
+
+  const nodePaths: string[] = [];
+  for (const line of lines) {
+    const match = PNPM_NODE_PATH_ASSIGNMENT.exec(line.trim());
+    const value = match?.[1];
+    if (value === undefined || /%NODE_PATH%/i.test(value)) continue;
+    nodePaths.push(value);
+  }
+  if (nodePaths.length !== 1) return undefined;
+  const nodePath = nodePaths[0];
+  if (nodePath === undefined) return undefined;
+
+  for (let index = 0; index < lines.length; index += 1) {
+    if (invocations.includes(index)) continue;
+    const trimmed = (lines[index] ?? '').trim();
+    if (trimmed.length === 0) continue;
+    if (!PNPM_STRUCTURE_LINE.test(trimmed)) return undefined;
+  }
+
+  return { kind: 'pnpm', target, nodePath };
+}
+
 // Turns a verified shim into the program it really runs. Returns undefined when the target does
 // not exist, hides behind an 8.3 name, or — when the shim launches an .exe — is itself a
 // forbidden launcher. The forbidden-launcher rule is not applied to a script shim: the script is
@@ -230,9 +315,14 @@ function resolveShim(dir: string, content: string, env: ExecutableEnvironment): 
   if (!env.exists(target) || hasShortNameInShimTarget(shim.target)) return undefined;
   if (shim.kind === 'exe' && isForbiddenLauncher(target)) return undefined;
 
-  if (shim.kind === 'script') {
+  if (shim.kind === 'script' || shim.kind === 'pnpm') {
     const localNode = joinPath(dir, 'node.exe', '\\');
     const command = env.exists(localNode) ? localNode : env.nodePath;
+    // The pnpm shape exports NODE_PATH; the npm shapes export nothing. A pnpm bin that lost that
+    // variable would start but not find its own modules, so it is carried along.
+    if (shim.kind === 'pnpm') {
+      return { ok: true, command, prefixArgs: [target], env: { NODE_PATH: shim.nodePath } };
+    }
     return { ok: true, command, prefixArgs: [target] };
   }
   return { ok: true, command: target, prefixArgs: [] };

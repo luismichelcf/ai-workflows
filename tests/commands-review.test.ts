@@ -20,7 +20,7 @@ const greenReader = (run: TestRun) =>
 describe('a long output is read whole, and a cut-off one never reads as green', () => {
   it('still sees an early failure after 100 KB of log', async () => {
     const script =
-      "process.stdout.write(' Tests  1 failed (1)\\n'); process.stdout.write(('y'.repeat(99) + '\\n').repeat(1000)); process.stdout.write(' Tests  5 passed (5)\\n'); process.exit(0);";
+      "process.stdout.write(' Tests  1 failed (1)\\n'); process.stdout.write(('y'.repeat(99) + '\\n').repeat(1000)); process.stdout.write(' Tests  5 passed (5)\\n'); process.exitCode = 0;";
     let seen: TestRun | undefined;
 
     const result = await runGateCommand({
@@ -39,7 +39,7 @@ describe('a long output is read whole, and a cut-off one never reads as green', 
 
   it('tells interpret the output was cut off, and a cut-off run is not green', async () => {
     const script =
-      "process.stdout.write(' Tests  1 failed (1)\\n'); const chunk = 'x'.repeat(1 << 20) + '\\n'; for (let i = 0; i < 40; i++) process.stdout.write(chunk); process.stdout.write(' Tests  2000 passed (2000)\\n'); process.exit(0);";
+      "process.stdout.write(' Tests  1 failed (1)\\n'); const chunk = 'x'.repeat(1 << 20) + '\\n'; for (let i = 0; i < 40; i++) process.stdout.write(chunk); process.stdout.write(' Tests  2000 passed (2000)\\n'); process.exitCode = 0;";
     let seen: TestRun | undefined;
 
     const result = await runGateCommand({
