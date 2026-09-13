@@ -45,13 +45,14 @@ const EMPTY_INTERPRET_REASON = 'La compuerta fallo pero su lector no explico por
 
 /**
  * ANSI OSC sequences (window titles, hyperlinks): ESC ] … BEL, or ESC ] … ESC backslash. The
- * character class excludes BEL and ESC, so a sequence ends at its own terminator and an
- * unterminated one is consumed only up to the next BEL or ESC: the text after a BEL-ended
- * title is kept. Rule 1: `[^\u0007]*` could restart inside the sequence and cost the
- * square of the input — 256 KB of `ESC ]` froze the engine for 21.5 s, during which the
- * timeout had already stopped being watched.
+ * terminator is required: an optional one let an UNTERMINATED title swallow everything up to the
+ * next ESC or BEL — newlines included — so the failure at the end of the output disappeared.
+ * With the terminator required the unterminated `ESC ]` never matches, the stray two-character
+ * escape is dropped later, and the text that followed survives. The character class excludes
+ * BEL and ESC, so an unterminated sequence cannot restart inside itself and cost the square of
+ * the input (Rule 1).
  */
-const ANSI_OSC = /\u001B\][^\u0007\u001B]*(?:\u0007|\u001B\\)?/g;
+const ANSI_OSC = /\u001B\][^\u0007\u001B]*(?:\u0007|\u001B\\)/g;
 /** ANSI CSI sequences: the colour and cursor codes a test runner emits. */
 const ANSI_CSI = /\u001B\[[0-9;?]*[A-Za-z]/g;
 /** Any remaining two-character ANSI escape (ESC followed by a byte in 0x40–0x5F). */
@@ -373,7 +374,10 @@ function failureReason(
   // Rule 2: bound the raw output to its head and tail BEFORE any cleaning regex runs. A person
   // never sees more than a few thousand characters, so sanitizing a whole 32 MB buffer — which
   // the old OSC pattern turned into minutes of CPU — buys nothing.
-  const body = boundForDisplay(output).trim();
+  // Rule: clean before deciding whether there is output. Bounding and trimming alone leave
+  // escape-only output non-empty, and the reason then came out empty after cleaning; stripping
+  // first makes "only escape codes" honestly report `(no output)`.
+  const body = sanitize(boundForDisplay(output)).trim();
   const detail = body.length > 0 ? body : '(no output)';
   return clip(`Command "${command}" failed with ${status}:\n${detail}`);
 }
@@ -396,7 +400,9 @@ function boundForDisplay(text: string): string {
   if (text.length <= MAX_REASON_CHARS * 2) return text;
   const head = text.slice(0, MAX_REASON_CHARS);
   const tail = text.slice(text.length - MAX_REASON_CHARS);
-  return head + tail;
+  // The head and tail are joined by a note that says the middle was cut, so a reader never
+  // takes two far-apart halves for continuous output.
+  return head + TRUNCATION_NOTE + tail;
 }
 
 /**
@@ -469,7 +475,10 @@ export function parseTestRun(run: TestRun): TestRunSummary {
 
   // Every `Tests ...` line, not just the first. Chained runs (`a && b`) print one summary
   // each, and reading only the first turned a red second run green. Rule 2.
-  const summaryLines = [...output.matchAll(/^[^\S\n]*Tests\s+(.+?)\s*$/gm)].map((match) =>
+  // Rule 1: `(.+?)\s*$` restarts the lazy group from every space, so a long run of spaces
+  // before an unmatched character took 47 s on 160 KB. `[^\n]+` is greedy with no retry, and
+  // the capture is trimmed below.
+  const summaryLines = [...output.matchAll(/^[^\S\n]*Tests\s+([^\n]+)$/gm)].map((match) =>
     (match[1] ?? '').trim(),
   );
   const passed = sumSummaryCounts(summaryLines, 'passed');
