@@ -1,6 +1,6 @@
 // Editor hook: may this tool call write here? Layer 1 of the locks (see ../locks.ts).
 
-import { canonicalize, isUnder } from './paths.js';
+import { isUnder, readAbsolute, readAgainst, readPapers } from './paths.js';
 import { pathsFromApplyPatch } from './patch.js';
 
 export interface HookInput {
@@ -105,20 +105,56 @@ export function decideToolUse(input: HookInput, context: LockContext): LockDecis
     };
   }
 
-  const projectRoot = canonicalize('.', input.cwd);
-  const papers = context.paperPaths.map((paper) => canonicalize(paper, input.cwd));
+  // Rule 3: the guarded folder is the configured project root, never the hook's cwd, which moves
+  // with every `cd`. A root the lock cannot read as an absolute path cannot be guarded at all:
+  // refuse everything and name the setting that is wrong.
+  const root = readAbsolute(context.projectRoot);
+  if (!root.ok) {
+    return {
+      allow: false,
+      reason:
+        `La raíz del proyecto (projectRoot) no es una ruta absoluta que el candado pueda leer ` +
+        `(${root.problem}). No puedo vigilar una carpeta que no entiendo.`,
+    };
+  }
 
-  const inside = targets.map((target) => canonicalize(target, input.cwd)).filter((target) => isUnder(target, projectRoot));
+  // Rule 4: a paper entry that is absolute, empty or climbs out would silently switch the lock
+  // off. Read it here and in pre-commit alike, and refuse it as a paperPaths problem.
+  const papers = readPapers(context.paperPaths, root.path);
+  if (!papers.ok) {
+    return {
+      allow: false,
+      reason:
+        `El candado no puede usar paperPaths: ${papers.problem}. ` +
+        'Corrige la configuración o el candado dejaría de proteger el código.',
+    };
+  }
 
-  // Rule 4: paths outside the project are not this lock's business; agents keep scratch
+  // Targets are read against the cwd (that is what a relative path needs); the project root is
+  // not. A path the lock cannot reduce is refused, never guessed into a decision.
+  const readings = targets.map((target) => readAgainst(target, input.cwd));
+  for (const reading of readings) {
+    if (!reading.ok) {
+      return {
+        allow: false,
+        reason: `No pude reducir una de las rutas sin adivinar (${reading.problem}). Me niego en vez de dejar pasar a ciegas.`,
+      };
+    }
+  }
+
+  const inside = readings
+    .flatMap((reading) => (reading.ok ? [reading.path] : []))
+    .filter((target) => isUnder(target, root.path));
+
+  // Rule 5: paths outside the project are not this lock's business; agents keep scratch
   // files elsewhere and the lock guards the project, not the disk.
   if (inside.length === 0) return { allow: true };
 
-  // Rule 5: a folder with work in flight, or one explicitly opened as /libre, may write.
+  // Rule 6: a folder with work in flight, or one explicitly opened as /libre, may write.
   if (context.activePiece || context.libre) return { allow: true };
 
-  // Rule 6: with no piece, only declared paper folders are writable.
-  const allPapers = inside.every((target) => papers.some((paper) => isUnder(target, paper)));
+  // Rule 7: with no piece, only declared paper folders are writable.
+  const allPapers = inside.every((target) => papers.paths.some((paper) => isUnder(target, paper)));
   if (allPapers) return { allow: true };
 
   return {

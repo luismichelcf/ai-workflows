@@ -1,7 +1,7 @@
 // Git hooks: layer 2 of the locks (see ../locks.ts).
 
 import type { LockContext, LockDecision } from './editor.js';
-import { canonicalize, isUnder } from './paths.js';
+import { isUnder, readAbsolute, readAgainst, readPapers } from './paths.js';
 
 export interface PreCommitInput {
   /** Staged paths, relative to the repository root. */
@@ -13,19 +13,45 @@ export function decidePreCommit(input: PreCommitInput): LockDecision {
   // An empty commit is not this lock's business: nothing is being added to the tree.
   if (input.stagedPaths.length === 0) return { allow: true };
 
+  // The guarded folder is the configured project root, never the folder git happens to run in.
+  // A root the lock cannot read is refused, like in the editor hook.
+  const root = readAbsolute(input.context.projectRoot);
+  if (!root.ok) {
+    return {
+      allow: false,
+      reason:
+        `La raíz del proyecto (projectRoot) no es una ruta absoluta que el candado pueda leer ` +
+        `(${root.problem}). No puedo vigilar una carpeta que no entiendo.`,
+    };
+  }
+
+  // Paper entries are read the same way in both locks: an entry that would switch the lock off
+  // is refused as a paperPaths problem, not silently accepted.
+  const papers = readPapers(input.context.paperPaths, root.path);
+  if (!papers.ok) {
+    return {
+      allow: false,
+      reason:
+        `El candado no puede usar paperPaths: ${papers.problem}. ` +
+        'Corrige la configuración o el candado dejaría de proteger el código.',
+    };
+  }
+
   // A folder with work in flight, or one opened as /libre, may commit. Same rule as the
   // editor hook, because both locks answer the same question at different moments.
   if (input.context.activePiece || input.context.libre) return { allow: true };
 
-  // Staged paths are relative to the repository root, so the root is the base for
-  // canonicalization. Reusing the editor lock's normalization makes `docs/../src/a.ts`
-  // resolve to `src/a.ts` and stop posing as a paper — one implementation, one answer.
-  const papers = input.context.paperPaths.map((paper) => canonicalize(paper, '.'));
-  const staged = input.stagedPaths.map((stagedPath) => canonicalize(stagedPath, '.'));
+  // Staged paths are relative to the repository root, so the root is the base that reads them.
+  // Sharing the editor lock's normalization makes `docs/../src/a.ts` resolve to `src/a.ts` and
+  // stop posing as a paper — one implementation, one answer.
+  const offenders: string[] = [];
+  for (const stagedPath of input.stagedPaths) {
+    const reading = readAgainst(stagedPath, root.path.display);
+    if (!reading.ok || !papers.paths.some((paper) => isUnder(reading.path, paper))) offenders.push(stagedPath);
+  }
 
   // With no piece, only papers may enter. One stray code file is enough to refuse, because
   // the commit would carry it.
-  const offenders = staged.filter((stagedPath) => !papers.some((paper) => isUnder(stagedPath, paper)));
   if (offenders.length === 0) return { allow: true };
 
   return {
