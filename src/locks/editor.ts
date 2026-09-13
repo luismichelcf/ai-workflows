@@ -62,6 +62,89 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
   return typeof value === 'object' && value !== null ? (value as Record<string, unknown>) : undefined;
 }
 
+// The owner's sign-off is a comment only he may write: `/visto-bueno <sha>` names the exact
+// version he looked at (see signoff.ts). When an agent writes it with the owner's account, the
+// server cannot tell it apart from him, so no agent may put the order itself into a command or a
+// file. The order counts when the command follows it, even as a short prefix of a longer SHA.
+const SIGN_OFF_ORDER = /\/visto-bueno\s+[0-9a-f]{7,}/i;
+
+/**
+ * The text each covered tool is about to execute or write. Shell tools `Bash` and `PowerShell`
+ * carry their command in `tool_input.command` (Codex's own docs, read 13-sep-2026: shell commands
+ * and `exec_command` arrive as `Bash` with the command there, like `apply_patch`). `undefined`
+ * means a shell tool's command could not be read — itself a refusal — while an editing tool with
+ * no readable text simply has nothing to check here.
+ */
+function signOffTexts(toolName: string, toolInput: unknown): string[] | undefined {
+  const record = asRecord(toolInput);
+
+  if (toolName === 'Bash' || toolName === 'PowerShell') {
+    const command = record?.command;
+    return typeof command === 'string' ? [command] : undefined;
+  }
+
+  if (toolName === 'Write') {
+    const content = record?.content;
+    return typeof content === 'string' ? [content] : [];
+  }
+
+  if (toolName === 'Edit') {
+    const changed = record?.new_string;
+    return typeof changed === 'string' ? [changed] : [];
+  }
+
+  if (toolName === 'MultiEdit') {
+    const edits = record?.edits;
+    if (!Array.isArray(edits)) return [];
+
+    const texts: string[] = [];
+    for (const edit of edits) {
+      const changed = asRecord(edit)?.new_string;
+      if (typeof changed === 'string') texts.push(changed);
+    }
+    return texts;
+  }
+
+  if (toolName === 'NotebookEdit') {
+    const source = record?.new_source;
+    return typeof source === 'string' ? [source] : [];
+  }
+
+  if (toolName === 'apply_patch') {
+    const command = record?.command;
+    return typeof command === 'string' ? [command] : [];
+  }
+
+  return [];
+}
+
+/**
+ * Rule 0 of the editor hook: refuse any tool call that would write the owner's sign-off itself.
+ * Returns `undefined` when the call may continue to the folder rules.
+ */
+function signOffRefusal(toolName: string, toolInput: unknown): LockDecision | undefined {
+  const texts = signOffTexts(toolName, toolInput);
+
+  // A shell command the hook cannot read might be anything, including the order. Refuse.
+  if (texts === undefined) {
+    return {
+      allow: false,
+      reason:
+        'No pude leer el comando de esta herramienta: el candado se niega a adivinar si iba a escribir el visto bueno. Revisa el formato de tool_input.',
+    };
+  }
+
+  if (texts.some((text) => SIGN_OFF_ORDER.test(text))) {
+    return {
+      allow: false,
+      reason:
+        'El visto bueno del dueño solo lo da él. No escribas tú `/visto-bueno <sha>` con su cuenta: pídeselo al dueño y que sea él quien lo escriba en el PR.',
+    };
+  }
+
+  return undefined;
+}
+
 /** The paths a covered tool will write, or `undefined` when the request cannot be read. */
 function writeTargets(toolName: string, toolInput: unknown): string[] | undefined {
   if (toolName === 'apply_patch') {
@@ -84,11 +167,24 @@ function writeTargets(toolName: string, toolInput: unknown): string[] | undefine
 }
 
 /**
- * The covered surfaces are declared, not implied: Claude's Write, Edit, MultiEdit and
- * NotebookEdit, and Codex's apply_patch. Shell commands that write are NOT covered here —
- * the git pre-commit hook catches what they stage.
+ * The covered surfaces are declared, not implied. For the folder rules (below): Claude's Write,
+ * Edit, MultiEdit and NotebookEdit, and Codex's apply_patch. Shell commands that write are not
+ * judged by their path — the git pre-commit hook catches what they stage. For the owner's
+ * sign-off rule only, Bash and PowerShell are covered too, since the order travels in their
+ * `command` text. It is help, not a guarantee: the hook never sees MCP tools, and an agent set on
+ * writing the order can still do it by other means this hook does not read.
  */
 export function decideToolUse(input: HookInput, context: LockContext): LockDecision {
+  // Rule 0: no agent writes the owner's sign-off for him. Checked before every other rule, and
+  // unaffected by a piece or a /libre folder, because those open writing, never the sign-off.
+  const signOff = signOffRefusal(input.toolName, input.toolInput);
+  if (signOff) return signOff;
+
+  // Shell tools are covered only by the sign-off rule above: their command is not a path this
+  // lock can judge, and without the order they always pass. The pre-commit hook guards what they
+  // stage, not what they run.
+  if (input.toolName === 'Bash' || input.toolName === 'PowerShell') return { allow: true };
+
   const isCovered =
     CLAUDE_FILE_TOOLS.has(input.toolName) || input.toolName === 'NotebookEdit' || input.toolName === 'apply_patch';
   // Rule 1: everything the hook is not wired to passes untouched.

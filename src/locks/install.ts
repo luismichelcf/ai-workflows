@@ -25,7 +25,9 @@ export interface HooksFile {
  * exact names keeps the hook off every other tool — reading included.
  */
 export function buildHooksConfig(client: HookClient, command: string): HooksFile {
-  const matcher = client === 'claude' ? 'Write|Edit|MultiEdit|NotebookEdit' : 'apply_patch';
+  // Bash and PowerShell ride along so the sign-off rule can see shell commands; the hook lets
+  // them through itself when they carry no sign-off (see editor.ts).
+  const matcher = client === 'claude' ? 'Write|Edit|MultiEdit|NotebookEdit|Bash|PowerShell' : 'apply_patch|Bash';
 
   return {
     hooks: {
