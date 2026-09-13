@@ -383,11 +383,15 @@ export function requireSameFiles(
   // their letters depending on who wrote them down.
   const normalize = (hash: string): string => hash.toLowerCase();
 
-  // A blank hash is not a hash. `''` and `'   '` carry no content, so two of them matching
-  // would pass exactly the case this gate exists to catch — an unrecorded or unreadable
-  // file — a green that proves nothing, the same one already refused for an empty record.
-  // A blank on either side therefore counts as a change and is named, never a match.
-  const isBlank = (hash: string): boolean => hash.trim().length === 0;
+  // Only a real hex digest proves a file kept its content: SHA-1 (40), SHA-256 (64) and
+  // SHA-512 (128) characters. Anything else — blank, `'undefined'`, `'null'`, a short or
+  // over-long string, non-hex letters — proves nothing about the file at all, and two such
+  // values agreeing means only that both are missing or unreadable, not that the file is
+  // unchanged. Each is a green that would prove nothing, like the empty record already
+  // refused, so a value that is not a real hash on EITHER side counts as a change and is
+  // named, never a match.
+  const HEX_DIGEST = /^(?:[0-9a-f]{40}|[0-9a-f]{64}|[0-9a-f]{128})$/i;
+  const isRealHash = (hash: string): boolean => HEX_DIGEST.test(hash);
 
   const changed: string[] = [];
   const appeared: string[] = [];
@@ -401,7 +405,7 @@ export function requireSameFiles(
 
     const before = recorded[name] ?? '';
     const now = current[name] ?? '';
-    if (isBlank(before) || isBlank(now) || normalize(before) !== normalize(now)) {
+    if (!isRealHash(before) || !isRealHash(now) || normalize(before) !== normalize(now)) {
       changed.push(name);
     }
   }
