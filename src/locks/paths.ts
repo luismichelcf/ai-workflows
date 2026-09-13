@@ -120,16 +120,19 @@ export function readAbsolute(value: string): PathReading {
  * readable absolute `cwd` is refused: without a base it could name anything, and the lock only
  * ever reads relative paths against the folder the session says it is in.
  */
-export function readAgainst(value: string, cwd: string): PathReading {
+export function readAgainst(value: string, cwd: string, projectDrive?: string): PathReading {
   const forward = toPosix(value);
 
   // A path with exactly one leading separator and no drive (a `\x` or a `/x`) is rooted at the
   // current drive on Windows: Windows fills the drive in and writes inside the project, not on a
-  // POSIX disk. When the base is a Windows path, anchor the spelling to that drive. With a POSIX
-  // base, `/x` is already absolute and keeps its POSIX meaning.
+  // POSIX disk. When the base is a Windows path, anchor the spelling to that drive. Without a
+  // readable Windows cwd, a Windows project anchors it to its own drive: reading it as POSIX
+  // would put the project's own files "outside" and open the lock. With a POSIX project, `/x`
+  // is already absolute and keeps its POSIX meaning.
   if (forward.startsWith('/') && !forward.startsWith('//')) {
     const base = readAbsolute(cwd);
-    const drive = base.ok && base.path.windows ? /^([A-Za-z]):/.exec(base.path.display)?.[1] : undefined;
+    const cwdDrive = base.ok && base.path.windows ? /^([A-Za-z]):/.exec(base.path.display)?.[1] : undefined;
+    const drive = cwdDrive ?? projectDrive;
     if (drive) return readAbsolute(`${drive}:${forward}`);
     return readAbsolute(forward);
   }

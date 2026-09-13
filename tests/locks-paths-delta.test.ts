@@ -31,6 +31,13 @@ describe('a path rooted at the current drive is still on that drive', () => {
   it('refuses it in a Codex patch too', () => {
     expect(decideToolUse(patch('/GitHub/Socialabs/src/evil.ts'), noPiece).allow).toBe(false);
   });
+
+  it('refuses it even when the CLI sent no cwd, anchoring to the drive of the project', () => {
+    // Without a cwd the drive cannot be read from the session; the project's own drive is the
+    // one that keeps the lock closed.
+    expect(decideToolUse(write('/GitHub/Socialabs/src/a.ts', ''), noPiece).allow).toBe(false);
+    expect(decideToolUse(write('\\GitHub\\Socialabs\\src\\a.ts', ''), noPiece).allow).toBe(false);
+  });
 });
 
 describe('a folder name ending in a dot or a space is the same folder to Windows', () => {

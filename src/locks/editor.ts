@@ -243,7 +243,8 @@ export function decideToolUse(input: HookInput, context: LockContext): LockDecis
 
   // Targets are read against the cwd (that is what a relative path needs); the project root is
   // not. A path the lock cannot reduce is refused, never guessed into a decision.
-  const readings = targets.map((target) => readAgainst(target, input.cwd));
+  const projectDrive = root.path.windows ? /^([A-Za-z]):/.exec(root.path.display)?.[1] : undefined;
+  const readings = targets.map((target) => readAgainst(target, input.cwd, projectDrive));
   for (const reading of readings) {
     if (!reading.ok) {
       return {
