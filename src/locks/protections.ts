@@ -29,26 +29,114 @@ interface RequiredCheckEntry {
 const BRANCH_REF_PREFIX = 'refs/heads/';
 
 /**
- * Compiles a GitHub ref pattern into a regular expression, mirroring fnmatch with
- * `File::FNM_PATHNAME`: `*` matches anything but a slash, `**` crosses slashes, and `?`
- * matches exactly one non-slash character; everything else is literal. Without this, a
- * ruleset aimed only at `refs/heads/release/*` would be read as covering `main`, and a
- * "protected" verdict would be false.
+ * Whether a string is a branch name git would accept (`git check-ref-format --branch`). An
+ * unreadable default branch makes every ruleset verdict meaningless, so it is reported before
+ * looking at any rule rather than guessed at.
  */
-function refPatternToRegExp(pattern: string): RegExp {
+function isValidGitBranchName(name: string): boolean {
+  if (name.length === 0) return false;
+  // `--branch` rejects a leading dash, and a ref cannot contain a control character, a space
+  // or any of `~^:?*[\]`.
+  if (name.startsWith('-')) return false;
+  if (/[\u0000-\u001f\u007f ~^:?*\[\]\\]/.test(name)) return false;
+  if (name.includes('..') || name.includes('@{')) return false;
+  if (name === '@') return false;
+  if (name.startsWith('/') || name.endsWith('/') || name.includes('//')) return false;
+  if (name.endsWith('.')) return false;
+  return name.split('/').every((part) => !part.startsWith('.') && !part.endsWith('.lock'));
+}
+
+/** Escapes one character for the body of a JavaScript regular-expression character class. */
+function escapeInClass(char: string): string {
+  if (char === '\\' || char === ']' || char === '[' || char === '^') return `\\${char}`;
+  return char;
+}
+
+/**
+ * Reads one `[...]` set starting at `start`, returning its regex source and the index of its
+ * closing `]`. Returns `undefined` when the set is never closed, which makes the whole pattern
+ * unevaluable. A `[!...]` or `[^...]` complement also excludes `/`, because under
+ * `FNM_PATHNAME` a set can never match a slash.
+ */
+function compileSet(pattern: string, start: number): { source: string; end: number } | undefined {
+  let index = start + 1;
+  let negated = false;
+  if (pattern[index] === '!' || pattern[index] === '^') {
+    negated = true;
+    index += 1;
+  }
+  let body = '';
+  let first = true;
+  let closed = false;
+  let canStartRange = false;
+  for (; index < pattern.length; index += 1) {
+    const char = pattern[index];
+    if (char === undefined) break;
+    // A `]` right after `[` or `[!` is a literal member, as in Ruby's fnmatch.
+    if (char === ']' && !first) {
+      closed = true;
+      break;
+    }
+    first = false;
+    if (char === '\\') {
+      const escaped = pattern[index + 1];
+      if (escaped === undefined) return undefined;
+      body += escapeInClass(escaped);
+      canStartRange = true;
+      index += 1;
+      continue;
+    }
+    // A `-` between two characters is a range; anywhere else it is literal.
+    if (char === '-' && canStartRange && pattern[index + 1] !== ']') {
+      body += '-';
+      canStartRange = false;
+      continue;
+    }
+    body += escapeInClass(char);
+    canStartRange = true;
+  }
+  if (!closed) return undefined;
+  const source = negated ? `[^/${body}]` : `[${body}]`;
+  return { source, end: index };
+}
+
+/**
+ * Compiles a GitHub ref pattern into a regular expression, mirroring Ruby's `File.fnmatch`
+ * with `File::FNM_PATHNAME` the way GitHub reads `ref_name`:
+ *   - `*` matches zero or more characters other than `/`; `?` matches exactly one.
+ *   - `[...]` is a set and `[!...]` or `[^...]` its complement; a set never matches `/`.
+ *   - a double star followed by `/` crosses zero or more whole folders; a double star not
+ *     followed by `/` is just a single star.
+ *   - everything else is literal.
+ * Returns `undefined` when the pattern cannot be read (for example an unclosed `[`), so the
+ * caller can fail closed instead of guessing. Without this, a ruleset aimed only at
+ * `refs/heads/release/*` would be read as covering `main`, and a "protected" verdict would be
+ * false.
+ */
+function refPatternToRegExp(pattern: string): RegExp | undefined {
   let source = '';
   for (let index = 0; index < pattern.length; index += 1) {
     const char = pattern[index];
     if (char === undefined) break;
     if (char === '*') {
       if (pattern[index + 1] === '*') {
-        source += '.*';
-        index += 1;
+        if (pattern[index + 2] === '/') {
+          source += '(?:[^/]*/)*';
+          index += 2;
+        } else {
+          source += '[^/]*';
+          index += 1;
+        }
       } else {
         source += '[^/]*';
       }
     } else if (char === '?') {
       source += '[^/]';
+    } else if (char === '[') {
+      const set = compileSet(pattern, index);
+      if (!set) return undefined;
+      source += set.source;
+      index = set.end;
     } else {
       source += char.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     }
@@ -56,24 +144,30 @@ function refPatternToRegExp(pattern: string): RegExp {
   return new RegExp(`^${source}$`);
 }
 
+type RefCoverage = 'covers' | 'does-not-cover' | 'unevaluable';
+
 /**
  * Whether one `ref_name` entry covers the repository's default branch. GitHub spells the
  * default branch as `~DEFAULT_BRANCH`, every branch as `~ALL`, and also accepts a literal
  * `refs/heads/<name>` or a `refs/heads/...` pattern. Anything else (tags, foreign prefixes,
- * tokens this code does not know) does not cover it.
+ * tokens this code does not know) does not cover it. A pattern that cannot be read is
+ * reported as `unevaluable` so the caller can fail closed.
  */
-function refEntryCoversDefaultBranch(entry: string, defaultBranch: string): boolean {
-  if (entry === '~DEFAULT_BRANCH' || entry === '~ALL') return true;
+function refEntryCoverage(entry: string, defaultBranch: string): RefCoverage {
+  if (entry === '~DEFAULT_BRANCH' || entry === '~ALL') return 'covers';
   const defaultRef = `${BRANCH_REF_PREFIX}${defaultBranch}`;
-  if (entry === defaultRef) return true;
-  if (entry.startsWith(BRANCH_REF_PREFIX)) return refPatternToRegExp(entry).test(defaultRef);
-  return false;
+  if (entry === defaultRef) return 'covers';
+  if (!entry.startsWith(BRANCH_REF_PREFIX)) return 'does-not-cover';
+  const pattern = refPatternToRegExp(entry);
+  if (!pattern) return 'unevaluable';
+  return pattern.test(defaultRef) ? 'covers' : 'does-not-cover';
 }
 
 /**
  * A branch ruleset only counts if GitHub is told to enforce it on the default branch. An
  * entry in `include` must cover the branch and no entry in `exclude` may cover it, because
- * GitHub lets an exclusion win over an inclusion.
+ * GitHub lets an exclusion win over an inclusion. An unreadable pattern in `exclude` counts
+ * as excluding (fail closed); in `include` it does not cover.
  */
 function appliesToDefaultBranch(ruleset: Record<string, unknown>, defaultBranch: string): boolean {
   const conditions = isRecord(ruleset.conditions) ? ruleset.conditions : undefined;
@@ -82,11 +176,11 @@ function appliesToDefaultBranch(ruleset: Record<string, unknown>, defaultBranch:
   const include = Array.isArray(refName.include) ? refName.include : [];
   const exclude = Array.isArray(refName.exclude) ? refName.exclude : [];
   const included = include.some(
-    (entry) => typeof entry === 'string' && refEntryCoversDefaultBranch(entry, defaultBranch),
+    (entry) => typeof entry === 'string' && refEntryCoverage(entry, defaultBranch) === 'covers',
   );
   if (!included) return false;
   const excluded = exclude.some(
-    (entry) => typeof entry === 'string' && refEntryCoversDefaultBranch(entry, defaultBranch),
+    (entry) => typeof entry === 'string' && refEntryCoverage(entry, defaultBranch) !== 'does-not-cover',
   );
   return !excluded;
 }
@@ -108,6 +202,18 @@ export function verifyProtections(
   const limits: readonly string[] = [
     'Nada de esto puede impedir que un administrador del repositorio cambie o desactive las reglas: el sistema acepta ese riesgo y lo declara aquí.',
   ];
+
+  // An unreadable default branch makes every verdict about "the default branch" meaningless,
+  // so it is reported up front and no rule is evaluated against it.
+  if (!isValidGitBranchName(requirement.defaultBranch)) {
+    return {
+      ok: false,
+      problems: [
+        `El nombre de la rama por defecto (defaultBranch) no es un nombre de rama válido de git: no se pueden evaluar las reglas.`,
+      ],
+      limits,
+    };
+  }
 
   // Input that is not a list of rulesets (for example an HTML error page) is an answer,
   // never an exception. The caller gets a report that says it could not read the rules.
@@ -171,23 +277,36 @@ export function verifyProtections(
       problems.push(
         'GitHub no mostró quién puede saltarse estas reglas (no vino la clave bypass_actors): no se puede verificar que nadie pueda saltárselas.',
       );
+    } else if (!Array.isArray(rawRuleset.bypass_actors)) {
+      // A non-list value (for example `null`) says nothing verifiable about who can bypass;
+      // reading it as "nobody" would report an unverifiable rule as fine.
+      problems.push(
+        'GitHub devolvió un valor que no es una lista en bypass_actors: no se puede verificar quién puede saltarse estas reglas.',
+      );
     } else {
       // Anyone in `bypass_actors` can merge without meeting the rules, so their mere
       // presence weakens the protection. Names are collected to say who.
-      const actors = Array.isArray(rawRuleset.bypass_actors) ? rawRuleset.bypass_actors : [];
-      for (const rawActor of actors) {
-        if (isRecord(rawActor) && typeof rawActor.actor_type === 'string') {
-          bypassActorTypes.push(rawActor.actor_type);
+      for (const rawActor of rawRuleset.bypass_actors) {
+        if (!isRecord(rawActor) || typeof rawActor.actor_type !== 'string') {
+          // An actor this code cannot identify may still be able to bypass, so it is not
+          // silently dropped.
+          problems.push(
+            'Hay un actor de bypass sin un tipo (actor_type) legible: no se puede verificar quién puede saltarse estas reglas.',
+          );
+          continue;
         }
+        bypassActorTypes.push(rawActor.actor_type);
       }
     }
 
     // `current_user_can_bypass` says whether the credentials used for this very check can
-    // sidestep the rules. Anything other than `never` weakens the protection.
-    if (
-      Object.prototype.hasOwnProperty.call(rawRuleset, 'current_user_can_bypass') &&
-      rawRuleset.current_user_can_bypass !== 'never'
-    ) {
+    // sidestep the rules. A missing key means it was not shown, which is not the same as
+    // "never"; anything other than `never` weakens the protection.
+    if (!Object.prototype.hasOwnProperty.call(rawRuleset, 'current_user_can_bypass')) {
+      problems.push(
+        'GitHub no dijo si quien está leyendo estas reglas puede saltárselas (no vino current_user_can_bypass): no se puede verificar.',
+      );
+    } else if (rawRuleset.current_user_can_bypass !== 'never') {
       problems.push(
         'Quien está leyendo estas reglas puede saltárselas (current_user_can_bypass no es "never").',
       );
