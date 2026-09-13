@@ -373,7 +373,10 @@ describe('writing a commit', () => {
     (updateReply: GhRun, headAfterError: string, compareStatus = 'diverged') =>
     (call: Call): GhRun | undefined => {
       if (call.method === 'GET' && call.endpoint.startsWith(`${BASE}/git/trees/${C1}`)) {
-        return ok({ sha: T1, truncated: false, tree: [{ path: 'lease.json', type: 'blob', sha: B1, mode: '100644' }] });
+        // Asked for the tree of a commit, GitHub echoes the commit SHA, not the tree's (delta review,
+        // measured on cli/cli). The fake says the same, so the test cannot pass on a reply GitHub
+        // never gives.
+        return ok({ sha: C1, truncated: false, tree: [{ path: 'lease.json', type: 'blob', sha: B1, mode: '100644' }] });
       }
       if (call.method === 'POST' && call.endpoint === `${BASE}/git/trees`) return ok({ sha: T2 });
       if (call.method === 'POST' && call.endpoint === `${BASE}/git/commits`) return ok({ sha: C2 });
@@ -394,7 +397,8 @@ describe('writing a commit', () => {
 
     expect(landed).toBe(C2);
     const [treePost] = treePosts(gh.calls);
-    expect(treePost?.body?.['base_tree']).toBe(T1);
+    // A commit SHA is a valid tree-ish for `base_tree`: the real runs kept every other file.
+    expect(treePost?.body?.['base_tree']).toBe(C1);
     expect(treePost?.body?.['tree']).toEqual(
       expect.arrayContaining([
         { path: 'status.json', mode: '100644', type: 'blob', content: '{"a":2}' },

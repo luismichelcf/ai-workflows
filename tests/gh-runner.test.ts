@@ -102,19 +102,41 @@ writeFileSync(process.argv[2], String(process.pid));
 setInterval(() => {}, 1000);
 `);
     const pidFile = join(dirs[dirs.length - 1] ?? tmpdir(), 'pid.txt');
-    const run = runnerFor(file, { timeoutMs: 3_000 });
+    const run = runnerFor(file, { timeoutMs: 6_000 });
     const started = Date.now();
 
     await expect(run([pidFile])).rejects.toThrow(/timed out|timeout/i);
 
-    expect(Date.now() - started).toBeLessThan(15_000);
-    if (existsSync(pidFile)) {
-      const pid = Number(readFileSync(pidFile, 'utf8'));
-      const deadline = Date.now() + 5_000;
-      while (alive(pid) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 100));
-      expect(alive(pid)).toBe(false);
+    expect(Date.now() - started).toBeLessThan(20_000);
+    // The fake must have started, or this test would pass on the rejection alone without proving
+    // that the process was stopped (delta review).
+    expect(existsSync(pidFile)).toBe(true);
+    const pid = Number(readFileSync(pidFile, 'utf8'));
+    const deadline = Date.now() + 5_000;
+    while (alive(pid) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(alive(pid)).toBe(false);
+  }, 40_000);
+
+  it('removes what would force a terminal or color back on, whatever its case', async () => {
+    const saved = { tty: process.env['GH_FORCE_TTY'], color: process.env['clicolor_force'] };
+    process.env['GH_FORCE_TTY'] = '1';
+    process.env['clicolor_force'] = '1';
+    try {
+      const run = runnerFor(
+        fakeGh(`
+const found = Object.keys(process.env).filter((name) => ['GH_FORCE_TTY', 'CLICOLOR_FORCE'].includes(name.toUpperCase()));
+process.stdout.write(JSON.stringify(found));
+`),
+      );
+
+      expect(JSON.parse((await run(['api', 'x'])).stdout)).toEqual([]);
+    } finally {
+      if (saved.tty === undefined) delete process.env['GH_FORCE_TTY'];
+      else process.env['GH_FORCE_TTY'] = saved.tty;
+      if (saved.color === undefined) delete process.env['clicolor_force'];
+      else process.env['clicolor_force'] = saved.color;
     }
-  }, 30_000);
+  }, 20_000);
 
   it('survives gh exiting before it read a large body, without an uncaught write error', async () => {
     const run = runnerFor(fakeGh('process.exit(2);'));

@@ -429,7 +429,14 @@ describe('the git store over a remote', () => {
       noise += 1;
       remote.put('pieces/997', 'noise.json', String(noise));
     });
-    const store = session(remote, { maxAttempts: 3 });
+    let pauses = 0;
+    const store = createGitStore({
+      port: remote.port(),
+      maxAttempts: 3,
+      pause: async () => {
+        pauses += 1;
+      },
+    });
 
     const error = await store.saveStatus({ piece: '997', state: 'running' }, undefined).then(
       () => undefined,
@@ -439,6 +446,8 @@ describe('the git store over a remote', () => {
     expect(error).toBeInstanceOf(Error);
     expect(error).not.toBeInstanceOf(StaleVersion);
     expect(remote.commitAttempts).toBe(3);
+    // A pause after the last attempt only delays the error (delta review: up to 2 s per write).
+    expect(pauses).toBe(2);
     expect(remote.files('pieces/997')['status.json']).toBeUndefined();
   });
 
@@ -471,7 +480,9 @@ describe('the git store over a remote', () => {
   it('keeps pieces with awkward names apart, each on its own ref with a safe name', async () => {
     const remote = fakeRemote();
     const store = session(remote);
-    const names = ['a/b', '..', '.', 'Plataforma y CI', 'a%2Fb', 'ü', 'a_b', 'a-b'];
+    // `a_2Fb` is what `a/b` would become if `_` were left unescaped: the pair proves the key is
+    // injective, not just safe.
+    const names = ['a/b', 'a_2Fb', '..', '.', 'Plataforma y CI', 'a%2Fb', 'ü', 'a_b', 'a-b'];
     for (const piece of names) await store.saveStatus({ piece, state: 'running' }, undefined);
 
     expect((await session(remote).listStatuses()).map((status) => status.piece).sort()).toEqual(
