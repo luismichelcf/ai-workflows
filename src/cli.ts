@@ -246,9 +246,20 @@ const HELP: Record<Language, string> = {
 };
 
 /** Builds the engine, reporting a config the engine refuses instead of throwing it out. */
-function openEngine(config: PipelineConfig, store: Store, locale: string): CommandOutput | ReturnType<typeof createEngine> {
+function openEngine(
+  config: PipelineConfig,
+  store: Store,
+  locale: string,
+  describeChange: CommandOptions['describeChange'],
+): CommandOutput | ReturnType<typeof createEngine> {
   try {
-    return createEngine({ config, store });
+    // `exactOptionalPropertyTypes` forbids an explicit `undefined`, so the key is only present
+    // when the project actually supplied a way to describe its changes.
+    return createEngine({
+      config,
+      store,
+      ...(describeChange === undefined ? {} : { describeChange }),
+    });
   } catch (error) {
     if (error instanceof InvalidPipeline) {
       return { ok: false, text: invalidConfigText(error.errors, locale) };
@@ -301,7 +312,7 @@ export async function runCommand(argv: readonly string[], options: CommandOption
         return { ok: false, text: missingPieceText(locale) };
       }
 
-      const engine = openEngine(config, store, locale);
+      const engine = openEngine(config, store, locale, options.describeChange);
       if (isOutput(engine)) return engine;
 
       const dryRun = args.includes('--dry-run');
@@ -310,7 +321,7 @@ export async function runCommand(argv: readonly string[], options: CommandOption
     }
 
     case 'status': {
-      const engine = openEngine(config, store, locale);
+      const engine = openEngine(config, store, locale, options.describeChange);
       if (isOutput(engine)) return engine;
 
       const piece = args[0];
