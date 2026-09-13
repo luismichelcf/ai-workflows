@@ -143,9 +143,62 @@ export function capabilities(provider: ProviderName): Capabilities {
   return CAPABILITIES[provider];
 }
 
+/**
+ * The effort values each CLI documents. A value outside its own list is refused rather than
+ * passed through: measured, `claude` prints "Unknown --effort value … using the default
+ * effort" and runs anyway, so a typo would silently run at an effort nobody chose. OpenCode
+ * has no closed list verified here, so it only gets the flag-looking-value guard.
+ */
+const KNOWN_EFFORTS: Record<ProviderName, readonly string[] | undefined> = {
+  claude: ['low', 'medium', 'high', 'xhigh', 'max'],
+  codex: ['minimal', 'low', 'medium', 'high', 'xhigh'],
+  antigravity: ['low', 'medium', 'high'],
+  opencode: undefined,
+  muse: undefined,
+};
+
+/**
+ * Refuses a value that starts with a dash. To the CLI's own argument parser such a value is
+ * indistinguishable from a flag: a tampered `resumeSession` of `--dangerously-skip-permissions`
+ * would otherwise switch on write access inside a review. The prompt never travels as a flag.
+ */
+function requireNotFlag(field: string, value: string): void {
+  if (value.startsWith('-')) {
+    throw new Error(`The ${field} '${value}' starts with a dash and looks like a flag; refusing it.`);
+  }
+}
+
+/** A session id is one opaque token: no spaces and no shell metacharacters. */
+const SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
+
+function requireSessionId(session: string): void {
+  requireNotFlag('resumeSession', session);
+  if (!SESSION_ID.test(session)) {
+    throw new Error(
+      `The resumeSession '${session}' is not a valid session id (letters, digits, dot, underscore, colon or dash only); refusing it.`,
+    );
+  }
+}
+
+function requireEffort(provider: ProviderName, effort: string): void {
+  requireNotFlag('effort', effort);
+  const known = KNOWN_EFFORTS[provider];
+  if (known !== undefined && !known.includes(effort)) {
+    throw new Error(
+      `The effort '${effort}' is not one of ${known.join(', ')} for ${provider}; refusing it rather than running at an unrequested effort.`,
+    );
+  }
+}
+
 /** Builds the command for one run. Throws when the provider cannot do what was asked. */
 export function buildInvocation(request: RunRequest): Invocation {
   const promptArg = { stdin: request.prompt } as const;
+
+  // Every value that reaches the command line is checked before it is placed there. The prompt
+  // is exempt: it travels on stdin and is never an argument unless it is the data itself.
+  requireNotFlag('model', request.model);
+  if (request.effort !== undefined) requireEffort(request.provider, request.effort);
+  if (request.resumeSession !== undefined) requireSessionId(request.resumeSession);
 
   if (request.provider === 'muse') {
     // Muse is not spawned from here. It runs inside the project's own WSL jail, moved in as a
@@ -226,9 +279,10 @@ function buildAntigravityInvocation(
   request: RunRequest,
   prompt: { readonly stdin: string },
 ): Invocation {
-  // Antigravity reports the effort inside the model name, so there is no separate flag.
+  // `--print-timeout` defaults to 5 minutes, which cut off every build longer than that; the
+  // explicit value keeps a build alive, while a review is bounded tighter than a build.
+  const printTimeout = request.mode === 'review' ? '10m' : '30m';
   const args: string[] = [
-    '-p',
     '--model',
     request.model,
     '--add-dir',
@@ -236,6 +290,9 @@ function buildAntigravityInvocation(
     '--output-format',
     'json',
   ];
+  // `agy --help` lists --effort (low|medium|high); dropping it silently ran at the default.
+  if (request.effort !== undefined) args.push('--effort', request.effort);
+  args.push('--print-timeout', printTimeout);
   if (request.mode === 'review') {
     // Plan mode reviews without permission to write; a build may skip permission prompts.
     args.push('--mode', 'plan');
@@ -243,6 +300,9 @@ function buildAntigravityInvocation(
     args.push('--dangerously-skip-permissions');
   }
   if (request.resumeSession !== undefined) args.push('--conversation', request.resumeSession);
+  // `-p` is the prompt flag and has to be last: a flag placed after it would be read as its
+  // value. The prompt itself still travels on stdin, never as an argument.
+  args.push('-p');
   return { command: 'agy', args, cwd: request.cwd, ...prompt };
 }
 
@@ -891,18 +951,8 @@ const PROVIDER_COMMAND: Record<ProviderName, string | undefined> = {
   muse: undefined,
 };
 
-/** Text emitted by a shell when the command does not exist. */
-const NOT_FOUND_MARKERS = [
-  /command not found/i,
-  /is not recognized as an internal or external command/i,
-  /no such file or directory/i,
-  /not found/i,
-];
-
-function looksNotInstalled(run: RawRun): boolean {
-  if (run.exitCode === null) return true;
-  return NOT_FOUND_MARKERS.some((marker) => marker.test(run.output));
-}
+/** How long one probe may take before it counts as failed, when the caller says nothing. */
+const DEFAULT_PROBE_TIMEOUT_MS = 15_000;
 
 function notInstalled(name: ProviderName, command: string | undefined): Detection {
   const label = command ?? name;
@@ -920,11 +970,58 @@ export interface DetectOptions {
   readonly timeoutMs?: number;
 }
 
+/** The outcome of one probe: what it answered, or why it could not be believed. */
+type ProbeResult =
+  | { readonly ok: true; readonly run: RawRun }
+  | { readonly ok: false; readonly reason: string };
+
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Runs one probe under a deadline. A rejection (spawn EINVAL, a killed process) and a probe
+ * that never answers both come back as a failed `ProbeResult`, never as a throw and never as
+ * a wait that has no end. Surface the failure reason instead of swallowing it, so the caller
+ * can put in `problem` what actually happened.
+ */
+async function probe(
+  run: CommandRunner,
+  command: string,
+  args: readonly string[],
+  timeoutMs: number,
+): Promise<ProbeResult> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<'timeout'>((resolve) => {
+    timer = setTimeout(() => resolve('timeout'), timeoutMs);
+  });
+  try {
+    const attempt = Promise.resolve()
+      .then(() => run(command, args))
+      .then((answered): ProbeResult => ({ ok: true, run: answered }))
+      .catch((error: unknown): ProbeResult => ({ ok: false, reason: describeError(error) }));
+    const raced = await Promise.race([attempt, deadline]);
+    if (raced === 'timeout') {
+      return { ok: false, reason: `did not answer within ${timeoutMs}ms` };
+    }
+    return raced;
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+/**
+ * Lines that are clearly a failure, not a model name. A probe can exit 0 while still printing
+ * a warning or a stack; listing that as a model would make the engine try to run something
+ * that does not exist.
+ */
+const PROBE_ERROR_LINES = [/^\s*error\b/i, /^\s*at\s/];
+
 /** Finds out what is installed and signed in. Never throws: a missing CLI is an answer. */
 export async function detectProvider(
   provider: ProviderName,
   run: CommandRunner,
-  _options: DetectOptions = {},
+  options: DetectOptions = {},
 ): Promise<Detection> {
   const command = PROVIDER_COMMAND[provider];
   if (command === undefined) {
@@ -938,16 +1035,22 @@ export async function detectProvider(
     };
   }
 
-  let version: RawRun;
-  try {
-    version = await run(command, ['--version']);
-  } catch {
-    // The runner failing (spawn EINVAL, a killed process) is itself the answer: the CLI could
-    // not be started, so it is reported as not installed instead of being thrown onward.
-    return notInstalled(provider, command);
-  }
+  const timeoutMs = options.timeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS;
 
-  if (looksNotInstalled(version)) return notInstalled(provider, command);
+  // Installed means `--version` actually succeeded (exit code 0). A non-zero exit, a command
+  // that could not be spawned, or a probe that timed out all count as not installed; no
+  // string like "not found" is consulted, because a mere warning can contain that phrase.
+  const version = await probe(run, command, ['--version'], timeoutMs);
+  if (!version.ok) {
+    return {
+      name: provider,
+      installed: false,
+      authenticated: false,
+      models: [],
+      problem: `The '${command}' command could not be verified (--version ${version.reason}); treating it as not installed.`,
+    };
+  }
+  if (version.run.exitCode !== 0) return notInstalled(provider, command);
 
   if (provider !== 'opencode') {
     // Installed is all that was verified for these CLIs. Claiming a session from an output we
@@ -963,21 +1066,32 @@ export async function detectProvider(
 
   // OpenCode is the provider whose output format is verified, so its models and session are read.
   const models: string[] = [];
-  let authProblem: string | undefined;
 
-  const modelsRun = await guard(run, command, ['models']);
-  if (modelsRun !== undefined && !looksNotInstalled(modelsRun)) {
-    for (const line of modelsRun.output.split(/\r?\n/)) {
+  // Models are only read from a probe that exited 0. A failed probe, or one that exited 0
+  // while printing an error, contributes no model at all.
+  const modelsProbe = await probe(run, command, ['models'], timeoutMs);
+  if (modelsProbe.ok && modelsProbe.run.exitCode === 0) {
+    for (const line of modelsProbe.run.output.split(/\r?\n/)) {
       const model = line.trim();
-      if (model !== '') models.push(model);
+      if (model === '') continue;
+      if (PROBE_ERROR_LINES.some((marker) => marker.test(model))) continue;
+      models.push(model);
     }
   }
 
-  const authRun = await guard(run, command, ['auth', 'list']);
-  if (authRun === undefined || looksNotInstalled(authRun)) {
-    authProblem = `'${command}' is installed, but its sign-in could not be checked; run '${command} auth login' and verify.`;
-  } else if (/0 credentials/i.test(authRun.output) || authRun.output.trim() === '') {
-    authProblem = `'${command}' is installed but has no credentials; run '${command} auth login' to sign in.`;
+  // Signed in means the `auth list` probe exited 0 and showed a credential. A non-zero exit,
+  // an `Error:` line, an empty output or the explicit "0 credentials" all mean it did not.
+  let authProblem: string | undefined;
+  const authProbe = await probe(run, command, ['auth', 'list'], timeoutMs);
+  if (!authProbe.ok) {
+    authProblem = `'${command}' is installed, but its sign-in could not be checked (auth list ${authProbe.reason}); run '${command} auth login' and verify.`;
+  } else if (
+    authProbe.run.exitCode !== 0 ||
+    authProbe.run.output.trim() === '' ||
+    /0 credentials/i.test(authProbe.run.output) ||
+    PROBE_ERROR_LINES.some((marker) => marker.test(authProbe.run.output))
+  ) {
+    authProblem = `'${command}' is installed but has no verified credentials; run '${command} auth login' to sign in.`;
   }
 
   return {
@@ -987,20 +1101,4 @@ export async function detectProvider(
     models,
     ...(authProblem !== undefined ? { problem: authProblem } : {}),
   };
-}
-
-/**
- * Runs one probe and never lets its failure escape: an unusable answer is reported as
- * `undefined` and the caller turns it into a problem, keeping detectProvider total.
- */
-async function guard(
-  run: CommandRunner,
-  command: string,
-  args: readonly string[],
-): Promise<RawRun | undefined> {
-  try {
-    return await run(command, args);
-  } catch {
-    return undefined;
-  }
 }
