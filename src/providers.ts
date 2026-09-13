@@ -636,8 +636,74 @@ export type RelayDecision =
   /** Only the owner can decide this one. */
   | { readonly action: 'ask-owner'; readonly reason: string };
 
-export function decideRelay(_report: RunReport, _state: RelayState): RelayDecision {
-  throw new Error('decideRelay: not implemented');
+/** One assignment is the same as another when it names the same provider, model and effort. */
+function sameAssignment(a: Assignment, b: Assignment): boolean {
+  return a.provider === b.provider && a.model === b.model && a.effort === b.effort;
+}
+
+/**
+ * What happens after one run. The owner's rules, applied literally:
+ *
+ *   - Only a quota or an auth failure may relay on its own, and only to the next assignment
+ *     he named in the same answer. Everything else stops and comes back to him.
+ *   - A quality failure (`failed`) never relays: changing heads because the work was poor is
+ *     his decision, not the engine's.
+ *   - A timeout or a hang (`incomplete`) is inspected, because a cutoff is not a quota and
+ *     must never be silently handed to another model.
+ *   - Two rounds stuck on the same point means changing heads, which is his call — overrides
+ *     everything except an outright success.
+ */
+export function decideRelay(report: RunReport, state: RelayState): RelayDecision {
+  // A success needs no decision at all; it is checked first so it survives the stuck rule.
+  if (report.status === 'success') return { action: 'continue' };
+
+  // Two stuck rounds in the same place means the head has to change, and only the owner
+  // chooses who runs next. This wins over quota/auth so a flapping relay cannot loop.
+  if (state.stuckRounds >= 2) {
+    return {
+      action: 'ask-owner',
+      reason: `Stuck for ${state.stuckRounds} rounds on the same point; the owner must choose who runs next.`,
+    };
+  }
+
+  if (report.status === 'quota' || report.status === 'auth') {
+    // The owner named the builder and its relay together, so moving to that relay is already
+    // authorised. Pick the first chain entry not yet tried; anything tried is skipped even if
+    // it appears again later in the chain.
+    const next = state.chain.find(
+      (candidate) => !state.tried.some((attempt) => sameAssignment(attempt, candidate)),
+    );
+    if (next === undefined) {
+      return {
+        action: 'ask-owner',
+        reason: `The owner's chain is exhausted for this block; no untried assignment remains.`,
+      };
+    }
+    const cause = report.status === 'quota' ? 'ran out of quota' : 'is not signed in';
+    const detail = report.reason !== undefined ? ` (${report.reason})` : '';
+    return {
+      action: 'relay',
+      to: next,
+      reason: `${report.status === 'quota' ? 'Quota' : 'Auth'}: ${state.chain[0]?.model ?? 'current model'} ${cause}${detail}; relaying to ${next.model}.`,
+    };
+  }
+
+  if (report.status === 'incomplete') {
+    // Nothing confirms whether this was a quota; a person looks at the process and the work.
+    return {
+      action: 'inspect',
+      reason: 'The run never reached a terminal record (cut off, hung or awaiting approval); inspect it before relaying.',
+    };
+  }
+
+  // `failed`: the work finished and went wrong. Automatic relay is never allowed for quality.
+  return {
+    action: 'ask-owner',
+    reason:
+      report.reason !== undefined
+        ? `The run failed (${report.reason}); only the owner decides whether to change heads.`
+        : 'The run failed; only the owner decides whether to change heads.',
+  };
 }
 
 // ---------------------------------------------------------------------------------------
@@ -655,7 +721,122 @@ export interface Detection {
   readonly problem?: string;
 }
 
+/**
+ * The command each provider is detected through, matching `buildInvocation`. Antigravity's
+ * binary is `agy`; muse is not spawned by the engine, so it has no probe here.
+ */
+const PROVIDER_COMMAND: Record<ProviderName, string | undefined> = {
+  claude: 'claude',
+  codex: 'codex',
+  opencode: 'opencode',
+  antigravity: 'agy',
+  muse: undefined,
+};
+
+/** Text emitted by a shell when the command does not exist. */
+const NOT_FOUND_MARKERS = [
+  /command not found/i,
+  /is not recognized as an internal or external command/i,
+  /no such file or directory/i,
+  /not found/i,
+];
+
+function looksNotInstalled(run: RawRun): boolean {
+  if (run.exitCode === null) return true;
+  return NOT_FOUND_MARKERS.some((marker) => marker.test(run.output));
+}
+
+function notInstalled(name: ProviderName, command: string | undefined): Detection {
+  const label = command ?? name;
+  return {
+    name,
+    installed: false,
+    authenticated: false,
+    models: [],
+    problem: `The '${label}' command is not installed. Install it and sign in before retrying.`,
+  };
+}
+
 /** Finds out what is installed and signed in. Never throws: a missing CLI is an answer. */
-export function detectProvider(_provider: ProviderName, _run: CommandRunner): Promise<Detection> {
-  throw new Error('detectProvider: not implemented');
+export async function detectProvider(
+  provider: ProviderName,
+  run: CommandRunner,
+): Promise<Detection> {
+  const command = PROVIDER_COMMAND[provider];
+  if (command === undefined) {
+    // Muse is moved in and out of its own WSL jail by the project launcher, never probed here.
+    return {
+      name: provider,
+      installed: false,
+      authenticated: false,
+      models: [],
+      problem: `'${provider}' is not started by the engine; use the project launcher that runs it in its WSL jail.`,
+    };
+  }
+
+  let version: RawRun;
+  try {
+    version = await run(command, ['--version']);
+  } catch {
+    // The runner failing (spawn EINVAL, a killed process) is itself the answer: the CLI could
+    // not be started, so it is reported as not installed instead of being thrown onward.
+    return notInstalled(provider, command);
+  }
+
+  if (looksNotInstalled(version)) return notInstalled(provider, command);
+
+  if (provider !== 'opencode') {
+    // Installed is all that was verified for these CLIs. Claiming a session from an output we
+    // cannot read safely would be a guess, so it is reported as not authenticated with a note.
+    return {
+      name: provider,
+      installed: true,
+      authenticated: false,
+      models: [],
+      problem: `'${command}' is installed, but its sign-in could not be verified safely; check it is logged in.`,
+    };
+  }
+
+  // OpenCode is the provider whose output format is verified, so its models and session are read.
+  const models: string[] = [];
+  let authProblem: string | undefined;
+
+  const modelsRun = await guard(run, command, ['models']);
+  if (modelsRun !== undefined && !looksNotInstalled(modelsRun)) {
+    for (const line of modelsRun.output.split(/\r?\n/)) {
+      const model = line.trim();
+      if (model !== '') models.push(model);
+    }
+  }
+
+  const authRun = await guard(run, command, ['auth', 'list']);
+  if (authRun === undefined || looksNotInstalled(authRun)) {
+    authProblem = `'${command}' is installed, but its sign-in could not be checked; run '${command} auth login' and verify.`;
+  } else if (/0 credentials/i.test(authRun.output) || authRun.output.trim() === '') {
+    authProblem = `'${command}' is installed but has no credentials; run '${command} auth login' to sign in.`;
+  }
+
+  return {
+    name: provider,
+    installed: true,
+    authenticated: authProblem === undefined,
+    models,
+    ...(authProblem !== undefined ? { problem: authProblem } : {}),
+  };
+}
+
+/**
+ * Runs one probe and never lets its failure escape: an unusable answer is reported as
+ * `undefined` and the caller turns it into a problem, keeping detectProvider total.
+ */
+async function guard(
+  run: CommandRunner,
+  command: string,
+  args: readonly string[],
+): Promise<RawRun | undefined> {
+  try {
+    return await run(command, args);
+  } catch {
+    return undefined;
+  }
 }
