@@ -94,6 +94,9 @@ export function runGateCommand(command: GateCommand): Promise<CheckResult> {
       stdio: ['ignore', 'pipe', 'pipe'],
     };
     if (command.cwd !== undefined) options.cwd = command.cwd;
+    // The shim may set variables the program needs: pnpm exports NODE_PATH so its bins find the
+    // modules installed beside them. They are laid over the engine's own environment.
+    if (resolved.env !== undefined) options.env = mergeShimEnvironment(resolved.env);
     // On POSIX, a new process group lets a timeout kill grandchildren, not only the child.
     if (process.platform !== 'win32') options.detached = true;
 
@@ -278,6 +281,26 @@ function executableEnvironment(): ExecutableEnvironment {
  */
 function resolveGateCommand(command: string): ResolvedExecutable {
   return resolveExecutable(command, executableEnvironment());
+}
+
+/**
+ * The environment a shim would have exported, laid over the engine's own. NODE_PATH is special:
+ * the shim's value goes in front of any the engine already had and keeps the existing one after
+ * it, separated the way the platform separates PATH entries (`;` on Windows, `:` on POSIX). That
+ * is exactly what the shim's own `%NODE_PATH%` reference does; a plain overwrite would hide the
+ * folders the engine already had.
+ */
+function mergeShimEnvironment(shimEnv: Readonly<Record<string, string>>): NodeJS.ProcessEnv {
+  const separator = process.platform === 'win32' ? ';' : ':';
+  const merged: NodeJS.ProcessEnv = { ...process.env };
+  for (const [name, value] of Object.entries(shimEnv)) {
+    const existing = merged[name];
+    merged[name] =
+      name.toUpperCase() === 'NODE_PATH' && existing !== undefined && existing.length > 0
+        ? `${value}${separator}${existing}`
+        : value;
+  }
+  return merged;
 }
 
 /** Kills the command and everything it started, so a timeout does not leak a live process. */
