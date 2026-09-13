@@ -17,3 +17,11 @@ export {
   type ProviderReport,
   type DoctorReport,
 } from './cli.js';
+export {
+  findSections,
+  requireSections,
+  countDistinctSources,
+  requireSources,
+  type CheckResult,
+  type SourceRequirement,
+} from './gates.js';
