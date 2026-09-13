@@ -31,17 +31,12 @@ const SIGN_OFF_LINE = /^\/visto-bueno\s+(\S+)$/;
  */
 const FENCE_OPEN = /^ {0,3}(`{3,}|~{3,})/;
 
-/**
- * A closing fence: up to three spaces, the marker, and nothing but spaces after it. The
- * "nothing else" is what GitHub needs: ```` ``` foo ```` inside a fence is content, not the
- * fence's end, so an order written after it is still inside the code block.
- */
-const FENCE_CLOSE = /^ {0,3}(`{3,}|~{3,})[ \t]*$/;
-
-/** The real `<details` and `<pre` tags: the name must end at a space, `>` or the line, so a
- * word like `<preview>` is not a tag. Case matters no more in HTML than in GitHub's renderer.
- * They carry the `g` flag because the left-to-right scan advances through a line. */
-const DETAILS_OPEN = /<details(?=[\s>]|$)/gi;
+/** The real `<details` and `<pre` tags: the name must end at a space, `>`, `/` or the line,
+ * so `/<details/>` is a tag while a word like `<preview>` is not. The `/` matters because a
+ * self-closing `<details/>` still opens a details in HTML: the slash is ignored. Case matters
+ * no more in HTML than in GitHub's renderer. They carry the `g` flag because the
+ * left-to-right scan advances through a line. */
+const DETAILS_OPEN = /<details(?=[\s>/]|$)/gi;
 const DETAILS_CLOSE = '</details>';
 const PRE_OPEN = /<pre(?=[\s>]|$)/gi;
 const PRE_CLOSE = '</pre>';
@@ -62,6 +57,38 @@ const HEADING = /^ {0,3}#{1,6}(?:[ \t]|$)/;
  */
 function stripInlineCode(raw: string): string {
   return raw.replace(/(`+)([\s\S]*?)\1/g, '');
+}
+
+/**
+ * Width of a run of text in columns, a tab advancing to the next multiple of four. CommonMark
+ * measures indentation this way, so a space plus a tab is four columns — an indented code
+ * block — even though it is only two characters.
+ */
+function columnWidth(text: string): number {
+  let columns = 0;
+  for (const char of text) {
+    if (char === '\t') columns += 4 - (columns % 4);
+    else columns += 1;
+  }
+  return columns;
+}
+
+/** How far a line is indented, in columns, before its first non-blank character. */
+function indentColumns(raw: string): number {
+  let columns = 0;
+  for (const char of raw) {
+    if (char === ' ') columns += 1;
+    else if (char === '\t') columns += 4 - (columns % 4);
+    else break;
+  }
+  return columns;
+}
+
+/** Where a list item's content starts, or `undefined` when the line opens no item. The marker
+ * and the whitespace after it set that column; what follows is the item's own content. */
+function listContentColumn(raw: string): number | undefined {
+  const match = LIST_MARKER.exec(raw);
+  return match === null ? undefined : columnWidth(match[0]);
 }
 
 /**
@@ -95,13 +122,20 @@ interface SignOffEvaluation {
 interface Fence {
   readonly char: '`' | '~';
   readonly length: number;
+  /** The column where a list item's content starts when the fence opened in that item, or
+   * `undefined` for a top-level fence. A fence inside an item closes on a marker indented
+   * from that column up to three further, and ends early when a non-blank line is less
+   * indented than the column, because the item itself has ended. */
+  readonly contentColumn: number | undefined;
 }
 
 /** The regions that hide the text they wrap from the rendered page. Each can open and close
  * several times on a line, so what matters is the state the last marker leaves behind. */
 interface HiddenState {
   readonly comment: boolean;
-  readonly details: boolean;
+  /** How many `<details>` are still open. They nest, so only the close that brings this back
+   * to zero ends the hidden region; an inner `</details>` closes the inner one alone. */
+  readonly details: number;
   readonly pre: boolean;
 }
 
@@ -130,7 +164,7 @@ function scanHidden(raw: string, state: HiddenState): HiddenScan {
   const lower = stripInlineCode(raw).toLowerCase();
   let { comment, details, pre } = state;
   // A line that begins inside a region is already hidden; any marker seen keeps it so.
-  let touched = comment || details || pre;
+  let touched = comment || details > 0 || pre;
   let at = 0;
 
   while (at < lower.length) {
@@ -142,14 +176,6 @@ function scanHidden(raw: string, state: HiddenState): HiddenScan {
       at = close + 3;
       continue;
     }
-    if (details) {
-      const close = lower.indexOf(DETAILS_CLOSE, at);
-      if (close === -1) break;
-      details = false;
-      touched = true;
-      at = close + DETAILS_CLOSE.length;
-      continue;
-    }
     if (pre) {
       const close = lower.indexOf(PRE_CLOSE, at);
       if (close === -1) break;
@@ -159,19 +185,26 @@ function scanHidden(raw: string, state: HiddenState): HiddenScan {
       continue;
     }
 
+    // The earliest marker decides. While a details is open both its nested opens and its
+    // closes are candidates, so `<details><details></details>` leaves one open and the next
+    // `</details>` is the one that closes the region.
     const commentAt = lower.indexOf('<!--', at);
-    const detailsAt = indexOfTag(lower, DETAILS_OPEN, at);
+    const detailsOpenAt = indexOfTag(lower, DETAILS_OPEN, at);
+    const detailsCloseAt = details > 0 ? lower.indexOf(DETAILS_CLOSE, at) : -1;
     const preAt = indexOfTag(lower, PRE_OPEN, at);
-    const candidates = [commentAt, detailsAt, preAt].filter((index) => index !== -1);
+    const candidates = [commentAt, detailsOpenAt, detailsCloseAt, preAt].filter((index) => index !== -1);
     if (candidates.length === 0) break;
     const next = Math.min(...candidates);
     touched = true;
     if (next === commentAt) {
       comment = true;
       at = next + 4;
-    } else if (next === detailsAt) {
-      details = true;
+    } else if (next === detailsOpenAt) {
+      details += 1;
       at = next + '<details'.length;
+    } else if (next === detailsCloseAt) {
+      details -= 1;
+      at = next + DETAILS_CLOSE.length;
     } else {
       pre = true;
       at = next + '<pre'.length;
@@ -182,13 +215,32 @@ function scanHidden(raw: string, state: HiddenState): HiddenScan {
 }
 
 /**
+ * A line that is nothing but a fence marker: its indentation in columns and the marker run,
+ * or `undefined` when the line carries anything else. The "nothing else" is what GitHub
+ * needs: ````` ``` foo ````` inside a fence is content, not the fence's end, so an order
+ * written after it is still inside the code block.
+ */
+function fenceMarker(raw: string): { readonly indent: number; readonly marker: string } | undefined {
+  const match = /^[ \t]*(`{3,}|~{3,})[ \t]*$/.exec(raw);
+  if (match === null || match[1] === undefined) return undefined;
+  return { indent: indentColumns(match[0]), marker: match[1] };
+}
+
+/**
  * Whether a line closes the open fence: same marker character, at least as long as the
  * opener, and nothing else on the line. A longer run closes a shorter fence, which is how
- * GitHub nests a smaller fence inside a bigger one.
+ * GitHub nests a smaller fence inside a bigger one. A top-level fence closes with up to
+ * three columns of indentation; a fence inside a list item closes with any indentation from
+ * the item's content column up to three columns further, because that is where the item's
+ * own closing fence can sit.
  */
 function closesFence(raw: string, fence: Fence): boolean {
-  const marker = FENCE_CLOSE.exec(raw)?.[1];
-  return marker !== undefined && marker[0] === fence.char && marker.length >= fence.length;
+  const close = fenceMarker(raw);
+  if (close === undefined || close.marker[0] !== fence.char || close.marker.length < fence.length) {
+    return false;
+  }
+  if (fence.contentColumn === undefined) return close.indent <= 3;
+  return close.indent >= fence.contentColumn && close.indent <= fence.contentColumn + 3;
 }
 
 /**
@@ -202,26 +254,38 @@ function collectOrderLines(body: string): readonly OrderLine[] {
   // are content, not regions. HTML comments, <details> and <pre> hide their contents from
   // the rendered page even across lines.
   let fence: Fence | undefined;
-  let hidden: HiddenState = { comment: false, details: false, pre: false };
+  let hidden: HiddenState = { comment: false, details: 0, pre: false };
   let quote = false;
 
   for (const raw of body.split(/\r?\n/)) {
     if (fence !== undefined) {
-      if (closesFence(raw, fence)) fence = undefined;
-      continue;
+      // A fence opened in a list item belongs to that item. A non-blank line less indented
+      // than the item's content column ends the item, so it also ends the fence; the same
+      // line is read again below as a normal line, which may open another fence or a quote.
+      const endedItem =
+        fence.contentColumn !== undefined
+        && raw.trim() !== ''
+        && indentColumns(raw) < fence.contentColumn;
+      if (!endedItem) {
+        if (closesFence(raw, fence)) fence = undefined;
+        continue;
+      }
+      fence = undefined;
     }
 
     // Inside a comment, <details> or <pre> the whole line is invisible. The scan still runs
     // so that a marker closing one region and another opening on the same line leave GitHub's
     // real final state, and the next line is hidden or not accordingly.
-    if (hidden.comment || hidden.details || hidden.pre) {
+    if (hidden.comment || hidden.details > 0 || hidden.pre) {
       const scan = scanHidden(raw, hidden);
       hidden = { comment: scan.comment, details: scan.details, pre: scan.pre };
       continue;
     }
 
     // A list item marker is a container, not content: dropping it (with its indentation) is
-    // what lets a fence or a quote written at the start of an item be recognised.
+    // what lets a fence or a quote written at the start of an item be recognised. Its content
+    // column is kept for a fence opened there, since that fence ends with the item.
+    const contentColumn = listContentColumn(raw);
     const content = raw.replace(LIST_MARKER, '');
 
     // A blank line ends a block quote.
@@ -246,10 +310,15 @@ function collectOrderLines(body: string): readonly OrderLine[] {
     }
 
     // A fence is literal from here on, so any marker on its opener line is content, not
-    // markup. Detect it before looking for tags, after the list marker was removed.
+    // markup. Detect it before looking for tags, after the list marker was removed. The
+    // item's content column is carried into the fence so it can end with the item.
     const openMarker = FENCE_OPEN.exec(content)?.[1];
     if (openMarker !== undefined) {
-      fence = { char: openMarker[0] === '~' ? '~' : '`', length: openMarker.length };
+      fence = {
+        char: openMarker[0] === '~' ? '~' : '`',
+        length: openMarker.length,
+        contentColumn,
+      };
       continue;
     }
 
@@ -263,9 +332,10 @@ function collectOrderLines(body: string): readonly OrderLine[] {
     const match = SIGN_OFF_LINE.exec(line);
     if (match?.[1] === undefined) continue;
 
-    // Four leading spaces or a tab makes an indented code block. Quoted lines never reach
-    // here: the quote state already consumed them above.
-    const indented = raw.startsWith('    ') || raw.startsWith('\t');
+    // Four or more columns of indentation make an indented code block; a tab counts as
+    // advancing to the next multiple of four, so a space plus a tab is four columns. Quoted
+    // lines never reach here: the quote state already consumed them above.
+    const indented = indentColumns(raw) >= 4;
     orders.push({ sha: match[1], hidden: indented });
   }
 
