@@ -1,5 +1,8 @@
-import { spawn, type ChildProcess, type SpawnOptions } from 'node:child_process';
+import { spawn, spawnSync, type ChildProcess, type SpawnOptions } from 'node:child_process';
+import { existsSync, readFileSync } from 'node:fs';
+import { isAbsolute } from 'node:path';
 
+import { resolveExecutable, type ExecutableEnvironment, type ResolvedExecutable } from './exec.js';
 import type { CheckResult } from './gates.js';
 
 export interface GateCommand {
@@ -18,61 +21,117 @@ export interface GateCommand {
 /** Generous but finite: a hung gate must never hang the whole engine. */
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
 
+/**
+ * The largest delay `setTimeout` can represent in 32 bits. Above it — and for `Infinity` or
+ * `NaN` — Node silently treats the value as 1ms, which would kill every command instantly and
+ * read as a timeout. Such a limit is refused before anything is launched, never obeyed.
+ */
+const MAX_TIMEOUT_MS = 2 ** 31 - 1;
+
 /** A reason has to stay readable in a terminal; 3900 leaves room for the truncation note. */
 const MAX_REASON_CHARS = 3900;
 
+/**
+ * The most output kept in memory. Only the tail matters (the failure is at the end), and a
+ * command that prints gigabytes must not crash the engine by growing one string without bound.
+ */
+const MAX_OUTPUT_CHARS = 64 * 1024;
+
 const TRUNCATION_NOTE = '...[output truncated; keeping the end, where the failure is]...\n';
+
+/** ANSI OSC sequences (window titles, hyperlinks): ESC ] … BEL, or ESC ] … ESC backslash. */
+const ANSI_OSC = /\u001B\][^\u0007]*(?:\u0007|\u001B\\)/g;
+/** ANSI CSI sequences: the colour and cursor codes a test runner emits. */
+const ANSI_CSI = /\u001B\[[0-9;?]*[A-Za-z]/g;
+/** Any remaining two-character ANSI escape (ESC followed by a byte in 0x40–0x5F). */
+const ANSI_ESCAPE = /\u001B[\u0040-\u005F]/g;
+/** Control characters other than newline and tab; they have no place in a reason a person reads. */
+const CONTROL_CHARS = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g;
 
 /**
  * Runs a command and turns it into a check. This is what "recompute" means in practice:
- * the engine produces the result now instead of believing a report. Output is kept, but
- * trimmed to something a person can read — keeping the END, since that is where the
- * failure is.
+ * the engine produces the result now instead of believing a report. The command is launched
+ * directly, never through a shell, so its arguments are never re-parsed; a hung or runaway
+ * process is bounded by a timeout that kills the whole tree and answers at once.
  */
 export function runGateCommand(command: GateCommand): Promise<CheckResult> {
   return new Promise((resolve) => {
-    const timeoutMs = command.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    // Rule: validate the limit before doing anything else. `NaN`/`Infinity`/negative/fractional
+    // values would otherwise become a 1ms delay and kill the command instantly; a value past 32
+    // bits cannot be represented. Refuse rather than obey, and never start the command.
+    const configured = command.timeoutMs;
+    const timeoutProblem = validateTimeout(configured);
+    if (timeoutProblem !== undefined) {
+      resolve({ ok: false, reason: clip(timeoutProblem) });
+      return;
+    }
+    const timeoutMs = configured ?? DEFAULT_TIMEOUT_MS;
 
-    // Resolved by exactly one of error/close; the other must stay silent so that an error
-    // arriving after a timeout does not overwrite the timeout's reason.
-    let settled = false;
-    let timedOut = false;
+    // Rule: resolve to a real executable without a shell. A `.cmd` shim cannot be spawned by
+    // Node on Windows, and going through a shell would re-parse the arguments.
+    const resolved = resolveGateCommand(command.command);
+    if (!resolved.ok) {
+      resolve({ ok: false, reason: clip(resolved.reason) });
+      return;
+    }
 
-    const options: SpawnOptions = { shell: false };
+    const options: SpawnOptions = {
+      // Never a shell: the command and its args come from project config and run as-is.
+      shell: false,
+      // stdin is closed so a command waiting for input that will never come cannot hang.
+      stdio: ['ignore', 'pipe', 'pipe'],
+    };
     if (command.cwd !== undefined) options.cwd = command.cwd;
+    // On POSIX, a new process group lets a timeout kill grandchildren, not only the child.
+    if (process.platform !== 'win32') options.detached = true;
 
     let child: ChildProcess;
     try {
-      // Arguments are passed as an array, never concatenated into a shell line: the command
-      // and its args come from project config and must not be reinterpreted by a shell.
-      child = spawn(command.command, [...command.args], options);
+      // Arguments are passed as an array, never concatenated into a shell line. The shim's
+      // target (if any) goes first, then the caller's args.
+      child = spawn(resolved.command, [...resolved.prefixArgs, ...command.args], options);
     } catch (error) {
       resolve({ ok: false, reason: describeStartFailure(command.command, error) });
       return;
     }
 
-    let stdout = '';
-    let stderr = '';
-    child.stdout?.on('data', (chunk: Buffer) => {
-      stdout += chunk.toString();
-    });
-    child.stderr?.on('data', (chunk: Buffer) => {
-      stderr += chunk.toString();
-    });
+    // One buffer, filled in arrival order from both pipes, bounded to the tail. `setEncoding`
+    // decodes UTF-8 across chunk boundaries, so a multi-byte character split between two
+    // writes (the `ñ` case) is not mangled into a replacement character.
+    let output = '';
+    const append = (chunk: string): void => {
+      output += chunk;
+      if (output.length > MAX_OUTPUT_CHARS) {
+        output = output.slice(output.length - MAX_OUTPUT_CHARS);
+      }
+    };
+    child.stdout?.setEncoding('utf8');
+    child.stderr?.setEncoding('utf8');
+    child.stdout?.on('data', (chunk: string) => append(chunk));
+    child.stderr?.on('data', (chunk: string) => append(chunk));
 
-    const timer = setTimeout(() => {
-      timedOut = true;
-      // Kill it for real. Reporting a timeout while the process keeps running would leak a
-      // live process and make the gate a lie.
-      child.kill('SIGKILL');
-    }, timeoutMs);
+    // Settled by exactly one of timeout/error/close; the others must stay silent so a later
+    // event cannot overwrite the first answer.
+    let settled = false;
+    let timedOut = false;
+    let timer: NodeJS.Timeout | undefined;
 
     const finish = (result: CheckResult): void => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
+      if (timer !== undefined) clearTimeout(timer);
       resolve(result);
     };
+
+    timer = setTimeout(() => {
+      timedOut = true;
+      // Kill the whole tree, then answer at once. Destroying the pipes means a grandchild that
+      // inherited them and is still alive cannot hold the answer open: `close` need never come.
+      killProcessTree(child);
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+      finish({ ok: false, reason: timeoutReason(command.command, timeoutMs) });
+    }, timeoutMs);
 
     child.on('error', (error) => {
       finish({
@@ -83,9 +142,23 @@ export function runGateCommand(command: GateCommand): Promise<CheckResult> {
       });
     });
 
+    // `close` — not `exit` — is when all output has been read. If the direct child exits while
+    // a grandchild keeps the pipes open, this waits until the timeout, which then treats it as
+    // unfinished: a command that leaves live processes behind did not end cleanly.
     child.on('close', (code, signal) => {
       if (timedOut) {
         finish({ ok: false, reason: timeoutReason(command.command, timeoutMs) });
+        return;
+      }
+
+      // Rule: a gate that knows how to read the output decides, even when the exit code is 0.
+      // A timeout or a start failure never reaches here, so it can never be interpreted away.
+      if (command.interpret !== undefined) {
+        try {
+          finish(command.interpret({ output, exitCode: code ?? 1 }));
+        } catch (error) {
+          finish({ ok: false, reason: describeInterpretFailure(command.command, error) });
+        }
         return;
       }
 
@@ -94,12 +167,75 @@ export function runGateCommand(command: GateCommand): Promise<CheckResult> {
         return;
       }
 
-      finish({
-        ok: false,
-        reason: failureReason(command.command, code, signal, stdout, stderr),
-      });
+      finish({ ok: false, reason: failureReason(command.command, code, signal, output) });
     });
   });
+}
+
+/** True when `timeoutMs` is a usable delay: an integer in `(0, 2^31 - 1]`. */
+function validateTimeout(timeoutMs: number | undefined): string | undefined {
+  if (timeoutMs === undefined) return undefined;
+  if (!Number.isInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > MAX_TIMEOUT_MS) {
+    return (
+      `Invalid timeoutMs ${String(timeoutMs)}: the timeout must be a positive integer ` +
+      `no greater than ${MAX_TIMEOUT_MS} milliseconds.`
+    );
+  }
+  return undefined;
+}
+
+/** The real environment `resolveExecutable` needs, so the resolver stays a pure function. */
+function executableEnvironment(): ExecutableEnvironment {
+  const pathExt = process.env['PATHEXT'];
+  return {
+    platform: process.platform,
+    path: process.env['PATH'] ?? process.env['Path'] ?? '',
+    // `exactOptionalPropertyTypes` forbids an explicit `undefined`: omit it instead.
+    ...(pathExt !== undefined ? { pathExt } : {}),
+    nodePath: process.execPath,
+    exists: existsSync,
+    readText: (file) => {
+      try {
+        return readFileSync(file, 'utf8');
+      } catch {
+        // A shim that cannot be read is skipped by the resolver, which keeps walking the PATH.
+        return undefined;
+      }
+    },
+  };
+}
+
+/**
+ * The command as a program that can be launched without a shell. An absolute path that exists
+ * is used as-is; anything else is a name looked up on the PATH, where a `.cmd` shim is read
+ * and replaced by the program behind it.
+ */
+function resolveGateCommand(command: string): ResolvedExecutable {
+  if (isAbsolute(command) && existsSync(command)) {
+    return { ok: true, command, prefixArgs: [] };
+  }
+  return resolveExecutable(command, executableEnvironment());
+}
+
+/** Kills the command and everything it started, so a timeout does not leak a live process. */
+function killProcessTree(child: ChildProcess): void {
+  const pid = child.pid;
+  if (pid === undefined) return;
+
+  if (process.platform === 'win32') {
+    // `/T` walks the tree and `/F` forces it, which a wedged grandchild needs. Spawned
+    // directly, never through a shell.
+    spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore' });
+    return;
+  }
+
+  try {
+    // The child was started detached, so `pid` is the process-group id and the negative pid
+    // reaches every process in the group, grandchildren included.
+    process.kill(-pid, 'SIGKILL');
+  } catch {
+    // The group is already gone, or was never created: there is nothing left to kill.
+  }
 }
 
 /** The command never started (missing binary, bad cwd): report it, do not throw. */
@@ -107,6 +243,12 @@ function describeStartFailure(command: string, error: unknown): string {
   const code = (error as NodeJS.ErrnoException).code;
   const message = error instanceof Error ? error.message : String(error);
   return clip(`Command "${command}" could not be started${code ? ` (${code})` : ''}: ${message}`);
+}
+
+/** A gate's own reader threw: that is a failure of the check, not a reason to hang. */
+function describeInterpretFailure(command: string, error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return clip(`Command "${command}" finished but its output could not be read: ${message}`);
 }
 
 function timeoutReason(command: string, timeoutMs: number): string {
@@ -118,16 +260,23 @@ function failureReason(
   command: string,
   code: number | null,
   signal: NodeJS.Signals | null,
-  stdout: string,
-  stderr: string,
+  output: string,
 ): string {
-  const detail = [stdout, stderr]
-    .map((stream) => stream.trim())
-    .filter((stream) => stream.length > 0)
-    .join('\n');
+  // The two pipes are already one interleaved stream, so the reason shows what actually
+  // happened, in the order it happened.
+  const detail = sanitize(output).trim();
   const status = signal ? `signal ${signal}` : `code ${code ?? 'unknown'}`;
   const body = detail.length > 0 ? detail : '(no output)';
   return clip(`Command "${command}" failed with ${status}:\n${body}`);
+}
+
+/** Removes terminal escape codes and control characters, keeping newlines and tabs. */
+function sanitize(text: string): string {
+  return text
+    .replace(ANSI_OSC, '')
+    .replace(ANSI_CSI, '')
+    .replace(ANSI_ESCAPE, '')
+    .replace(CONTROL_CHARS, '');
 }
 
 /**
@@ -135,9 +284,10 @@ function failureReason(
  * is where the failure lands. Says so when it trims, so nobody reads a clipped log as whole.
  */
 function clip(text: string): string {
-  if (text.length <= MAX_REASON_CHARS) return text;
+  const clean = sanitize(text);
+  if (clean.length <= MAX_REASON_CHARS) return clean;
   const keep = MAX_REASON_CHARS - TRUNCATION_NOTE.length;
-  return TRUNCATION_NOTE + text.slice(text.length - keep);
+  return TRUNCATION_NOTE + clean.slice(clean.length - keep);
 }
 
 export interface TestRun {
