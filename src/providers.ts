@@ -275,6 +275,10 @@ function asString(value: unknown): string | undefined {
   return typeof value === 'string' ? value : undefined;
 }
 
+function asNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
 /** Parses one JSON document, or undefined when the CLI emitted prose, HTML or a broken body. */
 function parseJsonDocument(output: string): unknown {
   try {
@@ -319,23 +323,40 @@ function buildReport(
   };
 }
 
-const QUOTA_MARKERS = [/usage limit/, /rate limit/, /rate-limit/, /quota/, /\b429\b/, /too many requests/];
+// Every marker is anchored to the start of the message, and the message is trimmed first.
+// That anchoring is the whole guard: the builder sees the output of the project's own tests,
+// so a red test's text ends up inside the CLI's error. Matching a bare word anywhere in the
+// text read "expected 200 to be 429", "should return 401 Unauthorized" or "memory usage limit
+// exceeded" as an outage and quietly relayed the work to another model without the owner
+// deciding it. Only the CLI's own phrasing, at the very start of its message, classifies.
+const QUOTA_MARKERS = [
+  // The two captured provider phrasings, which do not begin with a marker word.
+  /^you've hit your usage limit/,
+  /^claude ai usage limit reached/,
+  // Phrasings that begin with the marker itself.
+  /^usage limit/,
+  /^rate limit/,
+  /^rate-limit/,
+  /^quota/,
+  /^429\b/,
+  /^too many requests/,
+];
 const AUTH_MARKERS = [
-  /invalid api key/,
-  /unauthorized/,
-  /\b401\b/,
-  /please run \/login/,
-  /not logged in/,
-  /not signed in/,
+  /^invalid api key/,
+  /^unauthorized/,
+  /^401 unauthorized/,
+  /^please run \/login/,
+  /^not logged in/,
+  /^not signed in/,
 ];
 
 /**
- * Rule 2: a failure is only a quota when the text says so; anything unrecognised is a plain
- * failure. Guessing "quota" here would silently relay the work to another model, which is
- * exactly the incident this function exists to prevent.
+ * Rule 2: a failure is only a quota when the CLI's own message says so at its start; anything
+ * unrecognised is a plain failure. Guessing "quota" here would silently relay the work to
+ * another model, which is exactly the incident this function exists to prevent.
  */
 function classifyFailure(message: string): RunStatus {
-  const text = message.toLowerCase();
+  const text = message.trim().toLowerCase();
   if (QUOTA_MARKERS.some((marker) => marker.test(text))) return 'quota';
   if (AUTH_MARKERS.some((marker) => marker.test(text))) return 'auth';
   return 'failed';
@@ -345,13 +366,19 @@ function classifyFailure(message: string): RunStatus {
 function parseCodex(request: RunRequest, output: string): RunReport {
   let session: string | undefined;
   let text: string | undefined;
-  let terminal: 'completed' | 'failed' | undefined;
+  // A failure anywhere in the stream wins over a later completion. Codex can report a failed
+  // turn and then a completed one; reading only the last event declared success over work
+  // that did not happen. An empty `thread_id` is not an identity: accepting it would make two
+  // different runs look like "the same execution" to the identity gates.
+  let failed = false;
+  let completed = false;
   let failureMessage = '';
 
   for (const event of parseJsonLines(output)) {
     const type = asString(event.type);
     if (type === 'thread.started') {
-      session ??= asString(event.thread_id);
+      const id = asString(event.thread_id);
+      if (session === undefined && id !== undefined && id.trim() !== '') session = id;
     } else if (type === 'item.completed') {
       const item = asObject(event.item);
       if (item && asString(item.type) === 'agent_message') {
@@ -359,18 +386,15 @@ function parseCodex(request: RunRequest, output: string): RunReport {
         text = asString(item.text) ?? text;
       }
     } else if (type === 'turn.completed') {
-      terminal = 'completed';
+      completed = true;
     } else if (type === 'turn.failed') {
-      terminal = 'failed';
+      failed = true;
       const error = asObject(event.error);
       failureMessage = (error && asString(error.message)) ?? '';
     }
   }
 
-  if (terminal === 'completed') {
-    return buildReport(request, session, request.model, false, 'success', text);
-  }
-  if (terminal === 'failed') {
+  if (failed) {
     return buildReport(
       request,
       session,
@@ -380,6 +404,9 @@ function parseCodex(request: RunRequest, output: string): RunReport {
       text,
       failureMessage,
     );
+  }
+  if (completed) {
+    return buildReport(request, session, request.model, false, 'success', text);
   }
   return buildReport(
     request,
@@ -394,30 +421,42 @@ function parseCodex(request: RunRequest, output: string): RunReport {
 
 /** OpenCode reports its session but not the model it ran, so the model stays unconfirmed. */
 function parseOpencode(request: RunRequest, output: string): RunReport {
-  let session: string | undefined;
+  // The main session is the one named by the first event that carries a session id. Events
+  // from other sessions mixed into the stream (a sub-agent, a resumed run) are ignored: a
+  // stop there says nothing about this run.
+  let mainSession: string | undefined;
   let text: string | undefined;
-  let stopped = false;
+  // Only the LAST event of the main session decides. A stop followed by any further step or
+  // text means the process died mid-turn, so the run never reached its end. Tracking "any
+  // stop seen" reported success over a run that was cut off after the stop.
+  let lastWasStop = false;
+  let sawMainEvent = false;
 
   for (const event of parseJsonLines(output)) {
-    const type = asString(event.type);
-    session ??= asString(event.sessionID);
+    const eventSession = asString(event.sessionID);
+    if (mainSession === undefined && eventSession !== undefined) mainSession = eventSession;
+    if (mainSession !== undefined && eventSession !== mainSession) continue;
 
+    sawMainEvent = true;
+    lastWasStop = false;
+
+    const type = asString(event.type);
     if (type === 'text') {
       const part = asObject(event.part);
       if (part) text = asString(part.text) ?? text;
     } else if (type === 'step_finish') {
       const part = asObject(event.part);
       // `reason: 'tool-calls'` is a mid-turn step; only a stop finishes the run.
-      if (part && asString(part.reason) === 'stop') stopped = true;
+      if (part && asString(part.reason) === 'stop') lastWasStop = true;
     }
   }
 
-  if (stopped) {
-    return buildReport(request, session, request.model, false, 'success', text);
+  if (sawMainEvent && lastWasStop) {
+    return buildReport(request, mainSession, request.model, false, 'success', text);
   }
   return buildReport(
     request,
-    session,
+    mainSession,
     request.model,
     false,
     'incomplete',
@@ -426,15 +465,46 @@ function parseOpencode(request: RunRequest, output: string): RunReport {
   );
 }
 
-/** Prefers the requested model when it is among those used; otherwise the first reported one. */
-function pickModel(usage: JsonObject, requested: string): string | undefined {
-  const models = Object.keys(usage);
-  if (models.includes(requested)) return requested;
-  return models[0];
+/**
+ * The main model is the one that did the work: the entry with the most output tokens. The
+ * requested model being present is not enough — Claude Code can run a small auxiliary model
+ * for background chores, and if the chosen model only touched a few tokens the run the owner
+ * authorised did not happen. A single entry is the main one by definition.
+ */
+function pickModel(usage: JsonObject): string | undefined {
+  let main: string | undefined;
+  let mostTokens = -1;
+  for (const [name, entry] of Object.entries(usage)) {
+    const tokens = asNumber(asObject(entry)?.outputTokens) ?? 0;
+    if (tokens > mostTokens) {
+      main = name;
+      mostTokens = tokens;
+    }
+  }
+  return main;
+}
+
+/**
+ * Takes the last line that is a JSON object. The CLI sometimes prints a warning line before
+ * its JSON result; reading the whole output as one document would then lose a run that did
+ * finish. A stream with no JSON object at all still comes back undefined and is incomplete.
+ */
+function parseLastJsonRecord(output: string): JsonObject | undefined {
+  const whole = asObject(parseJsonDocument(output));
+  if (whole) return whole;
+
+  let found: JsonObject | undefined;
+  for (const line of output.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (trimmed === '') continue;
+    const record = asObject(parseJsonDocument(trimmed));
+    if (record) found = record;
+  }
+  return found;
 }
 
 function parseClaude(request: RunRequest, output: string): RunReport {
-  const record = asObject(parseJsonDocument(output));
+  const record = parseLastJsonRecord(output);
   if (!record) {
     return buildReport(
       request,
@@ -454,7 +524,7 @@ function parseClaude(request: RunRequest, output: string): RunReport {
 
   // `modelUsage` names the model that actually ran; that is the only model Claude confirms.
   const usage = asObject(record.modelUsage);
-  const reportedModel = usage ? pickModel(usage, request.model) : undefined;
+  const reportedModel = usage ? pickModel(usage) : undefined;
 
   if (!succeeded) {
     const detail = resultText ?? subtype ?? '';
@@ -542,43 +612,53 @@ function parseAntigravity(request: RunRequest, output: string): RunReport {
 function parseMuse(request: RunRequest, output: string): RunReport {
   let session: string | undefined;
   let model: string | undefined;
-  let completed = false;
-  let lastType: string | undefined;
+  // Any configured model other than the requested one fails the run. Keeping the first
+  // configured model let a later switch to another model go unnoticed.
+  let mismatchedModel: string | undefined;
+  // The LAST terminal event decides. A completion followed by a frozen proposal is not a
+  // finished run: muse stops on the proposal and never comes back in exec mode.
+  let lastTerminal: 'completed' | 'proposed' | undefined;
 
   for (const event of parseJsonLines(output)) {
     const type = asString(event.type);
-    lastType = type ?? lastType;
 
     if (type === 'stream') {
       if (asString(event.kind) === 'session') session ??= asString(event.session_id);
     } else if (type === 'run.model.configured') {
-      model ??= asString(event.model);
+      const configured = asString(event.model);
+      model ??= configured;
+      if (configured !== undefined && configured !== request.model && mismatchedModel === undefined) {
+        mismatchedModel = configured;
+      }
     } else if (type === 'run.terminal.completed') {
-      completed = true;
+      lastTerminal = 'completed';
+    } else if (type === 'task.lifecycle.proposed') {
+      lastTerminal = 'proposed';
     }
   }
 
-  if (model !== undefined && model !== request.model) {
+  if (mismatchedModel !== undefined) {
     // Muse echoes the model it configured; a mismatch is a different run than the one asked
-    // for, and it fails even if the turn later completed.
+    // for, and it fails even if the turn later completed. The reason names the model that
+    // actually ran, not the requested one.
     return buildReport(
       request,
       session,
-      model,
+      mismatchedModel,
       true,
       'failed',
       undefined,
-      `Muse configured ${model} when ${request.model} was requested.`,
+      `Muse configured ${mismatchedModel} when ${request.model} was requested.`,
     );
   }
 
   const modelConfirmed = model !== undefined;
 
-  if (completed) {
+  if (lastTerminal === 'completed') {
     return buildReport(request, session, model ?? request.model, modelConfirmed, 'success');
   }
 
-  if (lastType === 'task.lifecycle.proposed') {
+  if (lastTerminal === 'proposed') {
     // Documented: with a compound shell command muse waits for a human approval that never
     // arrives in exec mode; the stream simply stops on the proposal.
     return buildReport(
