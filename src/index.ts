@@ -25,3 +25,10 @@ export {
   type CheckResult,
   type SourceRequirement,
 } from './gates.js';
+export {
+  runGateCommand,
+  parseTestRun,
+  type GateCommand,
+  type TestRun,
+  type TestRunSummary,
+} from './commands.js';
