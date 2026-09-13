@@ -49,8 +49,10 @@ interface TreeEntry {
   readonly sha: string;
 }
 
-// The root SHA is kept with the entries: `commit` layers its tree over that SHA, and taking it
-// from the listing already read is what avoids a second GET of `git/commits/{parent}`.
+// The listing's own `sha` is kept with the entries. Asked for the tree of a commit, GitHub echoes
+// the commit SHA there rather than the tree's; `commit` passes it as `base_tree`, which GitHub
+// accepts as a tree-ish (measured: same tree as passing the real one), and that saves a GET of
+// `git/commits/{parent}` on every write.
 interface TreeListing {
   readonly rootSha: string;
   readonly entries: readonly TreeEntry[];
@@ -428,8 +430,8 @@ export function createGitHubStatePort(options: GitHubStatePortOptions): StatePor
 
     const treeBody: { base_tree?: string; tree: TreeChange[] } = { tree };
     if (parent !== undefined) {
-      // The new tree is layered over the tree the parent already points at. Taking its root SHA
-      // from the tree listing avoids a second GET of `git/commits/{parent}`.
+      // The new tree is layered over the parent. The listing's `sha` is the parent commit itself,
+      // a valid tree-ish for `base_tree`, so no GET of `git/commits/{parent}` is needed.
       const listing = await loadTree(parent);
       treeBody.base_tree = listing.rootSha;
     }
