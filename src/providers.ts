@@ -720,20 +720,59 @@ function sameAssignment(a: Assignment, b: Assignment): boolean {
 }
 
 /**
+ * The company whose account an assignment spends from. A quota is shared by the company, not
+ * by the model or the effort: every model under one company bills the same account, so
+ * swapping an exhausted model for a sibling, or just raising the effort, cannot help.
+ *
+ * The company is usually the CLI provider, but OpenCode is the exception that makes this a
+ * function instead of a string compare. OpenCode fronts models from several companies behind
+ * separate accounts and names the company in the `company/model` prefix
+ * (`deepseek/deepseek-flash` -> `deepseek`). Treating all of OpenCode as one company would
+ * refuse a relay that is actually moving to a different account, which is a valid relay.
+ */
+function companyOf(provider: string, model: string): string {
+  if (provider === 'opencode') {
+    const slash = model.indexOf('/');
+    if (slash > 0) return model.slice(0, slash);
+    return model;
+  }
+  return provider;
+}
+
+/**
  * What happens after one run. The owner's rules, applied literally:
  *
+ *   - Who failed is who the report says. `report.identity` names the provider and model that
+ *     just failed, so the engine never relays back to it even when `tried` is empty, and the
+ *     reason names that model rather than the first in the chain.
  *   - Only a quota or an auth failure may relay on its own, and only to the next assignment
- *     he named in the same answer. Everything else stops and comes back to him.
+ *     he named in the same answer. A quota is shared by the company, so no option from the
+ *     failing model's company, and not the same model at another effort, is ever chosen.
+ *   - The relay only ever moves forward in the owner's order, past the most advanced option
+ *     already tried and past the failed model. An option the owner ranked earlier is never
+ *     revisited.
  *   - A quality failure (`failed`) never relays: changing heads because the work was poor is
  *     his decision, not the engine's.
  *   - A timeout or a hang (`incomplete`) is inspected, because a cutoff is not a quota and
  *     must never be silently handed to another model.
  *   - Two rounds stuck on the same point means changing heads, which is his call — overrides
  *     everything except an outright success.
+ *   - A counter the engine cannot trust (NaN, negative, fractional, infinite) is also his
+ *     call, because a corrupted state must not drive an automatic relay.
  */
 export function decideRelay(report: RunReport, state: RelayState): RelayDecision {
-  // A success needs no decision at all; it is checked first so it survives the stuck rule.
+  // A success needs no decision at all; it is checked first so it survives both the stuck
+  // rule and a corrupted counter.
   if (report.status === 'success') return { action: 'continue' };
+
+  // A state the engine cannot parse cannot authorise a relay. NaN, a negative, a fractional
+  // or an infinite round count is corruption, and only the owner can read it.
+  if (!Number.isInteger(state.stuckRounds) || state.stuckRounds < 0) {
+    return {
+      action: 'ask-owner',
+      reason: `The stuck-round counter (${state.stuckRounds}) is not a valid count; the owner must decide.`,
+    };
+  }
 
   // Two stuck rounds in the same place means the head has to change, and only the owner
   // chooses who runs next. This wins over quota/auth so a flapping relay cannot loop.
@@ -745,24 +784,65 @@ export function decideRelay(report: RunReport, state: RelayState): RelayDecision
   }
 
   if (report.status === 'quota' || report.status === 'auth') {
-    // The owner named the builder and its relay together, so moving to that relay is already
-    // authorised. Pick the first chain entry not yet tried; anything tried is skipped even if
-    // it appears again later in the chain.
-    const next = state.chain.find(
-      (candidate) => !state.tried.some((attempt) => sameAssignment(attempt, candidate)),
-    );
-    if (next === undefined) {
+    // Who failed: the report's own identity, when it has one. It is the only trustworthy
+    // source, because `tried` can be empty (rule 1) or stale.
+    const identity = report.identity;
+    const failed =
+      identity !== undefined && identity.provider !== '' && identity.model !== ''
+        ? { provider: identity.provider, model: identity.model }
+        : undefined;
+
+    // The search starts after the furthest point the owner's order has already reached: the
+    // most advanced assignment already tried, and the failed model itself. Moving only
+    // forward is what stops the relay from stepping back onto an earlier-ranked option.
+    let furthestTried = -1;
+    for (const attempt of state.tried) {
+      const index = state.chain.findIndex((candidate) => sameAssignment(candidate, attempt));
+      if (index > furthestTried) furthestTried = index;
+    }
+
+    let failedIndex = -1;
+    if (failed !== undefined) {
+      // The identity carries no effort, so match provider and model only. Among several
+      // efforts of the same model, take the last, so the search cannot land on an earlier one.
+      state.chain.forEach((candidate, index) => {
+        if (candidate.provider === failed.provider && candidate.model === failed.model) {
+          failedIndex = index;
+        }
+      });
+    }
+
+    const startAt = Math.max(furthestTried, failedIndex);
+
+    for (let index = startAt + 1; index < state.chain.length; index += 1) {
+      const candidate = state.chain[index];
+      if (candidate === undefined) continue;
+      // An already-tried option is never picked, even if the owner listed it again.
+      if (state.tried.some((attempt) => sameAssignment(attempt, candidate))) continue;
+      // Rule 3: a quota/auth is shared by the company. `sameCompany` also covers the same
+      // model at a different effort, since a model is always in its own company.
+      if (
+        failed !== undefined &&
+        companyOf(candidate.provider, candidate.model) === companyOf(failed.provider, failed.model)
+      ) {
+        continue;
+      }
+
+      // The reason names the model that actually failed, not the first in the chain.
+      const failedModel =
+        failed?.model ?? state.chain[Math.max(furthestTried, 0)]?.model ?? 'current model';
+      const cause = report.status === 'quota' ? 'ran out of quota' : 'is not signed in';
+      const detail = report.reason !== undefined ? ` (${report.reason})` : '';
       return {
-        action: 'ask-owner',
-        reason: `The owner's chain is exhausted for this block; no untried assignment remains.`,
+        action: 'relay',
+        to: candidate,
+        reason: `${report.status === 'quota' ? 'Quota' : 'Auth'}: ${failedModel} ${cause}${detail}; relaying to ${candidate.model}.`,
       };
     }
-    const cause = report.status === 'quota' ? 'ran out of quota' : 'is not signed in';
-    const detail = report.reason !== undefined ? ` (${report.reason})` : '';
+
     return {
-      action: 'relay',
-      to: next,
-      reason: `${report.status === 'quota' ? 'Quota' : 'Auth'}: ${state.chain[0]?.model ?? 'current model'} ${cause}${detail}; relaying to ${next.model}.`,
+      action: 'ask-owner',
+      reason: `The owner's chain is exhausted for this block; no valid assignment remains after ${failed?.model ?? 'the attempted options'}.`,
     };
   }
 
