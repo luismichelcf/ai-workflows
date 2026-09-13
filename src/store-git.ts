@@ -51,15 +51,24 @@ export interface GitStoreOptions {
   readonly port: StatePort;
   /** Injected so leases can be tested without waiting on the wall clock. */
   readonly now?: () => number;
-  /** Lost races a single write retries before giving up. Defaults to 5. */
+  /** Lost races a single write retries before giving up. Defaults to 8. */
   readonly maxAttempts?: number;
   /** Waits between retries; injected so tests never sleep. */
   readonly pause?: (ms: number) => Promise<void>;
 }
 
-const DEFAULT_MAX_ATTEMPTS = 5;
-const RETRY_BASE_MS = 10;
-const RETRY_MAX_MS = 250;
+const DEFAULT_MAX_ATTEMPTS = 8;
+const RETRY_BASE_MS = 100;
+const RETRY_DOUBLING = 2;
+const RETRY_MAX_MS = 2_000;
+/** Reads `listStatuses` fires at once, so a fleet of pieces never opens an unbounded fan-out. */
+const STATUS_READ_BATCH = 8;
+
+// Every concern is a file inside the identity's own ref: the ref name already carries who it is.
+const STATUS_FILE = 'status.json';
+const JOURNAL_FILE = 'journal.json';
+const EFFECTS_FILE = 'effects.json';
+const LEASE_FILE = 'lease.json';
 
 /**
  * A round trip through JSON, the exact journey a result makes over the remote store, which
@@ -109,7 +118,8 @@ type Decision<T> =
 /**
  * The git-backed implementation of `Store`: a piece's progress lives on a ref, where every
  * write is «read the head, decide from that one read, commit on top, move the ref only if it
- * did not move». Nothing is instant here, so each mutation retries a lost race from a fresh
+ * did not move». Each piece and each zone gets its own ref, so writers on different identities
+ * never contend. Nothing is instant here, so each mutation retries a lost race from a fresh
  * read until it lands or `maxAttempts` is spent.
  */
 export function createGitStore(options: GitStoreOptions): Store {
@@ -118,26 +128,43 @@ export function createGitStore(options: GitStoreOptions): Store {
   const maxAttempts = options.maxAttempts ?? DEFAULT_MAX_ATTEMPTS;
   const pause = options.pause ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
 
-  const backoff = (attempt: number): number =>
-    Math.min(RETRY_MAX_MS, RETRY_BASE_MS * (attempt + 1));
+  /**
+   * Exponential backoff with jitter. The base doubles per lost race up to a ceiling, and a random
+   * factor in [0.5, 1) breaks the symmetry so two writers that lost together do not collide again
+   * on the next attempt.
+   */
+  const backoff = (attempt: number): number => {
+    const ceiling = Math.min(RETRY_MAX_MS, RETRY_BASE_MS * RETRY_DOUBLING ** attempt);
+    return ceiling * (0.5 + Math.random() * 0.5);
+  };
 
   /**
-   * A folder name for one id. `encodeURIComponent` leaves `.` alone, but a folder literally
-   * named `.` or `..` would escape its parent, so the dot is encoded too: every id stays
-   * inside its own single folder. An empty id has no folder at all, which is a caller bug.
+   * A ref-name key for one id: the UTF-8 bytes of the id, with `A-Z`, `a-z`, `0-9` and `-` left
+   * alone and every other byte written as `_` plus two uppercase hex digits. Unlike percent
+   * encoding this is injective over bytes, so `a_b`, `a-b` and `a/b` never collide, and it never
+   * emits `/`, `.`, `%` or a space, so a key is always one path segment that cannot escape its
+   * parent. An empty id has no key at all, which is a caller bug.
    */
   const encodeKey = (id: string): string => {
     if (id.length === 0) throw new Error('a piece or zone id cannot be empty');
-    return encodeURIComponent(id).replaceAll('.', '%2E');
+    let key = '';
+    for (const byte of Buffer.from(id, 'utf8')) {
+      const safe =
+        (byte >= 0x41 && byte <= 0x5a) ||
+        (byte >= 0x61 && byte <= 0x7a) ||
+        (byte >= 0x30 && byte <= 0x39) ||
+        byte === 0x2d;
+      key += safe
+        ? String.fromCharCode(byte)
+        : `_${byte.toString(16).toUpperCase().padStart(2, '0')}`;
+    }
+    return key;
   };
 
-  const statusPath = (piece: PieceId): string => `pieces/${encodeKey(piece)}/status.json`;
-  const journalPath = (piece: PieceId): string => `pieces/${encodeKey(piece)}/journal.json`;
-  const effectsPath = (piece: PieceId): string => `pieces/${encodeKey(piece)}/effects.json`;
-  const leasePath = (piece: PieceId): string => `pieces/${encodeKey(piece)}/lease.json`;
-  // Zones get their own top-level directory, so a piece and a zone sharing a name can never
-  // lock each other out.
-  const zonePath = (zone: string): string => `zones/${encodeKey(zone)}.json`;
+  // A piece and a zone that happen to share a name get different ref prefixes, so one can never
+  // lock out the other.
+  const pieceRef = (piece: PieceId): string => `pieces/${encodeKey(piece)}`;
+  const zoneRef = (zone: string): string => `zones/${encodeKey(zone)}`;
 
   const asObject = (value: unknown): JsonMap | undefined =>
     typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -149,47 +176,45 @@ export function createGitStore(options: GitStoreOptions): Store {
 
   /**
    * Parses stored text, failing closed: a file the store cannot understand is an Error naming
-   * the file, never an empty record. A read failure of the port itself is left untouched by
-   * the caller, so it can never be mistaken for «there is nothing here».
+   * the file and its ref, never an empty record. A read failure of the port itself is left
+   * untouched by the caller, so it can never be mistaken for «there is nothing here».
    */
-  const parseJson = (path: string, raw: string): unknown => {
+  const parseJson = (ref: string, path: string, raw: string): unknown => {
     try {
       return JSON.parse(raw) as unknown;
     } catch (error) {
-      throw new Error(`stored file ${path} is not valid JSON: ${String(error)}`);
+      throw new Error(`stored file ${path} on ref ${ref} is not valid JSON: ${String(error)}`);
     }
   };
 
-  const parseStatus = (path: string, raw: string): { status: PieceStatus; version: Version } => {
-    const value = asObject(parseJson(path, raw));
+  const parseStatus = (ref: string, raw: string): { status: PieceStatus; version: Version } => {
+    const value = asObject(parseJson(ref, STATUS_FILE, raw));
     if (value === undefined || typeof value['version'] !== 'string' || asObject(value['status']) === undefined) {
-      throw new Error(`stored file ${path} does not have the shape of a status record`);
+      throw new Error(`stored file ${STATUS_FILE} on ref ${ref} does not have the shape of a status record`);
     }
     return { version: value['version'], status: value['status'] as PieceStatus };
   };
 
   const readStatus = async (
-    head: string | undefined,
-    piece: PieceId,
+    ref: string,
+    commit: string | undefined,
   ): Promise<{ status: PieceStatus; version: Version } | undefined> => {
-    const path = statusPath(piece);
-    const raw = head === undefined ? undefined : await port.read(head, path);
+    const raw = commit === undefined ? undefined : await port.read(commit, STATUS_FILE);
     if (raw === undefined) return undefined;
-    return parseStatus(path, raw);
+    return parseStatus(ref, raw);
   };
 
-  const readJournal = async (head: string | undefined, piece: PieceId): Promise<JournalEntry[]> => {
-    const path = journalPath(piece);
-    const raw = head === undefined ? undefined : await port.read(head, path);
+  const readJournal = async (ref: string, commit: string | undefined): Promise<JournalEntry[]> => {
+    const raw = commit === undefined ? undefined : await port.read(commit, JOURNAL_FILE);
     if (raw === undefined) return [];
-    const value = parseJson(path, raw);
+    const value = parseJson(ref, JOURNAL_FILE, raw);
     if (!Array.isArray(value)) {
-      throw new Error(`stored file ${path} does not have the shape of a journal`);
+      throw new Error(`stored file ${JOURNAL_FILE} on ref ${ref} does not have the shape of a journal`);
     }
     const entries: JournalEntry[] = [];
     for (const item of value) {
       if (asObject(item) === undefined) {
-        throw new Error(`stored file ${path} does not have the shape of a journal`);
+        throw new Error(`stored file ${JOURNAL_FILE} on ref ${ref} does not have the shape of a journal`);
       }
       entries.push(item as JournalEntry);
     }
@@ -197,21 +222,20 @@ export function createGitStore(options: GitStoreOptions): Store {
   };
 
   const readEffects = async (
-    head: string | undefined,
-    piece: PieceId,
+    ref: string,
+    commit: string | undefined,
   ): Promise<Record<string, EffectRecord>> => {
-    const path = effectsPath(piece);
-    const raw = head === undefined ? undefined : await port.read(head, path);
+    const raw = commit === undefined ? undefined : await port.read(commit, EFFECTS_FILE);
     if (raw === undefined) return {};
-    const value = asObject(parseJson(path, raw));
+    const value = asObject(parseJson(ref, EFFECTS_FILE, raw));
     if (value === undefined) {
-      throw new Error(`stored file ${path} does not have the shape of an effect table`);
+      throw new Error(`stored file ${EFFECTS_FILE} on ref ${ref} does not have the shape of an effect table`);
     }
     const records: Record<string, EffectRecord> = {};
     for (const [operationId, record] of Object.entries(value)) {
       const fields = asObject(record);
       if (fields === undefined || !isEffectState(fields['state'])) {
-        throw new Error(`stored file ${path} does not have the shape of an effect table`);
+        throw new Error(`stored file ${EFFECTS_FILE} on ref ${ref} does not have the shape of an effect table`);
       }
       records[operationId] = record as EffectRecord;
     }
@@ -219,59 +243,59 @@ export function createGitStore(options: GitStoreOptions): Store {
   };
 
   const readLease = async (
-    head: string | undefined,
-    piece: PieceId,
+    ref: string,
+    commit: string | undefined,
   ): Promise<{ readonly runId: RunId; readonly expiresAt: number } | undefined> => {
-    const path = leasePath(piece);
-    const raw = head === undefined ? undefined : await port.read(head, path);
+    const raw = commit === undefined ? undefined : await port.read(commit, LEASE_FILE);
     if (raw === undefined) return undefined;
-    const value = asObject(parseJson(path, raw));
+    const value = asObject(parseJson(ref, LEASE_FILE, raw));
     if (value === undefined || typeof value['runId'] !== 'string' || typeof value['expiresAt'] !== 'number') {
-      throw new Error(`stored file ${path} does not have the shape of a lease`);
+      throw new Error(`stored file ${LEASE_FILE} on ref ${ref} does not have the shape of a lease`);
     }
     return { runId: value['runId'], expiresAt: value['expiresAt'] };
   };
 
   const readZone = async (
-    head: string | undefined,
-    zone: string,
+    ref: string,
+    commit: string | undefined,
   ): Promise<
     { readonly runId: RunId; readonly piece: PieceId; readonly expiresAt: number } | undefined
   > => {
-    const path = zonePath(zone);
-    const raw = head === undefined ? undefined : await port.read(head, path);
+    const raw = commit === undefined ? undefined : await port.read(commit, LEASE_FILE);
     if (raw === undefined) return undefined;
-    const value = asObject(parseJson(path, raw));
+    const value = asObject(parseJson(ref, LEASE_FILE, raw));
     if (
       value === undefined ||
       typeof value['runId'] !== 'string' ||
       typeof value['piece'] !== 'string' ||
       typeof value['expiresAt'] !== 'number'
     ) {
-      throw new Error(`stored file ${path} does not have the shape of a zone lease`);
+      throw new Error(`stored file ${LEASE_FILE} on ref ${ref} does not have the shape of a zone lease`);
     }
     return { runId: value['runId'], piece: value['piece'], expiresAt: value['expiresAt'] };
   };
 
   /**
-   * One attempt loop shared by every write. It reads the head, lets the caller decide from
-   * that single read, and commits only when there is a change. A commit that lost its race
-   * (`undefined`) is retried from a fresh read; after `maxAttempts` losses the ref is
-   * declared unstable, which is an Error — not `StaleVersion`, since that is a decision a
-   * caller can act on, while a ref that keeps moving is an operational failure.
+   * One attempt loop shared by every write, over the single ref the write belongs to. It reads
+   * that ref's head, lets the caller decide from that one read, and commits only when there is a
+   * change. A commit that lost its race (`undefined`) is retried from a fresh read; after
+   * `maxAttempts` losses the ref is declared unstable, which is an Error — not `StaleVersion`,
+   * since that is a decision a caller can act on, while a ref that keeps moving is an
+   * operational failure.
    */
   const transact = async <T>(
+    ref: string,
     decide: (head: string | undefined) => Promise<Decision<T>>,
   ): Promise<T> => {
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-      const head = await port.head();
+      const head = await port.head(ref);
       const decision = await decide(head);
       if (decision.kind === 'idle') return decision.value;
-      const committed = await port.commit(head, decision.plan.changes, decision.plan.message);
+      const committed = await port.commit(ref, head, decision.plan.changes, decision.plan.message);
       if (committed !== undefined) return decision.after(committed);
       await pause(backoff(attempt));
     }
-    throw new Error(`the state ref did not stop moving after ${maxAttempts} attempts`);
+    throw new Error(`the state ref ${ref} did not stop moving after ${maxAttempts} attempts`);
   };
 
   const writeEffect = async (
@@ -280,12 +304,13 @@ export function createGitStore(options: GitStoreOptions): Store {
     record: EffectRecord,
     message: string,
   ): Promise<void> => {
-    await transact<void>(async (head) => {
-      const records = await readEffects(head, piece);
+    const ref = pieceRef(piece);
+    await transact<void>(ref, async (head) => {
+      const records = await readEffects(ref, head);
       return {
         kind: 'write',
         plan: {
-          changes: { [effectsPath(piece)]: JSON.stringify({ ...records, [operationId]: record }) },
+          changes: { [EFFECTS_FILE]: JSON.stringify({ ...records, [operationId]: record }) },
           message,
         },
         after: () => undefined,
@@ -303,8 +328,9 @@ export function createGitStore(options: GitStoreOptions): Store {
 
   return {
     async reserve(piece, runId, leaseMs): Promise<Reservation> {
-      return transact<Reservation>(async (head) => {
-        const held = await readLease(head, piece);
+      const ref = pieceRef(piece);
+      return transact<Reservation>(ref, async (head) => {
+        const held = await readLease(ref, head);
         const current = now();
         // A live lease held by a different controller wins. A dead one (expired) or one's own
         // lease is taken over: without expiry a process killed mid-run would reserve forever.
@@ -315,7 +341,7 @@ export function createGitStore(options: GitStoreOptions): Store {
         return {
           kind: 'write',
           plan: {
-            changes: { [leasePath(piece)]: JSON.stringify({ runId, expiresAt }) },
+            changes: { [LEASE_FILE]: JSON.stringify({ runId, expiresAt }) },
             message: `ai-workflows: reserve piece ${piece}`,
           },
           after: (commit) => ({ ok: true, version: commit }),
@@ -324,8 +350,9 @@ export function createGitStore(options: GitStoreOptions): Store {
     },
 
     async renew(piece, runId, leaseMs): Promise<Reservation> {
-      return transact<Reservation>(async (head) => {
-        const held = await readLease(head, piece);
+      const ref = pieceRef(piece);
+      return transact<Reservation>(ref, async (head) => {
+        const held = await readLease(ref, head);
         // Only the holder extends its own lease. A free piece has no holder, so we must not
         // name the caller: reporting them as the owner would be a lie about who holds it.
         if (held === undefined) {
@@ -338,7 +365,7 @@ export function createGitStore(options: GitStoreOptions): Store {
         return {
           kind: 'write',
           plan: {
-            changes: { [leasePath(piece)]: JSON.stringify({ runId, expiresAt }) },
+            changes: { [LEASE_FILE]: JSON.stringify({ runId, expiresAt }) },
             message: `ai-workflows: renew piece ${piece}`,
           },
           after: (commit) => ({ ok: true, version: commit }),
@@ -347,15 +374,16 @@ export function createGitStore(options: GitStoreOptions): Store {
     },
 
     async release(piece, runId): Promise<void> {
-      return transact<void>(async (head) => {
-        const held = await readLease(head, piece);
+      const ref = pieceRef(piece);
+      return transact<void>(ref, async (head) => {
+        const held = await readLease(ref, head);
         // A late release from a previous holder must not free a lease someone else now owns,
         // or two controllers could end up running the same piece.
         if (held === undefined || held.runId !== runId) return { kind: 'idle', value: undefined };
         return {
           kind: 'write',
           plan: {
-            changes: { [leasePath(piece)]: null },
+            changes: { [LEASE_FILE]: null },
             message: `ai-workflows: release piece ${piece}`,
           },
           after: () => undefined,
@@ -364,14 +392,16 @@ export function createGitStore(options: GitStoreOptions): Store {
     },
 
     async loadStatus(piece: PieceId) {
-      const head = await port.head();
+      const ref = pieceRef(piece);
+      const head = await port.head(ref);
       if (head === undefined) return undefined;
-      return readStatus(head, piece);
+      return readStatus(ref, head);
     },
 
     async saveStatus(status, expected): Promise<Version> {
-      return transact<Version>(async (head) => {
-        const stored = await readStatus(head, status.piece);
+      const ref = pieceRef(status.piece);
+      return transact<Version>(ref, async (head) => {
+        const stored = await readStatus(ref, head);
         const current = stored?.version;
         // The token must match what the writer read; `undefined` means «no record yet». A
         // stale token is a caller decision, so it throws now instead of retrying.
@@ -380,7 +410,7 @@ export function createGitStore(options: GitStoreOptions): Store {
         return {
           kind: 'write',
           plan: {
-            changes: { [statusPath(status.piece)]: JSON.stringify({ version, status }) },
+            changes: { [STATUS_FILE]: JSON.stringify({ version, status }) },
             message: `ai-workflows: save status of ${status.piece}`,
           },
           after: () => version,
@@ -389,27 +419,35 @@ export function createGitStore(options: GitStoreOptions): Store {
     },
 
     async listStatuses(): Promise<readonly PieceStatus[]> {
-      const head = await port.head();
-      if (head === undefined) return [];
-      const paths = await port.list(head, 'pieces');
+      const refs = await port.refs('pieces/');
       const statuses: PieceStatus[] = [];
-      for (const path of paths) {
-        if (!path.endsWith('/status.json')) continue;
-        const raw = await port.read(head, path);
-        if (raw === undefined) continue;
-        statuses.push(parseStatus(path, raw).status);
+      // Read in bounded batches: a fleet of a thousand pieces must not open a thousand reads at
+      // once, but sequential reads would be needlessly slow.
+      for (let start = 0; start < refs.length; start += STATUS_READ_BATCH) {
+        const batch = refs.slice(start, start + STATUS_READ_BATCH);
+        const read = await Promise.all(
+          batch.map(async ({ name, commit }) => {
+            const raw = await port.read(commit, STATUS_FILE);
+            if (raw === undefined) return undefined;
+            return parseStatus(name, raw).status;
+          }),
+        );
+        for (const status of read) {
+          if (status !== undefined) statuses.push(status);
+        }
       }
       return statuses;
     },
 
     async append(piece, entry): Promise<void> {
-      return transact<void>(async (head) => {
-        const entries = await readJournal(head, piece);
+      const ref = pieceRef(piece);
+      return transact<void>(ref, async (head) => {
+        const entries = await readJournal(ref, head);
         const next = [...entries, freezeEntry(entry)];
         return {
           kind: 'write',
           plan: {
-            changes: { [journalPath(piece)]: JSON.stringify(next) },
+            changes: { [JOURNAL_FILE]: JSON.stringify(next) },
             message: `ai-workflows: append to journal of ${piece}`,
           },
           after: () => undefined,
@@ -418,24 +456,26 @@ export function createGitStore(options: GitStoreOptions): Store {
     },
 
     async journal(piece): Promise<readonly JournalEntry[]> {
-      const head = await port.head();
+      const ref = pieceRef(piece);
+      const head = await port.head(ref);
       if (head === undefined) return Object.freeze([]);
-      const entries = await readJournal(head, piece);
+      const entries = await readJournal(ref, head);
       // Hand out frozen entries inside a frozen array: the journal is the evidence
       // execution-record gates check, and a caller able to mutate it could rewrite it.
       return Object.freeze(entries.map((item) => freezeEntry(item)));
     },
 
     async forget(piece, stage): Promise<void> {
-      return transact<void>(async (head) => {
-        const entries = await readJournal(head, piece);
+      const ref = pieceRef(piece);
+      return transact<void>(ref, async (head) => {
+        const entries = await readJournal(ref, head);
         const remaining = entries.filter((item) => item.stage !== stage);
         // Nothing of that stage to drop: leave the ref untouched rather than rewrite it.
         if (remaining.length === entries.length) return { kind: 'idle', value: undefined };
         return {
           kind: 'write',
           plan: {
-            changes: { [journalPath(piece)]: JSON.stringify(remaining) },
+            changes: { [JOURNAL_FILE]: JSON.stringify(remaining) },
             message: `ai-workflows: forget stage ${stage} of ${piece}`,
           },
           after: () => undefined,
@@ -444,9 +484,10 @@ export function createGitStore(options: GitStoreOptions): Store {
     },
 
     async getEffect(piece, operationId): Promise<EffectRecord | undefined> {
-      const head = await port.head();
+      const ref = pieceRef(piece);
+      const head = await port.head(ref);
       if (head === undefined) return undefined;
-      const records = await readEffects(head, piece);
+      const records = await readEffects(ref, head);
       const record = records[operationId];
       if (record === undefined) return undefined;
       if (record.state === 'confirmed' && record.result !== undefined) {
@@ -468,12 +509,13 @@ export function createGitStore(options: GitStoreOptions): Store {
         return existing.then((value) => throughJson(value as T));
       }
 
+      const ref = pieceRef(piece);
       const flight = (async (): Promise<T> => {
         try {
           // Claim the effect before running it, so a crash mid-effect leaves `pending`, not
           // absent. Only a stored claim lets us run the effect.
-          const claim = await transact<Claim>(async (head) => {
-            const records = await readEffects(head, piece);
+          const claim = await transact<Claim>(ref, async (head) => {
+            const records = await readEffects(ref, head);
             const record = records[operationId];
             if (record !== undefined) {
               if (record.state === 'confirmed') {
@@ -488,7 +530,7 @@ export function createGitStore(options: GitStoreOptions): Store {
               kind: 'write',
               plan: {
                 changes: {
-                  [effectsPath(piece)]: JSON.stringify({
+                  [EFFECTS_FILE]: JSON.stringify({
                     ...records,
                     [operationId]: { state: 'pending' },
                   }),
@@ -543,8 +585,9 @@ export function createGitStore(options: GitStoreOptions): Store {
     },
 
     async reconcileEffect(piece, operationId, outcome): Promise<void> {
-      return transact<void>(async (head) => {
-        const records = await readEffects(head, piece);
+      const ref = pieceRef(piece);
+      return transact<void>(ref, async (head) => {
+        const records = await readEffects(ref, head);
         // The contract has two explicit outcomes. A bare value is also accepted because a
         // caller written against the previous single-result signature still passes one; the
         // wrapper is the only unambiguous way to confirm a value shaped like `didNotHappen`.
@@ -557,7 +600,7 @@ export function createGitStore(options: GitStoreOptions): Store {
           return {
             kind: 'write',
             plan: {
-              changes: { [effectsPath(piece)]: JSON.stringify(next) },
+              changes: { [EFFECTS_FILE]: JSON.stringify(next) },
               message: `ai-workflows: reconcile effect ${operationId} of ${piece} as not run`,
             },
             after: () => undefined,
@@ -571,7 +614,7 @@ export function createGitStore(options: GitStoreOptions): Store {
           kind: 'write',
           plan: {
             changes: {
-              [effectsPath(piece)]: JSON.stringify({
+              [EFFECTS_FILE]: JSON.stringify({
                 ...records,
                 [operationId]: { state: 'confirmed', result: throughJson(value) },
               }),
@@ -584,8 +627,9 @@ export function createGitStore(options: GitStoreOptions): Store {
     },
 
     async reserveZone(zone, piece, runId, leaseMs): Promise<Reservation> {
-      return transact<Reservation>(async (head) => {
-        const held = await readZone(head, zone);
+      const ref = zoneRef(zone);
+      return transact<Reservation>(ref, async (head) => {
+        const held = await readZone(ref, head);
         const current = now();
         // Same lease semantics as a piece: a live lease held by someone else wins, an expired
         // one is taken over so a zone never stays locked by a dead controller.
@@ -596,7 +640,7 @@ export function createGitStore(options: GitStoreOptions): Store {
         return {
           kind: 'write',
           plan: {
-            changes: { [zonePath(zone)]: JSON.stringify({ runId, piece, expiresAt }) },
+            changes: { [LEASE_FILE]: JSON.stringify({ runId, piece, expiresAt }) },
             message: `ai-workflows: reserve zone ${zone}`,
           },
           after: (commit) => ({ ok: true, version: commit }),
@@ -605,14 +649,15 @@ export function createGitStore(options: GitStoreOptions): Store {
     },
 
     async releaseZone(zone, runId): Promise<void> {
-      return transact<void>(async (head) => {
-        const held = await readZone(head, zone);
+      const ref = zoneRef(zone);
+      return transact<void>(ref, async (head) => {
+        const held = await readZone(ref, head);
         // A late release must not free a zone another controller has since taken.
         if (held === undefined || held.runId !== runId) return { kind: 'idle', value: undefined };
         return {
           kind: 'write',
           plan: {
-            changes: { [zonePath(zone)]: null },
+            changes: { [LEASE_FILE]: null },
             message: `ai-workflows: release zone ${zone}`,
           },
           after: () => undefined,
