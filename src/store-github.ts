@@ -255,7 +255,20 @@ export function createGitHubStatePort(options: GitHubStatePortOptions): StatePor
     const result = await readApi(`${base}/git/ref/${refPath}`);
     if (result.exitCode !== 0) {
       const failure = failureOf(result);
-      if (failure.status === 404) return undefined;
+      if (failure.status === 404) {
+        // GitHub answers 404 both for a missing ref and for a repository the gh account cannot
+        // see. Confirming the repository through the cached node_id lookup keeps a typo in the
+        // owner or a private repo without access from reading as «no state yet».
+        try {
+          await repositoryIdentifier();
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : String(error);
+          throw new Error(
+            `The repository ${owner}/${repo} does not exist or the gh account cannot see it: ${reason}`,
+          );
+        }
+        return undefined;
+      }
       throw new Error(failure.message);
     }
     const parsed = parseJson(result.stdout);
