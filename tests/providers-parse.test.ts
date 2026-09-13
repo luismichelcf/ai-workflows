@@ -268,3 +268,32 @@ describe('never mistaking an unknown failure for a quota', () => {
     });
   }
 });
+
+describe('never mistaking a failure that merely mentions logging in for a sign-in problem', () => {
+  // Found while building this slice: the sign-in check matched the bare word "login", so a
+  // build that failed on a login FORM test would read as "not signed in" and hand the work
+  // to the relay on its own. `auth` relays exactly like `quota` does, so it deserves the
+  // same caution: only a message that clearly says the CLI is not signed in counts.
+  const aboutLoginButNotSignedOut = [
+    'e2e: the login form test failed',
+    '3 authentication tests failed',
+    'could not find the Login button on the page',
+    'refactor the login flow before merging',
+  ];
+
+  for (const message of aboutLoginButNotSignedOut) {
+    it(`codex: "${message}" is not a sign-in problem`, () => {
+      const output = jsonl({ type: 'thread.started', thread_id: 't' }, { type: 'turn.failed', error: { message } });
+
+      expect(parseRun(req({ provider: 'codex', model: 'gpt-6-astra' }), run(output, 1)).status).not.toBe('auth');
+    });
+  }
+
+  it('still recognises a CLI that is genuinely not signed in', () => {
+    for (const message of ['Not logged in. Run `codex login`.', 'Invalid API key · Please run /login', '401 Unauthorized']) {
+      const output = jsonl({ type: 'thread.started', thread_id: 't' }, { type: 'turn.failed', error: { message } });
+
+      expect(parseRun(req({ provider: 'codex', model: 'gpt-6-astra' }), run(output, 1)).status, message).toBe('auth');
+    }
+  });
+});
