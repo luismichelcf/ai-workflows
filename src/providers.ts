@@ -168,6 +168,39 @@ function requireNotFlag(field: string, value: string): void {
   }
 }
 
+/**
+ * Absolute Windows (`C:\…`, `C:/…`) or POSIX (`/…`) path. A `cwd` that is relative is refused
+ * because the CLI would resolve it against whatever folder the engine happened to be in, not
+ * the piece's own folder, and a `--add-dir`-style value that looks like a flag is refused by
+ * `requireNotFlag` because the CLI's parser cannot tell it apart from an option.
+ */
+const ABSOLUTE_PATH = /^(?:[A-Za-z]:[\\/]|\/)/;
+
+/**
+ * The folder a run may touch has to be an absolute path. An empty or relative value would let
+ * a run work in the wrong tree, and a flag-looking value was landing right after `--add-dir`.
+ */
+function requireCwd(cwd: string): void {
+  if (cwd === '') {
+    throw new Error('The cwd is empty; an absolute folder is required so a run cannot work in the wrong tree.');
+  }
+  requireNotFlag('cwd', cwd);
+  if (!ABSOLUTE_PATH.test(cwd)) {
+    throw new Error(`The cwd '${cwd}' is not an absolute path; refusing it rather than letting the CLI resolve it.`);
+  }
+}
+
+/**
+ * A model name has to be present. An empty value would travel as `--model ''`, which the CLI
+ * reads as a missing or default model rather than the one the owner authorised.
+ */
+function requireModel(model: string): void {
+  if (model === '') {
+    throw new Error('The model is empty; a model name is required so the CLI cannot pick one.');
+  }
+  requireNotFlag('model', model);
+}
+
 /** A session id is one opaque token: no spaces and no shell metacharacters. */
 const SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
 
@@ -196,7 +229,8 @@ export function buildInvocation(request: RunRequest): Invocation {
 
   // Every value that reaches the command line is checked before it is placed there. The prompt
   // is exempt: it travels on stdin and is never an argument unless it is the data itself.
-  requireNotFlag('model', request.model);
+  requireModel(request.model);
+  requireCwd(request.cwd);
   if (request.effort !== undefined) requireEffort(request.provider, request.effort);
   if (request.resumeSession !== undefined) requireSessionId(request.resumeSession);
 
@@ -954,6 +988,18 @@ const PROVIDER_COMMAND: Record<ProviderName, string | undefined> = {
 /** How long one probe may take before it counts as failed, when the caller says nothing. */
 const DEFAULT_PROBE_TIMEOUT_MS = 15_000;
 
+/**
+ * The largest deadline a caller may ask for. A timeout has to be a positive integer: with
+ * `Infinity` the deadline never fires and every probe reads as "not installed"; 0, a negative,
+ * a fractional or an out-of-range value is not a deadline at all. Such a value is refused
+ * before any probe runs.
+ */
+const MAX_PROBE_TIMEOUT_MS = 2 ** 31 - 1;
+
+function validTimeout(timeoutMs: number): boolean {
+  return Number.isInteger(timeoutMs) && timeoutMs > 0 && timeoutMs <= MAX_PROBE_TIMEOUT_MS;
+}
+
 function notInstalled(name: ProviderName, command: string | undefined): Detection {
   const label = command ?? name;
   return {
@@ -1011,11 +1057,19 @@ async function probe(
 }
 
 /**
- * Lines that are clearly a failure, not a model name. A probe can exit 0 while still printing
- * a warning or a stack; listing that as a model would make the engine try to run something
- * that does not exist.
+ * A model line as OpenCode prints it: `provider/model`. Only lines matching this shape are
+ * listed. A blacklist of "error" and "at" prefixes still let a deprecation warning, a
+ * `TypeError:` line or a `WARN` line through and listed it as a model the engine would then
+ * try to run. Anchored at both ends so a warning that merely contains a slash is ignored.
  */
-const PROBE_ERROR_LINES = [/^\s*error\b/i, /^\s*at\s/];
+const MODEL_LINE = /^[A-Za-z0-9][A-Za-z0-9._-]*\/[A-Za-z0-9._:@-]+$/;
+
+/**
+ * An `Error` at the start of any line, case-insensitively, means the probe failed even when it
+ * exited 0. The review found that checking only the very start of the whole output let an
+ * `Error:` on a later line be read as a signed-in session. The `m` flag checks every line.
+ */
+const ERROR_LINE = /^\s*error\b/im;
 
 /** Finds out what is installed and signed in. Never throws: a missing CLI is an answer. */
 export async function detectProvider(
@@ -1035,7 +1089,19 @@ export async function detectProvider(
     };
   }
 
-  const timeoutMs = options.timeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS;
+  const requestedTimeout = options.timeoutMs;
+  if (requestedTimeout !== undefined && !validTimeout(requestedTimeout)) {
+    // The limit is refused before the first probe: a bad `timeoutMs` is the caller's mistake,
+    // not a reason to spend a spawn on every provider.
+    return {
+      name: provider,
+      installed: false,
+      authenticated: false,
+      models: [],
+      problem: `The probe timeout (timeoutMs ${requestedTimeout}) must be a positive integer no larger than ${MAX_PROBE_TIMEOUT_MS}ms; refusing to probe.`,
+    };
+  }
+  const timeoutMs = requestedTimeout ?? DEFAULT_PROBE_TIMEOUT_MS;
 
   // Installed means `--version` actually succeeded (exit code 0). A non-zero exit, a command
   // that could not be spawned, or a probe that timed out all count as not installed; no
@@ -1073,9 +1139,8 @@ export async function detectProvider(
   if (modelsProbe.ok && modelsProbe.run.exitCode === 0) {
     for (const line of modelsProbe.run.output.split(/\r?\n/)) {
       const model = line.trim();
-      if (model === '') continue;
-      if (PROBE_ERROR_LINES.some((marker) => marker.test(model))) continue;
-      models.push(model);
+      // Only a `provider/model` line is a model; warnings and stack lines fall through.
+      if (MODEL_LINE.test(model)) models.push(model);
     }
   }
 
@@ -1088,8 +1153,8 @@ export async function detectProvider(
   } else if (
     authProbe.run.exitCode !== 0 ||
     authProbe.run.output.trim() === '' ||
-    /0 credentials/i.test(authProbe.run.output) ||
-    PROBE_ERROR_LINES.some((marker) => marker.test(authProbe.run.output))
+    /(^|\D)0 credentials/i.test(authProbe.run.output) ||
+    ERROR_LINE.test(authProbe.run.output)
   ) {
     authProblem = `'${command}' is installed but has no verified credentials; run '${command} auth login' to sign in.`;
   }
