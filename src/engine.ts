@@ -30,8 +30,28 @@ const DEFAULT_LEASE_MS = 30_000;
  * before the run has had a chance to start its keepalive, leaving a live piece looking
  * abandoned. Renewals, by contrast, use the requested duration: a short lease must really
  * expire once its owner stops renewing, or a rehearsal and a theft could never be observed.
+ *
+ * Exported so `runCommand` can refuse a lease below it before building the engine, which is
+ * where a seconds-for-milliseconds mistake belongs: a units slip in a project script must be
+ * an answer to the person, not a renewal on every tick.
  */
-const MIN_LEASE_MS = DEFAULT_LEASE_MS;
+export const MIN_LEASE_MS = DEFAULT_LEASE_MS;
+
+/**
+ * A lease duration the engine cannot honour. It is the caller's mistake, like an invalid
+ * pipeline, so `runCommand` reports it instead of crashing the process. A lease that is not a
+ * finite number of milliseconds above zero would be written as an `expiresAt: null`, which the
+ * git store refuses to read, leaving the piece locked for good. The realistic way in is a
+ * project script passing `Number(process.env.X)` with `X` unset.
+ */
+export class InvalidLease extends Error {
+  constructor(readonly value: number) {
+    super(
+      `the lease duration must be a finite number of milliseconds greater than 0, got ${String(value)}`,
+    );
+    this.name = 'InvalidLease';
+  }
+}
 
 /** How often the keepalive re-extends a lease while a single stage is still running. */
 const leaseHeartbeatMs = (leaseMs: number): number => Math.max(1, Math.floor(leaseMs / 3));
@@ -263,6 +283,16 @@ export function createEngine(options: EngineOptions): Engine {
   const validation = validateConfig(options.config);
   if (!validation.ok) {
     throw new InvalidPipeline(validation.errors);
+  }
+
+  // Refuse a lease the store could not read back. `NaN`, `Infinity`, `0` and negatives all
+  // reach the store as a duration it cannot turn into an expiry; an absent lease is fine, the
+  // default below covers it.
+  if (
+    options.leaseMs !== undefined &&
+    !(Number.isFinite(options.leaseMs) && options.leaseMs > 0)
+  ) {
+    throw new InvalidLease(options.leaseMs);
   }
 
   const { config, store } = options;
