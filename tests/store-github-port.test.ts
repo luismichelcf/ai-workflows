@@ -84,9 +84,23 @@ describe('where the state lives', () => {
   });
 
   it('says there is no state yet when the ref does not exist', async () => {
-    const gh = fakeGh((call) => (HEAD_ENDPOINTS.includes(call.endpoint) ? httpError(404, 'Not Found') : undefined));
+    const gh = fakeGh((call) =>
+      HEAD_ENDPOINTS.includes(call.endpoint) ? httpError(404, 'Not Found') : repositoryId(call),
+    );
 
     expect(await port(gh.run).head()).toBeUndefined();
+  });
+
+  it('does not read a repository it cannot see as «no state yet»', async () => {
+    // GitHub answers 404 both for a missing ref and for a repository the account cannot see.
+    // Reading the second as empty would show «no pieces» for a typo in the owner's name.
+    const gh = fakeGh((call) =>
+      HEAD_ENDPOINTS.includes(call.endpoint) || call.endpoint === BASE || call.endpoint === 'graphql'
+        ? httpError(404, 'Not Found')
+        : undefined,
+    );
+
+    await expect(port(gh.run).head()).rejects.toThrow(/luismichelcf\/ai-workflows|repositor/i);
   });
 
   it('reports any other failure instead of pretending the ref is missing', async () => {
