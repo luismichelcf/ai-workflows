@@ -154,6 +154,12 @@ export interface TestRunSummary {
    * would be authorising it on nothing.
    */
   readonly brokenEnvironment: boolean;
+  /** Errors outside any test (an unhandled rejection, a failing setup file). */
+  readonly errors: number;
+  /** Nothing actually ran: every test skipped or todo, or no tests at all. Never green. */
+  readonly ranNothing: boolean;
+  /** The process exit code, kept so a non-zero exit with nothing explaining it is never green. */
+  readonly exitCode: number | null;
 }
 
 /** Markers that mean the runner never got as far as executing tests. */
@@ -194,4 +200,20 @@ export function parseTestRun(run: TestRun): TestRunSummary {
 function countInSummary(line: string, word: 'failed' | 'passed'): number {
   const match = new RegExp(`(\\d+)\\s+${word}`).exec(line);
   return match ? Number(match[1] ?? 0) : 0;
+}
+
+/**
+ * Green means: it ran, it loaded, nothing failed, nothing errored outside the tests, and the
+ * process agreed. Silence, skipped-only runs and a non-zero exit are never green.
+ */
+export function isGreenRun(_summary: TestRunSummary): boolean {
+  throw new Error('isGreenRun: not implemented');
+}
+
+/**
+ * A red test is evidence only when a test failed its own assertion. A suite that never
+ * loaded is a broken environment, and authorising a build on it is authorising it on nothing.
+ */
+export function isRedEvidence(_summary: TestRunSummary): boolean {
+  throw new Error('isRedEvidence: not implemented');
 }

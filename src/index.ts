@@ -28,6 +28,8 @@ export {
 export {
   runGateCommand,
   parseTestRun,
+  isGreenRun,
+  isRedEvidence,
   type GateCommand,
   type TestRun,
   type TestRunSummary,

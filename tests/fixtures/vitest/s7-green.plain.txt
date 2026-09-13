@@ -1,0 +1,10 @@
+
+ RUN  v2.1.9 C:/GitHub/_deps/vitest-samples
+
+ ✓ t/s7-green.test.ts (2 tests) 1ms
+
+ Test Files  1 passed (1)
+      Tests  2 passed (2)
+   Start at  10:07:46
+   Duration  415ms (transform 18ms, setup 0ms, collect 16ms, tests 1ms, environment 0ms, prepare 80ms)
+

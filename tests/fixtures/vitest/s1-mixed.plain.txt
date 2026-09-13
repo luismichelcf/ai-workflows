@@ -1,0 +1,32 @@
+
+ RUN  v2.1.9 C:/GitHub/_deps/vitest-samples
+
+ ❯ t/s1-mixed.test.ts (2 tests | 1 failed) 6ms
+   × paga el bono completo al 100% 4ms
+     → expected 800 to be 1000 // Object.is equality
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  t/s1-mixed.test.ts > paga el bono completo al 100%
+AssertionError: expected 800 to be 1000 // Object.is equality
+
+- Expected
++ Received
+
+- 1000
++ 800
+
+ ❯ t/s1-mixed.test.ts:3:57
+      1| import { it, expect } from 'vitest';
+      2| it('pasa', () => { expect(1).toBe(1); });
+      3| it('paga el bono completo al 100%', () => { expect(800).toBe(1000); });
+       |                                                         ^
+      4| 
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+
+ Test Files  1 failed (1)
+      Tests  1 failed | 1 passed (2)
+   Start at  10:07:33
+   Duration  705ms (transform 19ms, setup 0ms, collect 16ms, tests 6ms, environment 0ms, prepare 90ms)
+
