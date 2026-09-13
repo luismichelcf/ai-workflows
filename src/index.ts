@@ -62,3 +62,4 @@ export {
   type CommandRunner,
   type Detection,
 } from './providers.js';
+export { resolveExecutable, type ExecutableEnvironment, type ResolvedExecutable } from './exec.js';
