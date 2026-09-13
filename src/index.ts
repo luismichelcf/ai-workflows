@@ -6,6 +6,14 @@
 export * from './contract.js';
 export { validateConfig, fingerprint } from './config.js';
 export { createMemoryStore, type MemoryStoreOptions } from './state.js';
+export { createGitStore, type StatePort, type GitStoreOptions } from './store-git.js';
+export {
+  createGitHubStatePort,
+  DEFAULT_STATE_REF,
+  type GhRun,
+  type GhRunner,
+  type GitHubStatePortOptions,
+} from './store-github.js';
 export { createEngine } from './engine.js';
 export {
   runCommand,

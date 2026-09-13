@@ -12,6 +12,8 @@ import { createEngine } from './engine.js';
 export interface CommandOptions {
   readonly config: PipelineConfig;
   readonly store: Store;
+  /** How the project describes what a piece changes, handed to every gate as `change`. */
+  readonly describeChange?: (piece: string) => unknown | Promise<unknown>;
 }
 
 export interface CommandOutput {
