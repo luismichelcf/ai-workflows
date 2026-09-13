@@ -65,8 +65,11 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
 // The owner's sign-off is a comment only he may write: `/visto-bueno <sha>` names the exact
 // version he looked at (see signoff.ts). When an agent writes it with the owner's account, the
 // server cannot tell it apart from him, so no agent may put the order itself into a command or a
-// file. The order counts when the command follows it, even as a short prefix of a longer SHA.
-const SIGN_OFF_ORDER = /\/visto-bueno\s+[0-9a-f]{7,}/i;
+// file. The order counts when the command follows it, even as a short prefix of a longer SHA,
+// and when the shell fills the SHA in — `$(git rev-parse HEAD)`, `$SHA`, `${SHA}`, a backtick
+// substitution or `%SHA%` — which is the most natural way an agent would write it. A
+// placeholder such as `<sha>` in an explanation is not an order.
+const SIGN_OFF_ORDER = /\/visto-bueno\s+(?:[0-9a-f]{7,}|[$`%])/i;
 
 /**
  * The text each covered tool is about to execute or write. Shell tools `Bash` and `PowerShell`

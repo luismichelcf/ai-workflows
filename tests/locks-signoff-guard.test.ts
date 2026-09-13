@@ -60,6 +60,21 @@ describe('no agent writes the owner s sign-off for him', () => {
   it('refuses a prefix of a SHA too', () => {
     expect(decideToolUse(call('Bash', { command: `gh pr comment 12 --body "/visto-bueno ${sha.slice(0, 7)}"` }), noPiece).allow).toBe(false);
   });
+
+  it('refuses the SHA filled in by the shell, the most natural way to write it', () => {
+    const commands: ReadonlyArray<readonly [string, string]> = [
+      ['Bash', 'gh pr comment 12 --body "/visto-bueno $(git rev-parse HEAD)"'],
+      ['Bash', 'gh pr comment 12 --body "/visto-bueno $SHA"'],
+      ['Bash', 'gh pr comment 12 --body "/visto-bueno ${SHA}"'],
+      ['Bash', 'gh pr comment 12 --body "/visto-bueno `git rev-parse HEAD`"'],
+      ['PowerShell', 'gh pr comment 12 --body "/visto-bueno $(git rev-parse HEAD)"'],
+      ['PowerShell', 'gh pr comment 12 --body "/visto-bueno $env:SHA"'],
+      ['Bash', 'cmd /c gh pr comment 12 --body "/visto-bueno %SHA%"'],
+    ];
+    for (const [toolName, command] of commands) {
+      expect(decideToolUse(call(toolName, { command }), noPiece).allow, command).toBe(false);
+    }
+  });
 });
 
 describe('ordinary work is untouched', () => {
