@@ -327,8 +327,6 @@ const AUTH_MARKERS = [
   /please run \/login/,
   /not logged in/,
   /not signed in/,
-  /\blogin\b/,
-  /authentication/,
 ];
 
 /**
