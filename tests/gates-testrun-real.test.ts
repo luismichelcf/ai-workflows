@@ -132,6 +132,7 @@ describe('several runs in one output', () => {
   it('never reports fewer failures than tests it named as failing', () => {
     const summary = parseTestRun(fixture('s1-mixed', 'color'));
 
+    expect(summary.failures.length).toBeGreaterThan(0);
     expect(summary.failed).toBeGreaterThanOrEqual(summary.failures.length);
   });
 });
