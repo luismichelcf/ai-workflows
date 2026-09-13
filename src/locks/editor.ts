@@ -65,11 +65,14 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
 // The owner's sign-off is a comment only he may write: `/visto-bueno <sha>` names the exact
 // version he looked at (see signoff.ts). When an agent writes it with the owner's account, the
 // server cannot tell it apart from him, so no agent may put the order itself into a command or a
-// file. The order counts when the command follows it, even as a short prefix of a longer SHA,
-// and when the shell fills the SHA in — `$(git rev-parse HEAD)`, `$SHA`, `${SHA}`, a backtick
-// substitution or `%SHA%` — which is the most natural way an agent would write it. A
-// placeholder such as `<sha>` in an explanation is not an order.
-const SIGN_OFF_ORDER = /\/visto-bueno\s+(?:[0-9a-f]{7,}|[$`%])/i;
+// file. The order counts as soon as `/visto-bueno` is followed by anything but a `<placeholder>`,
+// and this must be judged before any other rule: the shell can split the order across quotes
+// (`"/visto-bueno "$SHA`), leave it unquoted (`/visto-bueno\ $SHA`), build it in a variable
+// (`"/visto-bueno " + $sha`), fill it in later (`$(git rev-parse HEAD)`, `${SHA}`, a backtick,
+// `%SHA%`) or simply end the text right after it (`echo -n /visto-bueno`) — GitHub still posts
+// each of those as a valid order. Allowing only the placeholder form is what keeps explanations
+// like "escribe `/visto-bueno <sha>`" safe to write.
+const SIGN_OFF_ORDER = /\/visto-bueno(?!\s*<)/i;
 
 /**
  * The text each covered tool is about to execute or write. Shell tools `Bash` and `PowerShell`
@@ -174,8 +177,11 @@ function writeTargets(toolName: string, toolInput: unknown): string[] | undefine
  * Edit, MultiEdit and NotebookEdit, and Codex's apply_patch. Shell commands that write are not
  * judged by their path — the git pre-commit hook catches what they stage. For the owner's
  * sign-off rule only, Bash and PowerShell are covered too, since the order travels in their
- * `command` text. It is help, not a guarantee: the hook never sees MCP tools, and an agent set on
- * writing the order can still do it by other means this hook does not read.
+ * `command` text. In Codex, `write_stdin` does not pass through this hook again (its own
+ * documentation, read 13-sep-2026), so a command typed into a running session is not re-judged
+ * here; there is no `tool_input` to read for it on this seam. It is help, not a guarantee: the
+ * hook never sees MCP tools, and an agent set on writing the order can still do it by other
+ * means this hook does not read.
  */
 export function decideToolUse(input: HookInput, context: LockContext): LockDecision {
   // Rule 0: no agent writes the owner's sign-off for him. Checked before every other rule, and
@@ -193,18 +199,7 @@ export function decideToolUse(input: HookInput, context: LockContext): LockDecis
   // Rule 1: everything the hook is not wired to passes untouched.
   if (!isCovered) return { allow: true };
 
-  // Rule 2: a request whose paths cannot be read is refused. A lock that lets through what
-  // it does not understand has stopped working without saying so.
-  const targets = writeTargets(input.toolName, input.toolInput);
-  if (targets === undefined || targets.length === 0) {
-    return {
-      allow: false,
-      reason:
-        'No pude leer las rutas de esta herramienta: el candado se niega a adivinar. Revisa el formato de tool_input.',
-    };
-  }
-
-  // Rule 3: the guarded folder is the configured project root, never the hook's cwd, which moves
+  // Rule 2: the guarded folder is the configured project root, never the hook's cwd, which moves
   // with every `cd`. A root the lock cannot read as an absolute path cannot be guarded at all:
   // refuse everything and name the setting that is wrong.
   const root = readAbsolute(context.projectRoot);
@@ -217,7 +212,7 @@ export function decideToolUse(input: HookInput, context: LockContext): LockDecis
     };
   }
 
-  // Rule 4: a paper entry that is absolute, empty or climbs out would silently switch the lock
+  // Rule 3: a paper entry that is absolute, empty or climbs out would silently switch the lock
   // off. Read it here and in pre-commit alike, and refuse it as a paperPaths problem.
   const papers = readPapers(context.paperPaths, root.path);
   if (!papers.ok) {
@@ -229,10 +224,22 @@ export function decideToolUse(input: HookInput, context: LockContext): LockDecis
     };
   }
 
-  // Rule 5: a folder with work in flight, or one explicitly opened as /libre, may write
-  // anywhere. Checked before reading the targets, because once writing is allowed everywhere
-  // a spelling the lock cannot reduce (a short-name TEMP folder) no longer changes the answer.
+  // Rule 4: a folder with work in flight, or one explicitly opened as /libre, may write
+  // anywhere. Checked before reading the targets, because with a piece writing is allowed
+  // everywhere: a path or a patch the lock cannot read no longer changes the answer.
   if (context.activePiece || context.libre) return { allow: true };
+
+  // Rule 5: a request whose paths cannot be read is refused. A lock that lets through what it
+  // does not understand has stopped working without saying so. Reached only without a piece,
+  // where the targets themselves decide.
+  const targets = writeTargets(input.toolName, input.toolInput);
+  if (targets === undefined || targets.length === 0) {
+    return {
+      allow: false,
+      reason:
+        'No pude leer las rutas de esta herramienta: el candado se niega a adivinar. Revisa el formato de tool_input.',
+    };
+  }
 
   // Targets are read against the cwd (that is what a relative path needs); the project root is
   // not. A path the lock cannot reduce is refused, never guessed into a decision.
