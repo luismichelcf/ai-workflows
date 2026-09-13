@@ -32,3 +32,12 @@ export {
   type TestRun,
   type TestRunSummary,
 } from './commands.js';
+export {
+  sameExecution,
+  requireDifferentBuilder,
+  requireFreshVerdicts,
+  type ExecutionIdentity,
+  type Verdict,
+  type IndependenceOptions,
+  type FreshnessOptions,
+} from './identity.js';
