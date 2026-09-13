@@ -291,6 +291,11 @@ function clip(text: string): string {
 }
 
 export interface TestRun {
+  /**
+   * True when the output was too large to keep whole. A cut-off output may hide a failure, so
+   * it is never read as green nor as red evidence.
+   */
+  readonly truncated?: boolean;
   readonly output: string;
   readonly exitCode: number;
 }

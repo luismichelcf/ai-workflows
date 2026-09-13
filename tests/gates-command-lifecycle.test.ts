@@ -40,12 +40,11 @@ const writeScript = (dir: string, name: string, body: string) => {
   return file;
 };
 
-// On Windows a Node process puts its children in a job that dies with it, so a Node
-// intermediate hides both bugs: its grandchild is killed for free. `pnpm check` runs through
-// processes that do not do that, so on Windows the intermediate is cmd.exe (a test fixture
-// only; the engine itself never starts a shell). On POSIX a Node intermediate reproduces it.
-const cmdExe = process.env['ComSpec'] ?? 'C:\\Windows\\System32\\cmd.exe';
-
+// On Windows a Node process puts its children in a job that dies with it, so a plain Node
+// intermediate hides both bugs: its grandchild is killed for free. A grandchild started with
+// `detached: true` leaves that job, like the processes `pnpm check` starts, and reproduces
+// both on every platform. (The engine refuses cmd.exe even by absolute path, so it cannot be
+// the intermediate.)
 const withGrandchild = (dir: string, mode: 'child-exits-grandchild-keeps-output' | 'child-waits-on-grandchild') => {
   const pidFile = join(dir, 'grandchild.pid');
   const grandchild = writeScript(
@@ -53,19 +52,14 @@ const withGrandchild = (dir: string, mode: 'child-exits-grandchild-keeps-output'
     'grandchild.js',
     `require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));\nsetInterval(() => {}, 1000);\n`,
   );
-
-  if (process.platform === 'win32') {
-    const line = mode === 'child-exits-grandchild-keeps-output' ? `start /b node ${grandchild}` : `node ${grandchild}`;
-    return { command: cmdExe, args: ['/d', '/s', '/c', line], pidFile };
-  }
-
+  const keepsOutput = mode === 'child-exits-grandchild-keeps-output';
   const child = writeScript(
     dir,
     'child.js',
     [
       "const { spawn } = require('node:child_process');",
-      `spawn(process.execPath, [${JSON.stringify(grandchild)}], { stdio: 'inherit' });`,
-      mode === 'child-exits-grandchild-keeps-output' ? 'setTimeout(() => process.exit(0), 300);' : 'setInterval(() => {}, 1000);',
+      `spawn(process.execPath, [${JSON.stringify(grandchild)}], { stdio: '${keepsOutput ? 'inherit' : 'ignore'}', detached: true });`,
+      keepsOutput ? 'setTimeout(() => process.exit(0), 300);' : 'setInterval(() => {}, 1000);',
     ].join('\n'),
   );
   return { command: node, args: [child], pidFile };
@@ -108,6 +102,11 @@ describe('a command that hangs cannot hang the engine', () => {
     expect(took).toBeLessThan(8000);
     expect(result.ok).toBe(false);
     expect(result.ok === false && result.reason.toLowerCase()).toMatch(/tiempo/);
+    // The direct child had already ended, so its number may belong to another program by now:
+    // nothing is killed by it, and the reason says processes may still be alive instead of
+    // claiming a kill that did not happen.
+    expect(result.ok === false && result.reason).not.toMatch(/killed|matado|mató/i);
+    expect(result.ok === false && result.reason).toMatch(/pueden quedar procesos vivos/);
   }, 15_000);
 
   it('kills the whole process tree when it gives up, not only the direct child', async () => {
