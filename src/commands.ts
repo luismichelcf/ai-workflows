@@ -478,7 +478,11 @@ export function parseTestRun(run: TestRun): TestRunSummary {
   // Rule 1: `(.+?)\s*$` restarts the lazy group from every space, so a long run of spaces
   // before an unmatched character took 47 s on 160 KB. `[^\n]+` is greedy with no retry, and
   // the capture is trimmed below.
-  const summaryLines = [...output.matchAll(/^[^\S\n]*Tests\s+([^\n]+)$/gm)].map((match) =>
+  // `^[ \t]*` instead of `^[^\S\n]*`: `[^\S\n]` is every whitespace but `\n`, so it also eats
+  // `\r` and U+2028, which the `m` flag treats as line starts. A progress bar of only those
+  // characters then restarts the leading-whitespace run at every one of them (quadratic time:
+  // 80 KB of `\r` took 17 s). Indentation is spaces and tabs only, so this stays linear.
+  const summaryLines = [...output.matchAll(/^[ \t]*Tests\s+([^\n]+)$/gm)].map((match) =>
     (match[1] ?? '').trim(),
   );
   const passed = sumSummaryCounts(summaryLines, 'passed');
@@ -489,7 +493,9 @@ export function parseTestRun(run: TestRun): TestRunSummary {
   // broken below. Rule 3.
   const failures: string[] = [];
   let failedSuite = false;
-  for (const match of output.matchAll(/^[^\S\n]*FAIL\s+([^\n]+)$/gm)) {
+  // `^[ \t]*` for the same reason as the summary lines above: `[^\S\n]*` is quadratic on a
+  // line-start run of `\r`/U+2028, and a FAIL line is only ever indented with spaces or tabs.
+  for (const match of output.matchAll(/^[ \t]*FAIL\s+([^\n]+)$/gm)) {
     const detail = (match[1] ?? '').trim();
     // Rule 1: the bracket class excludes `[` so the match cannot restart at every opening
     // bracket of a long run, which is what made this test quadratic.
@@ -562,7 +568,9 @@ function sumSummaryCounts(lines: readonly string[], word: 'passed' | 'failed'): 
  */
 function countErrors(output: string): number {
   let fromLine = 0;
-  for (const match of output.matchAll(/^[^\S\n]*Errors\s+(\d+)\s+errors?\s*$/gm)) {
+  // `^[ \t]*` for the same reason as the summary lines above: `[^\S\n]*` is quadratic on a
+  // line-start run of `\r`/U+2028, and an Errors line is only ever indented with spaces or tabs.
+  for (const match of output.matchAll(/^[ \t]*Errors\s+(\d+)\s+errors?\s*$/gm)) {
     fromLine += Number(match[1] ?? 0);
   }
   if (fromLine === 0 && output.includes('Unhandled Errors')) return 1;
