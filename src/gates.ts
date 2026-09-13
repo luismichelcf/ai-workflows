@@ -359,3 +359,15 @@ export function requireSources(document: string, requirement: SourceRequirement)
 
   return { ok: true };
 }
+
+/**
+ * The files recorded earlier still have the same content now. Keys are file names, values
+ * are content hashes. Names every file that changed, appeared or disappeared. An empty
+ * record protects nothing, so it is refused rather than passed.
+ */
+export function requireSameFiles(
+  _recorded: Readonly<Record<string, string>>,
+  _current: Readonly<Record<string, string>>,
+): CheckResult {
+  throw new Error('requireSameFiles: not implemented');
+}

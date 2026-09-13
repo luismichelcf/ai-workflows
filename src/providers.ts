@@ -915,10 +915,16 @@ function notInstalled(name: ProviderName, command: string | undefined): Detectio
   };
 }
 
+export interface DetectOptions {
+  /** How long one probe may take before it counts as failed. */
+  readonly timeoutMs?: number;
+}
+
 /** Finds out what is installed and signed in. Never throws: a missing CLI is an answer. */
 export async function detectProvider(
   provider: ProviderName,
   run: CommandRunner,
+  _options: DetectOptions = {},
 ): Promise<Detection> {
   const command = PROVIDER_COMMAND[provider];
   if (command === undefined) {

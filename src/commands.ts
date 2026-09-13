@@ -8,6 +8,11 @@ export interface GateCommand {
   readonly cwd?: string;
   /** Milliseconds before the command is given up on. Default is generous but finite. */
   readonly timeoutMs?: number;
+  /**
+   * How to read what the command did. Without it, exit code 0 is success — which is only
+   * honest for commands whose exit code is the whole truth. A test run is not one of them.
+   */
+  readonly interpret?: (run: TestRun) => CheckResult;
 }
 
 /** Generous but finite: a hung gate must never hang the whole engine. */

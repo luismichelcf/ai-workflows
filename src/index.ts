@@ -22,6 +22,7 @@ export {
   requireSections,
   countDistinctSources,
   requireSources,
+  requireSameFiles,
   type CheckResult,
   type SourceRequirement,
 } from './gates.js';
