@@ -1,0 +1,54 @@
+name: release
+
+# Publishes a built package as a GitHub Release asset when a version tag is pushed.
+# Projects install it by URL: nothing runs during their install (pnpm 10 refuses build scripts
+# from git dependencies), and every version stays immutable.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Check the tag matches the package version
+        run: |
+          expected="v$(node -p "require('./package.json').version")"
+          if [ "$GITHUB_REF_NAME" != "$expected" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match package.json version $expected" >&2
+            exit 1
+          fi
+
+      - name: Typecheck and test
+        run: pnpm check
+
+      - name: Pack
+        run: pnpm pack
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          gh release create "$GITHUB_REF_NAME" "ai-workflows-${version}.tgz" \
+            --title "$GITHUB_REF_NAME" \
+            --notes "Install: \`pnpm add https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/ai-workflows-${version}.tgz\`"
