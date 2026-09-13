@@ -366,8 +366,52 @@ export function requireSources(document: string, requirement: SourceRequirement)
  * record protects nothing, so it is refused rather than passed.
  */
 export function requireSameFiles(
-  _recorded: Readonly<Record<string, string>>,
-  _current: Readonly<Record<string, string>>,
+  recorded: Readonly<Record<string, string>>,
+  current: Readonly<Record<string, string>>,
 ): CheckResult {
-  throw new Error('requireSameFiles: not implemented');
+  // An empty record is not a weaker check, it is no check at all: every file trivially
+  // matches a set of zero expectations. Passing it would be a green that proves nothing,
+  // so it is refused instead.
+  if (Object.keys(recorded).length === 0) {
+    return {
+      ok: false,
+      reason: 'No files were recorded, so there is nothing to compare against.',
+    };
+  }
+
+  // Hashes are compared case-insensitively because hex digests differ only in the case of
+  // their letters depending on who wrote them down.
+  const normalize = (hash: string): string => hash.toLowerCase();
+
+  const changed: string[] = [];
+  const appeared: string[] = [];
+  const missing: string[] = [];
+
+  for (const name of Object.keys(recorded)) {
+    if (!Object.prototype.hasOwnProperty.call(current, name)) {
+      missing.push(name);
+    } else if (normalize(recorded[name] ?? '') !== normalize(current[name] ?? '')) {
+      changed.push(name);
+    }
+  }
+
+  for (const name of Object.keys(current)) {
+    if (!Object.prototype.hasOwnProperty.call(recorded, name)) appeared.push(name);
+  }
+
+  if (changed.length === 0 && appeared.length === 0 && missing.length === 0) {
+    return { ok: true };
+  }
+
+  // Report every difference at once, grouped by kind, so the author sees the whole drift
+  // rather than one file per run.
+  const parts: string[] = [];
+  if (changed.length > 0) parts.push(`changed: ${changed.join(', ')}`);
+  if (appeared.length > 0) parts.push(`appeared: ${appeared.join(', ')}`);
+  if (missing.length > 0) parts.push(`missing: ${missing.join(', ')}`);
+
+  return {
+    ok: false,
+    reason: `Files no longer match what was recorded (${parts.join('; ')}).`,
+  };
 }
