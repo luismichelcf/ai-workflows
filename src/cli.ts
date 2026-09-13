@@ -14,6 +14,11 @@ export interface CommandOptions {
   readonly store: Store;
   /** How the project describes what a piece changes, handed to every gate as `change`. */
   readonly describeChange?: (piece: string) => unknown | Promise<unknown>;
+  /**
+   * How long the engine's hold on a piece lasts before another controller may take it. A store
+   * over a remote pays for every renewal, so it needs minutes, not the default seconds.
+   */
+  readonly leaseMs?: number;
 }
 
 export interface CommandOutput {
