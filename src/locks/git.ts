@@ -69,11 +69,32 @@ export interface PrePushInput {
 }
 
 /**
- * A branch name is one or more slash-joined segments of bare name characters. It is a closed
- * shape on purpose: a setting that is not a branch name means the lock cannot know which ref is
- * the default one, and guessing would let pushes through.
+ * Whether git itself would accept a name as a ref (`git check-ref-format`), so the lock and git
+ * agree on which refs exist. It is written as git's own rule, not as a closed whitelist: git
+ * accepts `release+1`, `año` or `feat/ñandú`, and a whitelist would refuse those good settings;
+ * and it refuses names like `ma..in` or `main.`, which would never match a real ref and would
+ * turn the lock off without a word.
  */
-const DEFAULT_BRANCH_NAME = /^[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)*$/;
+function isValidDefaultBranch(name: string): boolean {
+  // An empty name, or the lone `@`, names no branch at all.
+  if (name.length === 0 || name === '@') return false;
+
+  // No character from this set may appear anywhere: `..` and `@{` are parsed by git as ranges or
+  // revisions, `//` leaves an empty segment, and a control character (U+0000-U+001F, U+007F), a
+  // space or one of `~ ^ : ? * [ \` is either rejected by git or ends the name early.
+  if (/\.\.|@\{|\/\/|[ \u0000-\u001f\u007f~^:?*\[\\]/.test(name)) return false;
+
+  // A leading or trailing slash leaves an empty segment, and a trailing dot is refused by git.
+  if (name.startsWith('/') || name.endsWith('/') || name.endsWith('.')) return false;
+
+  // Each slash-separated segment must itself be a valid name: it cannot start with `.` (git keeps
+  // `.`-prefixed refs for its own files) or end with `.lock`.
+  for (const segment of name.split('/')) {
+    if (segment.startsWith('.') || segment.endsWith('.lock')) return false;
+  }
+
+  return true;
+}
 
 /** Nothing is pushed straight to the default branch: everything goes through a PR. */
 export function decidePrePush(input: PrePushInput): LockDecision {
@@ -84,7 +105,7 @@ export function decidePrePush(input: PrePushInput): LockDecision {
   // or `refs/heads/origin/main`, a ref that never matches and so never refuses.
   const { defaultBranch } = input;
   const validDefaultBranch =
-    DEFAULT_BRANCH_NAME.test(defaultBranch) &&
+    isValidDefaultBranch(defaultBranch) &&
     !defaultBranch.startsWith('refs/') &&
     !defaultBranch.startsWith('origin/');
   if (!validDefaultBranch) {
