@@ -41,3 +41,22 @@ export {
   type IndependenceOptions,
   type FreshnessOptions,
 } from './identity.js';
+export {
+  capabilities,
+  buildInvocation,
+  parseRun,
+  decideRelay,
+  detectProvider,
+  type ProviderName,
+  type RunRequest,
+  type Invocation,
+  type RunStatus,
+  type RawRun,
+  type RunReport,
+  type Capabilities,
+  type Assignment,
+  type RelayState,
+  type RelayDecision,
+  type CommandRunner,
+  type Detection,
+} from './providers.js';
