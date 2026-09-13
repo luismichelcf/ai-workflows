@@ -104,14 +104,21 @@ export function createGhRunner(options: GhRunnerOptions = {}): GhRunner {
       // (NODE_PATH first, as the shim would have done), then forces the settings that make
       // `gh`'s output machine-readable. Without NO_COLOR and GH_PROMPT_DISABLED a colored or
       // prompting `gh` prints text no JSON parser can read; GH_NO_UPDATE_NOTIFIER keeps a
-      // background update notice out of stdout. CLICOLOR_FORCE is removed because it would
-      // re-enable color even with NO_COLOR set.
+      // background update notice out of stdout.
       const env: NodeJS.ProcessEnv =
         executable.env !== undefined ? mergeShimEnvironment(executable.env) : { ...process.env };
+      // GH_FORCE_TTY and CLICOLOR_FORCE would re-enable a terminal or color no matter what
+      // NO_COLOR says: with GH_FORCE_TTY, `gh` can open a paginator and leave the call hanging
+      // until the timeout. They are dropped before the overrides below are set. On Windows
+      // environment names are case-insensitive, so `delete env['CLICOLOR_FORCE']` would miss a
+      // differently-cased `clicolor_force`; scan by uppercased name to remove every spelling.
+      for (const name of Object.keys(env)) {
+        const upper = name.toUpperCase();
+        if (upper === 'GH_FORCE_TTY' || upper === 'CLICOLOR_FORCE') delete env[name];
+      }
       env['NO_COLOR'] = '1';
       env['GH_PROMPT_DISABLED'] = '1';
       env['GH_NO_UPDATE_NOTIFIER'] = '1';
-      delete env['CLICOLOR_FORCE'];
 
       const spawnOptions: SpawnOptions = {
         // Never a shell, so gh's arguments cannot be re-parsed. `windowsHide` avoids a
