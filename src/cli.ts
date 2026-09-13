@@ -7,11 +7,18 @@ import {
   type Store,
 } from './contract.js';
 import { validateConfig } from './config.js';
-import { createEngine } from './engine.js';
+import { createEngine, InvalidLease, MIN_LEASE_MS } from './engine.js';
 
 export interface CommandOptions {
   readonly config: PipelineConfig;
   readonly store: Store;
+  /** How the project describes what a piece changes, handed to every gate as `change`. */
+  readonly describeChange?: (piece: string) => unknown | Promise<unknown>;
+  /**
+   * How long the engine's hold on a piece lasts before another controller may take it. A store
+   * over a remote pays for every renewal, so it needs minutes, not the default seconds.
+   */
+  readonly leaseMs?: number;
 }
 
 export interface CommandOutput {
@@ -244,12 +251,41 @@ const HELP: Record<Language, string> = {
 };
 
 /** Builds the engine, reporting a config the engine refuses instead of throwing it out. */
-function openEngine(config: PipelineConfig, store: Store, locale: string): CommandOutput | ReturnType<typeof createEngine> {
+function openEngine(
+  config: PipelineConfig,
+  store: Store,
+  locale: string,
+  describeChange: CommandOptions['describeChange'],
+  leaseMs: CommandOptions['leaseMs'],
+): CommandOutput | ReturnType<typeof createEngine> {
+  // A finite lease below the floor is a units mistake a project script makes (seconds written
+  // where milliseconds were meant), not something the engine can honour: a renewal on every
+  // tick would commit over GitHub while the lease still lapses between ticks. Refuse it here,
+  // before the engine is built and before any store call, so no reservation is ever written.
+  // A value that is not a positive finite number is a different mistake and still reaches the
+  // engine, which names it as an `InvalidLease`.
+  if (leaseMs !== undefined && Number.isFinite(leaseMs) && leaseMs > 0 && leaseMs < MIN_LEASE_MS) {
+    return { ok: false, text: leaseTooShortText(locale) };
+  }
+
   try {
-    return createEngine({ config, store });
+    // `exactOptionalPropertyTypes` forbids an explicit `undefined`, so each key is only present
+    // when the project actually supplied a value. Over GitHub every renewal is a commit, so the
+    // lease the project asks for must reach the engine untouched.
+    return createEngine({
+      config,
+      store,
+      ...(describeChange === undefined ? {} : { describeChange }),
+      ...(leaseMs === undefined ? {} : { leaseMs }),
+    });
   } catch (error) {
     if (error instanceof InvalidPipeline) {
       return { ok: false, text: invalidConfigText(error.errors, locale) };
+    }
+    // A lease the engine refuses is the project's configuration mistake, like a bad pipeline:
+    // it is an answer to the person, not a stack trace out of the process.
+    if (error instanceof InvalidLease) {
+      return { ok: false, text: invalidLeaseText(locale) };
     }
     throw error;
   }
@@ -269,6 +305,19 @@ function invalidConfigText(errors: readonly string[], locale: string): string {
   return languageOf(locale) === 'es'
     ? `La configuración no es válida: ${detail}`
     : `The configuration is not valid: ${detail}`;
+}
+
+function invalidLeaseText(locale: string): string {
+  return languageOf(locale) === 'es'
+    ? 'La duración del lease no es válida: debe ser un número finito de milisegundos mayor que cero.'
+    : 'The lease duration is not valid: it must be a finite number of milliseconds greater than zero.';
+}
+
+function leaseTooShortText(locale: string): string {
+  const seconds = MIN_LEASE_MS / 1000;
+  return languageOf(locale) === 'es'
+    ? `La duración del lease es demasiado corta: el mínimo es ${seconds} segundos.`
+    : `The lease duration is too short: the minimum is ${seconds} seconds.`;
 }
 
 function busyText(locale: string): string {
@@ -299,7 +348,7 @@ export async function runCommand(argv: readonly string[], options: CommandOption
         return { ok: false, text: missingPieceText(locale) };
       }
 
-      const engine = openEngine(config, store, locale);
+      const engine = openEngine(config, store, locale, options.describeChange, options.leaseMs);
       if (isOutput(engine)) return engine;
 
       const dryRun = args.includes('--dry-run');
@@ -308,7 +357,7 @@ export async function runCommand(argv: readonly string[], options: CommandOption
     }
 
     case 'status': {
-      const engine = openEngine(config, store, locale);
+      const engine = openEngine(config, store, locale, options.describeChange, options.leaseMs);
       if (isOutput(engine)) return engine;
 
       const piece = args[0];
