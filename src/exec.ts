@@ -34,6 +34,11 @@ export type ResolvedExecutable =
       readonly command: string;
       /** Arguments that must go before the caller's, such as the script a shim runs. */
       readonly prefixArgs: readonly string[];
+      /**
+       * Environment the shim would have set before running the program, such as the NODE_PATH
+       * pnpm writes into its bins. Absent when the program needs nothing extra.
+       */
+      readonly env?: Readonly<Record<string, string>>;
     }
   | { readonly ok: false; readonly reason: string };
 
