@@ -38,14 +38,34 @@ package has to be compiled first, and pnpm 10 refuses build scripts from git dep
 
 ## Status
 
-Slices 1 to 4 are done: `engine` with the in-memory store, `gates`, `providers` and `locks`.
+Slices 1 to 4 are done: `engine`, `gates`, `providers` and `locks`. A piece's progress can live in
+memory (`createMemoryStore`) or on GitHub (`createGitStore` over `createGitHubStatePort`), so a run
+survives its session and another terminal sees it.
 
-Not built yet: the GitHub-backed store (labels, events and a journal in the branch). Until it
-exists, `run` does not survive between sessions and other terminals cannot see a piece.
+## Where progress lives on GitHub
+
+```ts
+const store = createGitStore({
+  port: createGitHubStatePort({ owner: 'you', repo: 'project' }),
+});
+```
+
+- The state is a commit history on `refs/ai-workflows/state`: not a branch or a tag, so writing it
+  fires no deployments and no push workflows. Branches and tags are refused.
+- One folder per piece: `pieces/<piece>/status.json`, `journal.json`, `effects.json` and
+  `lease.json`; one file per zone under `zones/`.
+- Every write reads the head, decides from that one read, commits on top of it and moves the ref
+  only if nobody moved it first (GraphQL `updateRefs` with `beforeOid`). A lost race is re-read and
+  retried; a stale status write fails with `StaleVersion`.
+- It talks to GitHub through `gh`, with the account `gh` is logged in to, never through a shell.
+- Each write costs about six API calls, and the engine renews its lease every third of `leaseMs`.
+  Over GitHub, use a lease of minutes (for example `leaseMs: 300_000`), not the 30-second default.
 
 ## What it does not promise
 
 - Nothing stops a repository administrator from changing or disabling the rules.
 - A sign-off by comment proves which GitHub account wrote it, not which person.
+- Anyone who can push to the repository can rewrite `refs/ai-workflows/state`. The journal is not
+  yet rebuilt from GitHub's own events, so a hand-edited state is believed.
 - The editor hooks are help, not a guarantee: they do not see MCP tools, and a determined agent
   can still reach the same result by other means. The server check is the mandatory layer.
