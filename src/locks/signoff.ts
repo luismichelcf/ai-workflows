@@ -39,11 +39,21 @@ const FENCE_OPEN = /^ {0,3}(`{3,}|~{3,})/;
 const FENCE_CLOSE = /^ {0,3}(`{3,}|~{3,})[ \t]*$/;
 
 /** The real `<details` and `<pre` tags: the name must end at a space, `>` or the line, so a
- * word like `<preview>` is not a tag. Case matters no more in HTML than in GitHub's renderer. */
-const DETAILS_OPEN = /<details(?=[\s>]|$)/i;
-const DETAILS_CLOSE = /<\/details>/i;
-const PRE_OPEN = /<pre(?=[\s>]|$)/i;
-const PRE_CLOSE = /<\/pre>/i;
+ * word like `<preview>` is not a tag. Case matters no more in HTML than in GitHub's renderer.
+ * They carry the `g` flag because the left-to-right scan advances through a line. */
+const DETAILS_OPEN = /<details(?=[\s>]|$)/gi;
+const DETAILS_CLOSE = '</details>';
+const PRE_OPEN = /<pre(?=[\s>]|$)/gi;
+const PRE_CLOSE = '</pre>';
+
+/** A list item marker at the start: up to three spaces, `-`/`*`/`+` or a number, then a space.
+ * It is a container, not content, so removing it is what exposes a fence or quote written
+ * at the start of an item. */
+const LIST_MARKER = /^ {0,3}(?:[-*+]|\d{1,9}[.)])[ \t]+/;
+
+/** An ATX heading: up to three spaces, one to six `#`, then a space or the end of the line.
+ * A heading interrupts the paragraph inside a block quote, so it ends the quote. */
+const HEADING = /^ {0,3}#{1,6}(?:[ \t]|$)/;
 
 /**
  * Drops inline code spans (matched runs of backticks) from a line. A tag or comment marker
@@ -87,6 +97,90 @@ interface Fence {
   readonly length: number;
 }
 
+/** The regions that hide the text they wrap from the rendered page. Each can open and close
+ * several times on a line, so what matters is the state the last marker leaves behind. */
+interface HiddenState {
+  readonly comment: boolean;
+  readonly details: boolean;
+  readonly pre: boolean;
+}
+
+/** The state after scanning a line, plus whether any marker appeared on it. */
+interface HiddenScan extends HiddenState {
+  readonly touched: boolean;
+}
+
+/**
+ * Position of the next matching tag from `from` onwards, or `-1`. The regex is shared and
+ * stateful, so its cursor is set before every search.
+ */
+function indexOfTag(lower: string, tag: RegExp, from: number): number {
+  tag.lastIndex = from;
+  const match = tag.exec(lower);
+  return match === null ? -1 : match.index;
+}
+
+/**
+ * Reads a line left to right and returns the state its last marker leaves, exactly as GitHub
+ * does: `<details>a</details><details>` still leaves a details open, and `<!-- a --> b <!--`
+ * still leaves a comment open. Inline code is dropped first, because a marker written inside
+ * backticks is literal text GitHub shows as typed, not markup.
+ */
+function scanHidden(raw: string, state: HiddenState): HiddenScan {
+  const lower = stripInlineCode(raw).toLowerCase();
+  let { comment, details, pre } = state;
+  // A line that begins inside a region is already hidden; any marker seen keeps it so.
+  let touched = comment || details || pre;
+  let at = 0;
+
+  while (at < lower.length) {
+    if (comment) {
+      const close = lower.indexOf('-->', at);
+      if (close === -1) break;
+      comment = false;
+      touched = true;
+      at = close + 3;
+      continue;
+    }
+    if (details) {
+      const close = lower.indexOf(DETAILS_CLOSE, at);
+      if (close === -1) break;
+      details = false;
+      touched = true;
+      at = close + DETAILS_CLOSE.length;
+      continue;
+    }
+    if (pre) {
+      const close = lower.indexOf(PRE_CLOSE, at);
+      if (close === -1) break;
+      pre = false;
+      touched = true;
+      at = close + PRE_CLOSE.length;
+      continue;
+    }
+
+    const commentAt = lower.indexOf('<!--', at);
+    const detailsAt = indexOfTag(lower, DETAILS_OPEN, at);
+    const preAt = indexOfTag(lower, PRE_OPEN, at);
+    const candidates = [commentAt, detailsAt, preAt].filter((index) => index !== -1);
+    if (candidates.length === 0) break;
+    const next = Math.min(...candidates);
+    touched = true;
+    if (next === commentAt) {
+      comment = true;
+      at = next + 4;
+    } else if (next === detailsAt) {
+      details = true;
+      at = next + '<details'.length;
+    } else {
+      pre = true;
+      at = next + '<pre'.length;
+    }
+  }
+
+  return { comment, details, pre, touched };
+}
+
 /**
  * Whether a line closes the open fence: same marker character, at least as long as the
  * opener, and nothing else on the line. A longer run closes a shorter fence, which is how
@@ -108,68 +202,62 @@ function collectOrderLines(body: string): readonly OrderLine[] {
   // are content, not regions. HTML comments, <details> and <pre> hide their contents from
   // the rendered page even across lines.
   let fence: Fence | undefined;
-  let htmlComment = false;
-  let details = false;
-  let pre = false;
+  let hidden: HiddenState = { comment: false, details: false, pre: false };
   let quote = false;
 
   for (const raw of body.split(/\r?\n/)) {
-    if (fence) {
+    if (fence !== undefined) {
       if (closesFence(raw, fence)) fence = undefined;
       continue;
     }
-    if (htmlComment) {
-      if (raw.includes('-->')) htmlComment = false;
-      continue;
-    }
-    if (details) {
-      if (DETAILS_CLOSE.test(raw)) details = false;
-      continue;
-    }
-    if (pre) {
-      if (PRE_CLOSE.test(raw)) pre = false;
+
+    // Inside a comment, <details> or <pre> the whole line is invisible. The scan still runs
+    // so that a marker closing one region and another opening on the same line leave GitHub's
+    // real final state, and the next line is hidden or not accordingly.
+    if (hidden.comment || hidden.details || hidden.pre) {
+      const scan = scanHidden(raw, hidden);
+      hidden = { comment: scan.comment, details: scan.details, pre: scan.pre };
       continue;
     }
 
-    // A blank line ends a block quote. Without one, the line after a quote is a lazy
-    // continuation: GitHub keeps it inside the quote, so it is not the owner's own text.
+    // A list item marker is a container, not content: dropping it (with its indentation) is
+    // what lets a fence or a quote written at the start of an item be recognised.
+    const content = raw.replace(LIST_MARKER, '');
+
+    // A blank line ends a block quote.
     if (raw.trim() === '') {
       quote = false;
       continue;
     }
-    if (/^ {0,3}>/.test(raw)) {
+
+    // A heading or a fence ends an open quote: both interrupt the quote's paragraph, so the
+    // owner's own text starts again after them. Any other line without `>` is a lazy
+    // continuation, which GitHub keeps inside the quote.
+    if (quote) {
+      if (/^ {0,3}>/.test(content)) continue;
+      if (!HEADING.test(content) && FENCE_OPEN.exec(content)?.[1] === undefined) continue;
+      quote = false;
+    }
+
+    // A quote written on this line opens one.
+    if (/^ {0,3}>/.test(content)) {
       quote = true;
       continue;
     }
-    if (quote) continue;
 
-    // A fence is literal from here on, so any tag or quote marker on the opener line is
-    // content, not markup. Detect it before looking for tags.
-    const openMarker = FENCE_OPEN.exec(raw)?.[1];
+    // A fence is literal from here on, so any marker on its opener line is content, not
+    // markup. Detect it before looking for tags, after the list marker was removed.
+    const openMarker = FENCE_OPEN.exec(content)?.[1];
     if (openMarker !== undefined) {
       fence = { char: openMarker[0] === '~' ? '~' : '`', length: openMarker.length };
       continue;
     }
 
-    // Inline code is literal too: `` `<!--` `` shows the marker, it does not open one.
-    const visible = stripInlineCode(raw);
-
-    // A comment that both opens and closes on one line hides only that line.
-    if (visible.includes('<!--')) {
-      if (!visible.includes('-->')) htmlComment = true;
-      continue;
-    }
-
-    // <details> and <pre> hide what follows only while their tag stays open. When the closing
-    // tag is on the same line, the line is complete and does not reach the next one.
-    if (DETAILS_OPEN.test(visible)) {
-      if (!DETAILS_CLOSE.test(visible)) details = true;
-      continue;
-    }
-    if (PRE_OPEN.test(visible)) {
-      if (!PRE_CLOSE.test(visible)) pre = true;
-      continue;
-    }
+    // Comments, <details> and <pre> hide what follows; the left-to-right scan keeps whatever
+    // state the last marker leaves. The line carries markup, so it is never an order itself.
+    const scan = scanHidden(raw, hidden);
+    hidden = { comment: scan.comment, details: scan.details, pre: scan.pre };
+    if (scan.touched) continue;
 
     const line = raw.trim();
     const match = SIGN_OFF_LINE.exec(line);
