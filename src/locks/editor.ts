@@ -67,10 +67,12 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
 // server cannot tell it apart from him, so no agent may put the order itself into a command or a
 // file. This must be judged before any other rule, and the two surfaces are read differently:
 //
-//   - Shell tools (Bash, PowerShell, and Claude Code's Monitor, which runs a shell command)
-//     carry their text in `command`. Any `/visto-bueno` there is refused, placeholder or not:
-//     the shell can fill a `<placeholder>` in before GitHub sees it (`"/visto-bueno <sha>"
-//     -replace '<sha>', (git rev-parse HEAD)`, `sed`, string concatenation, a variable).
+//   - Shell tools (Bash, PowerShell, and Claude Code's Monitor, which runs a shell command or a
+//     WebSocket) carry their text in `command` when they run one. Any `/visto-bueno` there is
+//     refused, placeholder or not: the shell can fill a `<placeholder>` in before GitHub sees it
+//     (`"/visto-bueno <sha>" -replace '<sha>', (git rev-parse HEAD)`, `sed`, string concatenation,
+//     a variable). A Monitor with no `command` but a `ws` object runs no shell at all, so it is
+//     allowed rather than refused as unreadable.
 //   - Writing tools (Write, Edit, MultiEdit, NotebookEdit, Codex's apply_patch) carry the file's
 //     text. Only a line the server itself would read as the order is refused: `/visto-bueno` at
 //     the start of the trimmed line, then whitespace, then a value that is not a `<placeholder>`.
@@ -161,7 +163,15 @@ function signOffRefusal(toolName: string, toolInput: unknown): LockDecision | un
   };
 
   if (SHELL_TOOLS.has(toolName)) {
-    const command = asRecord(toolInput)?.command;
+    const record = asRecord(toolInput);
+    const command = record?.command;
+    // Claude Code's Monitor runs either a shell `command` or a WebSocket `ws`, never both (its
+    // own documentation, 13-sep-2026). A `ws` monitor carries no shell text, so there is nothing
+    // that could smuggle the order in: it may pass. Only Monitor gets this exit; a shell tool
+    // with an unreadable command stays refused, because that command might be anything.
+    if (typeof command !== 'string' && toolName === 'Monitor' && asRecord(record?.ws)) {
+      return undefined;
+    }
     // A shell command the hook cannot read might be anything, including the order. Refuse.
     if (typeof command !== 'string') {
       return {
