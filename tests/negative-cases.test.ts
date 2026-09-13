@@ -35,12 +35,15 @@ export const NOT_YET_EXECUTABLE: Record<string, string> = {
   'CN-09': 'needs the module boundary lint of a real project (slice 5)',
 };
 
+const SHA_A = '9f420f5c1a2b3d4e5f60718293a4b5c6d7e8f901';
+const SHA_B = 'd9bbf4f0e1d2c3b4a59687766554433221100ffe';
+
 const builder: ExecutionIdentity = { provider: 'deepseek', model: 'deepseek-flash', session: 's-1' };
 const reviewer: ExecutionIdentity = { provider: 'claude', model: 'claude-opus-5', session: 's-2' };
 
 const verdict = (over: Partial<Verdict> = {}): Verdict => ({
   by: reviewer,
-  sha: 'abc123',
+  sha: SHA_B,
   approved: true,
   ...over,
 });
@@ -105,15 +108,15 @@ describe('CN-02 · the builder approving its own work', () => {
 
 describe('CN-03 · using the review of A after the code became B', () => {
   it('is refused, naming both versions', () => {
-    const result = requireFreshVerdicts([verdict({ sha: 'A' })], 'B');
+    const result = requireFreshVerdicts([verdict({ sha: SHA_A })], SHA_B);
 
     expect(result.ok).toBe(false);
-    expect(result.ok === false && result.reason).toContain('A');
-    expect(result.ok === false && result.reason).toContain('B');
+    expect(result.ok === false && result.reason).toContain(SHA_A.slice(0, 7));
+    expect(result.ok === false && result.reason).toContain(SHA_B.slice(0, 7));
   });
 
   it('positive control: once B is reviewed, it advances', () => {
-    expect(requireFreshVerdicts([verdict({ sha: 'B' })], 'B').ok).toBe(true);
+    expect(requireFreshVerdicts([verdict({ sha: SHA_B })], SHA_B).ok).toBe(true);
   });
 });
 
