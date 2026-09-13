@@ -293,7 +293,9 @@ export function createGitStore(options: GitStoreOptions): Store {
       if (decision.kind === 'idle') return decision.value;
       const committed = await port.commit(ref, head, decision.plan.changes, decision.plan.message);
       if (committed !== undefined) return decision.after(committed);
-      await pause(backoff(attempt));
+      // Pause only between attempts: sleeping after the last loss adds up to two seconds of
+      // backoff before reporting an error that is already decided, with no retry left to use it.
+      if (attempt + 1 < maxAttempts) await pause(backoff(attempt));
     }
     throw new Error(`the state ref ${ref} did not stop moving after ${maxAttempts} attempts`);
   };
