@@ -1,6 +1,6 @@
 {
   "name": "ai-workflows",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "private": true,
   "type": "module",
   "description": "Deterministic stage engine for coding agents: configurable pipelines whose transitions are verified by code, not by prompt.",
@@ -9,10 +9,14 @@
     "node": ">=20"
   },
   "exports": {
-    ".": "./dist/index.js"
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
   },
   "scripts": {
     "build": "tsc",
+    "prepare": "tsc",
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
@@ -22,5 +26,9 @@
     "@types/node": "^22.10.2",
     "typescript": "^5.7.2",
     "vitest": "^2.1.8"
-  }
+  },
+  "files": [
+    "dist"
+  ],
+  "types": "./dist/index.d.ts"
 }
