@@ -31,5 +31,21 @@ jobs:
       - name: Install
         run: pnpm install --frozen-lockfile
 
+      # How pnpm is installed on this machine: the engine must find the real program behind it
+      # without a shell, and shim shapes differ between installers.
+      - name: Show how pnpm is installed
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Get-Command pnpm -All | Format-Table -AutoSize CommandType, Source
+          foreach ($cmd in Get-Command pnpm -All) {
+            if ($cmd.Source -match '\.(cmd|ps1)$') {
+              Write-Output "----- $($cmd.Source)"
+              Get-Content $cmd.Source -TotalCount 40
+            }
+          }
+          Write-Output "PATH:"
+          $env:PATH -split ';' | Select-Object -First 25
+
       - name: Typecheck and test
         run: pnpm check
