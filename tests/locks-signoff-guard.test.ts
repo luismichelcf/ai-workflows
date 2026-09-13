@@ -101,8 +101,9 @@ describe('ordinary work is untouched', () => {
 });
 
 describe('the hook is wired to the shell tools as well', () => {
-  it('claude: the four editing tools plus Bash and PowerShell, nothing else', () => {
-    expect(buildHooksConfig('claude', 'x').hooks.PreToolUse[0]?.matcher).toBe('Write|Edit|MultiEdit|NotebookEdit|Bash|PowerShell');
+  it('claude: the four editing tools plus the shell tools, nothing else', () => {
+    // Monitor runs a shell command too (third review of the part 4 fixes).
+    expect(buildHooksConfig('claude', 'x').hooks.PreToolUse[0]?.matcher).toBe('Write|Edit|MultiEdit|NotebookEdit|Bash|PowerShell|Monitor');
   });
 
   it('codex: apply_patch and Bash', () => {

@@ -65,60 +65,84 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
 // The owner's sign-off is a comment only he may write: `/visto-bueno <sha>` names the exact
 // version he looked at (see signoff.ts). When an agent writes it with the owner's account, the
 // server cannot tell it apart from him, so no agent may put the order itself into a command or a
-// file. The order counts as soon as `/visto-bueno` is followed by anything but a `<placeholder>`,
-// and this must be judged before any other rule: the shell can split the order across quotes
-// (`"/visto-bueno "$SHA`), leave it unquoted (`/visto-bueno\ $SHA`), build it in a variable
-// (`"/visto-bueno " + $sha`), fill it in later (`$(git rev-parse HEAD)`, `${SHA}`, a backtick,
-// `%SHA%`) or simply end the text right after it (`echo -n /visto-bueno`) — GitHub still posts
-// each of those as a valid order. Allowing only the placeholder form is what keeps explanations
-// like "escribe `/visto-bueno <sha>`" safe to write.
-const SIGN_OFF_ORDER = /\/visto-bueno(?!\s*<)/i;
+// file. This must be judged before any other rule, and the two surfaces are read differently:
+//
+//   - Shell tools (Bash, PowerShell, and Claude Code's Monitor, which runs a shell command)
+//     carry their text in `command`. Any `/visto-bueno` there is refused, placeholder or not:
+//     the shell can fill a `<placeholder>` in before GitHub sees it (`"/visto-bueno <sha>"
+//     -replace '<sha>', (git rev-parse HEAD)`, `sed`, string concatenation, a variable).
+//   - Writing tools (Write, Edit, MultiEdit, NotebookEdit, Codex's apply_patch) carry the file's
+//     text. Only a line the server itself would read as the order is refused: `/visto-bueno` at
+//     the start of the trimmed line, then whitespace, then a value that is not a `<placeholder>`.
+//     Everything else — the project's own sign-off regex, a sentence that names the order, a
+//     document explaining it — is a mention, not the order, and stays writable.
+//
+// This is help, not a guarantee: an agent can still write a template holding `<sha>` in one step
+// and fill it in with the shell in another, never naming the order where this hook can read it.
+const SHELL_TOOLS = new Set(['Bash', 'PowerShell', 'Monitor']);
+const SHELL_SIGN_OFF = /\/visto-bueno/i;
+const FILE_SIGN_OFF_LINE = /^\/visto-bueno\s+(\S.*)$/i;
+
+interface SignOffText {
+  readonly text: string;
+  /** A Codex patch line carries a leading `+` when it adds; strip one before judging the line. */
+  readonly stripPlus: boolean;
+}
+
+/** True when one line, trimmed, is a line the server would read as the owner's order. */
+function isSignOffOrderLine(rawLine: string, stripPlus: boolean): boolean {
+  let line = rawLine.trim();
+  if (stripPlus) line = line.replace(/^\+/, '').trim();
+
+  const value = FILE_SIGN_OFF_LINE.exec(line)?.[1];
+  return value !== undefined && !value.startsWith('<');
+}
+
+/** True when any line of the text the tool is about to write would be read as the order. */
+function writesSignOffLine(text: string, stripPlus: boolean): boolean {
+  return text.split(/\r?\n/).some((line) => isSignOffOrderLine(line, stripPlus));
+}
 
 /**
- * The text each covered tool is about to execute or write. Shell tools `Bash` and `PowerShell`
- * carry their command in `tool_input.command` (Codex's own docs, read 13-sep-2026: shell commands
- * and `exec_command` arrive as `Bash` with the command there, like `apply_patch`). `undefined`
- * means a shell tool's command could not be read — itself a refusal — while an editing tool with
- * no readable text simply has nothing to check here.
+ * The text each writing tool is about to write, with whether its lines carry a leading `+`.
+ * `undefined` means the request could not be read and must be refused: an `apply_patch` whose
+ * `command` is not text cannot be inspected. An empty list means there is nothing to judge here.
  */
-function signOffTexts(toolName: string, toolInput: unknown): string[] | undefined {
+function fileSignOffTexts(toolName: string, toolInput: unknown): SignOffText[] | undefined {
   const record = asRecord(toolInput);
-
-  if (toolName === 'Bash' || toolName === 'PowerShell') {
-    const command = record?.command;
-    return typeof command === 'string' ? [command] : undefined;
-  }
 
   if (toolName === 'Write') {
     const content = record?.content;
-    return typeof content === 'string' ? [content] : [];
+    return typeof content === 'string' ? [{ text: content, stripPlus: false }] : [];
   }
 
   if (toolName === 'Edit') {
     const changed = record?.new_string;
-    return typeof changed === 'string' ? [changed] : [];
+    return typeof changed === 'string' ? [{ text: changed, stripPlus: false }] : [];
   }
 
   if (toolName === 'MultiEdit') {
     const edits = record?.edits;
     if (!Array.isArray(edits)) return [];
 
-    const texts: string[] = [];
+    const texts: SignOffText[] = [];
     for (const edit of edits) {
       const changed = asRecord(edit)?.new_string;
-      if (typeof changed === 'string') texts.push(changed);
+      if (typeof changed === 'string') texts.push({ text: changed, stripPlus: false });
     }
     return texts;
   }
 
   if (toolName === 'NotebookEdit') {
     const source = record?.new_source;
-    return typeof source === 'string' ? [source] : [];
+    return typeof source === 'string' ? [{ text: source, stripPlus: false }] : [];
   }
 
   if (toolName === 'apply_patch') {
     const command = record?.command;
-    return typeof command === 'string' ? [command] : [];
+    // Not text: the patch cannot be read, so it cannot be cleared. Refused even with a piece.
+    if (typeof command !== 'string') return undefined;
+    return [{ text: command, stripPlus: true }];
   }
 
   return [];
@@ -129,26 +153,38 @@ function signOffTexts(toolName: string, toolInput: unknown): string[] | undefine
  * Returns `undefined` when the call may continue to the folder rules.
  */
 function signOffRefusal(toolName: string, toolInput: unknown): LockDecision | undefined {
-  const texts = signOffTexts(toolName, toolInput);
+  const order: LockDecision = {
+    allow: false,
+    reason:
+      'El visto bueno del dueño solo lo da él. No escribas tú `/visto-bueno <sha>` con su cuenta: ' +
+      'pídeselo al dueño y que sea él quien lo escriba en el PR.',
+  };
 
-  // A shell command the hook cannot read might be anything, including the order. Refuse.
+  if (SHELL_TOOLS.has(toolName)) {
+    const command = asRecord(toolInput)?.command;
+    // A shell command the hook cannot read might be anything, including the order. Refuse.
+    if (typeof command !== 'string') {
+      return {
+        allow: false,
+        reason:
+          'No pude leer el comando de esta herramienta: el candado se niega a adivinar si iba a escribir el visto bueno del dueño. Revisa el formato de tool_input.',
+      };
+    }
+    // Shell text can fill a placeholder in before GitHub sees it, so any appearance is refused.
+    return SHELL_SIGN_OFF.test(command) ? order : undefined;
+  }
+
+  const texts = fileSignOffTexts(toolName, toolInput);
+  // An unreadable patch might carry the order; refuse rather than guess.
   if (texts === undefined) {
     return {
       allow: false,
       reason:
-        'No pude leer el comando de esta herramienta: el candado se niega a adivinar si iba a escribir el visto bueno. Revisa el formato de tool_input.',
+        'No pude leer lo que esta herramienta iba a escribir: el candado se niega a adivinar si era el visto bueno del dueño. Revisa el formato de tool_input.',
     };
   }
 
-  if (texts.some((text) => SIGN_OFF_ORDER.test(text))) {
-    return {
-      allow: false,
-      reason:
-        'El visto bueno del dueño solo lo da él. No escribas tú `/visto-bueno <sha>` con su cuenta: pídeselo al dueño y que sea él quien lo escriba en el PR.',
-    };
-  }
-
-  return undefined;
+  return texts.some(({ text, stripPlus }) => writesSignOffLine(text, stripPlus)) ? order : undefined;
 }
 
 /** The paths a covered tool will write, or `undefined` when the request cannot be read. */
@@ -176,12 +212,12 @@ function writeTargets(toolName: string, toolInput: unknown): string[] | undefine
  * The covered surfaces are declared, not implied. For the folder rules (below): Claude's Write,
  * Edit, MultiEdit and NotebookEdit, and Codex's apply_patch. Shell commands that write are not
  * judged by their path — the git pre-commit hook catches what they stage. For the owner's
- * sign-off rule only, Bash and PowerShell are covered too, since the order travels in their
- * `command` text. In Codex, `write_stdin` does not pass through this hook again (its own
+ * sign-off rule only, Bash, PowerShell and Monitor are covered too, since the order travels in
+ * their `command` text. In Codex, `write_stdin` does not pass through this hook again (its own
  * documentation, read 13-sep-2026), so a command typed into a running session is not re-judged
  * here; there is no `tool_input` to read for it on this seam. It is help, not a guarantee: the
- * hook never sees MCP tools, and an agent set on writing the order can still do it by other
- * means this hook does not read.
+ * hook never sees MCP tools, and an agent can write a `<sha>` template in one step and fill it in
+ * with the shell in another, never naming the order where this hook can read it.
  */
 export function decideToolUse(input: HookInput, context: LockContext): LockDecision {
   // Rule 0: no agent writes the owner's sign-off for him. Checked before every other rule, and
@@ -192,7 +228,7 @@ export function decideToolUse(input: HookInput, context: LockContext): LockDecis
   // Shell tools are covered only by the sign-off rule above: their command is not a path this
   // lock can judge, and without the order they always pass. The pre-commit hook guards what they
   // stage, not what they run.
-  if (input.toolName === 'Bash' || input.toolName === 'PowerShell') return { allow: true };
+  if (SHELL_TOOLS.has(input.toolName)) return { allow: true };
 
   const isCovered =
     CLAUDE_FILE_TOOLS.has(input.toolName) || input.toolName === 'NotebookEdit' || input.toolName === 'apply_patch';

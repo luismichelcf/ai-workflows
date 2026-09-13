@@ -25,9 +25,11 @@ export interface HooksFile {
  * exact names keeps the hook off every other tool — reading included.
  */
 export function buildHooksConfig(client: HookClient, command: string): HooksFile {
-  // Bash and PowerShell ride along so the sign-off rule can see shell commands; the hook lets
-  // them through itself when they carry no sign-off (see editor.ts).
-  const matcher = client === 'claude' ? 'Write|Edit|MultiEdit|NotebookEdit|Bash|PowerShell' : 'apply_patch|Bash';
+  // Bash, PowerShell and Monitor ride along so the sign-off rule can see shell commands; the hook
+  // lets them through itself when they carry no sign-off (see editor.ts). Monitor runs a shell
+  // command like Bash, so it carries the same `command` text.
+  const matcher =
+    client === 'claude' ? 'Write|Edit|MultiEdit|NotebookEdit|Bash|PowerShell|Monitor' : 'apply_patch|Bash';
 
   return {
     hooks: {
@@ -151,15 +153,17 @@ export function mergeHooksConfig(existing: unknown, ours: HooksFile): Record<str
   const ourCommand = normalizeCommand(firstCommand(ours));
   const ourGroups = ours.hooks.PreToolUse;
 
-  // Rule 1: look for a numeric timeout the user set on one of our handlers before we rebuild
-  // anything, so the single copy keeps it even when the first copy did not carry one.
+  // Rule 1: look for a usable timeout the user set on one of our handlers before we rebuild
+  // anything, so the single copy keeps it even when the first copy did not carry one. Only a
+  // positive whole number is kept: `'30'`, 0, -5, a fraction or NaN would be copied into the
+  // file as a timeout the CLI cannot honor, so they are dropped like an absent one.
   let ourTimeout: number | undefined;
   for (const group of currentGroups) {
     const handlers = Array.isArray(group.hooks) ? group.hooks : undefined;
     if (handlers === undefined) continue;
     for (const handler of handlers) {
       if (!isOurHandler(handler, ourCommand) || !isRecord(handler)) continue;
-      if (typeof handler.timeout === 'number') {
+      if (typeof handler.timeout === 'number' && Number.isInteger(handler.timeout) && handler.timeout > 0) {
         ourTimeout = handler.timeout;
         break;
       }
