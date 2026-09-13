@@ -58,7 +58,13 @@ describe('a long output is read whole, and a cut-off one never reads as green', 
 
   it('a truncated run is neither green nor red evidence', () => {
     const run: TestRun = { output: ' Tests  5 passed (5)\n', exitCode: 0, truncated: true };
-    const red: TestRun = { output: ' FAIL  t/a.test.ts > x\n Tests  1 failed (1)\n', exitCode: 1, truncated: true };
+    // A red run that would count as evidence if it were whole: a failure with its assertion.
+    const red: TestRun = {
+      output: ' FAIL  t/a.test.ts > x\nAssertionError: expected 1 to be 2\n Tests  1 failed (1)\n',
+      exitCode: 1,
+      truncated: true,
+    };
+    expect(isRedEvidence(parseTestRun({ ...red, truncated: false }))).toBe(true);
 
     expect(isGreenRun(parseTestRun(run))).toBe(false);
     expect(isRedEvidence(parseTestRun(red))).toBe(false);
