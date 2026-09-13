@@ -162,58 +162,129 @@ export interface TestRunSummary {
   readonly exitCode: number | null;
 }
 
-/** Markers that mean the runner never got as far as executing tests. */
-const BROKEN_ENVIRONMENT_MARKERS = ['Failed to load url', 'ERR_MODULE_NOT_FOUND', 'SyntaxError'];
+/**
+ * Strips ANSI CSI sequences. Colour is the normal case on Windows when output is piped, and
+ * an unstripped `\u001b[31m1 failed` never matches a count: a red run would read as "nothing
+ * failed". Every rule below reads this plain text, never the raw output.
+ */
+const ANSI_CSI_PATTERN = /\u001B\[[0-9;]*[A-Za-z]/g;
+
+function stripAnsi(text: string): string {
+  return text.replace(ANSI_CSI_PATTERN, '');
+}
 
 /** Reads what a test run actually did. Never trusts the exit code alone. */
 export function parseTestRun(run: TestRun): TestRunSummary {
-  const { output } = run;
+  const output = stripAnsi(run.output);
 
-  // A failure is only a failure if it is named. Keep the test name after `FAIL`.
-  const failures = [...output.matchAll(/^[^\S\n]*FAIL\s+(.+?)\s*$/gm)].map((match) =>
+  // Every `Tests ...` line, not just the first. Chained runs (`a && b`) print one summary
+  // each, and reading only the first turned a red second run green. Rule 2.
+  const summaryLines = [...output.matchAll(/^[^\S\n]*Tests\s+(.+?)\s*$/gm)].map((match) =>
     (match[1] ?? '').trim(),
   );
+  const passed = sumSummaryCounts(summaryLines, 'passed');
+  const failedFromSummary = sumSummaryCounts(summaryLines, 'failed');
+
+  // A named failing test is the only thing that counts as a red test. `FAIL  file [ file ]`
+  // is a suite that never loaded, not a test: it is skipped here and marks the environment
+  // broken below. Rule 3.
+  const failures: string[] = [];
+  let failedSuite = false;
+  for (const match of output.matchAll(/^[^\S\n]*FAIL\s+([^\n]+)$/gm)) {
+    const detail = (match[1] ?? '').trim();
+    if (/\[[^\]]*\]\s*$/.test(detail)) {
+      failedSuite = true;
+      continue;
+    }
+    const separator = detail.indexOf('>');
+    if (separator === -1) continue;
+    failures.push(detail.slice(separator + 1).trim());
+  }
 
   // The assertion message is what proves the test failed for the reason it was written for.
+  // Rule 4.
   const assertions = [...output.matchAll(/AssertionError:[^\n]*/g)].map((match) =>
     (match[0] ?? '').trim(),
   );
 
-  const summary = /^[^\S\n]*Tests\s+(.+)$/m.exec(output);
-  const summaryLine = summary?.[1] ?? '';
-  const failedFromSummary = countInSummary(summaryLine, 'failed');
-  const passed = countInSummary(summaryLine, 'passed');
+  // Rule 5: never fewer failed tests than the ones named. Even with no summary (the process
+  // was killed mid-run) the names are evidence, so the named count is a floor.
+  const failed = Math.max(failedFromSummary, failures.length);
 
-  // The output rules the exit code, not the other way around: a run that says "failed" is
-  // failed even when it exits zero. When there is no summary line, the named failures are
-  // the only count available.
-  const failed = summary ? failedFromSummary : failures.length;
+  const errors = countErrors(output);
 
+  // Rule 7: broken means the runner never got as far as executing tests. The loose markers
+  // (`SyntaxError`, `Failed to load url`, `ERR_MODULE_NOT_FOUND`) deliberately do NOT decide
+  // this on their own: a test whose own assertion mentions "SyntaxError" is still a valid red
+  // test, and the missing-import markers only mean something when the structure is empty.
   const empty = output.trim().length === 0;
+  const noSummary = summaryLines.length === 0;
+  const noTests = summaryLines.some((line) => line === 'no tests');
+  const noTestFiles = output.includes('No test files found');
+  // No summary is only readable when a failing test was still named; silence with neither a
+  // summary nor a name is a broken environment, never a pass.
   const brokenEnvironment =
-    empty || BROKEN_ENVIRONMENT_MARKERS.some((marker) => output.includes(marker));
+    empty || noTests || failedSuite || noTestFiles || (noSummary && failures.length === 0);
 
-  return { passed, failed, failures, assertions, brokenEnvironment };
+  // Rule 8: the run is intact but nothing ran — every test skipped or todo (or none at all).
+  const ranNothing = !brokenEnvironment && passed + failed === 0;
+
+  return {
+    passed,
+    failed,
+    failures,
+    assertions,
+    brokenEnvironment,
+    errors,
+    ranNothing,
+    exitCode: run.exitCode,
+  };
 }
 
-/** Reads `N failed` / `N passed` out of the `Tests ...` summary line only. */
-function countInSummary(line: string, word: 'failed' | 'passed'): number {
-  const match = new RegExp(`(\\d+)\\s+${word}`).exec(line);
-  return match ? Number(match[1] ?? 0) : 0;
+/** Sums `N passed` / `N failed` across every summary line. Rule 2. */
+function sumSummaryCounts(lines: readonly string[], word: 'passed' | 'failed'): number {
+  const pattern = new RegExp(`(\\d+)\\s+${word}`);
+  return lines.reduce((total, line) => {
+    const match = pattern.exec(line);
+    return total + (match ? Number(match[1] ?? 0) : 0);
+  }, 0);
 }
 
 /**
- * Green means: it ran, it loaded, nothing failed, nothing errored outside the tests, and the
- * process agreed. Silence, skipped-only runs and a non-zero exit are never green.
+ * Errors are failures outside any test: an unhandled rejection or a failing setup file. The
+ * `Errors  N error(s)` line is authoritative; the `Unhandled Errors` block header alone is
+ * one error, for the case where the count line is absent. Rule 6.
  */
-export function isGreenRun(_summary: TestRunSummary): boolean {
-  throw new Error('isGreenRun: not implemented');
+function countErrors(output: string): number {
+  let fromLine = 0;
+  for (const match of output.matchAll(/^[^\S\n]*Errors\s+(\d+)\s+errors?\s*$/gm)) {
+    fromLine += Number(match[1] ?? 0);
+  }
+  if (fromLine === 0 && output.includes('Unhandled Errors')) return 1;
+  return fromLine;
 }
 
 /**
- * A red test is evidence only when a test failed its own assertion. A suite that never
- * loaded is a broken environment, and authorising a build on it is authorising it on nothing.
+ * Rule 10: green means it ran, it loaded, nothing failed, nothing errored outside the tests,
+ * at least one test ran, and the process agreed. Silence, skipped-only runs, a non-zero exit
+ * and an unhandled error are all never green.
  */
-export function isRedEvidence(_summary: TestRunSummary): boolean {
-  throw new Error('isRedEvidence: not implemented');
+export function isGreenRun(summary: TestRunSummary): boolean {
+  return (
+    !summary.brokenEnvironment &&
+    !summary.ranNothing &&
+    summary.failed === 0 &&
+    summary.errors === 0 &&
+    summary.passed > 0 &&
+    summary.exitCode === 0
+  );
+}
+
+/**
+ * Rule 11: a red test is evidence only when a test failed its own assertion. A suite that
+ * never loaded is a broken environment, and authorising a build on it is authorising it on
+ * nothing.
+ */
+export function isRedEvidence(summary: TestRunSummary): boolean {
+  return !summary.brokenEnvironment && summary.failed > 0 && summary.assertions.length > 0;
 }
