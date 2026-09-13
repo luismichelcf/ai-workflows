@@ -26,14 +26,69 @@ interface RequiredCheckEntry {
   readonly integrationId: number | undefined;
 }
 
-/** A branch ruleset only counts if GitHub is told to truly enforce it on the default branch. */
-function appliesToDefaultBranch(ruleset: Record<string, unknown>): boolean {
+const BRANCH_REF_PREFIX = 'refs/heads/';
+
+/**
+ * Compiles a GitHub ref pattern into a regular expression, mirroring fnmatch with
+ * `File::FNM_PATHNAME`: `*` matches anything but a slash, `**` crosses slashes, and `?`
+ * matches exactly one non-slash character; everything else is literal. Without this, a
+ * ruleset aimed only at `refs/heads/release/*` would be read as covering `main`, and a
+ * "protected" verdict would be false.
+ */
+function refPatternToRegExp(pattern: string): RegExp {
+  let source = '';
+  for (let index = 0; index < pattern.length; index += 1) {
+    const char = pattern[index];
+    if (char === undefined) break;
+    if (char === '*') {
+      if (pattern[index + 1] === '*') {
+        source += '.*';
+        index += 1;
+      } else {
+        source += '[^/]*';
+      }
+    } else if (char === '?') {
+      source += '[^/]';
+    } else {
+      source += char.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    }
+  }
+  return new RegExp(`^${source}$`);
+}
+
+/**
+ * Whether one `ref_name` entry covers the repository's default branch. GitHub spells the
+ * default branch as `~DEFAULT_BRANCH`, every branch as `~ALL`, and also accepts a literal
+ * `refs/heads/<name>` or a `refs/heads/...` pattern. Anything else (tags, foreign prefixes,
+ * tokens this code does not know) does not cover it.
+ */
+function refEntryCoversDefaultBranch(entry: string, defaultBranch: string): boolean {
+  if (entry === '~DEFAULT_BRANCH' || entry === '~ALL') return true;
+  const defaultRef = `${BRANCH_REF_PREFIX}${defaultBranch}`;
+  if (entry === defaultRef) return true;
+  if (entry.startsWith(BRANCH_REF_PREFIX)) return refPatternToRegExp(entry).test(defaultRef);
+  return false;
+}
+
+/**
+ * A branch ruleset only counts if GitHub is told to enforce it on the default branch. An
+ * entry in `include` must cover the branch and no entry in `exclude` may cover it, because
+ * GitHub lets an exclusion win over an inclusion.
+ */
+function appliesToDefaultBranch(ruleset: Record<string, unknown>, defaultBranch: string): boolean {
   const conditions = isRecord(ruleset.conditions) ? ruleset.conditions : undefined;
   const refName = conditions && isRecord(conditions.ref_name) ? conditions.ref_name : undefined;
-  const include = refName && Array.isArray(refName.include) ? refName.include : [];
-  // GitHub spells the default branch as the `~DEFAULT_BRANCH` token; a literal
-  // `refs/heads/main` is accepted too, because both mean the same branch.
-  return include.some((entry) => entry === '~DEFAULT_BRANCH' || entry === 'refs/heads/main');
+  if (!refName) return false;
+  const include = Array.isArray(refName.include) ? refName.include : [];
+  const exclude = Array.isArray(refName.exclude) ? refName.exclude : [];
+  const included = include.some(
+    (entry) => typeof entry === 'string' && refEntryCoversDefaultBranch(entry, defaultBranch),
+  );
+  if (!included) return false;
+  const excluded = exclude.some(
+    (entry) => typeof entry === 'string' && refEntryCoversDefaultBranch(entry, defaultBranch),
+  );
+  return !excluded;
 }
 
 /**
@@ -66,6 +121,7 @@ export function verifyProtections(
     };
   }
 
+  const problems: string[] = [];
   let hasActiveApplicable = false;
   let hasDeletion = false;
   let hasNonFastForward = false;
@@ -78,16 +134,63 @@ export function verifyProtections(
     // Only branch rulesets that are actively enforced on the default branch can block a
     // merge; `evaluate` and `disabled` rulesets are recorded but never relied upon.
     if (rawRuleset.target !== 'branch' || rawRuleset.enforcement !== 'active') continue;
-    if (!appliesToDefaultBranch(rawRuleset)) continue;
+
+    // The list endpoint returns a summary without `rules` or `conditions`. Treating it as a
+    // real ruleset would invent a verdict for rules this code never saw, so it is reported
+    // and the caller is told to fetch the detail of each ruleset instead.
+    const hasRules = Object.prototype.hasOwnProperty.call(rawRuleset, 'rules');
+    const hasConditions = Object.prototype.hasOwnProperty.call(rawRuleset, 'conditions');
+    if (!hasRules && !hasConditions) {
+      problems.push(
+        'GitHub devolvió el resumen de una regla, sin sus condiciones ni sus reglas: hay que pedir el detalle de cada regla para saber si protege la rama por defecto.',
+      );
+      continue;
+    }
+
+    // Conditions this code cannot evaluate (repository_name, repository_id,
+    // repository_property, ...) may aim the ruleset at other repositories, so it is not a
+    // protection for this one and is left out rather than trusted.
+    const conditions = isRecord(rawRuleset.conditions) ? rawRuleset.conditions : undefined;
+    const unknownConditionKeys = conditions
+      ? Object.keys(conditions).filter((key) => key !== 'ref_name')
+      : [];
+    if (unknownConditionKeys.length > 0) {
+      problems.push(
+        `Hay una regla con condiciones que no se pueden evaluar (${unknownConditionKeys.join(', ')}): puede estar dirigida a otros repositorios y no se cuenta como protección.`,
+      );
+      continue;
+    }
+
+    if (!appliesToDefaultBranch(rawRuleset, requirement.defaultBranch)) continue;
     hasActiveApplicable = true;
 
-    // Anyone in `bypass_actors` can merge without meeting the rules, so their mere
-    // presence weakens the protection. Names are collected to say who.
-    const actors = Array.isArray(rawRuleset.bypass_actors) ? rawRuleset.bypass_actors : [];
-    for (const rawActor of actors) {
-      if (isRecord(rawActor) && typeof rawActor.actor_type === 'string') {
-        bypassActorTypes.push(rawActor.actor_type);
+    // `bypass_actors` is only returned when the API caller has write access to the ruleset,
+    // so a missing key means "not shown", not "nobody". Assuming nobody could bypass would
+    // turn an unverifiable rule into a green report.
+    if (!Object.prototype.hasOwnProperty.call(rawRuleset, 'bypass_actors')) {
+      problems.push(
+        'GitHub no mostró quién puede saltarse estas reglas (no vino la clave bypass_actors): no se puede verificar que nadie pueda saltárselas.',
+      );
+    } else {
+      // Anyone in `bypass_actors` can merge without meeting the rules, so their mere
+      // presence weakens the protection. Names are collected to say who.
+      const actors = Array.isArray(rawRuleset.bypass_actors) ? rawRuleset.bypass_actors : [];
+      for (const rawActor of actors) {
+        if (isRecord(rawActor) && typeof rawActor.actor_type === 'string') {
+          bypassActorTypes.push(rawActor.actor_type);
+        }
       }
+    }
+
+    // `current_user_can_bypass` says whether the credentials used for this very check can
+    // sidestep the rules. Anything other than `never` weakens the protection.
+    if (
+      Object.prototype.hasOwnProperty.call(rawRuleset, 'current_user_can_bypass') &&
+      rawRuleset.current_user_can_bypass !== 'never'
+    ) {
+      problems.push(
+        'Quien está leyendo estas reglas puede saltárselas (current_user_can_bypass no es "never").',
+      );
     }
 
     const rules = Array.isArray(rawRuleset.rules) ? rawRuleset.rules : [];
@@ -113,8 +216,6 @@ export function verifyProtections(
       }
     }
   }
-
-  const problems: string[] = [];
 
   // 1. No ruleset is both enforced and aimed at the default branch, so nothing stops
   //    changes there and every rule below is effectively absent.
