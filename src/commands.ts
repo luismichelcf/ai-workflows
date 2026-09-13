@@ -1,6 +1,5 @@
 import { spawn, spawnSync, type ChildProcess, type SpawnOptions } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
-import { isAbsolute } from 'node:path';
 
 import { resolveExecutable, type ExecutableEnvironment, type ResolvedExecutable } from './exec.js';
 import type { CheckResult } from './gates.js';
@@ -32,12 +31,14 @@ const MAX_TIMEOUT_MS = 2 ** 31 - 1;
 const MAX_REASON_CHARS = 3900;
 
 /**
- * The most output kept in memory. Only the tail matters (the failure is at the end), and a
- * command that prints gigabytes must not crash the engine by growing one string without bound.
+ * The most output kept in memory. 32 MB is large enough to hold a whole test run — a run in a
+ * real project prints plenty — while still bounding a command that prints gigabytes. Only the
+ * tail matters (the failure is at the end), so when the limit is passed the end is kept and the
+ * run is marked as truncated, never silently read as whole.
  */
-const MAX_OUTPUT_CHARS = 64 * 1024;
+const MAX_OUTPUT_CHARS = 32 * 1024 * 1024;
 
-const TRUNCATION_NOTE = '...[output truncated; keeping the end, where the failure is]...\n';
+const TRUNCATION_NOTE = '...[motivo recortado; se conservan el inicio y el final]...\n';
 
 /** ANSI OSC sequences (window titles, hyperlinks): ESC ] … BEL, or ESC ] … ESC backslash. */
 const ANSI_OSC = /\u001B\][^\u0007]*(?:\u0007|\u001B\\)/g;
@@ -99,10 +100,14 @@ export function runGateCommand(command: GateCommand): Promise<CheckResult> {
     // decodes UTF-8 across chunk boundaries, so a multi-byte character split between two
     // writes (the `ñ` case) is not mangled into a replacement character.
     let output = '';
+    // Rule 1: a cut-off output may hide the failure that mattered, so the cut is remembered
+    // and told to the reader; `interpret` and `parseTestRun` must never treat it as whole.
+    let truncated = false;
     const append = (chunk: string): void => {
       output += chunk;
       if (output.length > MAX_OUTPUT_CHARS) {
         output = output.slice(output.length - MAX_OUTPUT_CHARS);
+        truncated = true;
       }
     };
     child.stdout?.setEncoding('utf8');
@@ -114,6 +119,7 @@ export function runGateCommand(command: GateCommand): Promise<CheckResult> {
     // event cannot overwrite the first answer.
     let settled = false;
     let timedOut = false;
+    let childExited = false;
     let timer: NodeJS.Timeout | undefined;
 
     const finish = (result: CheckResult): void => {
@@ -123,21 +129,32 @@ export function runGateCommand(command: GateCommand): Promise<CheckResult> {
       resolve(result);
     };
 
+    // Rule 4: listen to `exit` so the timeout knows whether the direct child is still alive.
+    // `close` may never come while a grandchild keeps the pipes open, and at the timeout the
+    // child's number must not be used to kill if it has already ended: Windows reuses pids,
+    // and `taskkill /PID` could reach an unrelated program that now owns the number.
+    child.on('exit', () => {
+      childExited = true;
+    });
+
     timer = setTimeout(() => {
       timedOut = true;
-      // Kill the whole tree, then answer at once. Destroying the pipes means a grandchild that
-      // inherited them and is still alive cannot hold the answer open: `close` need never come.
-      killProcessTree(child);
+      // Kill the tree only when the direct child is still alive to own the process tree. When
+      // it already ended, there is nothing of ours to kill by that number: destroy the pipes
+      // so a grandchild cannot hold the answer open, and say plainly that processes may remain.
+      if (!childExited) {
+        killProcessTree(child);
+      }
       child.stdout?.destroy();
       child.stderr?.destroy();
-      finish({ ok: false, reason: timeoutReason(command.command, timeoutMs) });
+      finish({ ok: false, reason: timeoutReason(command.command, timeoutMs, childExited) });
     }, timeoutMs);
 
     child.on('error', (error) => {
       finish({
         ok: false,
         reason: timedOut
-          ? timeoutReason(command.command, timeoutMs)
+          ? timeoutReason(command.command, timeoutMs, childExited)
           : describeStartFailure(command.command, error),
       });
     });
@@ -147,18 +164,28 @@ export function runGateCommand(command: GateCommand): Promise<CheckResult> {
     // unfinished: a command that leaves live processes behind did not end cleanly.
     child.on('close', (code, signal) => {
       if (timedOut) {
-        finish({ ok: false, reason: timeoutReason(command.command, timeoutMs) });
+        finish({ ok: false, reason: timeoutReason(command.command, timeoutMs, childExited) });
         return;
       }
 
       // Rule: a gate that knows how to read the output decides, even when the exit code is 0.
       // A timeout or a start failure never reaches here, so it can never be interpreted away.
       if (command.interpret !== undefined) {
+        // Rule 1: `truncated` is present only when the output was actually cut, so a reader
+        // that ignores the contract still sees an honest run.
+        const run: TestRun = truncated
+          ? { output, exitCode: code ?? 1, truncated: true }
+          : { output, exitCode: code ?? 1 };
+        let answer: unknown;
         try {
-          finish(command.interpret({ output, exitCode: code ?? 1 }));
+          answer = command.interpret(run);
         } catch (error) {
           finish({ ok: false, reason: describeInterpretFailure(command.command, error) });
+          return;
         }
+        // Rule 5: `interpret` is a gate's own reader, not a trusted oracle. Whatever it
+        // returns is checked and its reason is cleaned and clipped like any other reason.
+        finish(normalizeInterpretAnswer(command.command, answer));
         return;
       }
 
@@ -206,14 +233,13 @@ function executableEnvironment(): ExecutableEnvironment {
 }
 
 /**
- * The command as a program that can be launched without a shell. An absolute path that exists
- * is used as-is; anything else is a name looked up on the PATH, where a `.cmd` shim is read
- * and replaced by the program behind it.
+ * The command as a program that can be launched without a shell. Rule 3: a name and an
+ * absolute path go through exactly the same resolver — an absolute path to `cmd.exe` or to a
+ * `.cmd` shim must follow the no-shell rule too, so there is no shortcut for "the path exists".
+ * A `.cmd` shim is read and replaced by the program behind it; anything unresolvable, including
+ * a forbidden launcher, comes back as a reason instead of throwing.
  */
 function resolveGateCommand(command: string): ResolvedExecutable {
-  if (isAbsolute(command) && existsSync(command)) {
-    return { ok: true, command, prefixArgs: [] };
-  }
   return resolveExecutable(command, executableEnvironment());
 }
 
@@ -251,9 +277,46 @@ function describeInterpretFailure(command: string, error: unknown): string {
   return clip(`Command "${command}" finished but its output could not be read: ${message}`);
 }
 
-function timeoutReason(command: string, timeoutMs: number): string {
-  // The word "tiempo" is required by the contract; the command is killed, not merely abandoned.
-  return clip(`Command "${command}" ran out of tiempo after ${timeoutMs}ms and was killed.`);
+/**
+ * Rule 4: the timeout has two honest stories, and they must not be confused. When the direct
+ * child is still alive it was stopped and its process tree was ended. When it had already
+ * ended while something else kept its output open, nothing of ours could be killed by that
+ * number without risking an unrelated program, so the reason says processes may remain rather
+ * than claiming a kill that never happened.
+ */
+function timeoutReason(command: string, timeoutMs: number, childExited: boolean): string {
+  if (childExited) {
+    return clip(
+      `Command "${command}" ran out of tiempo after ${timeoutMs}ms; the direct process had ` +
+        'already ended while other processes kept its output open, so pueden quedar procesos vivos.',
+    );
+  }
+  // The word "tiempo" is required by the contract; the command was stopped, not merely left.
+  return clip(`Command "${command}" ran out of tiempo after ${timeoutMs}ms and was stopped.`);
+}
+
+/**
+ * Rule 5: never hand a reader's answer out raw. Only the two exact shapes are accepted — a pass
+ * or a failure with a readable reason — and anything else (nothing, a missing reason, a
+ * non-string reason) is a failure of the check itself. The reason is cleaned and clipped so an
+ * escape-code-laden or 100 000-character message cannot reach a person, and `ok` can never be
+ * truthy by accident.
+ */
+function normalizeInterpretAnswer(command: string, answer: unknown): CheckResult {
+  if (typeof answer === 'object' && answer !== null) {
+    const record = answer as { readonly ok?: unknown; readonly reason?: unknown };
+    if (record.ok === true) return { ok: true };
+    if (record.ok === false && typeof record.reason === 'string') {
+      return { ok: false, reason: clip(record.reason) };
+    }
+  }
+  return {
+    ok: false,
+    reason: clip(
+      `Command "${command}" finished but its output reader returned no usable result ` +
+        '(expected { ok: true } or { ok: false, reason }).',
+    ),
+  };
 }
 
 function failureReason(
@@ -280,14 +343,19 @@ function sanitize(text: string): string {
 }
 
 /**
- * Keeps the END of a long message. The head of a test/command log is setup noise; the tail
- * is where the failure lands. Says so when it trims, so nobody reads a clipped log as whole.
+ * Keeps a long message readable and honest. It keeps BOTH ends and marks the middle as cut:
+ * the tail is where a command's failure lands, and the head is where an `interpret` gate names
+ * in one line what went wrong — a reason that dropped the start of the author's sentence would
+ * fool whoever reads it. The note says the rest was cut, so nobody takes a clipped message as
+ * whole.
  */
 function clip(text: string): string {
   const clean = sanitize(text);
   if (clean.length <= MAX_REASON_CHARS) return clean;
-  const keep = MAX_REASON_CHARS - TRUNCATION_NOTE.length;
-  return TRUNCATION_NOTE + clean.slice(clean.length - keep);
+  const available = MAX_REASON_CHARS - TRUNCATION_NOTE.length;
+  const head = Math.floor(available / 2);
+  const tail = available - head;
+  return clean.slice(0, head) + TRUNCATION_NOTE + clean.slice(clean.length - tail);
 }
 
 export interface TestRun {
@@ -303,6 +371,11 @@ export interface TestRun {
 export interface TestRunSummary {
   readonly passed: number;
   readonly failed: number;
+  /**
+   * Rule 2: true when the output was too large and only its end was kept. A cut-off output can
+   * hide the failure or the pass that mattered, so it is never green and never red evidence.
+   */
+  readonly truncated: boolean;
   /** Names of the tests that failed. */
   readonly failures: readonly string[];
   /** The assertion messages, which are what prove a test failed for its own reason. */
@@ -392,6 +465,7 @@ export function parseTestRun(run: TestRun): TestRunSummary {
   return {
     passed,
     failed,
+    truncated: run.truncated === true,
     failures,
     assertions,
     brokenEnvironment,
@@ -431,6 +505,7 @@ function countErrors(output: string): number {
  */
 export function isGreenRun(summary: TestRunSummary): boolean {
   return (
+    !summary.truncated &&
     !summary.brokenEnvironment &&
     !summary.ranNothing &&
     summary.failed === 0 &&
@@ -446,5 +521,10 @@ export function isGreenRun(summary: TestRunSummary): boolean {
  * nothing.
  */
 export function isRedEvidence(summary: TestRunSummary): boolean {
-  return !summary.brokenEnvironment && summary.failed > 0 && summary.assertions.length > 0;
+  return (
+    !summary.truncated &&
+    !summary.brokenEnvironment &&
+    summary.failed > 0 &&
+    summary.assertions.length > 0
+  );
 }
