@@ -1,0 +1,35 @@
+name: check
+
+# The engine runs where its users run it. It was written and tested on Windows; the first run on
+# Linux (the release workflow of v0.1.0) found two tests whose setup only held on Windows. Every
+# pull request and every push to main now runs typecheck and tests on both.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck and test
+        run: pnpm check
