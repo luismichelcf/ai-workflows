@@ -192,10 +192,12 @@ function requireCwd(cwd: string): void {
 
 /**
  * A model name has to be present. An empty value would travel as `--model ''`, which the CLI
- * reads as a missing or default model rather than the one the owner authorised.
+ * reads as a missing or default model rather than the one the owner authorised. A value made
+ * only of spaces is just as empty: the CLI trims it to nothing and picks its own model, so it
+ * is refused here rather than silently running on a model nobody chose.
  */
 function requireModel(model: string): void {
-  if (model === '') {
+  if (model.trim() === '') {
     throw new Error('The model is empty; a model name is required so the CLI cannot pick one.');
   }
   requireNotFlag('model', model);
@@ -1057,19 +1059,53 @@ async function probe(
 }
 
 /**
- * A model line as OpenCode prints it: `provider/model`. Only lines matching this shape are
- * listed. A blacklist of "error" and "at" prefixes still let a deprecation warning, a
- * `TypeError:` line or a `WARN` line through and listed it as a model the engine would then
- * try to run. Anchored at both ends so a warning that merely contains a slash is ignored.
+ * A model line as OpenCode prints it: `provider/model`, or a longer chain such as
+ * `openrouter/qwen/qwen3.7-max`. Only lines matching this shape are listed. A blacklist of
+ * "error" and "at" prefixes still let a deprecation warning, a `TypeError:` line or a `WARN`
+ * line through and listed it as a model the engine would then try to run. Anchored at both
+ * ends, and a single group repeated one-or-more times: the old pattern accepted exactly one
+ * slash and dropped the 4410 of 7784 cached models that name a vendor between the provider and
+ * the model. A space can never appear inside, so a prose line that merely contains a slash is
+ * ignored.
  */
-const MODEL_LINE = /^[A-Za-z0-9][A-Za-z0-9._-]*\/[A-Za-z0-9._:@-]+$/;
+const MODEL_LINE = /^[A-Za-z0-9][A-Za-z0-9._-]*(?:\/[A-Za-z0-9._:@+-]+)+$/;
 
 /**
  * An `Error` at the start of any line, case-insensitively, means the probe failed even when it
  * exited 0. The review found that checking only the very start of the whole output let an
  * `Error:` on a later line be read as a signed-in session. The `m` flag checks every line.
+ * The word boundary keeps `Errorless` from counting as an error.
  */
-const ERROR_LINE = /^\s*error\b/im;
+const ERROR_LINE = /^error\b/im;
+
+/**
+ * An ANSI escape sequence (CSI: ESC `[`, parameters, final byte). Stripped from `auth list`
+ * output before any marker is read, because opencode colours its own failures
+ * (`ESC[91mESC[1mError: `) and an anchored match would otherwise never reach the word. The
+ * pattern consumes a run of parameter characters in one pass, so it stays linear: a nested
+ * quantifier would backtrack catastrophically on the long unbroken streams a CLI can print.
+ */
+const ANSI_ESCAPE = /\u001b\[[0-9;]*[A-Za-z]/g;
+
+/**
+ * The box-drawing characters and spaces opencode wraps `auth list` in, at the start of every
+ * line (`│  Error: …`). Removed per line before anchoring, or an error hidden inside the box
+ * would read as a signed-in session.
+ */
+const BOX_PREFIX = /^[\s│┌└├─]+/;
+
+/**
+ * The `auth list` output with its presentation removed: ANSI escapes and each line's box
+ * prefix, so a marker is matched against the start of what the CLI meant to print rather than
+ * against decoration the CLI added.
+ */
+function stripAuthFormatting(output: string): string {
+  return output
+    .replace(ANSI_ESCAPE, '')
+    .split(/\r?\n/)
+    .map((line) => line.replace(BOX_PREFIX, ''))
+    .join('\n');
+}
 
 /** Finds out what is installed and signed in. Never throws: a missing CLI is an answer. */
 export async function detectProvider(
@@ -1150,13 +1186,18 @@ export async function detectProvider(
   const authProbe = await probe(run, command, ['auth', 'list'], timeoutMs);
   if (!authProbe.ok) {
     authProblem = `'${command}' is installed, but its sign-in could not be checked (auth list ${authProbe.reason}); run '${command} auth login' and verify.`;
-  } else if (
-    authProbe.run.exitCode !== 0 ||
-    authProbe.run.output.trim() === '' ||
-    /(^|\D)0 credentials/i.test(authProbe.run.output) ||
-    ERROR_LINE.test(authProbe.run.output)
-  ) {
-    authProblem = `'${command}' is installed but has no verified credentials; run '${command} auth login' to sign in.`;
+  } else {
+    // Colour codes and the box are presentation, not content: strip them once and read every
+    // marker against the cleaned text, so an error the CLI dressed up is still caught.
+    const authText = stripAuthFormatting(authProbe.run.output);
+    if (
+      authProbe.run.exitCode !== 0 ||
+      authText.trim() === '' ||
+      /(^|\D)0 credentials/i.test(authText) ||
+      ERROR_LINE.test(authText)
+    ) {
+      authProblem = `'${command}' is installed but has no verified credentials; run '${command} auth login' to sign in.`;
+    }
   }
 
   return {
