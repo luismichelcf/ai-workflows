@@ -71,8 +71,9 @@ describe('the reason never loses the failure', () => {
   });
 
   it('says it cut when head and tail of a long output are joined', async () => {
-    const noise = '\\u001b[2K\\u001b[1G'.repeat(1000);
-    const script = `process.stdout.write('${noise}' + 'MEDIO: la prueba X fallo\\n' + '${noise}' + 'fin\\n'); process.exit(1)`;
+    // The noise is built inside the child: written out in the command line it passed Windows'
+    // length limit, the spawn failed with ENAMETOOLONG and the test never reached the join.
+    const script = "const n = '\\u001b[2K\\u001b[1G'.repeat(1000); process.stdout.write(n + 'MEDIO: la prueba X fallo\\n' + n + 'fin\\n'); process.exit(1)";
     const result = await runGateCommand({ command: node, args: ['-e', script], timeoutMs: 10_000 });
 
     expect(result.ok === false && result.reason).toMatch(/MEDIO|recortado/);
