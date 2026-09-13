@@ -71,6 +71,15 @@ const EFFECTS_FILE = 'effects.json';
 const LEASE_FILE = 'lease.json';
 
 /**
+ * Every ref also carries this file, which names who the ref is for. It exists so a write can
+ * never leave an empty tree: measured on 13-sep-2026, GitHub answers 404 when a commit deletes
+ * a tree's only file and 422 for an empty tree, so releasing the last concern (the lease) on a
+ * ref used to fail and leave a zone locked until its lease expired. The marker is constant per
+ * identity, so rewriting it on every write is a no-op, and a release deletes only the lease.
+ */
+const REF_FILE = 'ref.json';
+
+/**
  * A round trip through JSON, the exact journey a result makes over the remote store, which
  * keeps it as text. A `Date` must come back a string here too, so the memory and git stores
  * cannot drift on the one path a resume in production exercises. Cloning also stops a caller
@@ -165,6 +174,10 @@ export function createGitStore(options: GitStoreOptions): Store {
   // lock out the other.
   const pieceRef = (piece: PieceId): string => `pieces/${encodeKey(piece)}`;
   const zoneRef = (zone: string): string => `zones/${encodeKey(zone)}`;
+
+  // The identity marker written on every commit to an identity's ref. `id` is the original id,
+  // not the ref-name key, so a reader can recover who the ref belongs to from the marker alone.
+  const refMarker = (kind: 'piece' | 'zone', id: string): string => JSON.stringify({ kind, id });
 
   const asObject = (value: unknown): JsonMap | undefined =>
     typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -312,7 +325,10 @@ export function createGitStore(options: GitStoreOptions): Store {
       return {
         kind: 'write',
         plan: {
-          changes: { [EFFECTS_FILE]: JSON.stringify({ ...records, [operationId]: record }) },
+          changes: {
+            [REF_FILE]: refMarker('piece', piece),
+            [EFFECTS_FILE]: JSON.stringify({ ...records, [operationId]: record }),
+          },
           message,
         },
         after: () => undefined,
@@ -343,7 +359,10 @@ export function createGitStore(options: GitStoreOptions): Store {
         return {
           kind: 'write',
           plan: {
-            changes: { [LEASE_FILE]: JSON.stringify({ runId, expiresAt }) },
+            changes: {
+              [REF_FILE]: refMarker('piece', piece),
+              [LEASE_FILE]: JSON.stringify({ runId, expiresAt }),
+            },
             message: `ai-workflows: reserve piece ${piece}`,
           },
           after: (commit) => ({ ok: true, version: commit }),
@@ -367,7 +386,10 @@ export function createGitStore(options: GitStoreOptions): Store {
         return {
           kind: 'write',
           plan: {
-            changes: { [LEASE_FILE]: JSON.stringify({ runId, expiresAt }) },
+            changes: {
+              [REF_FILE]: refMarker('piece', piece),
+              [LEASE_FILE]: JSON.stringify({ runId, expiresAt }),
+            },
             message: `ai-workflows: renew piece ${piece}`,
           },
           after: (commit) => ({ ok: true, version: commit }),
@@ -385,7 +407,10 @@ export function createGitStore(options: GitStoreOptions): Store {
         return {
           kind: 'write',
           plan: {
-            changes: { [LEASE_FILE]: null },
+            changes: {
+              [REF_FILE]: refMarker('piece', piece),
+              [LEASE_FILE]: null,
+            },
             message: `ai-workflows: release piece ${piece}`,
           },
           after: () => undefined,
@@ -412,7 +437,10 @@ export function createGitStore(options: GitStoreOptions): Store {
         return {
           kind: 'write',
           plan: {
-            changes: { [STATUS_FILE]: JSON.stringify({ version, status }) },
+            changes: {
+              [REF_FILE]: refMarker('piece', status.piece),
+              [STATUS_FILE]: JSON.stringify({ version, status }),
+            },
             message: `ai-workflows: save status of ${status.piece}`,
           },
           after: () => version,
@@ -449,7 +477,10 @@ export function createGitStore(options: GitStoreOptions): Store {
         return {
           kind: 'write',
           plan: {
-            changes: { [JOURNAL_FILE]: JSON.stringify(next) },
+            changes: {
+              [REF_FILE]: refMarker('piece', piece),
+              [JOURNAL_FILE]: JSON.stringify(next),
+            },
             message: `ai-workflows: append to journal of ${piece}`,
           },
           after: () => undefined,
@@ -477,7 +508,10 @@ export function createGitStore(options: GitStoreOptions): Store {
         return {
           kind: 'write',
           plan: {
-            changes: { [JOURNAL_FILE]: JSON.stringify(remaining) },
+            changes: {
+              [REF_FILE]: refMarker('piece', piece),
+              [JOURNAL_FILE]: JSON.stringify(remaining),
+            },
             message: `ai-workflows: forget stage ${stage} of ${piece}`,
           },
           after: () => undefined,
@@ -532,6 +566,7 @@ export function createGitStore(options: GitStoreOptions): Store {
               kind: 'write',
               plan: {
                 changes: {
+                  [REF_FILE]: refMarker('piece', piece),
                   [EFFECTS_FILE]: JSON.stringify({
                     ...records,
                     [operationId]: { state: 'pending' },
@@ -602,7 +637,10 @@ export function createGitStore(options: GitStoreOptions): Store {
           return {
             kind: 'write',
             plan: {
-              changes: { [EFFECTS_FILE]: JSON.stringify(next) },
+              changes: {
+                [REF_FILE]: refMarker('piece', piece),
+                [EFFECTS_FILE]: JSON.stringify(next),
+              },
               message: `ai-workflows: reconcile effect ${operationId} of ${piece} as not run`,
             },
             after: () => undefined,
@@ -616,6 +654,7 @@ export function createGitStore(options: GitStoreOptions): Store {
           kind: 'write',
           plan: {
             changes: {
+              [REF_FILE]: refMarker('piece', piece),
               [EFFECTS_FILE]: JSON.stringify({
                 ...records,
                 [operationId]: { state: 'confirmed', result: throughJson(value) },
@@ -642,7 +681,10 @@ export function createGitStore(options: GitStoreOptions): Store {
         return {
           kind: 'write',
           plan: {
-            changes: { [LEASE_FILE]: JSON.stringify({ runId, piece, expiresAt }) },
+            changes: {
+              [REF_FILE]: refMarker('zone', zone),
+              [LEASE_FILE]: JSON.stringify({ runId, piece, expiresAt }),
+            },
             message: `ai-workflows: reserve zone ${zone}`,
           },
           after: (commit) => ({ ok: true, version: commit }),
@@ -659,7 +701,10 @@ export function createGitStore(options: GitStoreOptions): Store {
         return {
           kind: 'write',
           plan: {
-            changes: { [LEASE_FILE]: null },
+            changes: {
+              [REF_FILE]: refMarker('zone', zone),
+              [LEASE_FILE]: null,
+            },
             message: `ai-workflows: release zone ${zone}`,
           },
           after: () => undefined,
