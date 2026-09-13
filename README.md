@@ -53,6 +53,8 @@ await runCommand(argv, { config, store, describeChange, leaseMs: 15 * 60_000 });
 
 - Each piece has its own ref, `refs/ai-workflows/pieces/<piece>`, holding `status.json`,
   `journal.json`, `effects.json` and `lease.json`; each zone has `refs/ai-workflows/zones/<zone>`.
+  Every ref also keeps `ref.json`, naming the piece or zone it belongs to: GitHub refuses a tree
+  with no files, so releasing a lease must never leave a ref empty.
   None of them is a branch or a tag, so writing them fires no deployments and no push workflows.
   Branches and tags are refused as a namespace.
 - Every write reads that ref's head, decides from that one read, commits on top of it and moves
