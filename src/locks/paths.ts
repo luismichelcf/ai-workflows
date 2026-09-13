@@ -60,7 +60,9 @@ function windowsPath(drive: string, rest: string): PathReading {
   // asking the filesystem. Never guess.
   if (/~[0-9]/.test(rest)) return unreadable('un nombre corto 8.3 que no se puede expandir sin preguntar al sistema');
 
-  const normalized = path.posix.normalize(`${drive.toLowerCase()}:/${rest}`);
+  // Anchor the rest at the drive root before resolving `..`: Windows resolves `C:\..` to `C:\`,
+  // while normalising `c:/../x` as a whole drops the drive and reads as a relative path.
+  const normalized = `${drive.toLowerCase()}:${path.posix.normalize(`/${rest}`)}`;
   // Windows does not distinguish case anywhere in the path, so the key folds all of it.
   return { ok: true, path: { display: normalized, key: normalized.toLowerCase(), windows: true } };
 }

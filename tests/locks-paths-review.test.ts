@@ -86,6 +86,24 @@ describe('what is legitimately allowed stays allowed', () => {
     expect(decideToolUse(write('\\\\?\\C:\\GitHub\\Socialabs\\src\\a.ts'), withPiece).allow).toBe(true);
     expect(decideToolUse(write('c:/github/socialabs/src/a.ts'), withPiece).allow).toBe(true);
   });
+
+  it('with a piece, does not refuse a spelling it cannot reduce: where it points no longer matters', () => {
+    // TEMP is often reported with a short name, like C:\Users\LUIS~1\AppData\Local\Temp.
+    expect(decideToolUse(write('C:\\Users\\LUIS~1\\AppData\\Local\\Temp\\x.ts'), withPiece).allow).toBe(true);
+  });
+});
+
+describe('climbing above the drive stays on the drive', () => {
+  it('refuses code at C:\\..\\GitHub\\Socialabs, which Windows writes into the project', () => {
+    // Windows resolves `C:\..` to `C:\`; a posix normalisation turned it into a relative path
+    // that looked like it was outside the project.
+    expect(decideToolUse(write('C:\\..\\GitHub\\Socialabs\\src\\a.ts'), noPiece).allow).toBe(false);
+    expect(decideToolUse(write('\\\\?\\C:\\..\\..\\GitHub\\Socialabs\\src\\a.ts'), noPiece).allow).toBe(false);
+  });
+
+  it('refuses a relative path that climbs above the drive from the project', () => {
+    expect(decideToolUse(write('..\\..\\..\\GitHub\\Socialabs\\src\\a.ts'), noPiece).allow).toBe(false);
+  });
 });
 
 describe('the project root is configured, not taken from where the session happens to be', () => {

@@ -130,6 +130,11 @@ export function decideToolUse(input: HookInput, context: LockContext): LockDecis
     };
   }
 
+  // Rule 5: a folder with work in flight, or one explicitly opened as /libre, may write
+  // anywhere. Checked before reading the targets, because once writing is allowed everywhere
+  // a spelling the lock cannot reduce (a short-name TEMP folder) no longer changes the answer.
+  if (context.activePiece || context.libre) return { allow: true };
+
   // Targets are read against the cwd (that is what a relative path needs); the project root is
   // not. A path the lock cannot reduce is refused, never guessed into a decision.
   const readings = targets.map((target) => readAgainst(target, input.cwd));
@@ -146,12 +151,9 @@ export function decideToolUse(input: HookInput, context: LockContext): LockDecis
     .flatMap((reading) => (reading.ok ? [reading.path] : []))
     .filter((target) => isUnder(target, root.path));
 
-  // Rule 5: paths outside the project are not this lock's business; agents keep scratch
+  // Rule 6: paths outside the project are not this lock's business; agents keep scratch
   // files elsewhere and the lock guards the project, not the disk.
   if (inside.length === 0) return { allow: true };
-
-  // Rule 6: a folder with work in flight, or one explicitly opened as /libre, may write.
-  if (context.activePiece || context.libre) return { allow: true };
 
   // Rule 7: with no piece, only declared paper folders are writable.
   const allPapers = inside.every((target) => papers.paths.some((paper) => isUnder(target, paper)));
