@@ -64,7 +64,8 @@ await runCommand(argv, { config, store, describeChange, leaseMs: 15 * 60_000 });
 - It talks to GitHub through `gh`, with the account `gh` is logged in to, never through a shell,
   and stops a call that has not answered in 60 seconds.
 - Each write costs about six API calls, three of them creating content, and the engine renews its
-  lease every third of `leaseMs`. Over GitHub use a lease of minutes: with 15 minutes a running
+  lease every third of `leaseMs`; `runCommand` refuses a lease under 30 seconds, and the engine
+  refuses one that is not a positive number. Over GitHub use a lease of minutes: with 15 minutes a running
   piece renews every 5 minutes, about 36 content-creating requests an hour, well under GitHub's
   limit of 500 an hour for ten pieces at once.
 
