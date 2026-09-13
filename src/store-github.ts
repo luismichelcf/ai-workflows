@@ -2,27 +2,22 @@ import { spawn, type SpawnOptions } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 
 import { resolveExecutable, type ExecutableEnvironment } from './exec.js';
+import type { GhRun, GhRunner } from './gh-runner.js';
 import type { StatePort } from './store-git.js';
-
-export interface GhRun {
-  readonly exitCode: number | null;
-  readonly stdout: string;
-  readonly stderr: string;
-}
-
-/** Runs `gh` with these arguments, feeding `input` to its stdin when given. Never through a shell. */
-export type GhRunner = (args: readonly string[], input?: string) => Promise<GhRun>;
 
 export interface GitHubStatePortOptions {
   readonly owner: string;
   readonly repo: string;
-  /** Where the state lives. Never under `refs/heads/` or `refs/tags/`. */
-  readonly ref?: string;
-  /** Defaults to the real `gh`, resolved without a shell. */
+  /**
+   * The ref prefix every state ref lives under, like `refs/ai-workflows/pieces/997`. Never
+   * `refs/heads` or `refs/tags`.
+   */
+  readonly namespace?: string;
+  /** Defaults to `createGhRunner()`: the real `gh`, resolved without a shell, with a timeout. */
   readonly run?: GhRunner;
 }
 
-export const DEFAULT_STATE_REF = 'refs/ai-workflows/state';
+export const DEFAULT_STATE_NAMESPACE = 'refs/ai-workflows';
 
 // A plain GitHub name: letters, digits, dot, underscore and hyphen. GitHub also lets names be
 // `.` or `..` in some URL positions, which would escape the path, so those two are excluded.

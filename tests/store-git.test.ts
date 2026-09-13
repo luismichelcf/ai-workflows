@@ -15,10 +15,12 @@ import { fakeClock } from './helpers.js';
 import { fakeRemote } from './remote.js';
 
 // ai-workflows#6, spec §5.7: a piece's progress must survive the session that made it and be
-// visible from another terminal. The git-backed store keeps it on a ref, where every write is
-// «read the head, decide from that one read, commit on top, move the ref only if it did not
-// move». These tests run over an in-memory remote with that exact property; the GitHub adapter
-// is tested on its own.
+// visible from another terminal. The git-backed store keeps each piece, and each zone, on its own
+// ref, where every write is «read the head, decide from that one read, commit on top, move the ref
+// only if it did not move». One ref per piece is a flock finding: with a single shared ref, three
+// pieces running at once exhausted each other's retries and ended blocked.
+// These tests run over an in-memory remote with that exact property; the GitHub adapter is tested
+// on its own.
 
 const LEASE = 30_000;
 const noPause = async (): Promise<void> => undefined;
@@ -321,6 +323,22 @@ describe('the git store over a remote', () => {
     expect(loser.ok === false && loser.heldBy).toBe(winner);
   });
 
+  it('does not make pieces wait for each other: a write to another piece costs no retry', async () => {
+    const remote = fakeRemote();
+    const store = session(remote);
+    const other = session(remote);
+    remote.beforeNextCommit(async () => {
+      await other.append('1000', entry('spec'));
+    });
+    const before = remote.commitAttempts;
+
+    await store.saveStatus({ piece: '997', state: 'running' }, undefined);
+
+    // One attempt by the session that slipped in, one by this store: nobody lost a race.
+    expect(remote.commitAttempts - before).toBe(2);
+    expect((await session(remote).journal('1000')).map((item) => item.stage)).toEqual(['spec']);
+  });
+
   it('refuses a status write when another session changed the status in between, and keeps theirs', async () => {
     const remote = fakeRemote();
     const store = session(remote);
@@ -334,19 +352,19 @@ describe('the git store over a remote', () => {
     expect((await session(remote).loadStatus('997'))?.status.state).toBe('parked');
   });
 
-  it('retries a write that lost only to an unrelated change, and keeps both', async () => {
+  it('retries a write that lost only to another change on the same piece, and keeps both', async () => {
     const remote = fakeRemote();
     const store = session(remote);
     const other = session(remote);
     remote.beforeNextCommit(async () => {
-      await other.append('1000', entry('spec'));
+      await other.append('997', entry('spec'));
     });
 
     await store.saveStatus({ piece: '997', state: 'running' }, undefined);
 
     const fresh = session(remote);
     expect((await fresh.loadStatus('997'))?.status.state).toBe('running');
-    expect((await fresh.journal('1000')).map((item) => item.stage)).toEqual(['spec']);
+    expect((await fresh.journal('997')).map((item) => item.stage)).toEqual(['spec']);
   });
 
   it('keeps both of two appends that raced, instead of one overwriting the other', async () => {
@@ -409,7 +427,7 @@ describe('the git store over a remote', () => {
     let noise = 0;
     remote.beforeEveryCommit(() => {
       noise += 1;
-      remote.put('noise.json', String(noise));
+      remote.put('pieces/997', 'noise.json', String(noise));
     });
     const store = session(remote, { maxAttempts: 3 });
 
@@ -421,7 +439,7 @@ describe('the git store over a remote', () => {
     expect(error).toBeInstanceOf(Error);
     expect(error).not.toBeInstanceOf(StaleVersion);
     expect(remote.commitAttempts).toBe(3);
-    expect(remote.files()['pieces/997/status.json']).toBeUndefined();
+    expect(remote.files('pieces/997')['status.json']).toBeUndefined();
   });
 
   it('passes a failure of the remote through, instead of reading it as «nothing stored»', async () => {
@@ -433,8 +451,8 @@ describe('the git store over a remote', () => {
     await expect(store.loadStatus('997')).rejects.toThrow('network down: head');
     remote.failNext('read', new Error('network down: read'));
     await expect(store.journal('997')).rejects.toThrow('network down: read');
-    remote.failNext('list', new Error('network down: list'));
-    await expect(store.listStatuses()).rejects.toThrow('network down: list');
+    remote.failNext('refs', new Error('network down: refs'));
+    await expect(store.listStatuses()).rejects.toThrow('network down: refs');
     remote.failNext('commit', new Error('network down: commit'));
     await expect(store.append('997', entry('spec'))).rejects.toThrow('network down: commit');
   });
@@ -444,27 +462,24 @@ describe('the git store over a remote', () => {
     const store = session(remote);
     await store.saveStatus({ piece: '997', state: 'running' }, undefined);
 
-    remote.put('pieces/997/status.json', '{not json');
-    await expect(store.loadStatus('997')).rejects.toThrow(/pieces\/997\/status\.json/);
-    remote.put('pieces/997/journal.json', '{"not":"a list"}');
-    await expect(store.journal('997')).rejects.toThrow(/pieces\/997\/journal\.json/);
+    remote.put('pieces/997', 'status.json', '{not json');
+    await expect(store.loadStatus('997')).rejects.toThrow(/status\.json/);
+    remote.put('pieces/997', 'journal.json', '{"not":"a list"}');
+    await expect(store.journal('997')).rejects.toThrow(/journal\.json/);
   });
 
-  it('keeps pieces with awkward names apart, each inside its own folder', async () => {
+  it('keeps pieces with awkward names apart, each on its own ref with a safe name', async () => {
     const remote = fakeRemote();
     const store = session(remote);
-    const names = ['a/b', '..', '.', 'Plataforma y CI', 'a%2Fb', 'ü'];
+    const names = ['a/b', '..', '.', 'Plataforma y CI', 'a%2Fb', 'ü', 'a_b', 'a-b'];
     for (const piece of names) await store.saveStatus({ piece, state: 'running' }, undefined);
 
     expect((await session(remote).listStatuses()).map((status) => status.piece).sort()).toEqual(
       [...names].sort(),
     );
-    for (const path of Object.keys(remote.files())) {
-      const parts = path.split('/');
-      expect(parts).toHaveLength(3);
-      expect(parts[0]).toBe('pieces');
-      expect(parts[1]).not.toMatch(/^\.{1,2}$/);
-    }
+    const refs = remote.refNames();
+    expect(refs).toHaveLength(names.length);
+    for (const name of refs) expect(name).toMatch(/^pieces\/[A-Za-z0-9_-]+$/);
   });
 
   it('reads nothing into existence: reading an empty remote writes no commit', async () => {
@@ -478,7 +493,7 @@ describe('the git store over a remote', () => {
     expect(remote.commits).toBe(0);
   });
 
-  it('keeps each concern in its own file, where a person can find it', async () => {
+  it('keeps each concern in its own file on the piece ref, and each zone on its own ref', async () => {
     const remote = fakeRemote();
     const store = session(remote);
     await store.saveStatus({ piece: '997', state: 'running' }, undefined);
@@ -487,16 +502,16 @@ describe('the git store over a remote', () => {
     await store.reserve('997', 'run-a', LEASE);
     await store.reserveZone('Plataforma y CI', '997', 'run-a', LEASE);
 
-    const files = remote.files();
-    const parse = (path: string): unknown => JSON.parse(files[path] ?? 'null');
-    expect(parse('pieces/997/status.json')).toMatchObject({ status: { piece: '997', state: 'running' } });
-    expect(parse('pieces/997/journal.json')).toHaveLength(1);
-    expect(parse('pieces/997/effects.json')).toMatchObject({
+    const piece = remote.files('pieces/997');
+    const parse = (text: string | undefined): unknown => JSON.parse(text ?? 'null');
+    expect(parse(piece['status.json'])).toMatchObject({ status: { piece: '997', state: 'running' } });
+    expect(parse(piece['journal.json'])).toHaveLength(1);
+    expect(parse(piece['effects.json'])).toMatchObject({
       'open-pr': { state: 'confirmed', result: { pr: 1004 } },
     });
-    expect(parse('pieces/997/lease.json')).toMatchObject({ runId: 'run-a' });
-    expect(Object.keys(files).some((path) => path.startsWith('zones/') && path.includes('Plataforma'))).toBe(
-      true,
-    );
+    expect(parse(piece['lease.json'])).toMatchObject({ runId: 'run-a' });
+    const zone = remote.refNames().find((name) => name.startsWith('zones/'));
+    expect(zone).toMatch(/^zones\/[A-Za-z0-9_-]+$/);
+    expect(parse(remote.files(zone ?? '')['lease.json'])).toMatchObject({ runId: 'run-a', piece: '997' });
   });
 });

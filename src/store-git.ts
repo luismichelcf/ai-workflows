@@ -15,24 +15,32 @@ import {
   type Version,
 } from './contract.js';
 
+/** One state ref: its name inside the port's namespace, like `pieces/997`, and its commit. */
+export interface StateRef {
+  readonly name: string;
+  readonly commit: string;
+}
+
 /**
- * What the git-backed store needs from wherever its state ref lives. Small on purpose: the
+ * What the git-backed store needs from wherever its state refs live. Small on purpose: the
  * store's logic is tested over an in-memory remote, and each host (GitHub today) implements
- * these four calls.
+ * these four calls. Each piece and each zone has its own ref, so a write to one never makes a
+ * write to another lose its race.
  */
 export interface StatePort {
-  /** The commit the state ref points at, or `undefined` while the ref does not exist yet. */
-  head(): Promise<string | undefined>;
+  /** The commit ref `name` points at, or `undefined` while that ref does not exist yet. */
+  head(name: string): Promise<string | undefined>;
+  /** Every ref whose name starts with `prefix`, with the commit each points at. */
+  refs(prefix: string): Promise<readonly StateRef[]>;
   /** One file's contents at a commit, or `undefined` when the file is absent. */
   read(commit: string, path: string): Promise<string | undefined>;
-  /** Every file path under `dir` at a commit, at any depth. */
-  list(commit: string, dir: string): Promise<readonly string[]>;
   /**
-   * Writes `changes` (`null` deletes a file) as a commit on top of `parent` and moves the ref
-   * only if it still points at `parent`. Returns the new commit, or `undefined` when the ref
-   * had moved: someone else wrote first. Anything else is thrown, never guessed.
+   * Writes `changes` (`null` deletes a file) as a commit on top of `parent` and moves ref `name`
+   * only if it still points at `parent`. Returns the new commit, or `undefined` when the ref had
+   * moved: someone else wrote first. Anything else is thrown, never guessed.
    */
   commit(
+    name: string,
     parent: string | undefined,
     changes: Readonly<Record<string, string | null>>,
     message: string,
