@@ -10,8 +10,9 @@ import {
 } from '../src/index.js';
 
 // Review of part 4 (13-sep-2026). Which comment really is the owner's sign-off.
-//   - Two different commits sharing their first 7 characters were fabricated in 57 seconds,
-//     so a prefix cannot name a version.
+//   - Two different commits sharing their first 7 characters were fabricated in 57 seconds.
+//     The owner still chose the 7-character code on 14-sep-2026 (ai-workflows#9); the risk and
+//     why it is accepted are in locks-signoff-short.test.ts.
 //   - GitHub lets anyone with write access edit a comment; the author stays the same.
 //   - An order hidden in an HTML comment is invisible on the page but was accepted.
 // What it cannot prove is declared: while the agents post with the owner's account, a
@@ -33,15 +34,7 @@ const comment = (body: string, over: Partial<PullRequestComment> = {}): PullRequ
 const counts = (body: string, over: Partial<PullRequestComment> = {}, signOffRules = rules) =>
   parseSignOff(comment(body, over), signOffRules).ok;
 
-describe('only the full SHA names a version', () => {
-  it('refuses a 7-character prefix, even of the current head', () => {
-    expect(counts(`/visto-bueno ${head.slice(0, 7)}`)).toBe(false);
-  });
-
-  it('refuses a 39-character prefix', () => {
-    expect(counts(`/visto-bueno ${head.slice(0, 39)}`)).toBe(false);
-  });
-
+describe('the full SHA still names a version', () => {
   it('accepts the full 40-character SHA', () => {
     expect(counts(`/visto-bueno ${head}`)).toBe(true);
   });

@@ -30,7 +30,7 @@ Each version is published as a built package attached to its GitHub Release. Ins
 nothing runs during your install:
 
 ```sh
-pnpm add https://github.com/luismichelcf/ai-workflows/releases/download/v0.2.0/ai-workflows-0.2.0.tgz
+pnpm add https://github.com/luismichelcf/ai-workflows/releases/download/v0.2.1/ai-workflows-0.2.1.tgz
 ```
 
 Requires Node 20 or later. Installing straight from the git repository is not supported: the
