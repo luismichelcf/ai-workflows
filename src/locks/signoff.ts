@@ -92,11 +92,19 @@ function listContentColumn(raw: string): number | undefined {
 }
 
 /**
- * A full SHA-1 (40 hex) or SHA-256 (64 hex). Seven characters were enough for GitHub to
- * display a version, but two different commits can share their first seven characters, so a
- * prefix cannot name which version was approved. Only the complete hash can.
+ * The shortest code GitHub shows next to a commit. The owner signs off with that code
+ * (ai-workflows#9) because nobody copies a 40-character SHA by hand and GitHub cuts the line
+ * that asks for it, so a shorter run cannot name one version.
  */
-const FULL_SHA = /^[0-9a-fA-F]{40}$|^[0-9a-fA-F]{64}$/;
+const MIN_SHA_PREFIX = 7;
+
+/**
+ * The shape of a commit code: hexadecimal digits only. Any prefix of the head at least
+ * MIN_SHA_PREFIX long names it. Two versions can share their first seven characters, but
+ * fabricating such a pair only helps whoever can already write the comment with the owner's
+ * account, a limit every check result declares; against a mistake the code is enough.
+ */
+const HEX_SHA = /^[0-9a-fA-F]+$/;
 
 /**
  * A GitHub login: ASCII letters, digits and hyphens. GitHub logins are plain ASCII, so a
@@ -399,26 +407,35 @@ function evaluateSignOff(comment: PullRequestComment, rules: SignOffRules): Sign
     return rejected(`El autor "${comment.author}" no es un product owner: su visto bueno no cuenta.`);
   }
 
-  if (!FULL_SHA.test(first.sha)) {
+  if (first.sha.length < MIN_SHA_PREFIX) {
     return rejected(
-      `"${first.sha}" no es un SHA válido: debe ser hexadecimal de 40 o 64 caracteres.`,
+      `"${first.sha}" no es un código de versión válido: hacen falta al menos ${MIN_SHA_PREFIX} caracteres.`,
+    );
+  }
+  if (!HEX_SHA.test(first.sha)) {
+    return rejected(
+      `"${first.sha}" no es un código de versión válido: debe ser hexadecimal.`,
     );
   }
   // Name both versions: the author sees which one they approved and which one is live now.
-  if (first.sha.toLowerCase() !== rules.headSha.toLowerCase()) {
+  // A code longer than the head fails the prefix test too, and gets the same message.
+  if (!rules.headSha.toLowerCase().startsWith(first.sha.toLowerCase())) {
     return rejected(
       `El visto bueno es para ${first.sha.slice(0, 7)}, pero la versión actual es ` +
         `${rules.headSha.slice(0, 7)}: un visto bueno no cubre una versión distinta.`,
     );
   }
 
-  return { ok: true, hadOrder, sha: first.sha, reason: '' };
+  // A code names the head; the result reports that head, never the shorter code written.
+  return { ok: true, hadOrder, sha: rules.headSha, reason: '' };
 }
 
 /**
- * `/visto-bueno <full sha>` on its own line, unedited, from a product owner, naming the
- * current head. The SHA matters in full: a prefix cannot name one version, and a sign-off of
- * an older version does not cover a newer one.
+ * `/visto-bueno <code>` on its own line, unedited, from a product owner, naming the current
+ * head. The code is the prefix GitHub shows next to the commit, at least MIN_SHA_PREFIX
+ * hexadecimal characters and at most the full SHA: a shorter code cannot name one version,
+ * and a sign-off of an older version does not cover a newer one. On success `sha` reports the
+ * full head, not the code written.
  */
 export function parseSignOff(
   comment: PullRequestComment,
@@ -495,7 +512,7 @@ export function concludeMergeCheck(input: MergeCheckInput): MergeCheckResult {
       // Name the order so the report says what to do, not just what is missing.
       reasons.push(
         'Falta el visto bueno del dueño: se necesita un comentario con la orden ' +
-          '/visto-bueno <sha> que apunte a la versión actual.',
+          `/visto-bueno ${input.headSha.slice(0, MIN_SHA_PREFIX)} que apunte a la versión actual.`,
       );
       // "Missing" alone hides whether the order named another version, was edited, or came
       // from someone else. Say why each comment that carried an order did not count.
