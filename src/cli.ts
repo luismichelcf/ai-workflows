@@ -7,7 +7,7 @@ import {
   type Store,
 } from './contract.js';
 import { validateConfig } from './config.js';
-import { createEngine, InvalidLease, MIN_LEASE_MS } from './engine.js';
+import { createEngine, InvalidCancellationPoll, InvalidLease, MIN_LEASE_MS } from './engine.js';
 
 export interface CommandOptions {
   readonly config: PipelineConfig;
@@ -19,6 +19,17 @@ export interface CommandOptions {
    * over a remote pays for every renewal, so it needs minutes, not the default seconds.
    */
   readonly leaseMs?: number;
+  /**
+   * How often a running stage checks the store for a park recorded by another controller.
+   * Injected so a project (or a test) can shorten it; it must be a whole number of milliseconds
+   * in [1, 2_147_483_647] or the engine refuses it and the command reports why.
+   */
+  readonly cancellationPollMs?: number;
+  /**
+   * How the environment is inspected for `doctor`. Omitted means no diagnosis was configured,
+   * and `doctor` fails closed rather than inventing a reassuring report.
+   */
+  readonly diagnose?: () => DoctorReport | Promise<DoctorReport>;
 }
 
 export interface CommandOutput {
@@ -238,6 +249,10 @@ const HELP: Record<Language, string> = {
     '  run <pieza> --dry-run  Ensaya sin cambiar nada.',
     '  status                 Muestra el estado de las piezas.',
     '  validate               Comprueba que la configuración es correcta.',
+    '  doctor                 Diagnostica los proveedores instalados.',
+    '  stop <pieza> [motivo]  Pone en pausa una pieza conservando su diagnóstico.',
+    '  pause                  Pone en pausa todas las piezas sin terminar.',
+    '  resume [pieza]         Reanuda una pieza o todas las pausadas.',
   ].join('\n'),
   en: [
     'Usage: ai-workflows <command>',
@@ -247,6 +262,10 @@ const HELP: Record<Language, string> = {
     '  run <piece> --dry-run  Rehearse without changing anything.',
     '  status                 Show the state of the pieces.',
     '  validate               Check that the configuration is correct.',
+    '  doctor                 Diagnose the installed providers.',
+    '  stop <piece> [reason]  Put one piece on hold, keeping its diagnosis.',
+    '  pause                  Put every unfinished piece on hold.',
+    '  resume [piece]         Resume one piece, or every piece on hold.',
   ].join('\n'),
 };
 
@@ -257,6 +276,7 @@ function openEngine(
   locale: string,
   describeChange: CommandOptions['describeChange'],
   leaseMs: CommandOptions['leaseMs'],
+  cancellationPollMs: CommandOptions['cancellationPollMs'],
 ): CommandOutput | ReturnType<typeof createEngine> {
   // A finite lease below the floor is a units mistake a project script makes (seconds written
   // where milliseconds were meant), not something the engine can honour: a renewal on every
@@ -277,6 +297,7 @@ function openEngine(
       store,
       ...(describeChange === undefined ? {} : { describeChange }),
       ...(leaseMs === undefined ? {} : { leaseMs }),
+      ...(cancellationPollMs === undefined ? {} : { cancellationPollMs }),
     });
   } catch (error) {
     if (error instanceof InvalidPipeline) {
@@ -286,6 +307,10 @@ function openEngine(
     // it is an answer to the person, not a stack trace out of the process.
     if (error instanceof InvalidLease) {
       return { ok: false, text: invalidLeaseText(locale) };
+    }
+    // A cancellation cadence Node timers cannot represent is the same kind of mistake.
+    if (error instanceof InvalidCancellationPoll) {
+      return { ok: false, text: invalidCancellationPollText(locale) };
     }
     throw error;
   }
@@ -320,10 +345,191 @@ function leaseTooShortText(locale: string): string {
     : `The lease duration is too short: the minimum is ${seconds} seconds.`;
 }
 
+function invalidCancellationPollText(locale: string): string {
+  return languageOf(locale) === 'es'
+    ? 'La cadencia de cancelación no es válida: debe ser un número entero de milisegundos entre 1 y 2147483647.'
+    : 'The cancellation cadence is not valid: it must be a whole number of milliseconds between 1 and 2147483647.';
+}
+
 function busyText(locale: string): string {
   return languageOf(locale) === 'es'
     ? 'La pieza la está trabajando otro controlador. Inténtalo de nuevo más tarde.'
     : 'Another controller is working on this piece. Try again later.';
+}
+
+function missingDiagnosisText(locale: string): string {
+  return languageOf(locale) === 'es'
+    ? 'No hay ningún diagnóstico configurado: falta la función diagnose en las opciones.'
+    : 'No diagnosis is configured: the diagnose function is missing from the options.';
+}
+
+/** Renders any thrown value as text a person can read. Never `[object Object]`, never blank. */
+function describeFailure(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message.length > 0 ? `${error.name}: ${error.message}` : error.name;
+  }
+  if (typeof error === 'string') return error;
+  if (error !== null && typeof error === 'object') {
+    try {
+      const json = JSON.stringify(error);
+      if (json !== undefined && json !== '{}') return json;
+    } catch {
+      // A value JSON cannot represent (bigint, circular): fall through to String below.
+    }
+  }
+  return String(error);
+}
+
+/** A diagnosis that threw. The reason is carried through; it is never disguised as a report. */
+function failedDiagnosisText(detail: string, locale: string): string {
+  return languageOf(locale) === 'es'
+    ? `El diagnóstico falló: ${detail}`
+    : `The diagnosis failed: ${detail}`;
+}
+
+function unknownPieceText(piece: string, locale: string): string {
+  return languageOf(locale) === 'es'
+    ? `La pieza ${piece} no está registrada: no se detuvo nada.`
+    : `Piece ${piece} is not registered: nothing was stopped.`;
+}
+
+function defaultStopReason(locale: string): string {
+  return languageOf(locale) === 'es' ? 'Detenida a petición del dueño' : "Stopped at the owner's request";
+}
+
+function pauseReason(locale: string): string {
+  return languageOf(locale) === 'es' ? 'En pausa' : 'On hold';
+}
+
+/**
+ * What `stop` prints. The store is the channel another controller watches, so this command
+ * only ever records the request: it must not claim the piece is already stopped, because a
+ * gate in flight elsewhere is still running until it sees the park.
+ */
+function stopRequestText(piece: string, reason: string, locale: string): string {
+  return languageOf(locale) === 'es'
+    ? `Solicitud de parada registrada para la pieza ${piece}: ${reason}.`
+    : `Stop request recorded for piece ${piece}: ${reason}.`;
+}
+
+/**
+ * What `resume` prints for an argument it cannot accept. Nothing has been read from the store at
+ * this point, so no hold can have been lifted: refusing here is what stops `resume --help` from
+ * being silently read as a bulk resume.
+ */
+function invalidResumeArgumentText(locale: string): string {
+  return languageOf(locale) === 'es'
+    ? 'Argumento no válido para resume. Uso: resume [pieza]'
+    : 'Invalid argument for resume. Usage: resume [piece]';
+}
+
+/** What `pause` prints for any operand: the command takes none, so nothing is touched. */
+function invalidPauseArgumentText(locale: string): string {
+  return languageOf(locale) === 'es'
+    ? 'Argumento no válido para pause. Uso: pause'
+    : 'Invalid argument for pause. Usage: pause';
+}
+
+/**
+ * What `stop` prints when the park could not be stored. The request was not recorded, so it is
+ * not reported as recorded; the piece is named and the reason is kept.
+ */
+function failedStopText(piece: string, detail: string, locale: string): string {
+  return languageOf(locale) === 'es'
+    ? `No se pudo registrar la parada de la pieza ${piece}: ${detail}`
+    : `Could not record the stop of piece ${piece}: ${detail}`;
+}
+
+/**
+ * A bulk `pause` that stopped partway. It accounts for the pieces this invocation actually
+ * paused, names the one that failed and its reason, and says nothing about untouched later
+ * pieces. Only the `engine.stop` call is guarded by the caller, so an error from anywhere else
+ * still surfaces as itself.
+ */
+function partialPauseText(
+  paused: readonly string[],
+  failed: string,
+  detail: string,
+  locale: string,
+): string {
+  if (languageOf(locale) === 'es') {
+    const done = paused.length === 0 ? 'Ninguna pieza quedó en pausa' : `Ya en pausa: ${paused.join(', ')}`;
+    return `No se pudieron pausar todas las piezas. ${done}. No se pudo pausar ${failed}: ${detail}.`;
+  }
+  const done = paused.length === 0 ? 'No piece was paused' : `Already paused: ${paused.join(', ')}`;
+  return `Could not pause every piece. ${done}. Could not pause ${failed}: ${detail}.`;
+}
+
+/**
+ * A bulk `pause` whose pauses landed but whose final status read failed. The pieces this
+ * invocation paused are named; the pieces that were not read are not described at all, and the
+ * read failure keeps its own reason instead of being lost with the progress.
+ */
+function pauseReadFailureText(paused: readonly string[], detail: string, locale: string): string {
+  if (languageOf(locale) === 'es') {
+    const done = paused.length === 0 ? 'Ninguna pieza quedó en pausa' : `Ya en pausa: ${paused.join(', ')}`;
+    return `No se pudo leer el estado tras la pausa. ${done}. Motivo: ${detail}.`;
+  }
+  const done = paused.length === 0 ? 'No piece was paused' : `Already paused: ${paused.join(', ')}`;
+  return `Could not read the status after pausing. ${done}. Reason: ${detail}.`;
+}
+
+/**
+ * A bulk `resume` whose resumes landed but whose final status read failed. The pieces this
+ * invocation resumed are named; pieces that were not read are not described, and the read
+ * failure keeps its own reason.
+ */
+function resumeReadFailureText(resumed: readonly string[], detail: string, locale: string): string {
+  if (languageOf(locale) === 'es') {
+    const done =
+      resumed.length === 0 ? 'Ninguna pieza quedó reanudada' : `Ya reanudadas: ${resumed.join(', ')}`;
+    return `No se pudo leer el estado tras reanudar. ${done}. Motivo: ${detail}.`;
+  }
+  const done = resumed.length === 0 ? 'No piece was resumed' : `Already resumed: ${resumed.join(', ')}`;
+  return `Could not read the status after resuming. ${done}. Reason: ${detail}.`;
+}
+
+/**
+ * A named `resume` that failed — a lost race against a newer hold, or a store that could not
+ * answer. It shares the vocabulary of a partial bulk resume but claims nothing about other
+ * pieces: only the one asked for is in play.
+ */
+function failedResumeText(piece: string, detail: string, locale: string): string {
+  return languageOf(locale) === 'es'
+    ? `No se pudo reanudar la pieza ${piece}: ${detail}`
+    : `Could not resume piece ${piece}: ${detail}`;
+}
+
+/**
+ * A named `resume` whose resume call returned but whose final listing could not be read. The
+ * status the engine actually returned is shown unchanged — a piece that was already `done` is
+ * never claimed as resumed — alongside the reason the listing could not be read.
+ */
+function resumeUnreadText(status: PieceStatus, detail: string, locale: string): string {
+  const rendered = renderStatus([status], { locale });
+  return languageOf(locale) === 'es'
+    ? `No se pudo leer el listado tras reanudar. Estado conocido:\n${rendered}\nMotivo: ${detail}.`
+    : `Could not read the listing after resuming. Known state:\n${rendered}\nReason: ${detail}.`;
+}
+
+/**
+ * A bulk `resume` that stopped partway. It accounts for the pieces that were actually resumed,
+ * names the one that failed and its reason, and says nothing about the untouched later pieces:
+ * claiming those succeeded would be the same false green the whole CLI exists to avoid.
+ */
+function partialResumeText(
+  resumed: readonly string[],
+  failed: string,
+  detail: string,
+  locale: string,
+): string {
+  if (languageOf(locale) === 'es') {
+    const done =
+      resumed.length === 0 ? 'Ninguna pieza quedó reanudada' : `Ya reanudadas: ${resumed.join(', ')}`;
+    return `No se pudieron reanudar todas las piezas. ${done}. No se pudo reanudar ${failed}: ${detail}.`;
+  }
+  const done = resumed.length === 0 ? 'No piece was resumed' : `Already resumed: ${resumed.join(', ')}`;
+  return `Could not resume every piece. ${done}. Could not resume ${failed}: ${detail}.`;
 }
 
 /** Reads a run's outcome through the same plain-language lens as `status`. */
@@ -348,7 +554,14 @@ export async function runCommand(argv: readonly string[], options: CommandOption
         return { ok: false, text: missingPieceText(locale) };
       }
 
-      const engine = openEngine(config, store, locale, options.describeChange, options.leaseMs);
+      const engine = openEngine(
+        config,
+        store,
+        locale,
+        options.describeChange,
+        options.leaseMs,
+        options.cancellationPollMs,
+      );
       if (isOutput(engine)) return engine;
 
       const dryRun = args.includes('--dry-run');
@@ -357,7 +570,14 @@ export async function runCommand(argv: readonly string[], options: CommandOption
     }
 
     case 'status': {
-      const engine = openEngine(config, store, locale, options.describeChange, options.leaseMs);
+      const engine = openEngine(
+        config,
+        store,
+        locale,
+        options.describeChange,
+        options.leaseMs,
+        options.cancellationPollMs,
+      );
       if (isOutput(engine)) return engine;
 
       const piece = args[0];
@@ -383,6 +603,219 @@ export async function runCommand(argv: readonly string[], options: CommandOption
         };
       }
       return { ok: false, text: invalidConfigText(validation.errors, locale) };
+    }
+
+    case 'doctor': {
+      // Without a diagnosis there is nothing to report. A reassuring empty screen would be a
+      // claim this command cannot back, so it fails closed and says what is missing.
+      if (options.diagnose === undefined) {
+        return { ok: false, text: missingDiagnosisText(locale) };
+      }
+      // A diagnosis is external input and may throw: a bad credential, a missing binary. That
+      // is a failed diagnosis with a reason, not something to let escape the command as a stack
+      // trace, and not a green report. The reason is kept and named.
+      let report: DoctorReport;
+      try {
+        report = await options.diagnose();
+      } catch (error) {
+        return { ok: false, text: failedDiagnosisText(describeFailure(error), locale) };
+      }
+      return { ok: true, text: renderDoctor(report, { locale }) };
+    }
+
+    case 'stop': {
+      const piece = args[0];
+      if (piece === undefined || piece.length === 0) {
+        return { ok: false, text: missingPieceText(locale) };
+      }
+
+      const engine = openEngine(
+        config,
+        store,
+        locale,
+        options.describeChange,
+        options.leaseMs,
+        options.cancellationPollMs,
+      );
+      if (isOutput(engine)) return engine;
+
+      // Parking a piece the store has never seen would invent a phantom that `list` hides and
+      // `status` shows. The engine stores nothing for it, so the CLI must not claim otherwise.
+      // If the read that establishes the piece fails, nothing was recorded; the piece is named
+      // with the read's reason and no «request recorded» text is printed.
+      let registered: boolean;
+      try {
+        registered = (await engine.status(piece)) !== undefined;
+      } catch (error) {
+        return { ok: false, text: failedStopText(piece, describeFailure(error), locale) };
+      }
+      if (!registered) {
+        return { ok: false, text: unknownPieceText(piece, locale) };
+      }
+
+      const reason = args.slice(1).join(' ').trim();
+      const parkedReason = reason.length > 0 ? reason : defaultStopReason(locale);
+      // Only a store that accepted the park gets the «request recorded» text. A failure here is
+      // the store's, not a successful brake, so it is reported with its reason.
+      try {
+        await engine.stop(piece, parkedReason);
+      } catch (error) {
+        return { ok: false, text: failedStopText(piece, describeFailure(error), locale) };
+      }
+      return { ok: true, text: stopRequestText(piece, parkedReason, locale) };
+    }
+
+    case 'pause': {
+      // `pause` takes no operands. Refused before the engine is built, so an operand can never
+      // be read as a bulk pause and park pieces the caller did not name.
+      if (args.length > 0) {
+        return { ok: false, text: invalidPauseArgumentText(locale) };
+      }
+
+      const engine = openEngine(
+        config,
+        store,
+        locale,
+        options.describeChange,
+        options.leaseMs,
+        options.cancellationPollMs,
+      );
+      if (isOutput(engine)) return engine;
+
+      // The snapshot only decides what to ask for. Each `stop` re-checks eligibility against its
+      // own fresh read, so a piece that finished after this list was read is not parked.
+      let unfinished: readonly PieceStatus[];
+      try {
+        unfinished = (await engine.list()).filter(
+          (status) => status.state !== 'done' && status.state !== 'parked',
+        );
+      } catch (error) {
+        // Nothing was paused: the snapshot never arrived. The report says exactly that, with the
+        // read failure's reason, rather than failing silently or naming pieces it never saw.
+        return { ok: false, text: pauseReadFailureText([], describeFailure(error), locale) };
+      }
+      const paused: string[] = [];
+      for (const status of unfinished) {
+        try {
+          const parked = await engine.stop(status.piece, pauseReason(locale), {
+            onlyWhenUnfinished: true,
+          });
+          // An eligible piece becomes `parked`; one excluded by a fresh read comes back as it
+          // already was, and is not claimed as paused by this invocation.
+          if (parked.state === 'parked') paused.push(status.piece);
+        } catch (error) {
+          // A store or network failure is an ordinary Error at this boundary. The pieces already
+          // paused stay paused, and the failure is reported with its reason rather than thrown.
+          return {
+            ok: false,
+            text: partialPauseText(paused, status.piece, describeFailure(error), locale),
+          };
+        }
+      }
+      // The pauses have landed; this read only reports them. If it fails, the progress is not
+      // thrown away — the pieces paused are named, with the read failure as the reason — and no
+      // piece that was never read is described.
+      try {
+        return { ok: true, text: renderStatus(await engine.list(), { locale }) };
+      } catch (error) {
+        return { ok: false, text: pauseReadFailureText(paused, describeFailure(error), locale) };
+      }
+    }
+
+    case 'resume': {
+      // Parsed before any read, so a flag can never fall through to bulk resume and lift every
+      // hold. `resume` with no arguments resumes every parked piece; `resume <piece>` names
+      // exactly one non-empty piece and no flags; anything else is refused here.
+      const piece = args.length === 1 ? args[0] : undefined;
+      const named = piece !== undefined && piece.length > 0 && !piece.startsWith('-');
+      if (args.length > 1 || (args.length === 1 && !named)) {
+        return { ok: false, text: invalidResumeArgumentText(locale) };
+      }
+
+      const engine = openEngine(
+        config,
+        store,
+        locale,
+        options.describeChange,
+        options.leaseMs,
+        options.cancellationPollMs,
+      );
+      if (isOutput(engine)) return engine;
+
+      if (piece !== undefined) {
+        // The initial read establishes whether the piece exists. If it cannot answer, nothing
+        // was resumed: the piece is named with the read's reason instead of throwing out.
+        let registered: boolean;
+        try {
+          registered = (await engine.status(piece)) !== undefined;
+        } catch (error) {
+          return { ok: false, text: failedResumeText(piece, describeFailure(error), locale) };
+        }
+        if (!registered) {
+          return {
+            ok: false,
+            text:
+              languageOf(locale) === 'es'
+                ? `La pieza ${piece} no está registrada: no se reanudó nada.`
+                : `Piece ${piece} is not registered: nothing was resumed.`,
+          };
+        }
+        // Restoring the prior state is the transition; whether that prior state was a
+        // rejection does not make the restore itself a failure. Any failed restore — a lost
+        // race or a store that cannot answer — is reported with its reason, and nothing is
+        // retried over a newer hold or undone.
+        let restored: PieceStatus;
+        try {
+          restored = await engine.resume(piece);
+        } catch (error) {
+          return { ok: false, text: failedResumeText(piece, describeFailure(error), locale) };
+        }
+        // The resume call returned; this read only reports the wider listing. If it fails, the
+        // status the engine actually returned is shown as-is — a piece already `done` is not
+        // claimed as resumed — with the read failure as the reason.
+        try {
+          return { ok: true, text: renderStatus(await engine.list(), { locale }) };
+        } catch (error) {
+          return {
+            ok: false,
+            text: resumeUnreadText(restored, describeFailure(error), locale),
+          };
+        }
+      }
+
+      // No name: resume every parked piece, without running any gate.
+      let parked: readonly PieceStatus[];
+      try {
+        parked = (await engine.list()).filter((status) => status.state === 'parked');
+      } catch (error) {
+        // The snapshot never arrived, so nothing was resumed. The report says so, with the read
+        // failure's reason, and names no piece it never saw.
+        return { ok: false, text: resumeReadFailureText([], describeFailure(error), locale) };
+      }
+      const resumed: string[] = [];
+      for (const status of parked) {
+        try {
+          await engine.resume(status.piece);
+          resumed.push(status.piece);
+        } catch (error) {
+          // The command boundary catches every failure, whether a lost race or a store that
+          // cannot answer: it is not retried over the newer hold and nothing is undone. The
+          // pieces already resumed stay resumed, and the report names them, the failed piece
+          // and the reason.
+          return {
+            ok: false,
+            text: partialResumeText(resumed, status.piece, describeFailure(error), locale),
+          };
+        }
+      }
+      // The resumes have landed; this read only reports them. If it fails, the progress is not
+      // thrown away — the pieces resumed are named, with the read failure as the reason — and no
+      // piece that was never read is described.
+      try {
+        return { ok: true, text: renderStatus(await engine.list(), { locale }) };
+      } catch (error) {
+        return { ok: false, text: resumeReadFailureText(resumed, describeFailure(error), locale) };
+      }
     }
 
     default:

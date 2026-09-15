@@ -1,5 +1,6 @@
 import {
   EffectNeedsReconciliation,
+  EffectRefusedBecauseParked,
   StaleVersion,
   type EffectRecord,
   type JournalEntry,
@@ -213,6 +214,15 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): Store {
         // Pending or uncertain: whether the effect landed is unknown. Blindly retrying is
         // how a second pull request gets opened, so report instead.
         throw new EffectNeedsReconciliation(piece, operationId, record.state);
+      }
+
+      // A stop that landed before this effect was claimed wins over it. The read and the claim
+      // below run without an await between them, so no park can slip in and be overwritten:
+      // stop-versus-effect has exactly one winner. A stop after the claim leaves the pending
+      // record alone, so an effect already in flight is never falsified or erased.
+      const parked = statuses.get(piece);
+      if (parked !== undefined && parked.status.state === 'parked') {
+        throw new EffectRefusedBecauseParked(piece);
       }
 
       // Claim before awaiting anything: two overlapping calls must see this marker. The
