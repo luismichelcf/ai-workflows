@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 
 import {
   EffectNeedsReconciliation,
+  EffectRefusedBecauseParked,
   StaleVersion,
   type EffectRecord,
   type EffectState,
@@ -561,6 +562,15 @@ export function createGitStore(options: GitStoreOptions): Store {
               // Pending or uncertain: whether the effect landed is unknown. Blindly retrying
               // is how a second pull request gets opened, so report instead.
               throw new EffectNeedsReconciliation(piece, operationId, record.state);
+            }
+            // A stop that landed before this effect was claimed wins over it. Both files live
+            // on the same piece ref, so reading the status and claiming the effect are one
+            // commit-on-top: stop-versus-effect has a single winner. A stop that lands after
+            // the claim moves the ref under this commit, which loses its race and retries into
+            // the parked status — a claimed effect is never overwritten or erased.
+            const stored = await readStatus(ref, head);
+            if (stored !== undefined && stored.status.state === 'parked') {
+              throw new EffectRefusedBecauseParked(piece);
             }
             return {
               kind: 'write',

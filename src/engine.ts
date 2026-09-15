@@ -1,4 +1,5 @@
 import {
+  EffectRefusedBecauseParked,
   InvalidPipeline,
   StaleVersion,
   type Engine,
@@ -12,6 +13,7 @@ import {
   type RunOutcome,
   type StageConfig,
   type StageOutcome,
+  type StopOptions,
   type Store,
   type VersionedStatus,
 } from './contract.js';
@@ -53,8 +55,37 @@ export class InvalidLease extends Error {
   }
 }
 
+/**
+ * A cancellation poll the engine cannot honour. Like a bad lease it is the caller's mistake, so
+ * it is reported rather than fed to `setInterval`, where `NaN`, a fraction or a value past the
+ * 32-bit timer ceiling would be rounded or silently clamped to a different cadence, changing how
+ * quickly a stop is observed.
+ */
+export class InvalidCancellationPoll extends Error {
+  constructor(readonly value: number) {
+    super(
+      'the cancellation poll must be a whole number of milliseconds between 1 and 2147483647, ' +
+        `got ${String(value)}`,
+    );
+    this.name = 'InvalidCancellationPoll';
+  }
+}
+
 /** How often the keepalive re-extends a lease while a single stage is still running. */
 const leaseHeartbeatMs = (leaseMs: number): number => Math.max(1, Math.floor(leaseMs / 3));
+
+/**
+ * How often a running stage looks at the shared store to see whether another controller parked
+ * the piece, unless the project asks otherwise. A stop from elsewhere writes to the store, not
+ * into this run's controller map, so the run must watch for it. The watch has its own interval,
+ * deliberately not derived from the lease: a lease measured in minutes must not mean minutes of
+ * silence before a stop is honoured. But the interval is also a budget: a watcher poll is at
+ * least two GitHub requests (one to read the ref, one for the status file), so thirty seconds is
+ * 120 polls — 240 requests — an hour per active gate. Ten pieces running at once are about
+ * 2,400 requests/h against the 5,000/h limit, leaving room for the lease renewals and the
+ * transitions themselves; five seconds would have spent the whole allowance on watching.
+ */
+const DEFAULT_CANCELLATION_POLL_MS = 30_000;
 
 type GateVerdict =
   | { readonly kind: 'passed'; readonly evidence?: JsonValue }
@@ -295,6 +326,20 @@ export function createEngine(options: EngineOptions): Engine {
     throw new InvalidLease(options.leaseMs);
   }
 
+  // Same treatment for the cancellation poll: it must be an interval `setInterval` can represent
+  // faithfully — a whole number of milliseconds in [1, 2_147_483_647] — because a fraction or a
+  // value past the 32-bit timer ceiling is rounded or clamped to a different cadence.
+  if (
+    options.cancellationPollMs !== undefined &&
+    !(
+      Number.isInteger(options.cancellationPollMs) &&
+      options.cancellationPollMs >= 1 &&
+      options.cancellationPollMs <= 2_147_483_647
+    )
+  ) {
+    throw new InvalidCancellationPoll(options.cancellationPollMs);
+  }
+
   const { config, store } = options;
   const instanceSerial = (engineSerial += 1);
   const runId = options.runId ?? `engine-${instanceSerial}`;
@@ -305,6 +350,7 @@ export function createEngine(options: EngineOptions): Engine {
   const now = options.now ?? Date.now;
   const requestedLeaseMs = options.leaseMs ?? DEFAULT_LEASE_MS;
   const reserveLeaseMs = Math.max(requestedLeaseMs, MIN_LEASE_MS);
+  const cancellationPollMs = options.cancellationPollMs ?? DEFAULT_CANCELLATION_POLL_MS;
   const describeChange = options.describeChange;
   // Computed once: a pipeline cannot change under a live engine, so its fingerprint is fixed.
   const pipeline = fingerprint(config);
@@ -379,21 +425,25 @@ export function createEngine(options: EngineOptions): Engine {
       }
     };
 
-    // Why the keepalive gave up on the lease. It is recorded before aborting so the abort
-    // can be translated honestly: an abort and a theft are not the same answer. `undefined`
-    // means no theft was seen, so an abort, if any, came from the caller's signal.
+    // Why this run stopped touching the piece. It is recorded before aborting so the abort can be
+    // translated honestly: an abort, a theft and a park are not the same answer. `undefined`
+    // means no loss was seen, so an abort, if any, came from the caller's signal.
     type LeaseLoss =
       | { readonly kind: 'taken'; readonly heldBy: string }
       | { readonly kind: 'lapsed' }
-      | { readonly kind: 'unconfirmed' };
+      | { readonly kind: 'unconfirmed' }
+      /** Another controller parked the piece; the stored status is the outcome to return. */
+      | { readonly kind: 'parked'; readonly status: PieceStatus };
     let leaseLoss: LeaseLoss | undefined;
 
     // A failed renewal with a named holder means another controller has the piece. Anything
-    // else — a lease nobody took, or a store that cannot answer — is a technical block, never
-    // `busy`: `busy` promises the caller someone else owns the piece, and a caller may wait on
-    // that controller to finish.
+    // else — a lease nobody took, a store that cannot answer, or a park another controller
+    // recorded — is not `busy`: `busy` promises the caller someone else owns the piece, and a
+    // caller may wait on that controller to finish. A park is a settled outcome, returned as
+    // itself rather than dressed up as a technical lease failure.
     const lostOutcome = (loss: LeaseLoss): RunOutcome => {
       if (loss.kind === 'taken') return { outcome: 'busy', heldBy: loss.heldBy };
+      if (loss.kind === 'parked') return { outcome: 'parked', status: loss.status };
       return {
         outcome: 'ran',
         status: blockedStatus(
@@ -415,6 +465,24 @@ export function createEngine(options: EngineOptions): Engine {
       leaseLoss === undefined
         ? { outcome: 'ran', status: { piece, state: 'running' } }
         : lostOutcome(leaseLoss);
+
+    // A park refuses an effect the gate — or its `appliesWhen` — was about to start. That is a
+    // cancellation decision, not a failure, so it is translated in exactly one place: the piece's
+    // current state decides whether the run is `parked` or simply cancelled where it stands. If
+    // that state cannot be read, the run reports it as a technical block without a `failed`
+    // entry, without a `finish`, and without writing over a transition that followed the park.
+    const cancellationOutcome = async (stageName: string): Promise<RunOutcome> => {
+      let current: VersionedStatus | undefined;
+      try {
+        current = await readStatus();
+      } catch (readError) {
+        return { outcome: 'ran', status: blockedStatus(stageName, describeUnknown(readError)) };
+      }
+      if (current !== undefined && current.status.state === 'parked') {
+        return { outcome: 'parked', status: current.status };
+      }
+      return { outcome: 'ran', status: current?.status ?? { piece, state: 'running' } };
+    };
 
     try {
       // A stop that happened before this run began still wins over any progress.
@@ -565,6 +633,9 @@ export function createEngine(options: EngineOptions): Engine {
         try {
           return classifyApplicability(await stage.appliesWhen(context));
         } catch (error) {
+          // A refusal is a cancellation decision, not a malformed applicability. It travels to
+          // the stage's catch, which is the one place that translates it.
+          if (error instanceof EffectRefusedBecauseParked) throw error;
           return {
             kind: 'malformed',
             reason: `appliesWhen of stage "${stage.name}" failed: ${describeUnknown(error)}`,
@@ -617,12 +688,25 @@ export function createEngine(options: EngineOptions): Engine {
       // A stage may run far longer than one lease. This timer re-extends the lease while the
       // gate works, and stops the run if the piece is gone: once another controller holds it,
       // whatever this run concludes is worthless and writing it would overwrite theirs. The
-      // timer is unref'd so it never keeps the process alive, and it is always cleared.
+      // timers are unref'd so they never keep the process alive, and they are always cleared.
+      //
+      // Each stage gets its own heartbeat with its own lifecycle. A `loadStatus` already on the
+      // wire when the stage ends may resolve much later, during a later stage: without a local
+      // `closed` flag its stale `parked` would abort that later stage and lose work the store
+      // says is still running. So once the stage closes, neither a pending renewal nor a pending
+      // watcher read may set `leaseLoss` or abort the controller, and a watcher read still in
+      // flight is not overlapped by the next tick.
       const startHeartbeat = (): (() => void) => {
         if (dryRun) return () => {};
-        const timer = setInterval(() => {
+
+        let closed = false;
+        let reading = false;
+
+        const renewal = setInterval(() => {
+          if (closed) return;
           store.renew(piece, leaseId, requestedLeaseMs).then(
             (renewed) => {
+              if (closed) return;
               if (!renewed.ok) {
                 // Record who took it before aborting: the abort is translated to `busy`
                 // with a holder, not to a `running` status the store never saw.
@@ -634,14 +718,51 @@ export function createEngine(options: EngineOptions): Engine {
               }
             },
             () => {
+              if (closed) return;
               // The lease could not be confirmed. Unknown is not held, so stop touching it.
               leaseLoss = { kind: 'unconfirmed' };
               controller.abort();
             },
           );
         }, leaseHeartbeatMs(requestedLeaseMs));
-        timer.unref();
-        return () => clearInterval(timer);
+        renewal.unref();
+
+        // A stop may come from another controller whose `stop` cannot reach this run's
+        // in-memory controller map, because it is a different Engine over the same store. The
+        // shared store is the channel, so the stored status is polled while the gate is open.
+        // The interval is its own setting, never the lease heartbeat, so a minutes-long lease
+        // does not mean minutes of silence; the project can shorten it for tests. A read failure
+        // is left to the run's own reads to report; it must not turn a healthy gate into a
+        // technical failure.
+        const parkedWatch = setInterval(() => {
+          // A slow store must not accumulate reads: skip a tick while the previous one is open.
+          if (closed || reading) return;
+          reading = true;
+          store.loadStatus(piece).then(
+            (current) => {
+              reading = false;
+              if (closed) return;
+              if (current !== undefined && current.status.state === 'parked') {
+                leaseLoss = { kind: 'parked', status: current.status };
+                controller.abort();
+              }
+            },
+            () => {
+              reading = false;
+            },
+          );
+        }, cancellationPollMs);
+        parkedWatch.unref();
+
+        let stopped = false;
+        return () => {
+          // Idempotent: a second cleanup must not undo anything or throw.
+          if (stopped) return;
+          stopped = true;
+          closed = true;
+          clearInterval(renewal);
+          clearInterval(parkedWatch);
+        };
       };
 
       const order = orderStages(config.stages);
@@ -698,6 +819,10 @@ export function createEngine(options: EngineOptions): Engine {
               try {
                 answer = await stage.stillValid(prior, context);
               } catch (error) {
+                // A refusal from `stillValid` is the same cancellation decision as one from a
+                // gate or `appliesWhen`: it must reach the stage's central translation instead of
+                // being journalled as a failure here. Ordinary errors keep their behaviour.
+                if (error instanceof EffectRefusedBecauseParked) throw error;
                 const reason = `stillValid of stage "${stage.name}" failed: ${describeUnknown(error)}`;
                 await record(stage.name, 'failed', reason);
                 return await finish(blockedStatus(stage.name, reason)); // await: a store failure in finish() must reach this stage's catch
@@ -766,6 +891,12 @@ export function createEngine(options: EngineOptions): Engine {
               unchecked.push(stage.name);
               continue;
             }
+            if (error instanceof EffectRefusedBecauseParked) {
+              // A refusal is a cancellation decision, not a gate failure. It is translated once,
+              // in the stage's catch, so it travels past this one without being journalled or
+              // turned into a `blocked:technical`.
+              throw error;
+            }
             const stopped = await readStatus();
             if (stopped !== undefined && stopped.status.state === 'parked') {
               return { outcome: 'parked', status: stopped.status };
@@ -828,6 +959,11 @@ export function createEngine(options: EngineOptions): Engine {
           // await: a store failure in finish() must reach this stage's catch, not reject run().
           return await finish(blockedStatus(stage.name, verdict.reason));
         } catch (error) {
+          if (error instanceof EffectRefusedBecauseParked) {
+            // Whether it came from the gate or from `appliesWhen`, a refusal is translated here,
+            // before any other failure: this is cancellation, not a technical block.
+            return await cancellationOutcome(stage.name);
+          }
           if (error instanceof StoreWriteFailure || error instanceof StoreReadFailure) {
             // The store failed mid-stage. Report it as a technical block; do not let the raw
             // store exception escape run() with no state and no diagnosis.
@@ -975,16 +1111,33 @@ export function createEngine(options: EngineOptions): Engine {
       return store.listStatuses();
     },
 
-    async stop(piece, reason): Promise<PieceStatus> {
-      // Freeze the stage's context signal first: the gate should learn it was stopped.
+    async stop(piece, reason, stopOptions): Promise<PieceStatus> {
+      const onlyWhenUnfinished = stopOptions?.onlyWhenUnfinished === true;
       const active = activeRuns.get(piece);
-      if (active !== undefined) controllers.get(active.key)?.abort();
+      const abortActive = (): void => {
+        if (active !== undefined) controllers.get(active.key)?.abort();
+      };
 
+      // The stored park is the source of truth, so the active run is aborted only once
+      // `saveStatus(parked, …)` has succeeded. Aborting first would cancel a gate for a stop
+      // that never landed, leaving the piece still running but its work thrown away.
+      //
       // `stop` reads, then writes with the version it read. Over a remote those are two
       // round trips and a write in between makes the write stale — losing the owner's brake.
       // Re-read and retry a few times before giving up.
       for (let attempt = 1; ; attempt += 1) {
         const current = await store.loadStatus(piece);
+
+        if (onlyWhenUnfinished) {
+          // Decided against the same read the write will be committed against, and re-decided on
+          // every retry: a piece that finished in between is left exactly as it is, and a gate
+          // still working on it is not aborted for a pause that will not happen.
+          const excluded =
+            current !== undefined &&
+            (current.status.state === 'done' || current.status.state === 'parked');
+          if (excluded) return current.status;
+        }
+
         if (current === undefined && active === undefined) {
           // A stop is a fact about a piece, not a piece. Parking one the store has never
           // seen would invent a phantom that `list` hides, `status` shows and a later run
@@ -1011,6 +1164,8 @@ export function createEngine(options: EngineOptions): Engine {
         };
         try {
           await store.saveStatus(parked, current?.version);
+          // Committed: now the gate that is still working learns the piece is stopped.
+          abortActive();
           return parked;
         } catch (error) {
           if (error instanceof StaleVersion && attempt < 3) continue;

@@ -242,6 +242,20 @@ export class EffectNeedsReconciliation extends Error {
   }
 }
 
+/**
+ * Thrown when `runEffect` is asked to start an effect for a parked piece. The effect was never
+ * claimed, so nothing reached the outside world and nothing needs reconciling: the caller is
+ * meant to read the parked status as the outcome instead. This is the effect's half of «stop
+ * versus effect has a single winner», checked inside the same transaction that claims the
+ * effect, so a stop that landed first can never be overwritten by an effect that slipped in.
+ */
+export class EffectRefusedBecauseParked extends Error {
+  constructor(readonly piece: PieceId) {
+    super(`effect of piece ${piece} was not started because the piece is parked`);
+    this.name = 'EffectRefusedBecauseParked';
+  }
+}
+
 /** Thrown when a write lost its race: someone else wrote since this caller read. */
 export class StaleVersion extends Error {
   constructor(readonly piece: PieceId) {
@@ -349,6 +363,16 @@ export interface RunOptions {
   readonly signal?: AbortSignal;
 }
 
+export interface StopOptions {
+  /**
+   * Park only if the freshly-read state is still unfinished — neither `done` nor `parked`. A
+   * bulk pause asks for this so a piece that finished after the pause list was read is left
+   * alone; the check lives inside the version-checked read/decide/write loop, so it is decided
+   * against the same read the write is committed against, not against an earlier snapshot.
+   */
+  readonly onlyWhenUnfinished?: boolean;
+}
+
 export interface Engine {
   /**
    * Advances the piece as far as its gates allow. Resumes by evidence: a stage with no
@@ -358,7 +382,7 @@ export interface Engine {
   status(piece: PieceId): Promise<PieceStatus | undefined>;
   list(): Promise<readonly PieceStatus[]>;
   /** Parks the piece, keeping its work and its previous diagnosis. */
-  stop(piece: PieceId, reason: string): Promise<PieceStatus>;
+  stop(piece: PieceId, reason: string, options?: StopOptions): Promise<PieceStatus>;
   /** Un-parks it. The next run resumes by evidence, like any other. */
   resume(piece: PieceId): Promise<PieceStatus>;
 }
@@ -372,4 +396,11 @@ export interface EngineOptions {
   /** Injected so runs are reproducible and tests do not depend on the wall clock. */
   readonly now?: () => number;
   readonly leaseMs?: number;
+  /**
+   * How often a running stage watches the store for a park recorded by another controller.
+   * Bounded on its own, never tied to the lease heartbeat: a minutes-long lease must not mean
+   * minutes of silence before a stop is honoured. Defaults to a production-safe value that
+   * stays well inside GitHub API limits while cancelling promptly.
+   */
+  readonly cancellationPollMs?: number;
 }

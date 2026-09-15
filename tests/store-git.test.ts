@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   EffectNeedsReconciliation,
+  EffectRefusedBecauseParked,
   StaleVersion,
   createGitStore,
   createMemoryStore,
@@ -175,6 +176,51 @@ describe.each(STORES)('the %s store keeps the Store contract', (_name, make) => 
   });
 
   describe('external effects', () => {
+    it('refuses to claim a new effect after the piece was parked', async () => {
+      const store = make();
+      await store.saveStatus({ piece: '997', state: 'parked', reason: 'owner hold' }, undefined);
+      let attempts = 0;
+
+      await expect(
+        store.runEffect('997', 'open-pr', async () => {
+          attempts += 1;
+          return { pr: 1234 };
+        }),
+      ).rejects.toBeInstanceOf(EffectRefusedBecauseParked);
+
+      expect(attempts).toBe(0);
+      expect(await store.getEffect('997', 'open-pr')).toBeUndefined();
+    });
+
+    it('keeps an effect claimed before parking for reconciliation', async () => {
+      const store = make();
+      let release: (() => void) | undefined;
+      let started: (() => void) | undefined;
+      const effectStarted = new Promise<void>((resolve) => {
+        started = resolve;
+      });
+      const held = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const flight = store.runEffect('997', 'open-pr', async () => {
+        started?.();
+        await held;
+        return { pr: 1234 };
+      });
+      await effectStarted;
+
+      await store.saveStatus({ piece: '997', state: 'parked', reason: 'owner hold' }, undefined);
+
+      expect(await store.getEffect('997', 'open-pr')).toEqual({ state: 'pending' });
+      release?.();
+      await expect(flight).resolves.toEqual({ pr: 1234 });
+      expect(await store.getEffect('997', 'open-pr')).toEqual({
+        state: 'confirmed',
+        result: { pr: 1234 },
+      });
+      expect((await store.loadStatus('997'))?.status.state).toBe('parked');
+    });
+
     it('does not repeat a confirmed effect', async () => {
       const store = make();
       let attempts = 0;
