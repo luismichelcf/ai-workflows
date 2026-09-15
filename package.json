@@ -1,6 +1,6 @@
 {
   "name": "ai-workflows",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "description": "Deterministic stage engine for coding agents: configurable pipelines whose transitions are verified by code, not by prompt.",
