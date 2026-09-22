@@ -121,6 +121,8 @@ export type Applicability = boolean | { readonly skip: string };
 export interface StageConfig {
   /** Unique within the pipeline. */
   readonly name: string;
+  /** Plain-language label shown when this step is skipped. */
+  readonly summary?: string;
   /** The stage that must pass before this one. Omitted only by the first stage. */
   readonly after?: string;
   readonly nature: GateNature;

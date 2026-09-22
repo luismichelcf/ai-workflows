@@ -42,6 +42,23 @@ Slices 1 to 4 are done: `engine`, `gates`, `providers` and `locks`. A piece's pr
 memory (`createMemoryStore`) or on GitHub (`createGitStore` over `createGitHubStatePort`), so a run
 survives its session and another terminal sees it.
 
+Version 1 (in progress, [PLAN-13](docs/plans/PLAN-13.md)) moves a project's process into a short
+recipe, `.ai-workflows/pipeline.yml`, that the owner can read without programming:
+
+```sh
+ai-workflows init       # writes an example recipe
+ai-workflows validate   # rejects with file:line:column and the reason
+ai-workflows explain    # the whole recipe in plain words, in the recipe's language
+```
+
+The recipe is strict YAML 1.2: duplicate keys, anchors, aliases, tags and unknown keys are
+rejected, and `NO` stays text. Its JSON Schema (`schema/recipe.schema.json`) is the same object
+`validate` enforces, so the editor and the engine agree. A stage's `applies-if` is a structured
+condition (`touches-any`, `touches-none`, `kind-any`, `kind-none`, `lane-any`), never an
+expression; a stage that does not apply is recorded as skipped with its reason, and
+`status <piece>` lists it that way. Blocks, the server check and running a recipe arrive in the
+next slices.
+
 ## Where progress lives on GitHub
 
 ```ts

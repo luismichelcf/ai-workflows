@@ -78,6 +78,14 @@ export {
   type Detection,
 } from './providers.js';
 export { resolveExecutable, type ExecutableEnvironment, type ResolvedExecutable } from './exec.js';
+export { recipeSchema } from './recipe/schema.js';
+export { parseRecipe } from './recipe/parse.js';
+export { classifyFiles } from './recipe/glob.js';
+export { appliesIfFor } from './recipe/applies.js';
+export { explainRecipe } from './recipe/explain.js';
+export { recipeCommand } from './recipe/command.js';
+export { DEFAULT_BANNED_TERMS, findBannedTerms } from './messages.js';
+export type { Recipe, RecipeStage, RecipeCondition, RecipeError } from './recipe/types.js';
 export {
   parseHookInput,
   decideToolUse,

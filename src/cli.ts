@@ -1,8 +1,10 @@
 import {
   InvalidPipeline,
+  type JournalEntry,
   type PieceState,
   type PieceStatus,
   type PipelineConfig,
+  type StageConfig,
   type RunOutcome,
   type Store,
 } from './contract.js';
@@ -73,6 +75,7 @@ const languageOf = (locale: string): Language => (locale.toLowerCase().startsWit
  */
 interface StatusWords {
   readonly header: string;
+  readonly skippedLabel: string;
   readonly empty: string;
   readonly startHint: string;
   readonly stageLabel: string;
@@ -83,6 +86,7 @@ interface StatusWords {
 const STATUS_WORDS: Record<Language, StatusWords> = {
   es: {
     header: 'Piezas',
+    skippedLabel: '  Pasos omitidos:',
     empty: 'Sin piezas.',
     startHint: 'Empieza con: run <pieza>',
     stageLabel: 'paso',
@@ -105,6 +109,7 @@ const STATUS_WORDS: Record<Language, StatusWords> = {
   },
   en: {
     header: 'Pieces',
+    skippedLabel: '  Skipped steps:',
     empty: 'No pieces.',
     startHint: 'Start with: run <piece>',
     stageLabel: 'step',
@@ -181,6 +186,27 @@ export function renderStatus(pieces: readonly PieceStatus[], options: RenderOpti
   const verbose = options.verbose === true;
   const lines = pieces.map((status) => renderPieceLine(status, words, verbose));
   return [words.header, ...lines].join('\n');
+}
+
+/** Show only the latest result for each stage, keeping its first journal position. */
+function renderSkippedSteps(
+  journal: readonly JournalEntry[],
+  stages: readonly StageConfig[],
+  options: RenderOptions,
+): string {
+  const latest = new Map<string, JournalEntry>();
+  for (const entry of journal) latest.set(entry.stage, entry);
+
+  const skipped = [...latest.values()].filter((entry) => entry.outcome === 'skipped');
+  if (skipped.length === 0) return '';
+
+  const words = STATUS_WORDS[languageOf(options.locale)];
+  const lines = skipped.map((entry) => {
+    const name = stages.find((stage) => stage.name === entry.stage)?.summary ?? entry.stage;
+    const line = `  - ${name} — ${entry.reason ?? ''}`;
+    return options.verbose ? line : clampLine(line);
+  });
+  return [words.skippedLabel, ...lines].join('\n');
 }
 
 interface DoctorWords {
@@ -591,7 +617,14 @@ export async function runCommand(argv: readonly string[], options: CommandOption
           text: languageOf(locale) === 'es' ? `La pieza ${piece} no está registrada.` : `Piece ${piece} is not registered.`,
         };
       }
-      return { ok: true, text: renderStatus([status], { locale }) };
+      const verbose = args.includes('--verbose');
+      const detail = renderSkippedSteps(
+        await store.journal(piece),
+        config.stages,
+        { locale, verbose },
+      );
+      const text = renderStatus([status], { locale, verbose });
+      return { ok: true, text: detail.length > 0 ? `${text}\n${detail}` : text };
     }
 
     case 'validate': {
