@@ -80,12 +80,15 @@ export {
 export { resolveExecutable, type ExecutableEnvironment, type ResolvedExecutable } from './exec.js';
 export { recipeSchema } from './recipe/schema.js';
 export { parseRecipe } from './recipe/parse.js';
+export { checkRecipe } from './recipe/blocks.js';
+export { engineBlockManifest } from './blocks/registry.js';
 export { classifyFiles } from './recipe/glob.js';
 export { appliesIfFor } from './recipe/applies.js';
 export { explainRecipe } from './recipe/explain.js';
 export { recipeCommand } from './recipe/command.js';
 export { DEFAULT_BANNED_TERMS, findBannedTerms } from './messages.js';
 export type { Recipe, RecipeStage, RecipeCondition, RecipeError } from './recipe/types.js';
+export type { BlockManifest, InputSpec } from './blocks/manifest.js';
 export {
   parseHookInput,
   decideToolUse,

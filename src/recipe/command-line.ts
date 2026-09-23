@@ -15,7 +15,11 @@ function shown(character: string): string {
   return character;
 }
 
-export function validateCommandLine(node: YamlNode, issues: LocatedIssue[]): void {
+export function validateCommandLine(
+  node: YamlNode,
+  issues: LocatedIssue[],
+  field = 'run',
+): void {
   const text = yamlWord(node);
   const offset = nodeStart(node);
 
@@ -23,7 +27,7 @@ export function validateCommandLine(node: YamlNode, issues: LocatedIssue[]): voi
   if (forbidden.length > 0) {
     issues.push({
       offset,
-      message: `"run" cannot contain shell characters: ${forbidden.map(shown).join(' ')}`,
+      message: `"${field}" cannot contain shell characters: ${forbidden.map(shown).join(' ')}`,
     });
   }
 

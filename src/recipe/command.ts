@@ -2,8 +2,8 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join } from 'node:path';
 
 import type { CommandOutput } from '../cli.js';
+import { checkRecipe } from './blocks.js';
 import { explainRecipe } from './explain.js';
-import { parseRecipe } from './parse.js';
 import { safeTerminalText } from '../safe-text.js';
 
 const DEFAULT_RECIPE = '.ai-workflows/pipeline.yml';
@@ -63,19 +63,19 @@ async function readRecipe(
     return { ok: false, text: `${shownFile}: ${errorReason(error)}` };
   }
 
-  const parsed = parseRecipe(content, file);
-  if (!parsed.ok) {
-    const text = parsed.errors
+  const checked = await checkRecipe(content, file, { root: cwd });
+  if (!checked.ok) {
+    const text = checked.errors
       .map((error) =>
         `${safeTerminalText(error.file)}:${error.line}:${error.column}: ${error.message}`)
       .join('\n');
     return { ok: false, text };
   }
 
-  if (action === 'explain') return { ok: true, text: explainRecipe(parsed.recipe) };
+  if (action === 'explain') return { ok: true, text: explainRecipe(checked.recipe) };
   return {
     ok: true,
-    text: `${shownFile}: valid recipe, ${parsed.recipe.stages.length} stages.`,
+    text: `${shownFile}: valid recipe, ${checked.recipe.stages.length} stages.`,
   };
 }
 
