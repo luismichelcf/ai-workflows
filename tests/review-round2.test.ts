@@ -179,7 +179,9 @@ describe('the report of the Windows launcher', () => {
 });
 
 describe('the survivors a group names end up in the quarantine', () => {
-  it('a command block stores them, so the check can wait for exactly those processes', async () => {
+  // Survivors are how a Windows quarantine names what is still alive; on POSIX the process group
+  // itself is asked, so there is no list to carry.
+  it.runIf(process.platform === 'win32')('a command block stores them, so the check can wait for exactly those processes', async () => {
     const root = repository();
     write(root, 'block.mjs', 'process.stdout.write(JSON.stringify({ ok: true }));\n');
     commit(root, 'block');
