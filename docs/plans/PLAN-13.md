@@ -618,29 +618,27 @@ Rebanadas 1 → 2 → 3 → 4 en orden; 5 puede empezar tras 3; 6 tras 4 y 5; 7 
 
 - Qué proyecto de base de datos de prueba usar (gratuito o del plan Pro), según límites vigentes
   al abrir la rebanada 6.
-- Que salieron de la parvada de la rebanada 1 y se resuelven al abrir la rebanada 2, antes de
-  construir las vigencias y los tipos:
-  - **Vigencia por omisión.** La receta leída deja `valid-while` sin valor si no se escribe; al
-    traducirla al motor, «sin valor» no puede significar «nunca caduca» (eso conservaría la puerta
-    tras un commit nuevo, contra §1.1). Opciones: hacerlo obligatorio o un valor conservador
-    (`same-sha`).
-  - **Tipos y carriles con vocabulario cerrado.** Hoy un error de escritura en `kind-any` o
-    `lane-any` valida y deja la etapa omitida para siempre. Se cierra junto con RC-07.
-  - **Reglas de `validate` diferidas:** exactamente una etapa `phase: merge`, `local-only` solo
-    fuera de `pre-merge` obligatoria, bloques comando sin `attest` ni `execution-record` (RC-08);
-    QA solo con `same-sha`; toda etapa `pre-merge` con `server:` (rebanada 3); orden de fases y
-    `applies-if` sobre la etapa de fusión (a proponer).
-  - **`{tests}` en `with.command`:** el bloque debe pasar los archivos como argumentos, nunca
-    armados dentro de un texto de consola (§3.4).
-  - **Salida saneada en todo el CLI (rebanada 4, mensajes al dueño):** `status`, `validate` y
-    `explain` ya no pueden imprimir caracteres de control, de formato ni separadores; `pause`,
-    `resume`, `stop` y `doctor` (heredados de v0.3.0) todavía repiten nombres de pieza y motivos
-    tal cual. Se cierra con las plantillas de mensajes.
+- Resueltos al construir la rebanada 2 ([PLAN-13-R2](PLAN-13-R2.md)): vigencia por omisión
+  (R14), vocabulario cerrado de tipos y carriles (R15), nombres en español (R16), las reglas de
+  `validate` de RC-08 más el orden de fases y la validación contra manifiestos, y `{tests}` como
+  argumentos sin consola.
+- Siguen abiertos:
+  - **Rebanada 3:** toda etapa `pre-merge` con `server:`; el juez no corre bloques módulo del
+    proyecto (corren en el proceso del motor).
+  - **Rebanada 4:** `required: false` y `retry` en ejecución (hoy `compileRecipe` los rechaza);
+    conectar `run`, `status` y `stop` del binario a la receta, y de dónde toma el CLI el tipo
+    declarado y el constructor de una pieza; publicar el veredicto de `sandboxed-review` como
+    evento autenticado; salida saneada en `pause`, `resume`, `stop` y `doctor`.
+  - **A proponer al dueño:** `applies-if` sobre la etapa de fusión.
   - **Costo aceptado del saneado:** una receta rechaza emojis compuestos (👩‍💻), banderas con
     etiquetas y el guion suave que deja Word; los acentos, «», —, ¿¡ y los emojis simples pasan.
-  - **Propuesta al dueño:** que `explain` muestre las clases y los tipos con un nombre en español
-    (hoy dice «toca «security»»). Sería un campo nuevo de la receta; no se añade sin su visto
-    bueno.
+  - **Después de v1, a proponer al dueño:** un modelo de decisión rápido (p. ej. Jev de
+    TypeSafe) solo como alarma que sube la exigencia, nunca la baja, y primero en modo sombra;
+    implica un servicio y un gasto nuevos (conversación del 22-sep).
+- Límites declarados en la rebanada 2: en Linux, un proceso que crea a propósito su propia sesión
+  sale del grupo del bloque (nivel A); una prueba editada y restaurada sin commit no se detecta
+  (nivel A, CN-11); la identidad del constructor es declarada por la pieza (nivel A, CN-02);
+  `same-fingerprint` caduca si una actualización con la base desplaza líneas (del lado seguro).
 
 ---
 

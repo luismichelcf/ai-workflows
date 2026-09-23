@@ -558,3 +558,29 @@ del resultado del lanzador con y sin nieto activo (§2.2, §7).
 
 **Ronda 5 — misma sesión (versión 5):** **APPROVED**, sin bloqueantes. Aprobación del diseño; la
 implementación y sus pruebas se verifican aparte (puerta del orquestador y parvada).
+
+## 11. Desviaciones durante la construcción
+
+Decididas por el orquestador al verificar cada parte; ninguna cambia lo que decidió el dueño.
+
+- **`check-reachable` (§3.2):** una fuente que no responde es un **rechazo** que la nombra, no un
+  bloqueo técnico, y si la página exacta no responde se intenta la raíz de su dominio (un
+  proveedor real puede mover sus páginas). La prueba usa dominios `.invalid`, que nunca
+  resuelven, para no depender de internet.
+- **Cierre del grupo de procesos (§2.2):** si `terminate()` no confirma el vacío, el bloque
+  comando vuelve a preguntar al sistema (`checkQuarantine`) antes de declarar la cuarentena; una
+  respuesta afirmativa de vacío es la confirmación que §2.2 exige. En Windows la comprobación
+  solo consulta el objeto de trabajo: el sistema no permite terminar el de otro proceso, y un
+  trabajo que ya no existe se da por vacío porque `KILL_ON_JOB_CLOSE` solo lo deja desaparecer
+  tras terminar todos sus procesos.
+- **Bloque módulo (§2.2):** recibe un tercer argumento `project = { root }` (también
+  `reconcile`). Corre dentro del proceso del motor y, sin la carpeta del proyecto, sus órdenes
+  actuaban sobre la carpeta del motor: así la primera prueba contra GitHub subió por error dos
+  ramas al repositorio del motor (borradas el mismo día; solo contenían el código de esta rama y
+  no dispararon trabajos ni solicitudes de cambio).
+- **`reader: vitest` de `command@1` (§3.6):** el rechazo lleva, además de los fallos, las
+  últimas 20 líneas de la salida, porque `parseTestRun` recorta la ruta del archivo en los
+  nombres de los fallos.
+- **Pruebas:** las que manejan git y procesos reales tienen tope de 30 s y el borrado de
+  carpetas temporales reintenta en Windows; RC-09 contra GitHub vive en `tests/github/` y corre
+  con `pnpm test:github` (evidencia en el PR).
