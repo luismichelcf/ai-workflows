@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import type { Gate, GateResult } from '../contract.js';
-import type { BlockDefinition, EngineBlockDeps } from './definition.js';
+import type { BlockDefinition, EngineBlockDeps, ServerContext, ServerResult } from './definition.js';
 import type { BlockManifest } from './manifest.js';
 import { analyzeDocument, canonicalText, type DocumentAnalysis } from '../gates.js';
 
@@ -271,6 +271,48 @@ function createGate(
   };
 }
 
+function reasonOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/** PLAN-13-R3 §1.3: the same structure check, read from the judged commit, never the disk. */
+async function recompute(
+  inputs: Record<string, unknown>,
+  context: ServerContext,
+): Promise<ServerResult> {
+  const spanish = isSpanish(context.locale);
+  const file = asString(inputs['file']) ?? '';
+  const relative = file.replaceAll('{piece}', context.piece);
+
+  let content: string | undefined;
+  try {
+    content = await context.files.read(relative);
+  } catch (error) {
+    return { outcome: 'technical', reason: reasonOf(error) };
+  }
+  if (content === undefined) {
+    return {
+      outcome: 'rejected',
+      reason: spanish
+        ? `No existe el archivo del plan ${quoted(relative, spanish)}.`
+        : `The plan file ${quoted(relative, spanish)} does not exist.`,
+    };
+  }
+
+  const problems = evaluate(
+    content,
+    asStringList(inputs['sections']),
+    readSummary(inputs['summary']),
+    readCriteria(inputs['criteria']),
+    readDecisions(inputs['decisions']),
+    spanish,
+  );
+  if (problems.length > 0) return { outcome: 'rejected', reason: problems.join(' ') };
+
+  const sha256 = createHash('sha256').update(content).digest('hex');
+  return { outcome: 'passed', evidence: { file: relative, sha256 } };
+}
+
 export const specStructureBlock: BlockDefinition = {
   manifest,
   create(inputs, deps) {
@@ -284,4 +326,5 @@ export const specStructureBlock: BlockDefinition = {
       deps,
     );
   },
+  server: { recompute },
 };

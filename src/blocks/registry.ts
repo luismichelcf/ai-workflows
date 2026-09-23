@@ -1,5 +1,6 @@
 import type { BlockDefinition } from './definition.js';
 import type { BlockManifest } from './manifest.js';
+import { approvalCommentAttestation } from '../judge/attest.js';
 import { benchmarkSourcesBlock } from './benchmark-sources.js';
 import { buildVerifyBlock } from './build-verify.js';
 import { commandBlock } from './command.js';
@@ -121,6 +122,15 @@ const BUILT: Readonly<Record<string, BlockDefinition>> = {
   'build-verify': buildVerifyBlock,
   'sandboxed-review': sandboxedReviewBlock,
   'scope-reconcile': scopeReconcileBlock,
+  // PLAN-13-R3 §3.6: its gate next to the agent arrives in slice 4, but the judge can already
+  // read the owner's approval published on the pull request.
+  'approval-comment': {
+    manifest: MANIFESTS['approval-comment'] as BlockManifest,
+    create: () => () => {
+      throw new Error('block "ai-workflows/approval-comment@1" is not built yet (slice 4)');
+    },
+    server: { attestation: approvalCommentAttestation },
+  },
 };
 
 export const ENGINE_BLOCKS: Readonly<Record<string, BlockDefinition>> = Object.fromEntries([

@@ -29,6 +29,17 @@ export {
   type CheckRunSummary,
   type CommitStatus,
 } from './judge/port.js';
+export {
+  runJudge,
+  type JudgeInput,
+  type JudgeReport,
+  type JudgeDeps,
+  type JudgeStageReport,
+  type JudgePieceReport,
+  type JudgePublished,
+  type StageOutcome as JudgeStageOutcome,
+  type JudgeVerdict,
+} from './judge/judge.js';
 export { createEngine } from './engine.js';
 export {
   launchInGroup,

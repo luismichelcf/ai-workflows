@@ -349,3 +349,47 @@ export function diskProjectFiles(root: string): ProjectFiles {
     },
   };
 }
+
+// ---------------------------------------------------------------------------------------------
+// PLAN-13-R3 §3.1 and §3.6: the few git facts the judge needs about the checkout it works in.
+// They go through the same `runGit` as everything else, so they inherit its time limit, its
+// wide buffer and its environment without the inherited `GIT_*` variables.
+
+/** The commit the checkout is at, so the judge knows whether it has to move it. */
+export async function gitHead(root: string): Promise<string> {
+  return text(await runGit(root, ['rev-parse', 'HEAD']));
+}
+
+/** Moves the checkout to a commit, detached and quiet: the judge's own trustworthy base. */
+export async function gitCheckoutDetach(root: string, sha: string): Promise<void> {
+  await runGit(root, ['checkout', '--detach', '-q', sha]);
+}
+
+/** Whether `ancestor` is reachable from `descendant`. A failure to tell is not an answer. */
+export async function gitIsAncestor(
+  root: string,
+  ancestor: string,
+  descendant: string,
+): Promise<boolean> {
+  try {
+    await runGit(root, ['merge-base', '--is-ancestor', ancestor, descendant]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** The commits reachable from `from` and not from `notFrom`, as git lists them (newest first). */
+export async function gitCommitsReachable(
+  root: string,
+  from: readonly string[],
+  notFrom: string,
+): Promise<string[]> {
+  if (from.length === 0) return [];
+  const raw = await runGit(root, ['rev-list', ...from, '--not', notFrom]);
+  return raw
+    .toString('utf8')
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+}
