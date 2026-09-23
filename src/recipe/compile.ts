@@ -528,12 +528,22 @@ export async function compileRecipe(
         : 'the working tree changed during the run';
     },
     async confirmQuarantine(quarantine: JsonValue): Promise<string | undefined> {
-      try {
-        const answer = await groups.check(quarantine);
-        return answer.empty ? undefined : answer.reason;
-      } catch (error) {
-        return `the quarantine could not be checked: ${reasonOf(error)}`;
+      // A stored quarantine is one object or a list of them. Every part is asked; only when
+      // ALL of them are confirmed empty is the quarantine lifted. Otherwise the first motive
+      // wins, so a person reads a reason rather than an aggregate.
+      const parts = Array.isArray(quarantine) ? quarantine : [quarantine];
+      let firstMotive: string | undefined;
+      for (const part of parts) {
+        let motive: string | undefined;
+        try {
+          const answer = await groups.check(part);
+          motive = answer.empty ? undefined : answer.reason;
+        } catch (error) {
+          motive = `the quarantine could not be checked: ${reasonOf(error)}`;
+        }
+        if (motive !== undefined && firstMotive === undefined) firstMotive = motive;
       }
+      return firstMotive;
     },
   };
 }

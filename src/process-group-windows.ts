@@ -1,4 +1,4 @@
-import { spawn, execFile } from 'node:child_process';
+import { spawn, execFile, execFileSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { hostname, tmpdir } from 'node:os';
@@ -12,6 +12,7 @@ import {
   type ProcessGroup,
   type Quarantine,
   type QuarantineSurvivor,
+  type QuarantineSurvivors,
   type TerminateResult,
 } from './process-group.js';
 
@@ -200,7 +201,8 @@ namespace AiWorkflows {
     /**
      * The pids still assigned to the job, each with the process's creation time as FILETIME UTC
      * text, so a reused pid is told apart. Read after a failed terminate: the launcher names
-     * exactly what it could not end.
+     * exactly what it could not end. A query that fails returns null, never an empty array, so
+     * "could not list" is not read as "nothing left".
      */
     public static string[] Survivors(IntPtr job) {
       int header = 8;
@@ -209,7 +211,7 @@ namespace AiWorkflows {
       try {
         uint returned;
         if (!QueryInformationJobObject(job, 3, info, (uint)(header + capacity * IntPtr.Size), out returned)) {
-          return new string[0];
+          return null;
         }
         uint count = (uint)Marshal.ReadInt32(info, 4);
         if (count > (uint)capacity) count = (uint)capacity;
@@ -414,16 +416,21 @@ try {
   [void][AiWorkflows.Native]::GetExitCodeProcess($process, [ref]$code)
   $empty = 'false'
   if ($active -eq 0) { $empty = 'true' }
-  $entries = @()
+  # A list that could not be read is "null", never "[]": the reader must tell them apart.
+  $survivors = 'null'
   if ($active -ne 0) {
-    foreach ($pair in [AiWorkflows.Native]::Survivors($job)) {
-      $split = $pair.IndexOf(':')
-      $pidText = $pair.Substring(0, $split)
-      $createdText = $pair.Substring($split + 1)
-      $entries += ('{"pid":' + $pidText + ',"created":"' + $createdText + '"}')
+    $listed = [AiWorkflows.Native]::Survivors($job)
+    if ($null -ne $listed) {
+      $entries = @()
+      foreach ($pair in $listed) {
+        $split = $pair.IndexOf(':')
+        $pidText = $pair.Substring(0, $split)
+        $createdText = $pair.Substring($split + 1)
+        $entries += ('{"pid":' + $pidText + ',"created":"' + $createdText + '"}')
+      }
+      $survivors = '[' + ($entries -join ',') + ']'
     }
   }
-  $survivors = '[' + ($entries -join ',') + ']'
   # The logon session is reported so a quarantine can tell a group of this session from one
   # that cannot be asked from here.
   $session = [System.Diagnostics.Process]::GetCurrentProcess().SessionId
@@ -529,7 +536,8 @@ interface Report {
   readonly error?: string;
   readonly openError?: number;
   readonly session?: number;
-  readonly survivors: readonly QuarantineSurvivor[];
+  /** The readable survivor list, or absent when the launcher could not list one. */
+  readonly survivors?: readonly QuarantineSurvivor[];
 }
 
 function parseReport(raw: string): Report | undefined {
@@ -541,6 +549,7 @@ function parseReport(raw: string): Report | undefined {
   }
   if (typeof parsed !== 'object' || parsed === null) return undefined;
   const record = parsed as Record<string, unknown>;
+  const survivors = readReportSurvivors(record['survivors']);
   return {
     ...(typeof record['childExit'] === 'number' ? { childExit: record['childExit'] } : {}),
     ...(typeof record['treeEmpty'] === 'boolean' ? { treeEmpty: record['treeEmpty'] } : {}),
@@ -548,7 +557,7 @@ function parseReport(raw: string): Report | undefined {
     ...(typeof record['error'] === 'string' ? { error: record['error'] } : {}),
     ...(typeof record['openError'] === 'number' ? { openError: record['openError'] } : {}),
     ...(typeof record['session'] === 'number' ? { session: record['session'] } : {}),
-    survivors: readReportSurvivors(record['survivors']),
+    ...(survivors === undefined ? {} : { survivors }),
   };
 }
 
@@ -565,17 +574,23 @@ function readReport(file: string): Report | undefined {
   return raw === undefined ? undefined : parseReport(raw);
 }
 
-function readReportSurvivors(value: unknown): readonly QuarantineSurvivor[] {
-  if (!Array.isArray(value)) return [];
+/**
+ * The survivor list a report carries, or `undefined` when there is no readable one. A missing,
+ * empty or malformed list is unreadable, never "no survivors": the launcher reports `null` when
+ * it could not list them, and a blank list while processes remain is just as unreadable.
+ */
+function readReportSurvivors(value: unknown): readonly QuarantineSurvivor[] | undefined {
+  if (!Array.isArray(value) || value.length === 0) return undefined;
   const survivors: QuarantineSurvivor[] = [];
   for (const item of value) {
-    if (typeof item !== 'object' || item === null) continue;
+    if (typeof item !== 'object' || item === null) return undefined;
     const record = item as Record<string, unknown>;
     const pid = record['pid'];
     const created = record['created'];
-    if (typeof pid === 'number' && Number.isInteger(pid) && pid > 0 && typeof created === 'string') {
-      survivors.push({ pid, created });
+    if (!(typeof pid === 'number' && Number.isInteger(pid) && pid > 0 && typeof created === 'string')) {
+      return undefined;
     }
+    survivors.push({ pid, created });
   }
   return survivors;
 }
@@ -602,7 +617,9 @@ export function terminateResultFromReport(
   const report = typeof raw === 'string' ? parseReport(raw) : undefined;
   if (report === undefined) return { empty: false, lost: true };
   if (report.treeEmpty === true) return { empty: true };
-  if (report.treeEmpty === false) return { empty: false, survivors: report.survivors };
+  if (report.treeEmpty === false) {
+    return { empty: false, survivors: report.survivors ?? 'unreadable' };
+  }
   return { empty: false, lost: true };
 }
 
@@ -650,9 +667,17 @@ export function groupExitFromReport(
 
 export function launchWindowsGroup(options: LaunchInGroupOptions): ProcessGroup {
   const job = `Local\\ai-workflows-${randomUUID()}`;
-  const baseQuarantine: Quarantine = { host: hostname(), platform: 'win32', job, confirmed: false };
-  let survivors: readonly QuarantineSurvivor[] = [];
-  let session: number | undefined;
+  // The logon session is recorded when the group starts, not only once the launcher reports:
+  // a quarantine must be askable from the very moment there may be something to ask about.
+  let session = readWindowsSessionSync();
+  const baseQuarantine: Quarantine = {
+    host: hostname(),
+    platform: 'win32',
+    job,
+    confirmed: false,
+    ...(session === undefined ? {} : { session }),
+  };
+  let survivors: QuarantineSurvivors = [];
   const stdoutBytes = options.stdoutBytes ?? DEFAULT_STDOUT_BYTES;
   const directory = mkdtempSync(join(tmpdir(), 'aiw-group-'));
   const stdinFile = join(directory, 'stdin.txt');
@@ -722,7 +747,10 @@ export function launchWindowsGroup(options: LaunchInGroupOptions): ProcessGroup 
     const raw = readReportText(resultFile);
     const result = terminateResultFromReport(raw, launcherExit);
     const report = raw === undefined ? undefined : parseReport(raw);
-    survivors = result.empty ? [] : (result.survivors ?? []);
+    // A lost answer names nothing: the system is asked again. An explicit "not empty" without
+    // a readable list is unreadable, so the quarantine keeps saying so.
+    survivors =
+      result.empty || result.lost === true ? [] : (result.survivors ?? 'unreadable');
     if (report?.session !== undefined) session = report.session;
     removeQuietly(directory);
     return result;
@@ -763,6 +791,7 @@ export function launchWindowsGroup(options: LaunchInGroupOptions): ProcessGroup 
   return {
     get quarantine(): Quarantine {
       const base = session === undefined ? baseQuarantine : { ...baseQuarantine, session };
+      if (survivors === 'unreadable') return { ...base, survivors: 'unreadable' };
       return survivors.length === 0 ? base : { ...base, survivors };
     },
     wait,
@@ -839,46 +868,108 @@ export type SurvivorStatus = 'alive' | 'dead' | 'unknown';
 export async function windowsSurvivorStatus(
   survivors: readonly QuarantineSurvivor[],
 ): Promise<SurvivorStatus> {
-  let sawUnknown = false;
-  for (const survivor of survivors) {
-    const state = await survivorState(survivor.pid, survivor.created);
-    if (state === 'alive') return 'alive';
-    if (state === 'unknown') sawUnknown = true;
-  }
-  return sawUnknown ? 'unknown' : 'dead';
-}
-
-async function survivorState(pid: number, created: string): Promise<SurvivorStatus> {
-  if (!Number.isInteger(pid) || pid <= 0) return 'unknown';
-  // Both values come from the launcher itself; the guard keeps a repaired quarantine from
-  // turning into a PowerShell injection anyway.
-  if (!/^\d+$/.test(created)) return 'unknown';
-  const script =
-    `try { $p = Get-Process -Id ${pid} -ErrorAction Stop; ` +
-    `if ($p.StartTime.ToFileTimeUtc().ToString() -eq "${created}") { "alive" } else { "other" } } ` +
-    `catch { "dead" }`;
-  const output = await runPowershell(script);
-  const answer = output.trim();
-  if (answer === 'alive') return 'alive';
-  if (answer === 'dead' || answer === 'other') return 'dead';
-  // Empty output is a PowerShell error or a timeout: unknown, never gone.
-  return 'unknown';
+  if (survivors.length === 0) return 'dead';
+  const states = await survivorStates(survivors);
+  if (states.includes('alive')) return 'alive';
+  return states.includes('unknown') ? 'unknown' : 'dead';
 }
 
 /**
- * The logon session of this process, read from PowerShell once and kept. A quarantine recorded
- * in another session cannot be asked from this one, so the comparison must be stable and cheap.
+ * Reads every survivor's state in ONE PowerShell call. A survivor recorded with
+ * `created: "unknown"` is checked by pid alone: gone is dead, still there is unknown — its
+ * creation time cannot be compared, so it is never called alive. An entry whose pid is not a
+ * usable id is unknown without asking.
  */
-let currentSession: Promise<number | undefined> | undefined;
-
-export function currentWindowsSessionId(): Promise<number | undefined> {
-  currentSession ??= runPowershell(
-    '[System.Diagnostics.Process]::GetCurrentProcess().SessionId',
-  ).then((output) => {
-    const value = Number.parseInt(output.trim(), 10);
-    return Number.isInteger(value) ? value : undefined;
+async function survivorStates(
+  survivors: readonly QuarantineSurvivor[],
+): Promise<SurvivorStatus[]> {
+  const states: SurvivorStatus[] = survivors.map(() => 'unknown');
+  const askable: { readonly index: number; readonly pid: number; readonly created: string }[] = [];
+  survivors.forEach((survivor, index) => {
+    if (
+      Number.isInteger(survivor.pid) &&
+      survivor.pid > 0 &&
+      (survivor.created === 'unknown' || /^\d+$/.test(survivor.created))
+    ) {
+      askable.push({ index, pid: survivor.pid, created: survivor.created });
+    }
   });
-  return currentSession;
+  if (askable.length === 0) return states;
+
+  // Both values come from the launcher itself; the guard keeps a repaired quarantine from
+  // turning into a PowerShell injection anyway.
+  const script = askable
+    .map(({ pid, created }) =>
+      created === 'unknown'
+        ? `try { $null = Get-Process -Id ${pid} -ErrorAction Stop; 'exists' } catch { 'dead' }`
+        : `try { $proc = Get-Process -Id ${pid} -ErrorAction Stop; ` +
+          `if ($proc.StartTime.ToFileTimeUtc().ToString() -eq '${created}') { 'alive' } ` +
+          `else { 'other' } } catch { 'dead' }`,
+    )
+    .join('; ');
+  const output = await runPowershell(script);
+  const answers = output
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+
+  askable.forEach(({ index, created }, position) => {
+    const answer = answers[position];
+    if (answer === 'alive') states[index] = 'alive';
+    else if (answer === 'dead' || answer === 'other') states[index] = 'dead';
+    // 'exists' on an unknown creation time, or no answer at all: unknown, never gone.
+    else if (answer === 'exists' && created === 'unknown') states[index] = 'unknown';
+    else states[index] = 'unknown';
+  });
+  return states;
+}
+
+/**
+ * The logon session of this process, cached only when it could be read. A failure is never
+ * remembered, so the next caller retries instead of inheriting an undefined answer for good.
+ */
+let cachedWindowsSession: number | undefined;
+
+function parseSessionId(output: string): number | undefined {
+  const value = Number.parseInt(output.trim(), 10);
+  return Number.isInteger(value) ? value : undefined;
+}
+
+/**
+ * The current session, read synchronously so a launch can put it in its quarantine from the
+ * start, without waiting for the launcher's report. Cached on success, retried on failure.
+ */
+function readWindowsSessionSync(): number | undefined {
+  if (cachedWindowsSession !== undefined) return cachedWindowsSession;
+  try {
+    const output = execFileSync(
+      POWERSHELL,
+      [
+        '-NoProfile',
+        '-NonInteractive',
+        '-ExecutionPolicy',
+        'Bypass',
+        '-Command',
+        '[System.Diagnostics.Process]::GetCurrentProcess().SessionId',
+      ],
+      { windowsHide: true, encoding: 'utf8', timeout: 15_000 },
+    );
+    const value = parseSessionId(output);
+    if (value !== undefined) cachedWindowsSession = value;
+    return value;
+  } catch {
+    return undefined;
+  }
+}
+
+export async function currentWindowsSessionId(): Promise<number | undefined> {
+  if (cachedWindowsSession !== undefined) return cachedWindowsSession;
+  const output = await runPowershell(
+    '[System.Diagnostics.Process]::GetCurrentProcess().SessionId',
+  );
+  const value = parseSessionId(output);
+  if (value !== undefined) cachedWindowsSession = value;
+  return value;
 }
 
 function runPowershell(script: string): Promise<string> {

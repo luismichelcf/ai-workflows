@@ -289,7 +289,14 @@ async function retireFromSnapshot(
 ): Promise<{ readonly ok: true } | { readonly ok: false; readonly reason: string }> {
   const { root, snapshot, mergeBase, implementation, tests, spanish } = options;
 
+  // The temporary commit must not depend on a git identity being configured: a machine (or a
+  // CI job) with no `user.name`/`user.email`, neither local nor global, must still be able to
+  // run the retirement. The identity is set on this one command, never in the user's config.
   const created = await runGit(root, [
+    '-c',
+    'user.name=ai-workflows',
+    '-c',
+    'user.email=ai-workflows@localhost',
     'commit-tree',
     snapshot,
     '-p',

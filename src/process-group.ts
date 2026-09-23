@@ -31,6 +31,13 @@ export type QuarantineSurvivor = {
   readonly created: string;
 };
 
+/**
+ * The processes a Windows quarantine names, or `'unreadable'` when the launcher could not list
+ * them. Reading failures as "no survivors" is how a live process is called gone, so unreadable
+ * is its own answer and keeps the quarantine.
+ */
+export type QuarantineSurvivors = readonly QuarantineSurvivor[] | 'unreadable';
+
 /** How to ask the system again whether a group is empty; never a list of processes. */
 export type Quarantine =
   | {
@@ -43,8 +50,11 @@ export type Quarantine =
        * this one, so the quarantine must hold; absent means the session was never recorded.
        */
       readonly session?: number;
-      /** Processes the launcher could not end, with their creation time; absent means none. */
-      readonly survivors?: readonly QuarantineSurvivor[];
+      /**
+       * Processes the launcher could not end, with their creation time; absent means none and
+       * `'unreadable'` means they could not be listed.
+       */
+      readonly survivors?: QuarantineSurvivors;
     }
   | { readonly host: string; readonly platform: 'posix'; readonly pgid: number; readonly confirmed: false };
 
@@ -61,8 +71,11 @@ export type TerminateResult =
   | {
       readonly empty: false;
       readonly lost?: boolean;
-      /** The processes the launcher named as still alive; absent means it named none. */
-      readonly survivors?: readonly QuarantineSurvivor[];
+      /**
+       * The processes the launcher named as still alive, or `'unreadable'` when its list could
+       * not be read; absent means it named none.
+       */
+      readonly survivors?: QuarantineSurvivors;
     };
 
 export interface LaunchInGroupOptions {
@@ -362,6 +375,14 @@ export async function checkQuarantine(quarantine: unknown): Promise<QuarantineCh
       if (current !== session) {
         return { empty: false, reason: `processes to confirm in another session: ${session}` };
       }
+    }
+    // A launcher that could not list what is left is never "empty": the answer it could not
+    // give is exactly the one that would have lifted the quarantine.
+    if (record['survivors'] === 'unreadable') {
+      return {
+        empty: false,
+        reason: `the processes of the job object "${job}" could not be listed`,
+      };
     }
     // Survivors the launcher named are checked first, by pid AND creation time: a pid reused
     // by another process is not the survivor, and while one really lives the quarantine holds

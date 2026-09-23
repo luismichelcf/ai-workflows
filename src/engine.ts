@@ -1,3 +1,5 @@
+import { isDeepStrictEqual } from 'node:util';
+
 import {
   EffectRefusedBecauseParked,
   InvalidPipeline,
@@ -244,16 +246,57 @@ function deepFreeze(value: JsonValue): void {
  */
 function frozenFacts(change: unknown): unknown {
   if (typeof change !== 'object' || change === null) return change;
+  // `structuredClone` copies a cycle happily, but `deepFreeze` would then recurse into it
+  // forever and overflow the stack. The cycle is refused here, with a readable motive, before
+  // anything is cloned or frozen.
+  if (hasCycle(change, new Set())) {
+    throw new FrozenFactsFailure('a value refers back to itself');
+  }
   let copy: unknown;
   try {
     copy = structuredClone(change);
   } catch (error) {
-    // A value structured cloning cannot copy (a function inside it) must never travel to a
-    // gate unfrozen: the stage is blocked instead, with a motive a person can read.
+    // A value structured cloning cannot copy (a function or a symbol inside it) must never
+    // travel to a gate unfrozen: the stage is blocked instead, with a motive a person can read.
     throw new FrozenFactsFailure(describeUnknown(error));
   }
   deepFreeze(copy as JsonValue);
   return copy;
+}
+
+/**
+ * Whether the value refers back to itself on its own path. The visited set is released on the
+ * way out, so two branches sharing one object are not mistaken for a cycle: a shared reference
+ * is plain data (JSON duplicates it), a back edge is not.
+ */
+function hasCycle(value: unknown, path: Set<object>): boolean {
+  if (value === null || typeof value !== 'object') return false;
+  if (path.has(value)) return true;
+  path.add(value);
+  const nested = Array.isArray(value) ? value : Object.values(value as Record<string, unknown>);
+  for (const item of nested) {
+    if (hasCycle(item, path)) return true;
+  }
+  path.delete(value);
+  return false;
+}
+
+/** A stored quarantine is one object or a list of them; either way, its parts are what count. */
+function quarantineParts(value: JsonValue): readonly JsonValue[] {
+  return Array.isArray(value) ? value : [value];
+}
+
+/**
+ * PLAN-13-R2 §2.2: a new quarantine never replaces one already stored. If it is not already
+ * there (by deep equality) it joins it; several of them are kept as a list. One part collapses
+ * back to a bare object, so a quarantine that is only ever seen alone keeps its old shape.
+ */
+function mergeQuarantine(existing: JsonValue | undefined, incoming: JsonValue): JsonValue {
+  const parts: JsonValue[] = existing === undefined ? [] : [...quarantineParts(existing)];
+  for (const candidate of quarantineParts(incoming)) {
+    if (!parts.some((seen) => isDeepStrictEqual(seen, candidate))) parts.push(candidate);
+  }
+  return parts.length === 1 ? (parts[0] as JsonValue) : parts;
 }
 
 /**
@@ -331,9 +374,10 @@ class ChangeDescriptionFailure extends Error {
 }
 
 /**
- * The facts of the change cannot be copied as plain data (they hold a function, a symbol, a
- * bigint or a cycle). The original object must never be handed to a gate — a block could
- * rewrite what the next stage reads — so the stage is blocked technically instead.
+ * The facts of the change cannot be copied as plain data: they hold a function, a symbol or a
+ * cycle. The original object must never be handed to a gate — a block could rewrite what the
+ * next stage reads — so the stage is blocked technically instead. A cycle is refused here, by
+ * walking the value before freezing it, because walking a frozen copy would exhaust the stack.
  */
 class FrozenFactsFailure extends Error {
   constructor(detail: string) {
@@ -550,7 +594,12 @@ export function createEngine(options: EngineOptions): Engine {
       // exception: a process nobody can account for must be written even when the piece was
       // parked AND even when the lease was lost — what prevents another run is the stored
       // quarantine, not the lease.
-      const finish = async (status: PieceStatus, overParked = false): Promise<RunOutcome> => {
+      const finish = async (
+        status: PieceStatus,
+        options?: { readonly overParked?: boolean; readonly quarantine?: JsonValue },
+      ): Promise<RunOutcome> => {
+        const overParked = options?.overParked === true;
+        const incoming = options?.quarantine;
         if (dryRun) return { outcome: 'ran', status };
 
         if (!overParked) {
@@ -570,12 +619,33 @@ export function createEngine(options: EngineOptions): Engine {
         for (let attempt = 1; ; attempt += 1) {
           try {
             const current = attempt === 1 ? latest : await readStatus();
-            // A quarantine in the stored state at this moment is preserved: only the branch
-            // that got an affirmative empty answer from `confirmQuarantine` may drop it.
-            const writing =
-              status.quarantine === undefined && current?.status.quarantine !== undefined
-                ? { ...status, quarantine: current.status.quarantine }
-                : status;
+            let writing: PieceStatus;
+            if (incoming !== undefined) {
+              // A new quarantine never replaces one already stored: a different one joins it.
+              const merged = mergeQuarantine(current?.status.quarantine, incoming);
+              // An owner's stop that landed while the processes were quarantined is kept as
+              // `previous`, so lifting the quarantine later can restore it instead of losing it.
+              const previous =
+                current?.status.state === 'parked'
+                  ? {
+                      state: 'parked' as const,
+                      ...(current.status.reason === undefined
+                        ? {}
+                        : { reason: current.status.reason }),
+                    }
+                  : status.previous;
+              writing = {
+                ...status,
+                quarantine: merged,
+                ...(previous === undefined ? {} : { previous }),
+              };
+            } else if (status.quarantine === undefined && current?.status.quarantine !== undefined) {
+              // A quarantine in the stored state at this moment is preserved: only the branch
+              // that got an affirmative empty answer from `confirmQuarantine` may drop it.
+              writing = { ...status, quarantine: current.status.quarantine };
+            } else {
+              writing = status;
+            }
             await store.saveStatus(writing, current?.version);
             return { outcome: 'ran', status: writing };
           } catch (error) {
@@ -646,10 +716,40 @@ export function createEngine(options: EngineOptions): Engine {
           // await: a store failure inside finish() must reach the outer catch, not reject run().
           return await finish(blockedStatus(undefined, motive, quarantine));
         }
-        // Confirmed empty: a real run drops it from the stored state so it can proceed normally.
-        if (!dryRun) {
-          const current = await readStatus();
-          if (current !== undefined && current.status.quarantine !== undefined) {
+        // The answer is affirmative only for THAT quarantine. If the stored one changed while
+        // it was being checked, the run stops without touching a stage and keeps what is there:
+        // the next run will ask about it in turn.
+        const current = await readStatus();
+        if (current !== undefined && current.status.quarantine !== undefined) {
+          if (!isDeepStrictEqual(current.status.quarantine, quarantine)) {
+            return await finish(
+              blockedStatus(
+                undefined,
+                'the quarantine changed while it was being checked',
+                current.status.quarantine,
+              ),
+            );
+          }
+          // The owner parked the piece while its processes were quarantined: lifting the
+          // quarantine must not undo that stop. The piece goes back to parked and no stage runs.
+          const previous = current.status.previous;
+          if (previous !== undefined && previous.state === 'parked') {
+            const parked: PieceStatus = {
+              piece,
+              state: 'parked',
+              ...(previous.reason === undefined ? {} : { reason: previous.reason }),
+            };
+            if (!dryRun) {
+              try {
+                await store.saveStatus(parked, current.version);
+              } catch (error) {
+                if (!(error instanceof StaleVersion)) throw error;
+              }
+            }
+            return { outcome: 'parked', status: parked };
+          }
+          // Confirmed empty: a real run drops it so it can proceed normally.
+          if (!dryRun) {
             try {
               const { quarantine: _dropped, ...cleared } = current.status;
               await store.saveStatus(cleared, current.version);
@@ -1010,10 +1110,10 @@ export function createEngine(options: EngineOptions): Engine {
                   reason += ` (the journal could not record the failure: ${describeUnknown(appendError)})`;
                 }
               }
-              return await finish(
-                blockedStatus(stage.name, reason, error.quarantine),
-                true,
-              );
+              return await finish(blockedStatus(stage.name, reason), {
+                overParked: true,
+                quarantine: error.quarantine,
+              });
             }
             if (error instanceof DryRunEffectRefused) {
               // The stage could not be evaluated without acting. A healthy pipeline in dry

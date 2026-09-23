@@ -680,3 +680,20 @@ punto con su prueba (`tests/review-round2.test.ts`):
 fuente se compara con el actual, pero el DLL no se verifica criptográficamente: código que corre
 con el mismo usuario podría plantar uno. Es el mismo usuario que ya puede leer y escribir el
 proyecto (nivel A); queda declarado.
+
+## 14. Revisión de la parvada (PR #17, ronda 3)
+
+Correcciones (`tests/review-round3.test.ts`): una cuarentena solo se levanta si la guardada es
+exactamente la que se comprobó; una cuarentena nueva nunca reemplaza a otra distinta (se guardan
+ambas, en lista, y solo se levantan cuando todas están vacías); la parada del dueño sobrevive a una
+cuarentena (`previous: parked` y, al levantarla, la pieza vuelve a quedar parada); hechos con ciclos
+se rechazan con un motivo legible; en Windows, una lista de sobrevivientes que el lanzador no pudo
+leer es «ilegible» y nunca vacía, un sobreviviente de hora desconocida cuyo proceso ya no existe
+cuenta como muerto, la sesión se registra al lanzar y los sobrevivientes se revisan en una sola
+consulta; el commit temporal de `build-verify` no depende de una identidad de git configurada.
+
+Límites declarados: una cuarentena que nunca puede confirmarse vacía (por ejemplo, una lista de
+sobrevivientes ilegible) deja la pieza bloqueada hasta que un operador la libere a mano; la orden
+para hacerlo llega con el CLI de la rebanada 4. Correcciones a §13: la carpeta del resultado sí se
+borra a los 25 s si el lanzador sigue vivo (entonces el resultado se da por perdido), y las entradas
+mal formadas del informe del lanzador ahora vuelven ilegible la lista entera.
