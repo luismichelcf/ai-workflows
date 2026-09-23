@@ -79,7 +79,8 @@ function missingFact(stageId: string, fact: 'files' | 'kind' | 'lane'): Error {
 
 function requireFiles(context: GateContext, stageId: string): string[] {
   const files = changeFact(context, 'files');
-  if (!Array.isArray(files) || !files.every(isCanonicalFile)) {
+  // A touched-path condition cannot exempt a stage from an empty or unmatchable change.
+  if (!Array.isArray(files) || files.length === 0 || !files.every(isCanonicalFile)) {
     throw missingFact(stageId, 'files');
   }
   return files;
@@ -87,7 +88,10 @@ function requireFiles(context: GateContext, stageId: string): string[] {
 
 function isCanonicalFile(file: unknown): file is string {
   if (typeof file !== 'string' || file.length === 0) return false;
-  if (file.startsWith('/') || file.startsWith('"') || file.endsWith('/')) return false;
+  // Git paths use '/', so a backslash cannot stand in for a directory separator here.
+  if (file.startsWith('/') || file.startsWith('"') || file.endsWith('/') || file.includes('\\')) {
+    return false;
+  }
   return file.split('/').every((segment) => segment !== '' && segment !== '.' && segment !== '..');
 }
 

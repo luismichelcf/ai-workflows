@@ -91,7 +91,7 @@ describe('RC-04: when it does not hold, the stage is skipped saying why, in Span
     expect(await ask('es', '{ touches-any: [visible] }', { files: ['lib/x.ts'] })).toEqual({
       skip: 'No aplica: el cambio no toca «visible».',
     });
-    expect(await ask('es', '{ touches-any: [money, visible] }', { files: [] })).toEqual({
+    expect(await ask('es', '{ touches-any: [money, visible] }', { files: ['README.md'] })).toEqual({
       skip: 'No aplica: el cambio no toca «money» ni «visible».',
     });
     expect(
@@ -130,7 +130,7 @@ describe('RC-04: when it does not hold, the stage is skipped saying why, in Span
     expect(await ask('es', condition, { files: ['lib/calc/a.ts'], kind: 'docs' })).toEqual({
       skip: 'No aplica: el tipo de cambio es «docs», no «behavior».',
     });
-    expect(await ask('es', condition, { files: [], kind: 'docs' })).toEqual({
+    expect(await ask('es', condition, { files: ['README.md'], kind: 'docs' })).toEqual({
       skip: 'No aplica: el cambio no toca «money».',
     });
   });
@@ -138,7 +138,7 @@ describe('RC-04: when it does not hold, the stage is skipped saying why, in Span
 
 describe('RC-04: the motive follows the recipe locale', () => {
   it('speaks English for a non-Spanish locale', async () => {
-    expect(await ask('en', '{ touches-any: [money, visible] }', { files: [] })).toEqual({
+    expect(await ask('en', '{ touches-any: [money, visible] }', { files: ['README.md'] })).toEqual({
       skip: 'Does not apply: the change does not touch "money" or "visible".',
     });
     expect(
@@ -156,7 +156,7 @@ describe('RC-04: the motive follows the recipe locale', () => {
   });
 
   it('treats es-MX as Spanish', async () => {
-    expect(await ask('es-MX', '{ touches-any: [money] }', { files: [] })).toEqual({
+    expect(await ask('es-MX', '{ touches-any: [money] }', { files: ['README.md'] })).toEqual({
       skip: 'No aplica: el cambio no toca «money».',
     });
   });
@@ -190,6 +190,9 @@ describe('a fact the condition needs and the change lacks never exempts', () => 
       'app/',
       '',
       '"lib/calc/c\\303\\241lculo.ts"',
+      // A Windows-style path would silently miss every class: it blocks instead.
+      'lib\\calc\\x.ts',
+      'app\\a.tsx',
     ];
     for (const file of odd) {
       await expect(ask('es', '{ touches-any: [money] }', { files: ['lib/calc/ok.ts', file] })).rejects.toThrow(
@@ -198,9 +201,13 @@ describe('a fact the condition needs and the change lacks never exempts', () => 
     }
   });
 
-  it('positive: accents, spaces and backslashes inside a name are ordinary characters', async () => {
+  it('blocks on an empty list of files: a change touches at least one, so it is a broken description', async () => {
+    await expect(ask('es', '{ touches-any: [money] }', { files: [] })).rejects.toThrow(/files/);
+    await expect(ask('es', '{ touches-none: [money] }', { files: [] })).rejects.toThrow(/files/);
+  });
+
+  it('positive: accents and spaces inside a name are ordinary characters', async () => {
     expect(await ask('es', '{ touches-any: [money] }', { files: ['lib/calc/cálculo final.ts'] })).toBe(true);
-    expect(await ask('es', '{ touches-any: [money] }', { files: ['lib/calc/a\\b.ts'] })).toBe(true);
   });
 
   it('does not need facts that no clause asks for', async () => {
