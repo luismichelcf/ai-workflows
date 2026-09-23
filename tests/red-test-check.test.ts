@@ -428,3 +428,16 @@ describe('flock 1: red-test-check', () => {
     expect(result.summary).not.toContain('<b>');
   });
 });
+
+describe('flock 2: red-test-check and a PR into another branch', () => {
+  it('a PR into another branch is not tested, and the check does not pass', async () => {
+    const p = project();
+    const head = p.pr(7, 'feat/13-sin-pruebas', { 'src/bonus.mjs': BONUS(1000) });
+    p.checkout(head);
+    const event = p.pullRequestEvent(7);
+    (event.event as { pull_request: { base: { ref: string } } }).pull_request.base.ref = 'develop';
+    const result = await runRedTestCheck(event, p.deps());
+    expect(result.ok).toBe(false);
+    expect(result.summary).toMatch(/develop/);
+  });
+});

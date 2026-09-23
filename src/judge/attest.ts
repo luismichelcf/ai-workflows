@@ -44,10 +44,14 @@ async function resolve(
   context: ServerAttestContext,
   previousHeads: readonly string[],
   sameFingerprint: boolean,
+  spanish: boolean,
 ): Promise<Resolution> {
   const lower = code.toLowerCase();
   if (!sameFingerprint) {
-    return { ok: context.head.toLowerCase().startsWith(lower), reason: 'no es la versión juzgada' };
+    return {
+      ok: context.head.toLowerCase().startsWith(lower),
+      reason: spanish ? 'no es la versión juzgada' : 'it is not the judged version',
+    };
   }
 
   const seeds = [context.head];
@@ -70,14 +74,27 @@ async function resolve(
 
   const matches = reachable.filter((sha) => sha.toLowerCase().startsWith(lower));
   if (matches.length > 1) {
-    return { ok: false, reason: 'el código casa con más de una versión' };
+    return {
+      ok: false,
+      reason: spanish ? 'el código casa con más de una versión' : 'the code matches more than one version',
+    };
   }
   const candidate = matches[0];
-  if (candidate === undefined) return { ok: false, reason: 'no nombra ninguna versión del cambio' };
+  if (candidate === undefined) {
+    return {
+      ok: false,
+      reason: spanish ? 'no nombra ninguna versión del cambio' : 'it names no version of the change',
+    };
+  }
   if (candidate === context.head) return { ok: true };
 
   if (context.facts.fingerprint === '') {
-    return { ok: false, reason: 'la versión juzgada no tiene cambios propios que comparar' };
+    return {
+      ok: false,
+      reason: spanish
+        ? 'la versión juzgada no tiene cambios propios que comparar'
+        : 'the judged version has no changes of its own to compare',
+    };
   }
   let candidateFingerprint: string;
   try {
@@ -87,7 +104,10 @@ async function resolve(
   }
   return candidateFingerprint === context.facts.fingerprint
     ? { ok: true }
-    : { ok: false, reason: 'sus cambios propios no son los mismos' };
+    : {
+        ok: false,
+        reason: spanish ? 'sus cambios propios no son los mismos' : 'its own changes are not the same',
+      };
 }
 
 /**
@@ -120,7 +140,12 @@ export async function approvalCommentAttestation(
 
   const evaluations = comments.map((comment) => ({
     comment,
-    order: evaluateOwnerOrder(comment, { order, minCodeLength: codeLength, productOwners: owners }),
+    order: evaluateOwnerOrder(comment, {
+      order,
+      minCodeLength: codeLength,
+      productOwners: owners,
+      locale: context.locale,
+    }),
   }));
 
   const sameFingerprint = context.validWhile === 'same-fingerprint';
@@ -140,7 +165,7 @@ export async function approvalCommentAttestation(
   let firstError: string | undefined;
   for (const entry of evaluations) {
     if (!entry.order.ok) continue;
-    const resolution = await resolve(entry.order.code, context, previousHeads, sameFingerprint);
+    const resolution = await resolve(entry.order.code, context, previousHeads, sameFingerprint, spanish);
     if (resolution.ok) return { outcome: 'passed' };
     if (resolution.error !== undefined) {
       if (firstError === undefined) firstError = resolution.error;
@@ -150,12 +175,12 @@ export async function approvalCommentAttestation(
   }
   if (firstError !== undefined) return { outcome: 'technical', reason: firstError };
 
-  // The order's command can be a project value and may itself read as another language, so the
-  // English motive says what is needed without pasting it; the Spanish one spells it out.
+  // §3.6 and §3.8: in both languages the motive spells out exactly what to write, so the owner
+  // can copy the order and the first `code-length` characters of the head.
   const wanted = `${order} ${context.head.slice(0, codeLength)}`;
   const base = spanish
     ? `Falta el visto bueno del dueño: se necesita un comentario con la orden ${wanted} para la versión juzgada.`
-    : `The owner's approval is missing: a comment with the owner's order for the judged version is needed.`;
+    : `The owner's approval is missing: a comment with the owner's order ${wanted} for the judged version is needed.`;
   const refusals = evaluations
     .filter((entry) => entry.order.hadOrder && !entry.order.ok)
     .map((entry) => entry.order.reason);

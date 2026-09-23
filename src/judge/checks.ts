@@ -114,7 +114,12 @@ function headBranchIsOfficial(
   headBranch: string | undefined,
   principal: string,
 ): boolean {
-  if (headBranch === undefined) return true;
+  if (headBranch === undefined) {
+    // `pull_request_target` and `issue_comment` always run the workflow of the principal, so a run
+    // without a head branch cannot be an imitation there. Every other event must name one: a copy
+    // of the judge dispatched from another branch, or a run nobody can place, is not official.
+    return event === 'pull_request_target' || event === 'issue_comment';
+  }
   if (event === 'merge_group') return headBranch.startsWith(`gh-readonly-queue/${principal}/`);
   if (event === 'pull_request_target') return true;
   return headBranch === principal;
@@ -167,7 +172,9 @@ export async function collectUnofficial(
   principal: string,
   serverUrl: string,
   contexts: readonly string[] = JUDGE_CONTEXTS,
+  locale = 'es',
 ): Promise<TraceCollection> {
+  const spanish = isSpanish(locale);
   const unofficial: Unofficial[] = [];
   const notes: string[] = [];
 
@@ -175,7 +182,11 @@ export async function collectUnofficial(
   try {
     statuses = await github.statuses(sha);
   } catch (error) {
-    notes.push(`No se pudieron leer los estados de ${sha}: ${reasonOf(error)}`);
+    notes.push(
+      spanish
+        ? `No se pudieron leer los estados de ${sha}: ${reasonOf(error)}`
+        : `The statuses of ${sha} could not be read: ${reasonOf(error)}`,
+    );
     return { unofficial, notes };
   }
   for (const status of statuses) {
@@ -184,7 +195,11 @@ export async function collectUnofficial(
     try {
       official = await officialRunId(github, status, repository, judgePath, principal, serverUrl);
     } catch (error) {
-      notes.push(`No se pudo comprobar el estado ${status.context} de ${sha}: ${reasonOf(error)}`);
+      notes.push(
+        spanish
+          ? `No se pudo comprobar el estado ${status.context} de ${sha}: ${reasonOf(error)}`
+          : `The status ${status.context} of ${sha} could not be checked: ${reasonOf(error)}`,
+      );
       continue;
     }
     if (official !== undefined) continue;
@@ -196,7 +211,11 @@ export async function collectUnofficial(
     try {
       runs = await github.checkRuns(sha, name);
     } catch (error) {
-      notes.push(`No se pudieron leer los check-runs «${name}» de ${sha}: ${reasonOf(error)}`);
+      notes.push(
+        spanish
+          ? `No se pudieron leer los check-runs «${name}» de ${sha}: ${reasonOf(error)}`
+          : `The check-runs "${name}" of ${sha} could not be read: ${reasonOf(error)}`,
+      );
       continue;
     }
     for (const run of runs) {

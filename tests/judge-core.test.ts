@@ -1646,6 +1646,58 @@ describe('flock 1: the language of the recipe (§3.8)', () => {
     w2.github.commentList.set(7, []);
     w2.github.pendingFromConsoleStep(head);
     await w2.judge();
-    expect(w2.github.on()[0]?.description ?? '').not.toMatch(/Falta|dueñ|visto/i);
+    expect(w2.github.on()[0]?.description ?? '').not.toMatch(/Falta|dueñ/i);
   });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Flock review, round 2.
+
+describe('flock 2', () => {
+  it('a PR retargeted just before publishing publishes nothing (the last check before publishing)', async () => {
+    const w = world();
+    const head = behaviorPr(w);
+    w.green(7, head);
+    w.github.baseSequence.set(7, ['main', 'main', 'main', 'develop']);
+    w.github.pendingFromConsoleStep(head);
+    const report = await w.judge();
+    expect(w.github.published).toEqual([]);
+    expect(report.notes.join(' ')).toMatch(/develop/);
+  });
+
+  it('with locale: en, a missing sign-off still says exactly what to write, in English', async () => {
+    const w = world({ '.ai-workflows/pipeline.yml': RECIPE.replace('locale: es', 'locale: en') });
+    const head = behaviorPr(w);
+    w.green(7, head);
+    w.github.commentList.set(7, [byOwner(`/visto-bueno ${'0'.repeat(7)}`)]);
+    w.github.pendingFromConsoleStep(head);
+    const report = await w.judge();
+    const description = w.github.on()[0]?.description ?? '';
+    expect(description).toContain(`/visto-bueno ${head.slice(0, 7)}`);
+    expect(description).not.toMatch(/Falta|dueñ|versión|comentario/i);
+    const reason = stageOf(report, 'owner-approval')?.reason ?? '';
+    expect(reason).not.toMatch(/no es la versión|comentario|dueñ/i);
+  });
+
+  it('a run without head_branch is not official', async () => {
+    const w = world();
+    const head = behaviorPr(w);
+    w.green(7, head);
+    w.github.runs.set(449, { path: WORKFLOW, event: 'workflow_dispatch' });
+    w.github.addStatus(head, { context: 'ai-workflows', state: 'success', targetUrl: `https://github.com/${REPO}/actions/runs/449` });
+    w.github.pendingFromConsoleStep(head);
+    const report = await w.judge();
+    expect(report.unofficial).toEqual([expect.objectContaining({ url: `https://github.com/${REPO}/actions/runs/449` })]);
+  });
+
+  it('an early error (invalid recipe) still reports the imitated statuses it can see', async () => {
+    const w = world({ '.ai-workflows/pipeline.yml': 'version: 2\n' });
+    const head = behaviorPr(w);
+    w.github.addStatus(head, { context: 'ai-workflows', state: 'success', targetUrl: 'https://example.com/imitado' });
+    w.github.pendingFromConsoleStep(head);
+    const report = await w.judge();
+    expect(w.github.on()).toEqual([expect.objectContaining({ state: 'error' })]);
+    expect(report.unofficial).toEqual([expect.objectContaining({ url: 'https://example.com/imitado' })]);
+  });
+
 });

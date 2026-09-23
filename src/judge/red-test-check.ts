@@ -596,6 +596,9 @@ export async function runRedTestCheck(
   let allOk = true;
   for (const pr of collected.prs) {
     if (pr.baseRef !== branch) {
+      // §3.1: a pull request into another branch is not tested, and the check never passes on
+      // that: it names the target branch and leaves the run red, so a retargeted PR cannot keep a
+      // green that was never tested.
       outcomes.push({
         number: pr.number,
         headRef: pr.headRef,
@@ -604,6 +607,7 @@ export async function runRedTestCheck(
           : `Not tested: the target branch is "${pr.baseRef}", not ${branch}.`,
         stages: [],
       });
+      allOk = false;
       continue;
     }
     const outcome = await checkPullRequest(context, pr, trusted);

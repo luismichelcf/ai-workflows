@@ -15,6 +15,8 @@ import {
   type Recipe,
 } from '../src/index.js';
 
+import { gitIsAncestor } from '../src/recipe/facts.js';
+
 import { commit, git, removeRepositories, repository, write } from './git-fixtures.js';
 
 // PLAN-13-R3 §1.1 (R19) and §2: on GitHub the judge never has the piece's working tree. It reads
@@ -264,5 +266,17 @@ describe('R19: the declared kind comes from a line of the plan', () => {
       list: async () => [],
     };
     await expect(readDeclaredKind(RECIPE, '13', broken)).rejects.toThrow(/Needed a single revision/);
+  });
+});
+
+describe('flock 2: whether a commit is an ancestor', () => {
+  it('answers yes and no, and throws when git cannot tell', async () => {
+    const root = repository();
+    const main = git(root, 'rev-parse', 'main');
+    write(root, 'app/page.tsx', 'export const page = 9;\n');
+    const head = commit(root, 'piece');
+    expect(await gitIsAncestor(root, main, head)).toBe(true);
+    expect(await gitIsAncestor(root, head, main)).toBe(false);
+    await expect(gitIsAncestor(root, 'f'.repeat(40), head)).rejects.toThrow();
   });
 });

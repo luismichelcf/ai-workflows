@@ -502,6 +502,7 @@ async function judgeFilesNote(
       order: '/approve-judge-change',
       minCodeLength: 7,
       productOwners: owners,
+      locale: work.recipe.locale,
     });
     return order.ok && work.target.head.toLowerCase().startsWith(order.code.toLowerCase());
   });
@@ -737,13 +738,70 @@ export async function runJudge(input: JudgeInput, deps: JudgeDeps): Promise<Judg
   }
 
   const targets = await resolveTargets(input, github, principal);
+  const judgedSha = targets.ok === 'empty' ? '' : targets.sha;
+  const infos = new Map<number, PrInfo>();
+  const targetList: Target[] = [];
+
+  // §3.7 rastro de estados imitados: collected on every path that does not publish a verdict, and
+  // after publishing, when the judge's own status is already official. A read failure is a note.
+  const traceComment = (unofficial: readonly Unofficial[], locale: string): string => {
+    const spanish = isSpanish(locale);
+    const heading = pick(
+      spanish,
+      'Estados con el nombre del juez que no salieron de su corrida oficial:',
+      'Statuses named like the judge that did not come from its official run:',
+    );
+    const lines = unofficial.map((entry) => {
+      const detail = entry.app === undefined ? '' : ` (${escapeReportText(entry.app)})`;
+      return `- ${escapeReportText(entry.context)} [${entry.kind}]${detail}: ${escapeReportText(entry.url ?? '')}`;
+    });
+    return [heading, ...lines].join('\n');
+  };
+  const conclude = async (judged: readonly JudgedPr[], locale: string): Promise<JudgeReport> => {
+    const collected = await collectUnofficial(
+      github,
+      judgedSha,
+      input.repository,
+      judgePath,
+      principal,
+      input.serverUrl,
+      traceContexts,
+      locale,
+    );
+    notes.push(...collected.notes);
+    if (collected.unofficial.length > 0) {
+      const body = traceComment(collected.unofficial, locale);
+      for (const target of targetList) {
+        try {
+          await github.upsertTraceComment(target.pr, body);
+        } catch (error) {
+          notes.push(
+            pick(
+              isSpanish(locale),
+              `No se pudo escribir el rastro en el PR #${target.pr}: ${reasonOf(error)}`,
+              `The trace could not be written on pull request #${target.pr}: ${reasonOf(error)}`,
+            ),
+          );
+        }
+      }
+    }
+    const summary: SummaryPiece[] = judged.map((piece) => ({
+      pr: piece.pr,
+      ...(piece.piece === undefined ? {} : { piece: piece.piece }),
+      verdict: piece.verdict,
+      stages: piece.stages,
+      ...(piece.note === undefined ? {} : { note: piece.note }),
+    }));
+    return finish(judged, collected.unofficial, buildSummary(summary, collected.unofficial, locale, notes));
+  };
+
   if (targets.ok === 'empty') {
     notes.push(targets.note);
     return finish();
   }
   if (targets.ok === 'technical') {
     await publish(targets.sha, targetContext, 'error', targets.reason);
-    return finish();
+    return conclude([], 'es');
   }
 
   // §3.1 rama destino: before publishing anything, not even an error. A pull request whose base
@@ -754,8 +812,6 @@ export async function runJudge(input: JudgeInput, deps: JudgeDeps): Promise<Judg
     notes.push(`la rama destino del PR es "${eventBase}", no la principal: nada se publica`);
     return finish();
   }
-  const infos = new Map<number, PrInfo>();
-  const targetList: Target[] = [];
   for (const target of targets.targets) {
     let pr;
     try {
@@ -786,7 +842,7 @@ export async function runJudge(input: JudgeInput, deps: JudgeDeps): Promise<Judg
     await deps.fetchObjects([...toFetch]);
   } catch (error) {
     await publish(targets.sha, targetContext, 'error', reasonOf(error));
-    return finish();
+    return conclude([], 'es');
   }
 
   const readRecipeAt = async (sha: string): Promise<{ ok: true; recipe: Recipe } | { ok: false; reason: string }> => {
@@ -810,7 +866,7 @@ export async function runJudge(input: JudgeInput, deps: JudgeDeps): Promise<Judg
   let read = await readRecipeAt(trusted);
   if (!read.ok) {
     await publish(targets.sha, targetContext, 'error', `La receta de la rama principal no se pudo leer: ${read.reason}`);
-    return finish();
+    return conclude([], 'es');
   }
   let recipe = read.recipe;
 
@@ -836,7 +892,7 @@ export async function runJudge(input: JudgeInput, deps: JudgeDeps): Promise<Judg
     const problem = await ancestorProblem(trusted);
     if (problem !== undefined) {
       await publish(targets.sha, targetContext, 'error', problem);
-      return finish();
+      return conclude([], recipe.locale);
     }
   }
 
@@ -860,77 +916,44 @@ export async function runJudge(input: JudgeInput, deps: JudgeDeps): Promise<Judg
     return judged;
   };
 
-  // §3.7 rastro de estados imitados: collected on every path that does not publish a verdict, and
-  // after publishing, when the judge's own status is already official. A read failure is a note.
-  const traceComment = (unofficial: readonly Unofficial[], locale: string): string => {
-    const spanish = isSpanish(locale);
-    const heading = pick(
-      spanish,
-      'Estados con el nombre del juez que no salieron de su corrida oficial:',
-      'Statuses named like the judge that did not come from its official run:',
-    );
-    const lines = unofficial.map((entry) => {
-      const detail = entry.app === undefined ? '' : ` (${escapeReportText(entry.app)})`;
-      return `- ${escapeReportText(entry.context)} [${entry.kind}]${detail}: ${escapeReportText(entry.url ?? '')}`;
-    });
-    return [heading, ...lines].join('\n');
-  };
-  const conclude = async (judged: readonly JudgedPr[], locale: string): Promise<JudgeReport> => {
-    const collected = await collectUnofficial(
-      github,
-      targets.sha,
-      input.repository,
-      judgePath,
-      principal,
-      input.serverUrl,
-      traceContexts,
-    );
-    notes.push(...collected.notes);
-    if (collected.unofficial.length > 0) {
-      const body = traceComment(collected.unofficial, locale);
-      for (const target of targetList) {
-        try {
-          await github.upsertTraceComment(target.pr, body);
-        } catch (error) {
-          notes.push(
-            pick(
-              isSpanish(locale),
-              `No se pudo escribir el rastro en el PR #${target.pr}: ${reasonOf(error)}`,
-              `The trace could not be written on pull request #${target.pr}: ${reasonOf(error)}`,
-            ),
-          );
-        }
-      }
-    }
-    const summary: SummaryPiece[] = judged.map((piece) => ({
-      pr: piece.pr,
-      ...(piece.piece === undefined ? {} : { piece: piece.piece }),
-      verdict: piece.verdict,
-      stages: piece.stages,
-      ...(piece.note === undefined ? {} : { note: piece.note }),
-    }));
-    return finish(judged, collected.unofficial, buildSummary(summary, collected.unofficial, locale, notes));
-  };
-
   let pieces = await judgeAll(recipe, trusted);
 
   // §3.8 corridas que se cruzan: (a) head, (b) main, (c) another official run.
   for (let attempt = 0; ; attempt += 1) {
     let moved = false;
     for (const target of targetList) {
+      const spanish = isSpanish(recipe.locale);
       let live;
       try {
         live = await github.pullRequest(target.pr);
       } catch (error) {
-        notes.push(`no se pudo releer el PR #${target.pr}: ${reasonOf(error)}`);
+        notes.push(
+          pick(
+            spanish,
+            `no se pudo releer el PR #${target.pr}: ${reasonOf(error)}`,
+            `pull request #${target.pr} could not be re-read: ${reasonOf(error)}`,
+          ),
+        );
         return conclude(pieces, recipe.locale);
       }
       if (live.headSha !== target.head) {
-        notes.push(`la cabeza del PR #${target.pr} cambió antes de publicar (${live.headSha}); no se publica veredicto`);
+        notes.push(
+          pick(
+            spanish,
+            `la cabeza del PR #${target.pr} cambió antes de publicar (${live.headSha}); no se publica veredicto`,
+            `the head of pull request #${target.pr} moved before publishing (${live.headSha}); no verdict is published`,
+          ),
+        );
         moved = true;
       }
       if (live.baseRef !== principal) {
-        notes.push(`la rama destino del PR #${target.pr} pasó a ser "${live.baseRef}"; no se publica`);
+        notes.push(
+          pick(
+            spanish,
+            `la rama destino del PR #${target.pr} pasó a ser "${live.baseRef}"; no se publica`,
+            `the target branch of pull request #${target.pr} became "${live.baseRef}"; nothing is published`,
+          ),
+        );
         moved = true;
       }
     }
@@ -952,7 +975,16 @@ export async function runJudge(input: JudgeInput, deps: JudgeDeps): Promise<Judg
       await checkout(input.root, trusted);
       read = await readRecipeAt(trusted);
       if (!read.ok) {
-        await publish(targets.sha, targetContext, 'error', `La receta de la rama principal no se pudo leer: ${read.reason}`);
+        await publish(
+          targets.sha,
+          targetContext,
+          'error',
+          pick(
+            isSpanish(recipe.locale),
+            `La receta de la rama principal no se pudo leer: ${read.reason}`,
+            `The recipe of the main branch could not be read: ${read.reason}`,
+          ),
+        );
         return conclude(pieces, recipe.locale);
       }
       recipe = read.recipe;
@@ -977,7 +1009,13 @@ export async function runJudge(input: JudgeInput, deps: JudgeDeps): Promise<Judg
       try {
         official = await officialRunId(github, newest, input.repository, judgePath, principal, input.serverUrl);
       } catch (error) {
-        notes.push(`no se pudo comprobar el estado más reciente de ${targetContext}: ${reasonOf(error)}`);
+        notes.push(
+          pick(
+            isSpanish(recipe.locale),
+            `no se pudo comprobar el estado más reciente de ${targetContext}: ${reasonOf(error)}`,
+            `the newest status of ${targetContext} could not be checked: ${reasonOf(error)}`,
+          ),
+        );
         official = undefined;
       }
       if (official !== undefined && official > input.runId) {
@@ -986,6 +1024,35 @@ export async function runJudge(input: JudgeInput, deps: JudgeDeps): Promise<Judg
             isSpanish(recipe.locale),
             `otra corrida oficial del juez publicó después (${official}); esta no publica`,
             `another official judge run published later (${official}); this one stays quiet`,
+          ),
+        );
+        return conclude(pieces, recipe.locale);
+      }
+    }
+
+    // §3.1: the live target branch, one last time before writing the verdict. A pull request
+    // retargeted during the run receives nothing, not even an earlier verdict.
+    for (const target of targetList) {
+      const spanish = isSpanish(recipe.locale);
+      let live;
+      try {
+        live = await github.pullRequest(target.pr);
+      } catch (error) {
+        notes.push(
+          pick(
+            spanish,
+            `no se pudo releer el PR #${target.pr} antes de publicar: ${reasonOf(error)}`,
+            `pull request #${target.pr} could not be re-read before publishing: ${reasonOf(error)}`,
+          ),
+        );
+        return conclude(pieces, recipe.locale);
+      }
+      if (live.baseRef !== principal) {
+        notes.push(
+          pick(
+            spanish,
+            `la rama destino del PR #${target.pr} es "${live.baseRef}"; no se publica`,
+            `the target branch of pull request #${target.pr} is "${live.baseRef}"; nothing is published`,
           ),
         );
         return conclude(pieces, recipe.locale);

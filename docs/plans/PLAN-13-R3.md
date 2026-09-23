@@ -647,3 +647,22 @@ se puede fusionar. El comentario de rastro no se borra cuando los estados imitad
 resumen de cada corrida sí lo dice). Un constructor añadió al listado de archivos que ignorara los
 cambios de fin de línea para que pasara una prueba; se retiró (dejaba al juez ciego a un cambio
 real) y se corrigió la prueba, que clonaba con otra configuración de fin de línea.
+
+## 13. Revisión de la parvada (ronda 2) y recorrido real
+
+**Ronda 2** (un revisor Claude en sesión fresca, sobre el cambio de la ronda 1): confirmó cerrados
+los nueve bloqueantes y encontró dos nuevos, corregidos con su prueba: (1) la prueba roja daba
+verde a un PR hacia otra rama, que luego podía volver a la principal sin probarse → falla, y su
+workflow escucha `edited`; (2) en `workflow_run` una lectura fallida de los PRs no dejaba el rojo
+→ el paso se arma antes de leer. Menores aplicados: la última comprobación de la rama destino antes
+de publicar, textos completos en inglés (también los del visto bueno), una corrida sin `head_branch`
+no es oficial, rastro en los caminos de error temprano. Ajuste del orquestador: con el interruptor
+en `off`, el `trap` del primer paso no publica nada (`off` desatasca siempre).
+
+**Recorrido real** en `socialabs-margin/ai-workflows-pruebas` (juez fijado al commit bajo prueba,
+protección y variable reales, cola nativa real). Primera pasada: 10 de 13 (un fallo de red de esta
+PC, uno de la prueba al cancelar tarde, uno de la prueba al buscar la re-evaluación del grupo; el
+juez respondió bien en los tres). Segunda pasada, tras la ronda 1: 11 de 13; los dos fallos venían
+de la prueba, que reusó un nombre de archivo ya fusionado por la primera pasada (ahora cada pasada
+usa nombres propios). En ambas el repositorio de pruebas quedó restaurado: protección, variable y
+workflows como estaban.

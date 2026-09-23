@@ -206,3 +206,32 @@ describe('flock 1: the command never leaks the token', () => {
     expect(cli).not.toMatch(/\|\|\s*error\.message/);
   });
 });
+
+describe('flock 2: templates and the first step', () => {
+  it('the red-test workflow runs again when a PR changes its target branch', () => {
+    const on = RED['on'] as Record<string, any>;
+    expect([...(on['pull_request']?.types ?? [])].sort()).toEqual(['edited', 'opened', 'reopened', 'synchronize']);
+  });
+
+  it('for workflow_run, the step is armed before it reads the PRs of the SHA, so a failed read leaves error', () => {
+    const decide = String(steps(ACTION['runs']).find((step) => step['id'] === 'decide')?.['run'] ?? '');
+    const armedAt = decide.indexOf("armed='true'");
+    const readAt = decide.search(/commits\/\$\{?sha\}?\/pulls/);
+    expect(armedAt).toBeGreaterThanOrEqual(0);
+    expect(readAt).toBeGreaterThan(armedAt);
+    expect(decide).toMatch(/commits\/\$\{?sha\}?\/pulls[^\n]*--paginate/);
+  });
+});
+
+describe('flock 2: off never blocks', () => {
+  it('when the first step fails with the switch off, it does not publish an error', () => {
+    const decide = String(steps(ACTION['runs']).find((step) => step['id'] === 'decide')?.['run'] ?? '');
+    const start = decide.indexOf('on_exit() {');
+    const body = decide.slice(start, decide.indexOf('trap ', start));
+    expect(start).toBeGreaterThanOrEqual(0);
+    // The trap looks at the mode: with off (or no value) nothing is published, so off can
+    // always unjam a merge, even when GitHub answers badly.
+    expect(body).toMatch(/\$mode/);
+    expect(body).toMatch(/off/);
+  });
+});

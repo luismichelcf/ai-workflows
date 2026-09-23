@@ -28,6 +28,8 @@ export interface OwnerOrderRules {
   /** The shortest code that names one version. */
   readonly minCodeLength: number;
   readonly productOwners: readonly string[];
+  /** The language of the motive; Spanish by default, because the local motor speaks Spanish. */
+  readonly locale?: string;
 }
 
 /** What one comment carries: whether it holds a genuine order, and the code it names. */
@@ -384,6 +386,7 @@ export function evaluateOwnerOrder(
   comment: PullRequestComment,
   rules: OwnerOrderRules,
 ): OwnerOrderEvaluation {
+  const spanish = (rules.locale ?? 'es').toLowerCase().startsWith('es');
   const orders = collectOrderLines(comment.body, orderLinePattern(rules.order));
   const genuine = orders.filter((order) => !order.hidden);
   const hadOrder = orders.length > 0;
@@ -391,7 +394,9 @@ export function evaluateOwnerOrder(
     ok: false,
     hadOrder,
     code: '',
-    reason: `No hay ninguna orden ${rules.order} en su propia línea en este comentario.`,
+    reason: spanish
+      ? `No hay ninguna orden ${rules.order} en su propia línea en este comentario.`
+      : `There is no ${rules.order} order on its own line in this comment.`,
   });
   const rejected = (reason: string): OwnerOrderEvaluation => ({ ok: false, hadOrder, code: '', reason });
 
@@ -404,7 +409,9 @@ export function evaluateOwnerOrder(
   // Two orders in one comment are ambiguous: nobody can say which version was approved.
   if (genuine.length > 1) {
     return rejected(
-      `Este comentario trae ${genuine.length} órdenes ${rules.order}: no queda claro cuál vale, así que ninguna cuenta.`,
+      spanish
+        ? `Este comentario trae ${genuine.length} órdenes ${rules.order}: no queda claro cuál vale, así que ninguna cuenta.`
+        : `This comment brings ${genuine.length} ${rules.order} orders: it is not clear which one counts, so none does.`,
     );
   }
 
@@ -412,18 +419,24 @@ export function evaluateOwnerOrder(
   // so an edited comment no longer proves what the owner approved.
   if (comment.edited) {
     return rejected(
-      'El comentario fue editado después de publicarse: cualquiera con permiso de escritura pudo cambiar la orden, así que no cuenta.',
+      spanish
+        ? 'El comentario fue editado después de publicarse: cualquiera con permiso de escritura pudo cambiar la orden, así que no cuenta.'
+        : 'The comment was edited after it was posted: anyone with write access could have changed the order, so it does not count.',
     );
   }
   if (comment.performedViaApp) {
     return rejected(
-      'El comentario se publicó a través de una aplicación: no prueba que lo escribiera el dueño.',
+      spanish
+        ? 'El comentario se publicó a través de una aplicación: no prueba que lo escribiera el dueño.'
+        : 'The comment was posted through an app: it does not prove the owner wrote it.',
     );
   }
   // A bot or organization account is never the person whose sign-off this process needs.
   if (comment.authorType !== 'User') {
     return rejected(
-      `El comentario no lo escribió una cuenta de persona ("${comment.authorType}"): su visto bueno no cuenta.`,
+      spanish
+        ? `El comentario no lo escribió una cuenta de persona ("${comment.authorType}"): su visto bueno no cuenta.`
+        : `The comment was not written by a person's account ("${comment.authorType}"): its approval does not count.`,
     );
   }
   // Empty logins never match; a login is ASCII and compared without case, so a character
@@ -433,17 +446,25 @@ export function evaluateOwnerOrder(
   const isOwner = LOGIN.test(comment.author)
     && rules.productOwners.some((owner) => LOGIN.test(owner) && owner.toLowerCase() === author);
   if (!isOwner) {
-    return rejected(`El autor "${comment.author}" no es un product owner: su visto bueno no cuenta.`);
+    return rejected(
+      spanish
+        ? `El autor "${comment.author}" no es un product owner: su visto bueno no cuenta.`
+        : `The author "${comment.author}" is not a product owner: their approval does not count.`,
+    );
   }
 
   if (first.sha.length < rules.minCodeLength) {
     return rejected(
-      `"${first.sha}" no es un código de versión válido: hacen falta al menos ${rules.minCodeLength} caracteres.`,
+      spanish
+        ? `"${first.sha}" no es un código de versión válido: hacen falta al menos ${rules.minCodeLength} caracteres.`
+        : `"${first.sha}" is not a valid version code: at least ${rules.minCodeLength} characters are needed.`,
     );
   }
   if (!HEX_SHA.test(first.sha)) {
     return rejected(
-      `"${first.sha}" no es un código de versión válido: debe ser hexadecimal.`,
+      spanish
+        ? `"${first.sha}" no es un código de versión válido: debe ser hexadecimal.`
+        : `"${first.sha}" is not a valid version code: it must be hexadecimal.`,
     );
   }
 

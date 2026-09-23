@@ -13,7 +13,10 @@
 name: ai-workflows red-test
 
 on:
+  # `edited` vuelve a correr la prueba roja cuando un PR cambia su rama destino (§3.1): sin él, un
+  # PR retargetado a la principal conservaría el resultado de la rama a la que apuntaba antes.
   pull_request:
+    types: [opened, synchronize, reopened, edited]
   merge_group:
     types: [checks_requested]
 

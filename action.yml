@@ -105,12 +105,16 @@ runs:
 
         # Si el paso falla después de conocer el SHA y antes de terminar, deja el rojo honesto en
         # el contexto donde iría el veredicto (en `advisory`, el consultivo) y sale con 1, para que
-        # un verde viejo nunca quede.
+        # un verde viejo nunca quede. Con el interruptor apagado (`off`, o sin valor) no publica
+        # nada: `off` debe desatascar siempre, incluso si el motor o GitHub fallan.
         on_exit() {
           local code="$1"
           if [ "$decided" = 'true' ] || [ "$armed" != 'true' ]; then
             exit "$code"
           fi
+          case "$mode" in
+            ''|off) exit "$code" ;;
+          esac
           publish_status error "$status_context" 'el juez no pudo decidir' || true
           exit 1
         }
@@ -189,13 +193,20 @@ runs:
             ;;
           workflow_run)
             sha="$(jq -r '.workflow_run.head_sha // empty' "$GITHUB_EVENT_PATH")"
+            if [ -z "$sha" ]; then
+              stop "no se pudo calcular el SHA a marcar ($GITHUB_EVENT_NAME)"
+            fi
+            # El SHA ya se conoce por el evento: se arma ANTES de leer los PRs de ese SHA, para que
+            # un fallo de la lectura deje el rojo honesto (lo publica el `trap`) sobre ese SHA,
+            # nunca un verde. La lectura va paginada y junta las páginas con `--slurp`.
+            armed='true'
             run_event="$(jq -r '.workflow_run.event // empty' "$GITHUB_EVENT_PATH")"
             if [ "$run_event" = 'merge_group' ]; then
               :
             elif [ "$run_event" = 'pull_request' ]; then
-              match="$(gh api "repos/$GITHUB_REPOSITORY/commits/${sha}/pulls" \
+              match="$(gh api "repos/$GITHUB_REPOSITORY/commits/${sha}/pulls?per_page=100" --paginate --slurp \
                 | jq -r --arg head "$sha" --arg base "$default_branch" \
-                  '[.[] | select(.state == "open" and .head.sha == $head and .base.ref == $base)] | length')"
+                  '[.[][] | select(.state == "open" and .head.sha == $head and .base.ref == $base)] | length')"
               if [ "$match" = '0' ]; then
                 stop "no hay un PR abierto con la cabeza $sha hacia $default_branch"
               fi
