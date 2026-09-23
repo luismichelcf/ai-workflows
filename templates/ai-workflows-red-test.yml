@@ -1,0 +1,56 @@
+# El job sin privilegios `ai-workflows/red-test` (PLAN-13-R3 §5 y §6). Corre con `pull_request` y
+# `merge_group`, no con `pull_request_target`: a diferencia del juez, ESTA corrida ejecuta código
+# del PR (las pruebas que el PR trae), y por eso su YAML sale del propio PR y no tiene permiso de
+# publicar estados: su `statuses` no está en la lista de permisos y su token no puede escribir uno.
+# Lo que garantiza el aislamiento son los permisos, no la confianza en la rama.
+#
+# Este workflow NO hace checkout del YAML del juez: la acción de ai-workflows solo comprueba la
+# prueba roja; el veredicto lo publica el workflow `ai-workflows` con su propio estado.
+#
+# Sustituye <ENGINE_SHA> por el SHA de la versión fijada del motor. Los pasos de instalación del
+# proyecto son un ejemplo: ajústalos a tu gestor de paquetes y a tu comando de pruebas.
+
+name: ai-workflows red-test
+
+on:
+  pull_request:
+  merge_group:
+    types: [checks_requested]
+
+permissions: {}
+
+jobs:
+  # Este es el nombre del check exigido: el juez lo busca como `ai-workflows/red-test`.
+  red-test:
+    name: ai-workflows/red-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    # Sin `statuses: write` a propósito: aunque este job lo pidiera, su token no puede publicar
+    # estados. Es la garantía de SV-09 frente a un PR que intentara darse por aprobado.
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      # Se revisa la cabeza del PR (o el SHA del grupo en la cola), con la historia completa y sin
+      # conservar el token para que los procesos de prueba no lo hereden por la configuración de git.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      # EJEMPLO a ajustar: los pasos con los que tu proyecto instala sus dependencias. La prueba
+      # roja corre contra la base usando las dependencias de la cabeza, así que deben instalarse.
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 10
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+      - run: pnpm install --frozen-lockfile
+
+      # La acción solo comprueba la prueba roja; no publica estados (no tiene permiso para ello).
+      - uses: luismichelcf/ai-workflows@<ENGINE_SHA>
+        with:
+          task: red-test
+          token: ${{ github.token }}

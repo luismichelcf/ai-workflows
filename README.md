@@ -56,7 +56,7 @@ rejected, and `NO` stays text. Its JSON Schema (`schema/recipe.schema.json`) is 
 `validate` enforces, so the editor and the engine agree. A stage's `applies-if` is a structured
 condition (`touches-any`, `touches-none`, `kind-any`, `kind-none`, `lane-any`), never an
 expression; a stage that does not apply is recorded as skipped with its reason, and
-`status <piece>` lists it that way. The server check arrives in slice 3.
+`status <piece>` lists it that way. The server check, the judge, is described below.
 
 ## Blocks
 
@@ -121,6 +121,67 @@ Wiring `run`, `status` and `stop` of the command line to the recipe arrives in s
 The independence of a review is judged by provider and session: the same session under another
 model is still the builder (PLAN-13 R18).
 
+## The judge: the check on GitHub
+
+Next to the agent the engine guides and stops every stage, but anyone can open a pull request from
+the web or merge from another machine. The judge is a status check on GitHub that re-checks every
+stage before merging, with the recipe of the main branch, on the pull request and in the merge
+queue. Design: [PLAN-13-R3](docs/plans/PLAN-13-R3.md).
+
+**Install.** Copy `templates/ai-workflows.yml` and `templates/ai-workflows-red-test.yml` into
+`.github/workflows/`, replace `<ENGINE_SHA>` with the full commit SHA of the engine version you
+use (never a tag: the judge refuses to run unpinned), adjust the install steps of the red-test
+workflow to your project, and add to `workflow_run.workflows` of the judge the workflows that
+produce the checks your recipe requires. Then turn it on with the repository variable and, after
+that, require the `ai-workflows` status in the branch ruleset.
+
+**Where a stage is checked.** Every pre-merge stage says it with `server:`, within what its block
+allows, and `validate` enforces it:
+
+| `server:` | What the judge does |
+|---|---|
+| `recompute` | Runs the block's server check again on the pull request's files, read from git objects (spec structure, benchmark sources without reachability, scope) |
+| `require-check: <name>` | Requires that check — a check run or a commit status — green on the judged SHA (the pull request head, or the merge group SHA in the queue) |
+| `attestation` | Looks for the authenticated event: today the owner's approval comment (`approval-comment`); independent reviews arrive in slice 4 |
+| `local-only` | Only for post-merge stages or `required: false`: checked next to the agent only |
+
+**Pieces.** `pieces:` tells the judge which branch is which piece (`branch: ["*/{piece}-*"]`,
+`{piece}` being a number), which branches never merge (`exclude-branches`), and which line of the
+piece's plan declares its kind (`declared-kind`). A branch without a piece is rejected. The
+declared kind is the piece's word; paths still raise it.
+
+**Provenance.** The judge runs with `pull_request_target` and `merge_group` (plus
+`issue_comment`, `workflow_run` and `workflow_dispatch` to judge again), checks out only the
+live head of the main branch, and reads the pull request as git objects: it never checks out or
+runs its code, and it never reads the state refs, the store or the providers. It refuses to judge
+when its workflow does not come from the main branch (or, in the queue, from the queue branch), and
+publishes nothing for a pull request into another branch. A pull request that touches
+`.ai-workflows/`, the judge's workflow or the red-test workflow is rejected unless the recipe's
+`owner` comments `/approve-judge-change <sha>` for that exact head.
+
+**The red test.** The `ai-workflows/red-test` check runs in its own workflow, with
+`pull_request` and `merge_group`, read-only permissions and no secrets: each piece's new or
+changed tests must fail by their assertion against its base (in the queue, the base of its own
+entry) and pass against the head, with the dependencies installed from the head. It runs the pull
+request's code, so it deserves the trust of any test suite check, not more.
+
+**The switch.** The repository variable `AI_WORKFLOWS_MODE`: `off` (or unset) publishes green
+"motor apagado" without installing anything; `advisory` publishes green and the real verdict in
+`ai-workflows/advisory`; `on` publishes the real verdict. Any other value is an error. Each pull
+request is judged on its own, so one that fails technically does not block the others.
+
+**Statuses.** passed → success, rejected → failure, waiting (for a check or the owner) → pending,
+technical → error, with the stage that decided in the description and the detail in the run
+summary. A run first replaces any earlier green with pending; before publishing it re-reads the
+pull request's head and the main branch, and stays quiet if a newer run already published.
+
+**Limits.** Any workflow in the repository can publish a status or a check with the judge's name
+(accepted, PLAN-13 R13): the judge reports such statuses and check runs on the pull request, but
+one that copies the link of a real judge run is not detected. A required check produced by an app
+outside Actions does not trigger the judge again; the next event or `workflow_dispatch` does. If
+GitHub's status API or Actions are down, nothing can be published, not even the green of `off`.
+An approval whose commit GitHub no longer delivers after a force push has to be given again.
+
 ## Where progress lives on GitHub
 
 ```ts
@@ -153,7 +214,8 @@ await runCommand(argv, { config, store, describeChange, leaseMs: 15 * 60_000 });
 - Nothing stops a repository administrator from changing or disabling the rules.
 - A sign-off by comment proves which GitHub account wrote it, not which person.
 - Anyone who can push to the repository can rewrite the state refs. The journal is not yet
-  rebuilt from GitHub's own events, so a hand-edited state is believed.
+  rebuilt from GitHub's own events, so a hand-edited state is believed next to the agent; the
+  judge never reads it.
 - Leases compare clocks: a machine whose clock runs far ahead or behind can take a lease that is
   still alive. A controller that dies keeps its piece until its lease runs out.
 - A lease does not fence effects: a gate still running after losing its lease can start one. The

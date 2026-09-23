@@ -1,0 +1,85 @@
+# El juez de ai-workflows (PLAN-13-R3 §3, §4 y §6). Este es el workflow que se instala en la rama
+# principal; su acción se fija por SHA (donde dice <ENGINE_SHA>) al publicar una versión.
+#
+# POR QUÉ `pull_request_target` Y NO `pull_request`. El YAML que corre sale de la rama principal,
+# no de la rama del PR: un PR no puede reemplazar al juez que lo juzga. Es seguro porque ningún paso
+# revisa ni ejecuta el código del PR: este workflow no hace checkout y la acción solo trae la rama
+# principal y lee el PR como objetos de git.
+#
+# EL JOB NO SE LLAMA COMO EL ESTADO. Si se llamara `ai-workflows`, GitHub publicaría además un
+# check-run con ese nombre y su marca de «corriendo» competiría con el estado que publica el juez.
+#
+# EL INTERRUPTOR. Todo cuelga de la variable del repositorio `AI_WORKFLOWS_MODE`: sin valor o `off`
+# publica verde «motor apagado» y no bloquea; `advisory` publica verde y manda el veredicto real al
+# estado consultivo; `on` publica el veredicto real en la principal. El interruptor lo aplica la
+# acción, no este YAML, para que el apagado funcione incluso con el motor roto.
+
+name: ai-workflows
+
+on:
+  # `edited` hace que cambiar la rama destino (o volver a la principal con el mismo SHA) dispare
+  # otra corrida: la procedencia no lo dice, porque `pull_request_target` corre el YAML de la
+  # principal sea cual sea el destino.
+  pull_request_target:
+    types: [opened, synchronize, reopened, edited]
+  merge_group:
+    types: [checks_requested]
+  # El visto bueno llega como comentario del PR: al crearse, editarlo o borrarlo hay que reevaluar.
+  issue_comment:
+    types: [created, edited, deleted]
+  # Se dispara al terminar los workflows que producen checks exigidos. Agrega aquí los tuyos: el de
+  # `ai-workflows/red-test` va de ejemplo. Un check de una app externa no vuelve a disparar el juez;
+  # para eso queda `workflow_dispatch` o el siguiente evento del PR.
+  workflow_run:
+    workflows: ["ai-workflows red-test"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: Número del pull request a juzgar.
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  # El id es `judge`, nunca `ai-workflows`: ver arriba.
+  judge:
+    name: Juez de ai-workflows
+    # En un comentario solo se juzga si es de un PR y trae una orden (`/…`), o si el comentario se
+    # editó o borró (el visto bueno pudo retirarse). En un issue suelto no hay nada que juzgar.
+    if: >-
+      github.event_name != 'issue_comment'
+      || (github.event.issue.pull_request
+        && (contains(github.event.comment.body, '/') || github.event.action != 'created'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: write # el rastro de estados imitados se escribe como comentario del PR
+      issues: read # leer los comentarios del PR (visto bueno, rastro)
+      checks: read # leer los check-runs de `require-check`
+      actions: read # comprobar que una corrida que dice ser el juez existe y es su workflow
+      statuses: write # publicar el `pending` y el veredicto del juez
+    # Una corrida por PR (o por SHA del grupo), y la nueva cancela la vieja: reduce las corridas que
+    # se cruzan. Un verde viejo sobre el mismo SHA solo sobrevive si no arranca ninguna posterior.
+    concurrency:
+      group: >-
+        ai-workflows-${{
+          github.event.pull_request.number
+          || github.event.issue.number
+          || inputs.pr
+          || github.event.merge_group.head_sha
+          || github.event.workflow_run.head_sha
+        }}
+      cancel-in-progress: true
+    steps:
+      # Ningún checkout aquí: la acción lo hace solo de la rama principal, dentro de sí misma.
+      - uses: luismichelcf/ai-workflows@<ENGINE_SHA>
+        with:
+          task: judge
+          mode: ${{ vars.AI_WORKFLOWS_MODE }}
+          token: ${{ github.token }}
+          # El workflow del job sin privilegios también es archivo del juez: un PR que lo toque sin
+          # atestación del dueño se rechaza.
+          also-protect: .github/workflows/ai-workflows-red-test.yml
