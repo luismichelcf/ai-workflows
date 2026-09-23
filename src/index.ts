@@ -20,6 +20,15 @@ export {
   type GhRunnerOptions,
   type GhExecutable,
 } from './gh-runner.js';
+export {
+  createJudgeGitHub,
+  type JudgeGitHub,
+  type JudgeGitHubOptions,
+  type JudgePullRequest,
+  type MergeQueueEntry,
+  type CheckRunSummary,
+  type CommitStatus,
+} from './judge/port.js';
 export { createEngine } from './engine.js';
 export {
   launchInGroup,
