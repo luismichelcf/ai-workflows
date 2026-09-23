@@ -566,7 +566,7 @@ Socialabs antes de la rebanada 7.
 Una rama y un PR por rebanada en este repositorio. Prueba roja primero en cada cambio de
 comportamiento; el orquestador escribe las pruebas rojas y el constructor las pone verdes.
 
-- [ ] **1. Receta:** lector estricto, esquema, `validate`, `explain`, `init`. (RC-01, 02, 04, 05)
+- [x] **1. Receta:** lector estricto, esquema, `validate`, `explain`, `init`. (RC-01, 02, 04, 05)
 - [ ] **2. Bloques:** registro de bloques, manifiestos, bloques módulo y comando, vigencias de §3.3
       y los bloques genéricos de §4.1 portados desde las compuertas existentes. (RC-03, RC-07…RC-10,
       CN-01…CN-04, CN-09…CN-11)
@@ -605,6 +605,29 @@ Rebanadas 1 → 2 → 3 → 4 en orden; 5 puede empezar tras 3; 6 tras 4 y 5; 7 
 
 - Qué proyecto de base de datos de prueba usar (gratuito o del plan Pro), según límites vigentes
   al abrir la rebanada 6.
+- Que salieron de la parvada de la rebanada 1 y se resuelven al abrir la rebanada 2, antes de
+  construir las vigencias y los tipos:
+  - **Vigencia por omisión.** La receta leída deja `valid-while` sin valor si no se escribe; al
+    traducirla al motor, «sin valor» no puede significar «nunca caduca» (eso conservaría la puerta
+    tras un commit nuevo, contra §1.1). Opciones: hacerlo obligatorio o un valor conservador
+    (`same-sha`).
+  - **Tipos y carriles con vocabulario cerrado.** Hoy un error de escritura en `kind-any` o
+    `lane-any` valida y deja la etapa omitida para siempre. Se cierra junto con RC-07.
+  - **Reglas de `validate` diferidas:** exactamente una etapa `phase: merge`, `local-only` solo
+    fuera de `pre-merge` obligatoria, bloques comando sin `attest` ni `execution-record` (RC-08);
+    QA solo con `same-sha`; toda etapa `pre-merge` con `server:` (rebanada 3); orden de fases y
+    `applies-if` sobre la etapa de fusión (a proponer).
+  - **`{tests}` en `with.command`:** el bloque debe pasar los archivos como argumentos, nunca
+    armados dentro de un texto de consola (§3.4).
+  - **Salida saneada en todo el CLI (rebanada 4, mensajes al dueño):** `status`, `validate` y
+    `explain` ya no pueden imprimir caracteres de control, de formato ni separadores; `pause`,
+    `resume`, `stop` y `doctor` (heredados de v0.3.0) todavía repiten nombres de pieza y motivos
+    tal cual. Se cierra con las plantillas de mensajes.
+  - **Costo aceptado del saneado:** una receta rechaza emojis compuestos (👩‍💻), banderas con
+    etiquetas y el guion suave que deja Word; los acentos, «», —, ¿¡ y los emojis simples pasan.
+  - **Propuesta al dueño:** que `explain` muestre las clases y los tipos con un nombre en español
+    (hoy dice «toca «security»»). Sería un campo nuevo de la receta; no se añade sin su visto
+    bueno.
 
 ---
 

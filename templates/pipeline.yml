@@ -1,0 +1,109 @@
+# yaml-language-server: $schema=https://github.com/luismichelcf/ai-workflows/releases/download/v1.0.0/recipe.schema.json
+#
+# Receta de ejemplo de ai-workflows. Cada paso dice qué exige el proceso, cuándo aplica y qué
+# pasa si no se cumple. Ajusta las rutas y los pasos a tu proyecto.
+# Para leerla explicada en español: ai-workflows explain
+
+version: 1
+locale: es
+owner: tu-cuenta-de-github            # quien da el visto bueno y toma las decisiones
+
+classify:                             # qué rutas son de cada clase: datos, no código
+  security: ["**/*auth*", "**/*permission*"]
+  visible: ["app/**", "components/**", "public/**"]
+  production: [".github/workflows/**"]
+
+kinds:                                # tipos de cambio que declara cada pieza
+  default: behavior
+  from-paths:                         # si TODOS los archivos caen aquí, ese es el tipo
+    docs: ["docs/**", "**/*.md"]
+  elevate:                            # el riesgo real manda sobre lo declarado
+    - when: { touches-any: [security], kind-none: [behavior] }
+      to: behavior
+
+stages:
+  - id: spec
+    summary: "Un plan escrito con el resumen de tres líneas y criterios con identificador"
+    nature: structure
+    gate:
+      uses: ai-workflows/spec-structure@1
+    server: recompute
+
+  - id: red-test
+    summary: "Primero una prueba que falla por la razón correcta"
+    after: spec
+    nature: execution-record
+    applies-if: { kind-any: [behavior] }
+    gate:
+      uses: ai-workflows/red-test@1
+      with: { command: "pnpm vitest run {tests}" }
+    server: { require-check: ai-workflows/red-test }
+
+  - id: implementation
+    summary: "La prueba pasa y vuelve a fallar si se retira solo el código nuevo"
+    after: red-test
+    nature: execution-record
+    applies-if: { kind-any: [behavior] }
+    gate:
+      uses: ai-workflows/build-verify@1
+    server: { require-check: ai-workflows/red-test }
+
+  - id: checks
+    summary: "Tipos y todas las pruebas en verde"
+    after: implementation
+    nature: recompute
+    gate:
+      uses: ai-workflows/command@1
+      with: { command: "pnpm check", timeout-minutes: 20 }
+    server: { require-check: check }
+
+  - id: review
+    summary: "Revisores independientes aprueban el cambio final"
+    after: checks
+    nature: attest
+    applies-if: { touches-any: [security, production] }
+    valid-while: same-fingerprint-or-clean-update
+    gate:
+      uses: ai-workflows/independent-review@1
+      with: { forbid-same-family: true }
+    server: attestation
+
+  - id: owner-approval
+    summary: "El dueño aprueba lo que se ve"
+    after: review
+    nature: attest
+    needs-human: true
+    applies-if: { touches-any: [visible] }
+    valid-while: same-fingerprint
+    gate:
+      uses: ai-workflows/approval-comment@1
+      with: { command: /approve }
+    server: attestation
+
+  - id: merge
+    summary: "Entra a la cola de GitHub y la observa hasta el final"
+    after: owner-approval
+    phase: merge
+    nature: recompute
+    valid-while: same-sha
+    gate:
+      uses: ai-workflows/github-merge@1
+
+  - id: after-merge
+    summary: "Lo publicado queda en verde"
+    after: merge
+    phase: post-merge
+    nature: recompute
+    gate:
+      uses: ai-workflows/post-merge@1
+    server: local-only
+
+  - id: cleanup
+    summary: "Se limpia la carpeta de trabajo y se liberan las reservas de la pieza"
+    after: after-merge
+    phase: post-merge
+    nature: recompute
+    retry: { attempts: 3, wait-seconds: 30 }
+    gate:
+      uses: ai-workflows/cleanup@1
+    server: local-only

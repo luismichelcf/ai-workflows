@@ -1,13 +1,16 @@
 import {
   InvalidPipeline,
+  type JournalEntry,
   type PieceState,
   type PieceStatus,
   type PipelineConfig,
+  type StageConfig,
   type RunOutcome,
   type Store,
 } from './contract.js';
 import { validateConfig } from './config.js';
 import { createEngine, InvalidCancellationPoll, InvalidLease, MIN_LEASE_MS } from './engine.js';
+import { safeTerminalText } from './safe-text.js';
 
 export interface CommandOptions {
   readonly config: PipelineConfig;
@@ -73,6 +76,7 @@ const languageOf = (locale: string): Language => (locale.toLowerCase().startsWit
  */
 interface StatusWords {
   readonly header: string;
+  readonly skippedLabel: string;
   readonly empty: string;
   readonly startHint: string;
   readonly stageLabel: string;
@@ -83,6 +87,7 @@ interface StatusWords {
 const STATUS_WORDS: Record<Language, StatusWords> = {
   es: {
     header: 'Piezas',
+    skippedLabel: '  Pasos omitidos:',
     empty: 'Sin piezas.',
     startHint: 'Empieza con: run <pieza>',
     stageLabel: 'paso',
@@ -105,6 +110,7 @@ const STATUS_WORDS: Record<Language, StatusWords> = {
   },
   en: {
     header: 'Pieces',
+    skippedLabel: '  Skipped steps:',
     empty: 'No pieces.',
     startHint: 'Start with: run <piece>',
     stageLabel: 'step',
@@ -138,16 +144,20 @@ function clampLine(line: string): string {
 
 /** One human-readable line for one piece: its number, its step, its state, and its reason. */
 function renderPieceLine(status: PieceStatus, words: StatusWords, verbose: boolean): string {
-  const stagePart = status.stage === undefined ? '' : ` · ${words.stageLabel} "${status.stage}"`;
+  // Clean data fields before layout so stored line breaks cannot forge status rows.
+  const piece = safeTerminalText(status.piece);
+  const stage = status.stage === undefined ? undefined : safeTerminalText(status.stage);
+  const reason = status.reason === undefined ? undefined : safeTerminalText(status.reason);
+  const stagePart = stage === undefined ? '' : ` · ${words.stageLabel} "${stage}"`;
   const stateText = words.state[status.state];
   const guidance = words.guidance[status.state];
-  const base = `- ${status.piece}${stagePart} · ${stateText}`;
+  const base = `- ${piece}${stagePart} · ${stateText}`;
 
-  if (status.reason === undefined) {
+  if (reason === undefined) {
     return clampLine(guidance.length === 0 ? base : `${base} — ${guidance}`);
   }
 
-  const withReason = `${base}: ${status.reason}`;
+  const withReason = `${base}: ${reason}`;
   const tail = guidance.length === 0 ? '' : `. ${guidance}`;
   if (verbose) return withReason + tail;
   if (withReason.length + tail.length <= MAX_LINE_WIDTH) return withReason + tail;
@@ -162,7 +172,7 @@ function renderPieceLine(status: PieceStatus, words: StatusWords, verbose: boole
   // error that says only what broke, with no way out, is the screen this CLI exists to avoid.
   const budget = MAX_LINE_WIDTH - base.length - 2 - tail.length - 1;
   if (budget <= 0) return clampLine(withReason + tail);
-  return `${base}: ${status.reason.slice(0, budget)}…${tail}`;
+  return `${base}: ${reason.slice(0, budget)}…${tail}`;
 }
 
 /**
@@ -181,6 +191,27 @@ export function renderStatus(pieces: readonly PieceStatus[], options: RenderOpti
   const verbose = options.verbose === true;
   const lines = pieces.map((status) => renderPieceLine(status, words, verbose));
   return [words.header, ...lines].join('\n');
+}
+
+/** Show only the latest result for each stage, keeping its first journal position. */
+function renderSkippedSteps(
+  journal: readonly JournalEntry[],
+  stages: readonly StageConfig[],
+  options: RenderOptions,
+): string {
+  const latest = new Map<string, JournalEntry>();
+  for (const entry of journal) latest.set(entry.stage, entry);
+
+  const skipped = [...latest.values()].filter((entry) => entry.outcome === 'skipped');
+  if (skipped.length === 0) return '';
+
+  const words = STATUS_WORDS[languageOf(options.locale)];
+  const lines = skipped.map((entry) => {
+    const name = stages.find((stage) => stage.name === entry.stage)?.summary ?? entry.stage;
+    const line = `  - ${safeTerminalText(name)} — ${safeTerminalText(entry.reason ?? '')}`;
+    return options.verbose ? line : clampLine(line);
+  });
+  return [words.skippedLabel, ...lines].join('\n');
 }
 
 interface DoctorWords {
@@ -580,18 +611,30 @@ export async function runCommand(argv: readonly string[], options: CommandOption
       );
       if (isOutput(engine)) return engine;
 
-      const piece = args[0];
+      const piece = args.find((arg) => !arg.startsWith('--'));
       if (piece === undefined) {
-        return { ok: true, text: renderStatus(await engine.list(), { locale }) };
+        return {
+          ok: true,
+          text: renderStatus(await engine.list(), { locale, verbose: args.includes('--verbose') }),
+        };
       }
       const status = await engine.status(piece);
       if (status === undefined) {
         return {
           ok: true,
-          text: languageOf(locale) === 'es' ? `La pieza ${piece} no está registrada.` : `Piece ${piece} is not registered.`,
+          text: languageOf(locale) === 'es'
+            ? `La pieza ${safeTerminalText(piece)} no está registrada.`
+            : `Piece ${safeTerminalText(piece)} is not registered.`,
         };
       }
-      return { ok: true, text: renderStatus([status], { locale }) };
+      const verbose = args.includes('--verbose');
+      const detail = renderSkippedSteps(
+        await store.journal(piece),
+        config.stages,
+        { locale, verbose },
+      );
+      const text = renderStatus([status], { locale, verbose });
+      return { ok: true, text: detail.length > 0 ? `${text}\n${detail}` : text };
     }
 
     case 'validate': {
