@@ -310,14 +310,10 @@ async function retireFromSnapshot(
   }
   const commit = created.stdout.split('\n')[0] ?? '';
 
-  const parent = await mkdtemp(join(tmpdir(), 'aiw-retire-'));
-  const worktree = join(parent, 'tree');
+  const { parent, tree: worktree } = await createWorktree(root, commit, 'aiw-retire-');
   // The linked `node_modules` is remembered so it can be removed as a LINK, never followed.
   let modulesLink: string | undefined;
   try {
-    const added = await runGit(root, ['worktree', 'add', '--detach', worktree, commit]);
-    if (!added.ok) throw new Error('the temporary worktree could not be created');
-
     for (const file of implementation) {
       const inBase = await runGit(root, ['cat-file', '-e', `${mergeBase}:${file}`]);
       if (inBase.ok) {
@@ -328,14 +324,7 @@ async function retireFromSnapshot(
       }
     }
 
-    const modules = join(root, 'node_modules');
-    if (existsSync(modules)) {
-      const link = join(worktree, 'node_modules');
-      if (!existsSync(link)) {
-        symlinkSync(modules, link, process.platform === 'win32' ? 'junction' : 'dir');
-        modulesLink = link;
-      }
-    }
+    modulesLink = await linkModules(root, worktree);
 
     const run: TestGroupResult = await runTests({
       command: options.command,
@@ -359,20 +348,63 @@ async function retireFromSnapshot(
     }
     return { ok: true };
   } finally {
-    // On Windows `git worktree remove --force` follows the `node_modules` junction and deletes
-    // the project's real dependencies. The link is removed first, by its own name only. If it
-    // cannot be removed, the worktree is LEFT in place and a technical error names it, so the
-    // real dependencies are never deleted.
-    const link = modulesLink;
-    if (link !== undefined && !removeLink(link)) {
-      throw new Error(
-        `the link "${link}" to node_modules could not be removed; the worktree "${worktree}" was left in place so the real dependencies are not deleted`,
-      );
-    }
-    await runGit(root, ['worktree', 'remove', '--force', worktree]);
-    await runGit(root, ['worktree', 'prune']);
-    await rm(parent, { recursive: true, force: true });
+    await removeWorktree(root, worktree, parent, modulesLink);
   }
+}
+
+/**
+ * A throwaway detached worktree of `commit`, at its own temporary folder. Its cleanup is the
+ * caller's job, always through `removeWorktree`.
+ */
+export async function createWorktree(
+  root: string,
+  commit: string,
+  prefix: string,
+): Promise<{ readonly parent: string; readonly tree: string }> {
+  const parent = await mkdtemp(join(tmpdir(), prefix));
+  const tree = join(parent, 'tree');
+  const added = await runGit(root, ['worktree', 'add', '--detach', tree, commit]);
+  if (!added.ok) {
+    await rm(parent, { recursive: true, force: true });
+    throw new Error('the temporary worktree could not be created');
+  }
+  return { parent, tree };
+}
+
+/**
+ * Links the project's `node_modules` into a worktree, so a test run there uses the dependencies
+ * installed beside the checkout and not a fresh install. Returns the link it created, or
+ * `undefined` when there is nothing to link.
+ */
+export async function linkModules(root: string, tree: string): Promise<string | undefined> {
+  const modules = join(root, 'node_modules');
+  if (!existsSync(modules)) return undefined;
+  const link = join(tree, 'node_modules');
+  if (existsSync(link)) return undefined;
+  symlinkSync(modules, link, process.platform === 'win32' ? 'junction' : 'dir');
+  return link;
+}
+
+/**
+ * Retires a temporary worktree, always. On Windows `git worktree remove --force` follows the
+ * `node_modules` junction and deletes the project's real dependencies, so the link is removed
+ * first, by its own name only. If the link cannot be removed, the worktree is LEFT in place and
+ * a technical error names it, so the real dependencies are never deleted.
+ */
+export async function removeWorktree(
+  root: string,
+  tree: string,
+  parent: string,
+  modulesLink: string | undefined,
+): Promise<void> {
+  if (modulesLink !== undefined && !removeLink(modulesLink)) {
+    throw new Error(
+      `the link "${modulesLink}" to node_modules could not be removed; the worktree "${tree}" was left in place so the real dependencies are not deleted`,
+    );
+  }
+  await runGit(root, ['worktree', 'remove', '--force', tree]);
+  await runGit(root, ['worktree', 'prune']);
+  await rm(parent, { recursive: true, force: true });
 }
 
 /**

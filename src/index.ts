@@ -146,6 +146,7 @@ export {
   type ProjectFiles,
 } from './recipe/facts.js';
 export { pieceOfBranch, readDeclaredKind } from './judge/pieces.js';
+export { runRedTestCheck } from './judge/red-test-check.js';
 export { appliesIfFor } from './recipe/applies.js';
 export { explainRecipe } from './recipe/explain.js';
 export { recipeCommand } from './recipe/command.js';

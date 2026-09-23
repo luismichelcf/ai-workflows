@@ -46,6 +46,31 @@ export interface RunTestsOptions {
   readonly timeoutMs: number;
   readonly piece: string;
   readonly signal: AbortSignal;
+  /**
+   * PLAN-13-R3 §5: when given, the test processes run with exactly this environment and inherit
+   * nothing else. The unprivileged `red-test` job hands in a copy of its own environment with
+   * every token, secret, password and key removed, so a test can neither read nor leak them.
+   */
+  readonly environment?: NodeJS.ProcessEnv;
+}
+
+/**
+ * Launches the group with an environment that replaces the process's own. The process group
+ * always lays its extra variables over `process.env`; to remove variables the process's own
+ * environment is swapped for the filtered one for the one synchronous moment the launch reads
+ * it, then restored at once. Nothing else of the engine ever sees the swap.
+ */
+function launchWithEnvironment(
+  options: Parameters<typeof DEFAULT_PROCESS_GROUPS.launch>[0],
+  environment: NodeJS.ProcessEnv,
+): ReturnType<typeof DEFAULT_PROCESS_GROUPS.launch> {
+  const saved = process.env;
+  process.env = environment;
+  try {
+    return DEFAULT_PROCESS_GROUPS.launch(options);
+  } finally {
+    process.env = saved;
+  }
 }
 
 /** The real environment `resolveExecutable` needs, so the resolver stays a pure function. */
@@ -187,7 +212,7 @@ export async function runTests(options: RunTestsOptions): Promise<TestGroupResul
   const resolved = resolveExecutable(program, executableEnvironment());
   if (!resolved.ok) return { kind: 'technical', reason: `could not start ${program}: ${resolved.reason}` };
 
-  const group = DEFAULT_PROCESS_GROUPS.launch({
+  const launchOptions = {
     command: resolved.command,
     args: [...resolved.prefixArgs, ...args],
     cwd: options.root,
@@ -195,7 +220,11 @@ export async function runTests(options: RunTestsOptions): Promise<TestGroupResul
     ...(resolved.env === undefined ? {} : { env: resolved.env }),
     timeoutMs: options.timeoutMs,
     stdoutBytes: TEST_STDOUT_BYTES,
-  });
+  };
+  const group =
+    options.environment === undefined
+      ? DEFAULT_PROCESS_GROUPS.launch(launchOptions)
+      : launchWithEnvironment(launchOptions, options.environment);
 
   // Cancellation must be honoured at once: the wait races the signal, and on abort the group
   // is terminated and confirmed right there.
