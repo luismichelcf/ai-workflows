@@ -55,8 +55,8 @@ Fuera: documentación y configuración sin comportamiento.
 
 ## Construcción y revisión (R12)
 
-- **Constructor: GPT-6 Sol `high`.** Relevo por cuota, autenticación o dos intentos fallidos:
-  **DeepSeek V4.1 Flash `high`** por OpenCode. **Revisión del código: parvada de revisores Claude
+- **Constructor desde la rebanada 2: DeepSeek V4.1 Flash `high`** por OpenCode (R17). Relevo por
+  cuota, autenticación o dos intentos fallidos: **GPT-6 Sol `high`**. **Revisión del código: parvada de revisores Claude
   en sesiones frescas**, cada uno desde un ángulo (correctitud, seguridad, contrato del motor,
   pruebas). La elección vale para toda la pieza; no se vuelve a preguntar.
 - El orquestador escribe pruebas, encargos y documentación; el constructor escribe el código. El

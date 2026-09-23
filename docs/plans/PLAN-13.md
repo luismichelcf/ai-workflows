@@ -99,6 +99,10 @@ permanente (§8.2).
 | R11 | **Se integra solo cuando se cumplan las condiciones de ADR 0219** (§7) y el dueño lo apruebe en un único cambio. |
 | R12 | **Modelos de esta pieza:** constructor GPT-6 Sol `high`; relevo DeepSeek V4.1 Flash `high` por OpenCode; revisión del spec GPT-6 Sol `high`; revisión del código, parvada de revisores Claude especializados en sesiones frescas. |
 | R13 | **Se acepta el riesgo de que un workflow deliberado imite el estado del juez** (decisión del 22-sep, tras la ronda 2 de revisión), igual que ADR 0214 lo aceptó para `visto-bueno`. Se declara y se deja rastro; no se crea una app propia ni se paga el plan Enterprise por esto. Alternativas descartadas: app de GitHub propia (gratis, más montaje) y flujos obligatorios de Enterprise (~21 USD por persona al mes tras la prueba). |
+| R14 | **Vigencia por omisión: `same-sha`** (22-sep, al abrir la rebanada 2). Una etapa que no escribe `valid-while` pierde su evidencia en cuanto cambia el SHA. Descartado: hacerlo obligatorio (una línea más por etapa sin ganar seguridad). |
+| R15 | **La receta declara su vocabulario de tipos y carriles** (22-sep). `kinds.names` lista una vez los tipos válidos y `lanes:` reparte cada tipo en un carril; `validate` rechaza cualquier tipo o carril fuera de esa lista en `applies-if`, `default`, `from-paths` y `elevate`. El carril no se declara: sale del tipo efectivo, así que sube cuando sube el riesgo (detalle en [PLAN-13-R2](PLAN-13-R2.md) §1.1). Descartado: una lista fija dentro del motor (otro proyecto no podría usar sus propios tipos, contra R05). |
+| R16 | **Nombres en el idioma del dueño para clases y tipos** (22-sep). Cada clase de `classify` y cada tipo o carril puede llevar un nombre legible que `explain` usa en lugar de la palabra en inglés («toca permisos y datos» en vez de «toca security»). Opcional: sin nombre, `explain` muestra la palabra en inglés. |
+| R17 | **Constructor desde la rebanada 2: DeepSeek V4.1 Flash `high`** por OpenCode (22-sep, porque se agota la cuota de ChatGPT). Relevo: GPT-6 Sol `high`, por cuota, autenticación o dos intentos fallidos. La revisión del spec sigue con Sol y la del código con la parvada Claude (R12). |
 
 Decisiones de construcción tomadas por el orquestador (el dueño decide qué, el orquestador cómo):
 YAML 1.2 con esquema publicado (§3.2), condiciones estructuradas sin lenguaje de expresiones en v1
@@ -149,7 +153,8 @@ classify:                           # tablas de rutas: datos, no código
   visible:    ["app/**", "components/**", "public/**", "electron/**"]
   production: [".github/workflows/**", "scripts/fila/**"]
 
-kinds:                              # tipos de cambio que declara cada pieza
+kinds:                              # tipos de cambio que declara cada pieza (ejemplo parcial)
+  names: [behavior, ui-behavior, visual-only, prod-config, config-no-prod, generated, docs, prototype]
   default: behavior
   from-paths:                       # si TODOS los archivos caen aquí, ese es el tipo
     docs: ["docs/**"]
@@ -159,6 +164,14 @@ kinds:                              # tipos de cambio que declara cada pieza
       to: behavior
     - when: { touches-any: [production], kind-any: [visual-only, config-no-prod, generated] }
       to: prod-config
+
+lanes:                              # el carril sale del tipo efectivo (R15)
+  full: [behavior, ui-behavior, prod-config]
+  light: [visual-only, config-no-prod, generated, docs, prototype]
+
+labels:                             # nombres para el dueño en `explain` (R16)
+  money: "dinero"
+  security: "permisos y datos"
 
 stages:
   - id: red-test
