@@ -712,3 +712,13 @@ es vacía; en Windows, un proceso que existe pero cuya hora de inicio no se pued
 «desconocido» (solo «no existe» es muerto), la respuesta de PowerShell se lee por pid, y el lanzador
 vuelve a contar los procesos activos antes de declarar ilegible una lista vacía.
 Pruebas: `tests/review-round4.test.ts`, con las sondas del revisor como prueba permanente.
+
+## 16. Revisión de la parvada (PR #17, ronda 5)
+
+La reorganización de §15 trajo dos regresiones, corregidas con su prueba
+(`tests/review-round5.test.ts`): el ayudante de cuarentena vuelve a renovar el arrendamiento antes
+de escribir en los caminos de comprobación y, si se perdió, no escribe nada y responde `busy` (la
+única escritura sin arrendamiento sigue siendo la cuarentena de `ProcessTreeSurvived`); y una parada
+que llega mientras se comprueba una cuarentena gana, como siempre en el motor (la pieza queda
+`parked` con su cuarentena). Además: un levantamiento que agota sus intentos lo dice en su motivo,
+un fallo al releer el almacén ya no se traga, y `writeRunning` no escribe encima de una parada.
