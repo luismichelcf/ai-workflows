@@ -942,8 +942,10 @@ export function createEngine(options: EngineOptions): Engine {
         } catch (error) {
           if (error instanceof LeaseLost) {
             // The lease was lost while the quarantine was checked. Nothing may be written
-            // over whoever holds the piece now; the run reports the theft as its answer.
-            return { outcome: 'busy', heldBy: error.heldBy };
+            // over whoever holds the piece now; the run reports the loss as the rest of the
+            // engine does: `busy` only if another controller actually holds it, and the
+            // lapsed-lease answer when nobody does.
+            return lostByHolder(error.heldBy);
           }
           return {
             outcome: 'ran',
@@ -1080,21 +1082,31 @@ export function createEngine(options: EngineOptions): Engine {
         try {
           // `stopWins`: a stop that landed between the stage's own read and this write is
           // kept — the parked status is not overwritten with `running` — and the caller is
-          // told so the stage does not run.
+          // told so the stage does not run. `guard`: like every other write, the lease is
+          // renewed right before it, so a run that lost the piece writes nothing, runs no
+          // stage and is told who holds it.
           update = await updateQuarantined(
             piece,
             () => ({
               kind: 'carry',
               status: { piece, stage: stage.name, state: 'running', startedAt: now() },
             }),
-            { dryRun: false, attempts: 3, read: readStatus, stopWins: true },
+            { dryRun: false, attempts: 3, read: readStatus, stopWins: true, guard: renewLease },
           );
         } catch (error) {
+          // A lost lease is not a store failure: it travels to the stage's catch, which is
+          // the one place that turns it into the right answer without writing anything.
+          if (error instanceof LeaseLost) throw error;
           throw new StoreWriteFailure(
             `store failed to save the running status of stage "${stage.name}": ${describeUnknown(error)}`,
           );
         }
-        return update.parked ? update.status : undefined;
+        // The write lost its races. A park that landed is honoured — the stage does not run
+        // — exactly as the quarantine-check path does.
+        if (update.parked || (update.stale && update.status.state === 'parked')) {
+          return update.status;
+        }
+        return undefined;
       };
 
       // A stage may run far longer than one lease. This timer re-extends the lease while the

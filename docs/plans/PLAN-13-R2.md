@@ -722,3 +722,11 @@ de escribir en los caminos de comprobación y, si se perdió, no escribe nada y 
 que llega mientras se comprueba una cuarentena gana, como siempre en el motor (la pieza queda
 `parked` con su cuarentena). Además: un levantamiento que agota sus intentos lo dice en su motivo,
 un fallo al releer el almacén ya no se traga, y `writeRunning` no escribe encima de una parada.
+
+**Ronda 6 (sobre §16):** perder el arrendamiento en los caminos de comprobación responde como el
+resto del motor (`busy` solo si alguien tiene la pieza); `writeRunning` también renueva el
+arrendamiento antes de escribir y, si pierde todas sus carreras contra una parada, la etapa no
+corre. La prueba anterior que esperaba `busy` sin titular estaba mal (la corrigió el orquestador).
+Pendiente aparte: `tests/integrity.test.ts` «holds the piece through a stage far longer than the
+lease», anterior a esta rebanada, falló dos veces bajo carga (una en la CI de Windows y otra local)
+y pasó al relanzarla; es sensible a tiempos y se investiga en su propio cambio.

@@ -42,7 +42,9 @@ describe('a controller that lost its lease while checking a quarantine writes no
     const { store, outcomeOfA, outcomeOfB, ran } = await race('still alive');
     expect(outcomeOfB).toMatchObject({ outcome: 'ran', status: { state: 'done' } });
     expect(ran).toBe(1);
-    expect(outcomeOfA).toMatchObject({ outcome: 'busy' });
+    // Nobody holds the piece any more (B finished and let go): A must not claim it is busy.
+    expect(outcomeOfA).not.toMatchObject({ outcome: 'busy' });
+    expect(outcomeOfA).not.toMatchObject({ outcome: 'ran', status: { state: 'done' } });
     expect((await store.loadStatus('42'))?.status).toMatchObject({ state: 'done' });
     expect((await store.loadStatus('42'))?.status.quarantine).toBeUndefined();
   });
@@ -50,7 +52,9 @@ describe('a controller that lost its lease while checking a quarantine writes no
   it('an answer of "empty" does not block the piece another controller already lifted and finished', async () => {
     const { store, outcomeOfA, ran } = await race(undefined);
     expect(ran).toBe(1);
-    expect(outcomeOfA).toMatchObject({ outcome: 'busy' });
+    // Nobody holds the piece any more (B finished and let go): A must not claim it is busy.
+    expect(outcomeOfA).not.toMatchObject({ outcome: 'busy' });
+    expect(outcomeOfA).not.toMatchObject({ outcome: 'ran', status: { state: 'done' } });
     expect((await store.loadStatus('42'))?.status).toMatchObject({ state: 'done' });
   });
 });
@@ -141,5 +145,100 @@ describe('resume decides for the owner', () => {
     expect(resumed.quarantine).toEqual(QA);
     await createEngine({ config, store, confirmQuarantine: async () => undefined }).run('42');
     expect(ran()).toBe(1);
+  });
+});
+
+describe('review round 6: writing "running" obeys the lease and the stop like every other write', () => {
+  it('a controller whose lease lapsed before the stage does not write "running" over a finished piece', async () => {
+    let clock = 1_000_000;
+    const store = createMemoryStore({ now: () => clock });
+    let ran = 0;
+    const config = {
+      locale: 'es',
+      stages: [{
+        name: 'only',
+        nature: 'recompute' as const,
+        appliesWhen: async () => {
+          clock += 10 * 60_000;
+          await store.reserve('42', 'b', 60_000);
+          const current = await store.loadStatus('42');
+          await store.saveStatus({ piece: '42', state: 'done' }, current?.version);
+          return true;
+        },
+        gate: () => { ran += 1; return { ok: true as const }; },
+      }],
+    };
+    await createEngine({ config, store, now: () => clock, leaseMs: 30_000, runId: 'a' }).run('42');
+    expect((await store.loadStatus('42'))?.status.state).toBe('done');
+    expect(ran).toBe(0);
+  });
+
+  it('a stop from another terminal while the stage is being decided wins: no stage, still parked', async () => {
+    const store = createMemoryStore();
+    let ran = 0;
+    const holder: { config?: unknown } = {};
+    const config = {
+      locale: 'es',
+      stages: [{
+        name: 'only',
+        nature: 'recompute' as const,
+        appliesWhen: async () => {
+          await createEngine({ config: holder.config as never, store, runId: 'owner' }).stop('42', 'the owner stops it');
+          return true;
+        },
+        gate: () => { ran += 1; return { ok: true as const }; },
+      }],
+    };
+    holder.config = config;
+    await store.saveStatus({ piece: '42', state: 'running' }, undefined);
+    await createEngine({ config, store }).run('42');
+    expect(ran).toBe(0);
+    expect((await store.loadStatus('42'))?.status.state).toBe('parked');
+  });
+
+  it('losing every race to write "running", the last one to a stop, runs no stage', async () => {
+    const inner = createMemoryStore();
+    let left = 3;
+    const store: Store = {
+      ...inner,
+      saveStatus: async (status, version) => {
+        if (status.state === 'running' && left > 0) {
+          left -= 1;
+          const current = await inner.loadStatus('42');
+          if (left === 0) await inner.saveStatus({ piece: '42', state: 'parked', reason: 'the owner stops it' }, current?.version);
+          else await inner.saveStatus({ ...(current?.status ?? { piece: '42', state: 'running' }) }, current?.version);
+          throw new StaleVersion('42');
+        }
+        return inner.saveStatus(status, version);
+      },
+    };
+    const { config, ran } = counting();
+    const outcome = await createEngine({ config, store }).run('42');
+    expect(ran()).toBe(0);
+    expect(outcome).toMatchObject({ outcome: 'parked' });
+  });
+
+  it('a store that cannot be read again after a lost race blocks the piece; the error is not swallowed', async () => {
+    const inner = createMemoryStore();
+    await inner.saveStatus({ piece: '42', state: 'blocked:technical', reason: 'processes', quarantine: QA }, undefined);
+    let failReads = false;
+    const store: Store = {
+      ...inner,
+      loadStatus: async (piece) => {
+        if (failReads) throw new Error('the store is unreachable');
+        return inner.loadStatus(piece);
+      },
+      saveStatus: async (status, version) => {
+        if (status.quarantine === undefined && status.state === 'blocked:technical') {
+          failReads = true;
+          throw new StaleVersion('42');
+        }
+        return inner.saveStatus(status, version);
+      },
+    };
+    const { config, ran } = counting();
+    const outcome = await createEngine({ config, store, confirmQuarantine: async () => undefined }).run('42');
+    expect(ran()).toBe(0);
+    expect(outcome).toMatchObject({ outcome: 'ran', status: { state: 'blocked:technical', reason: expect.stringMatching(/unreachable/) } });
   });
 });
