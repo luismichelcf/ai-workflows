@@ -1,3 +1,4 @@
+import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
@@ -7,6 +8,7 @@ import {
   type GateContext,
 } from '../contract.js';
 import { resolveExecutable, type ExecutableEnvironment } from '../exec.js';
+import { gitEnvironment } from '../git-env.js';
 import { classifyFiles } from '../recipe/glob.js';
 import {
   DEFAULT_PROCESS_GROUPS,
@@ -102,6 +104,44 @@ export function existingFiles(root: string, files: readonly string[]): string[] 
 /** The files of `files`, in order, that match the `tests` globs. */
 export function filesMatching(globs: readonly string[], files: readonly string[]): string[] {
   return files.filter((file) => matchesGlobs(globs, file));
+}
+
+const GIT_TIMEOUT_MS = 60_000;
+
+/** The id of the blob git itself would store for a working-tree file, filters included. */
+function gitBlobId(root: string, file: string): Promise<string | undefined> {
+  return new Promise((resolve) => {
+    execFile(
+      'git',
+      ['hash-object', '--path', file, file],
+      {
+        cwd: root,
+        timeout: GIT_TIMEOUT_MS,
+        windowsHide: true,
+        encoding: 'utf8',
+        env: gitEnvironment(),
+      },
+      (error, stdout) => resolve(error === null ? stdout.trim() : undefined),
+    );
+  });
+}
+
+/**
+ * The blob id git would give each file, applying `core.autocrlf` and the attribute filters —
+ * the same id a commit will hold. build-verify compares these against history, so a test that
+ * merely gains CRLF on disk is not read as a change. Outside a repository the ids are missing
+ * and build-verify falls back to the content hashes.
+ */
+export async function hashBlobs(
+  root: string,
+  files: readonly string[],
+): Promise<Record<string, string>> {
+  const blobs: Record<string, string> = {};
+  for (const file of files) {
+    const id = await gitBlobId(root, file);
+    if (id !== undefined && id.length > 0) blobs[file] = id;
+  }
+  return blobs;
 }
 
 /** sha256 of each file's current content. A file that cannot be read is left out. */

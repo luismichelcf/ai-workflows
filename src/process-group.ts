@@ -4,7 +4,8 @@ import { hostname } from 'node:os';
 import {
   launchWindowsGroup,
   checkWindowsQuarantine,
-  windowsSurvivorAlive,
+  currentWindowsSessionId,
+  windowsSurvivorStatus,
 } from './process-group-windows.js';
 
 // PLAN-13-R2 §2.2 (RC-10): a block's processes live inside one group the operating system
@@ -37,6 +38,11 @@ export type Quarantine =
       readonly platform: 'win32';
       readonly job: string;
       readonly confirmed: false;
+      /**
+       * The logon session the launcher ran in. A group of another session cannot be asked from
+       * this one, so the quarantine must hold; absent means the session was never recorded.
+       */
+      readonly session?: number;
       /** Processes the launcher could not end, with their creation time; absent means none. */
       readonly survivors?: readonly QuarantineSurvivor[];
     }
@@ -52,7 +58,12 @@ export type QuarantineCheck = { readonly empty: true } | { readonly empty: false
  */
 export type TerminateResult =
   | { readonly empty: true }
-  | { readonly empty: false; readonly lost?: boolean };
+  | {
+      readonly empty: false;
+      readonly lost?: boolean;
+      /** The processes the launcher named as still alive; absent means it named none. */
+      readonly survivors?: readonly QuarantineSurvivor[];
+    };
 
 export interface LaunchInGroupOptions {
   readonly command: string;
@@ -84,6 +95,9 @@ export const DEFAULT_PROCESS_GROUPS: ProcessGroupControl = {
   check: (quarantine) => checkQuarantine(quarantine),
 };
 
+/** How long a killed POSIX group is given to let its pipes close before the wait gives up. */
+const KILL_SETTLE_MS = 2_000;
+
 /** The command block's default output limit, one mebibyte. */
 export const DEFAULT_STDOUT_BYTES = 1_048_576;
 /** The output limit for a test suite or a coding CLI, whose report can be large (32 MiB). */
@@ -108,7 +122,7 @@ interface CollectOptions {
   readonly timeoutMs?: number;
   readonly stdoutBytes: number;
   /** Empties the group when a limit is reached, so the wait can settle. */
-  readonly kill: () => void;
+  readonly kill: (limit: 'timeout' | 'overLimit') => void;
 }
 
 /**
@@ -149,7 +163,7 @@ export function collectExit(child: ChildProcess, options: CollectOptions): Promi
       stdoutBytes += Buffer.byteLength(chunk, 'utf8');
       if (stdoutBytes > options.stdoutBytes) {
         overLimit = true;
-        options.kill();
+        options.kill('overLimit');
         return;
       }
       stdout += chunk;
@@ -178,7 +192,7 @@ export function collectExit(child: ChildProcess, options: CollectOptions): Promi
     if (options.timeoutMs !== undefined) {
       timer = setTimeout(() => {
         timedOut = true;
-        options.kill();
+        options.kill('timeout');
       }, options.timeoutMs);
       timer.unref();
     }
@@ -232,7 +246,12 @@ function launchPosix(options: LaunchInGroupOptions): ProcessGroup {
   const pgid = child.pid ?? 0;
   const quarantine: Quarantine = { host: hostname(), platform: 'posix', pgid, confirmed: false };
 
+  let killReason: 'timeout' | 'overLimit' | undefined;
   let terminatePromise: Promise<TerminateResult> | undefined;
+  let notifyTerminated: (() => void) | undefined;
+  const terminated = new Promise<void>((resolve) => {
+    notifyTerminated = resolve;
+  });
   const doTerminate = async (): Promise<TerminateResult> => {
     if (pgid <= 0) return { empty: true };
     try {
@@ -251,9 +270,23 @@ function launchPosix(options: LaunchInGroupOptions): ProcessGroup {
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
   };
-  const terminate = (): Promise<TerminateResult> => (terminatePromise ??= doTerminate());
+  const terminate = (): Promise<TerminateResult> => {
+    const promise = (terminatePromise ??= doTerminate());
+    void promise.then(
+      () => notifyTerminated?.(),
+      () => notifyTerminated?.(),
+    );
+    return promise;
+  };
 
-  const raw = collectExit(child, { ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }), stdoutBytes, kill: () => void terminate() });
+  const raw = collectExit(child, {
+    ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
+    stdoutBytes,
+    kill: (limit) => {
+      killReason = limit;
+      void terminate();
+    },
+  });
 
   let waitPromise: Promise<GroupExit> | undefined;
   const wait = (): Promise<GroupExit> => {
@@ -263,7 +296,35 @@ function launchPosix(options: LaunchInGroupOptions): ProcessGroup {
       } catch {
         // A child that never started has nowhere to read the input from.
       }
-      return posixExit(options.command, options.timeoutMs, stdoutBytes, await raw);
+      // An escaped process (a `setsid` grandchild) keeps the inherited pipes open, so the child
+      // never emits `close` and waiting forever would hang the engine. Once the group was
+      // killed, the streams are given a short grace and then destroyed by hand.
+      const settled = await Promise.race([
+        raw,
+        terminated.then(
+          () =>
+            new Promise<'killed'>((resolve) => {
+              const timer = setTimeout(() => resolve('killed'), KILL_SETTLE_MS);
+              timer.unref?.();
+            }),
+        ),
+      ]);
+      if (settled === 'killed') {
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+        child.stdin?.destroy();
+        if (killReason === 'overLimit') {
+          return { kind: 'technical', reason: `printed more than ${stdoutBytes} bytes` };
+        }
+        if (killReason === 'timeout') {
+          return { kind: 'technical', reason: `ran out of time after ${options.timeoutMs ?? 0} ms` };
+        }
+        return {
+          kind: 'technical',
+          reason: `the command of "${options.command}" was stopped before it reported an exit code`,
+        };
+      }
+      return posixExit(options.command, options.timeoutMs, stdoutBytes, settled);
     })();
     return waitPromise;
   };
@@ -289,32 +350,69 @@ export async function checkQuarantine(quarantine: unknown): Promise<QuarantineCh
   }
   if (record['platform'] === 'posix') return checkPosix(record['pgid']);
   if (record['platform'] === 'win32' && typeof record['job'] === 'string') {
+    const job = record['job'];
+    // A group of another logon session cannot be asked from this one, so it stays quarantined.
+    // The current session is read once and kept, because asking is slow and it cannot change.
+    const session = record['session'];
+    if (typeof session === 'number' && Number.isInteger(session)) {
+      const current = await currentWindowsSessionId();
+      if (current === undefined) {
+        return { empty: false, reason: `the session of the job object "${job}" could not be confirmed` };
+      }
+      if (current !== session) {
+        return { empty: false, reason: `processes to confirm in another session: ${session}` };
+      }
+    }
     // Survivors the launcher named are checked first, by pid AND creation time: a pid reused
     // by another process is not the survivor, and while one really lives the quarantine holds
-    // whatever the job name says. Only when none is alive does the job name decide.
-    const survivors = readSurvivors(record['survivors']);
-    if (survivors.length > 0 && (await windowsSurvivorAlive(survivors))) {
-      return { empty: false, reason: `the job object "${record['job']}" still has the processes it named` };
+    // whatever the job name says. Only when every one is really gone does the job name decide.
+    // An entry that cannot be read is not ignored: unknown keeps the quarantine.
+    const named = inspectReportSurvivors(record['survivors']);
+    if (named.malformed) {
+      return { empty: false, reason: `the job object "${job}" named processes that cannot be read` };
     }
-    return checkWindowsQuarantine(record['job']);
+    if (named.survivors.length > 0) {
+      const state = await windowsSurvivorStatus(named.survivors);
+      if (state === 'alive') {
+        return { empty: false, reason: `the job object "${job}" still has the processes it named` };
+      }
+      if (state === 'unknown') {
+        return { empty: false, reason: `the processes of the job object "${job}" could not be confirmed gone` };
+      }
+    }
+    return checkWindowsQuarantine(job);
   }
   return { empty: false, reason: 'the quarantine is not readable' };
 }
 
-/** The well-formed survivors of a Windows quarantine, ignoring anything unreadable. */
-function readSurvivors(value: unknown): QuarantineSurvivor[] {
-  if (!Array.isArray(value)) return [];
+/**
+ * The survivors of a Windows quarantine. Unlike the old reader, an unreadable entry is not
+ * dropped in silence: it is reported so the caller keeps the quarantine instead of asking a
+ * job name that may have been reused.
+ */
+function inspectReportSurvivors(value: unknown): {
+  readonly survivors: QuarantineSurvivor[];
+  readonly malformed: boolean;
+} {
+  if (value === undefined) return { survivors: [], malformed: false };
+  if (!Array.isArray(value)) return { survivors: [], malformed: true };
   const survivors: QuarantineSurvivor[] = [];
+  let malformed = false;
   for (const item of value) {
-    if (typeof item !== 'object' || item === null) continue;
+    if (typeof item !== 'object' || item === null) {
+      malformed = true;
+      continue;
+    }
     const record = item as Record<string, unknown>;
     const pid = record['pid'];
     const created = record['created'];
     if (typeof pid === 'number' && Number.isInteger(pid) && pid > 0 && typeof created === 'string') {
       survivors.push({ pid, created });
+    } else {
+      malformed = true;
     }
   }
-  return survivors;
+  return { survivors, malformed };
 }
 
 function checkPosix(pgid: unknown): QuarantineCheck {

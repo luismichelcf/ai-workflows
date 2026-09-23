@@ -36,7 +36,8 @@ const RUNNER = [
   'if (total > 0 && failedCount > 0 && passedCount === 0) tests = `${failedCount} failed (${total})`;',
   'if (total > 0 && failedCount === 0) tests = `${passedCount} passed (${total})`;',
   'console.log(`      Tests  ${tests}`);',
-  'process.exit(failedCount + broken > 0 ? 1 : 0);',
+  // exitCode, not exit(): on POSIX a pipe is written asynchronously and exit() drops the tail.
+  'process.exitCode = failedCount + broken > 0 ? 1 : 0;',
   '',
 ].join('\n');
 
@@ -301,7 +302,7 @@ describe('review round 1: what counts as red', () => {
     const RUNNER_TYPEERROR = RUNNER.replace('`AssertionError: ${error.message.split("\\n")[0]}`', '`${error.name}: ${error.message.split("\\n")[0]}`');
     write(root, 'runner.mjs', RUNNER_TYPEERROR);
     commit(root, 'runner prints the error type');
-    expect((await runBlock(root, RED_STAGE)).outcome).toMatchObject(refused(/importación o entorno|aserción/));
+    expect((await runBlock(root, RED_STAGE)).outcome).toMatchObject(refused(/importación o entorno/));
   });
 
   it('a red run that prints a lot is still read, not cut off as too much output', async () => {

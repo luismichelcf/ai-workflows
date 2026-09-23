@@ -97,7 +97,12 @@ export { parseRecipe } from './recipe/parse.js';
 export { checkRecipe } from './recipe/blocks.js';
 export type { CheckRecipeResult } from './recipe/blocks.js';
 export { engineBlockManifest } from './blocks/registry.js';
-export type { BlockDefinition, EngineBlockDeps, ProviderRunner } from './blocks/definition.js';
+export type {
+  BlockDefinition,
+  EngineBlockDeps,
+  ProviderRunner,
+  ProviderRunOptions,
+} from './blocks/definition.js';
 export {
   compileRecipe,
   runProviderInGroup,

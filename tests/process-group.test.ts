@@ -242,20 +242,20 @@ describe('review round 1: a process that dies by a signal never counts as succes
 
 describe('review round 1: on Windows only "no such job" means empty', () => {
   it.runIf(process.platform === 'win32')('a job name the system cannot even look up is not empty', async () => {
-    for (const job of ['', 'Local\a\b\c', `Local\${'x'.repeat(40_000)}`]) {
+    for (const job of ['', String.raw`Local\a\b\c`, 'Local\\' + 'x'.repeat(40_000)]) {
       expect(await checkQuarantine({ host: hostname(), platform: 'win32', job, confirmed: false })).toMatchObject({ empty: false });
     }
   });
 
   it.runIf(process.platform === 'win32')('a well-formed job that does not exist is empty', async () => {
-    const job = 'Local\ai-workflows-00000000-0000-0000-0000-000000000000';
+    const job = String.raw`Local\ai-workflows-00000000-0000-0000-0000-000000000000`;
     expect(await checkQuarantine({ host: hostname(), platform: 'win32', job, confirmed: false })).toEqual({ empty: true });
   });
 
   it.runIf(process.platform === 'win32')('a survivor the launcher named keeps the quarantine while it lives, whatever the job says', async () => {
     const { execFileSync } = await import('node:child_process');
     const created = execFileSync('powershell', ['-NoProfile', '-Command', `(Get-Process -Id ${process.pid}).StartTime.ToFileTimeUtc()`], { encoding: 'utf8' }).trim();
-    const job = 'Local\ai-workflows-00000000-0000-0000-0000-000000000001';
+    const job = String.raw`Local\ai-workflows-00000000-0000-0000-0000-000000000001`;
     const alive = { host: hostname(), platform: 'win32', job, confirmed: false, survivors: [{ pid: process.pid, created }] };
     expect(await checkQuarantine(alive)).toMatchObject({ empty: false });
     const gone = { ...alive, survivors: [{ pid: process.pid, created: '1' }] };

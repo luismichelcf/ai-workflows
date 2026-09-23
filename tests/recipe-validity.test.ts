@@ -548,7 +548,7 @@ describe('§5 from the recipe to the engine', () => {
 });
 
 describe('review round 1: a piece is named by a plain identifier', () => {
-  for (const piece of ['../../etc', '-rf', '.hidden', 'a/b', 'a b', '']) {
+  for (const piece of ['../../etc', '-rf', '.hidden', 'a/b', 'a b', '', 'a..b']) {
     it(`refuses the piece id ${JSON.stringify(piece)} before reading anything`, async () => {
       const root = repository();
       write(root, 'app/page.tsx', 'x\n');

@@ -82,7 +82,7 @@ describe('CN-04 · declaring all green with a test of the zone in red, through t
   it('refuses a run that ran no test at all', async () => {
     const root = projectWith({ 'suite.mjs': 'process.exit(0);\n' });
     const result = await runBlock(root, stage('node suite.mjs', 'reader: vitest'));
-    expect(result.outcome).toMatchObject({ status: { stage: 'check', state: expect.stringMatching(/^blocked:/) } });
+    expect(result.outcome).toMatchObject({ status: { stage: 'check', state: 'blocked:rejected' } });
   });
 
   it('positive control: a genuinely green suite passes', async () => {

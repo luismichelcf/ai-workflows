@@ -1,3 +1,4 @@
+import { realpathSync } from 'node:fs';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import {
@@ -195,7 +196,8 @@ describe('§2.2: what a command block receives', () => {
     const script = 'process.stdout.write(JSON.stringify({ ok: true, evidence: { cwd: process.cwd(), args: process.argv.slice(2) } }));\n';
     const { journal, root } = await runWith(script, { run: 'node block.mjs --piece={piece} plain' });
     const evidence = journal.find((entry) => entry.stage === 'check')?.evidence as { block: { cwd: string; args: string[] } };
-    const normalize = (path: string) => path.replace(/\\/g, '/').toLowerCase();
+    // The engine resolves the root to its real path (long names, not Windows 8.3 short ones).
+    const normalize = (path: string) => realpathSync.native(path).replace(/\\/g, '/').toLowerCase();
     expect(normalize(evidence.block.cwd)).toBe(normalize(root));
     expect(evidence.block.args).toEqual(['--piece=42', 'plain']);
   });
@@ -250,7 +252,8 @@ describe('§2.2: a command block of the project', () => {
     const engine = createEngine({ config: compiled.config, store, describeChange: compiled.describeChange });
     await engine.run('42');
     const entry = (await store.journal('42')).find((item) => item.stage === 'check');
-    const normalize = (path: string) => path.replace(/\\/g, '/').toLowerCase();
+    // The engine resolves the root to its real path (long names, not Windows 8.3 short ones).
+    const normalize = (path: string) => realpathSync.native(path).replace(/\\/g, '/').toLowerCase();
     expect(entry?.outcome).toBe('passed');
     expect(normalize((entry?.evidence as { block: { cwd: string } }).block.cwd)).toBe(normalize(root));
   });

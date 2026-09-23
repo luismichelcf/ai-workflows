@@ -49,6 +49,8 @@ export const manifest: BlockManifest = {
 
 interface RedEvidence {
   readonly files: Record<string, string>;
+  /** Blob ids git gave the tests at red time; absent in old evidence, then content hashes rule. */
+  readonly blobs: Record<string, string>;
   readonly failures: readonly string[];
   readonly assertions: readonly string[];
   readonly judgedSha: string;
@@ -101,6 +103,14 @@ function readRedEvidence(entry: JournalEntry | undefined): RedEvidence | undefin
     if (typeof hash === 'string') files[name] = hash;
   }
 
+  const rawBlobs = readObject(block['blobs']);
+  const blobs: Record<string, string> = {};
+  if (rawBlobs !== undefined) {
+    for (const [name, hash] of Object.entries(rawBlobs)) {
+      if (typeof hash === 'string') blobs[name] = hash;
+    }
+  }
+
   const failures = asStringList(block['failures']);
   const assertions = asStringList(block['assertions']);
   const judgedSha = asString(judged['sha']);
@@ -112,7 +122,7 @@ function readRedEvidence(entry: JournalEntry | undefined): RedEvidence | undefin
   ) {
     return undefined;
   }
-  return { files, failures, assertions, judgedSha };
+  return { files, blobs, failures, assertions, judgedSha };
 }
 
 /** Runs `git <args>` with a time limit and no console, returning its trimmed output. */
@@ -167,6 +177,7 @@ async function changedTestCommits(
   since: string,
   paths: readonly string[],
   recorded: Readonly<Record<string, string>>,
+  recordedBlobs: Readonly<Record<string, string>>,
 ): Promise<string[]> {
   if (paths.length === 0) return [];
   const history = await runGit(root, [
@@ -179,24 +190,41 @@ async function changedTestCommits(
   ]);
   if (!history.ok) throw new Error('the history of the test files could not be read');
 
+  // Old red evidence carried only sha256 of the raw bytes; new evidence carries the blob id git
+  // gave the test, so `core.autocrlf` and the attribute filters are applied. With blob ids the
+  // comparison is by git's own idea of the content; without them, the old behaviour is kept.
+  const useBlobs = Object.keys(recordedBlobs).length > 0;
+
   const commits: string[] = [];
   let commit: string | undefined;
   for (const raw of history.stdout.split('\n')) {
     const line = raw.trim();
     if (line.length === 0) continue;
-    if (/^[0-9a-f]{40}$/.test(line)) {
+    // SHA-1 and SHA-256 repositories both spell a commit as hex.
+    if (/^[0-9a-f]{40}(?:[0-9a-f]{24})?$/.test(line)) {
       commit = line;
       continue;
     }
     if (commit === undefined) continue;
     const file = line;
-    const recordedHash = Object.hasOwn(recorded, file) ? recorded[file] : undefined;
-    let changed = typeof recordedHash !== 'string';
-    if (!changed && typeof recordedHash === 'string') {
-      const expected = recordedHash;
-      const shown = await runGitRaw(root, ['show', `${commit}:${file}`]);
-      const hash = shown.ok ? createHash('sha256').update(shown.stdout).digest('hex') : undefined;
-      changed = hash === undefined || hash.toLowerCase() !== expected.toLowerCase();
+    let changed: boolean;
+    if (useBlobs) {
+      const expected = Object.hasOwn(recordedBlobs, file) ? recordedBlobs[file] : undefined;
+      if (typeof expected !== 'string') {
+        changed = true;
+      } else {
+        const blob = await runGit(root, ['rev-parse', `${commit}:${file}`]);
+        changed = !blob.ok || blob.stdout.toLowerCase() !== expected.toLowerCase();
+      }
+    } else {
+      const recordedHash = Object.hasOwn(recorded, file) ? recorded[file] : undefined;
+      changed = typeof recordedHash !== 'string';
+      if (!changed && typeof recordedHash === 'string') {
+        const expected = recordedHash;
+        const shown = await runGitRaw(root, ['show', `${commit}:${file}`]);
+        const hash = shown.ok ? createHash('sha256').update(shown.stdout).digest('hex') : undefined;
+        changed = hash === undefined || hash.toLowerCase() !== expected.toLowerCase();
+      }
     }
     if (changed && !commits.includes(commit)) commits.push(commit);
   }
@@ -324,27 +352,39 @@ async function retireFromSnapshot(
     return { ok: true };
   } finally {
     // On Windows `git worktree remove --force` follows the `node_modules` junction and deletes
-    // the project's real dependencies. The link is removed first, by its own name only.
-    if (modulesLink !== undefined) removeLink(modulesLink);
+    // the project's real dependencies. The link is removed first, by its own name only. If it
+    // cannot be removed, the worktree is LEFT in place and a technical error names it, so the
+    // real dependencies are never deleted.
+    const link = modulesLink;
+    if (link !== undefined && !removeLink(link)) {
+      throw new Error(
+        `the link "${link}" to node_modules could not be removed; the worktree "${worktree}" was left in place so the real dependencies are not deleted`,
+      );
+    }
     await runGit(root, ['worktree', 'remove', '--force', worktree]);
     await runGit(root, ['worktree', 'prune']);
     await rm(parent, { recursive: true, force: true });
   }
 }
 
-/** Removes the link itself — never the folder it points at, and never its contents. */
-function removeLink(link: string): void {
+/**
+ * Removes the link itself — never the folder it points at, and never its contents. Returns
+ * whether the link is gone; `false` means the caller must not let git follow it.
+ */
+function removeLink(link: string): boolean {
   let isLink = false;
   try {
     isLink = lstatSync(link).isSymbolicLink();
-  } catch {
-    return;
+  } catch (error) {
+    // Absent means there is nothing to remove; any other failure leaves it in doubt.
+    return (error as NodeJS.ErrnoException).code === 'ENOENT';
   }
-  if (!isLink) return;
+  if (!isLink) return true;
   try {
     rmSync(link, { force: true });
+    return true;
   } catch {
-    // Best effort: the worktree removal follows, and the link cannot be left in the project.
+    return false;
   }
 }
 
@@ -380,7 +420,7 @@ function createGate(
 
     const commits = await changedTestCommits(deps.root, red.judgedSha, [
       ...new Set([...Object.keys(red.files), ...testFiles]),
-    ], red.files);
+    ], red.files, red.blobs);
     if (commits.length > 0) return { ok: false, reason: changedTestsReason(commits, spanish) };
 
     const greenTests = testFiles.length > 0 ? testFiles : Object.keys(red.files);

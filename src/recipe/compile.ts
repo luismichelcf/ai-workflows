@@ -105,9 +105,10 @@ export interface ProviderRunInGroupOptions {
 /**
  * Runs a coding CLI the same way a command block runs: inside a group of its own, without a
  * console, under a time limit, cancellable at once, and with the group ALWAYS confirmed before
- * it returns — an explicit "not empty" from a command that did not exit 0 raises
- * `ProcessTreeSurvived`, and one from a clean exit (or a lost answer) is settled by asking the
- * system again (PLAN-13-R2 §11). A technical end rejects with its motive.
+ * it returns — an explicit "not empty" raises `ProcessTreeSurvived` whatever the command's exit
+ * code was, because it is a fact and final; only a LOST answer is settled by asking the system
+ * again, and even then only an affirmative "empty" lifts it (PLAN-13-R2 §11). A technical end
+ * rejects with its motive.
  */
 export async function runProviderInGroup(
   invocation: Invocation,

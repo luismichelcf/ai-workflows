@@ -5,6 +5,7 @@ import type { BlockManifest } from './manifest.js';
 import {
   existingFiles,
   filesMatching,
+  hashBlobs,
   hashFiles,
   refuseDryRun,
   runTests,
@@ -91,6 +92,9 @@ async function readRedRun(
       ok: true,
       evidence: {
         files: await hashFiles(root, tests),
+        // The blob id git will give each test, so build-verify compares history by git's own
+        // idea of the content (line-ending conversion included) and not by raw bytes.
+        blobs: await hashBlobs(root, tests),
         failures: [...summary.failures],
         assertions: [...summary.assertions],
       },

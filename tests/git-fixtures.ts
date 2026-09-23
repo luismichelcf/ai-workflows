@@ -38,10 +38,11 @@ export function emptyFolder(): string {
 export function repository(files: Readonly<Record<string, string>> = {
   'app/page.tsx': 'export const page = 1;\n',
   'lib/calc/tax.ts': 'export const tax = 1;\n',
-}): string {
+}, options: { readonly objectFormat?: 'sha1' | 'sha256' } = {}): string {
   const root = mkdtempSync(join(tmpdir(), 'aiw-git-'));
   created.push(root);
-  git(root, 'init', '-q', '-b', 'main');
+  const format = options.objectFormat === undefined ? [] : [`--object-format=${options.objectFormat}`];
+  git(root, 'init', '-q', '-b', 'main', ...format);
   git(root, 'config', 'user.email', 'test@example.com');
   git(root, 'config', 'user.name', 'Test');
   git(root, 'config', 'core.autocrlf', 'false');

@@ -247,9 +247,10 @@ function frozenFacts(change: unknown): unknown {
   let copy: unknown;
   try {
     copy = structuredClone(change);
-  } catch {
-    // A value structured cloning cannot copy (a function inside it) is left as it came.
-    return change;
+  } catch (error) {
+    // A value structured cloning cannot copy (a function inside it) must never travel to a
+    // gate unfrozen: the stage is blocked instead, with a motive a person can read.
+    throw new FrozenFactsFailure(describeUnknown(error));
   }
   deepFreeze(copy as JsonValue);
   return copy;
@@ -326,6 +327,18 @@ class ChangeDescriptionFailure extends Error {
   constructor(piece: PieceId, cause: unknown) {
     super(`describeChange failed for piece "${piece}": ${describeUnknown(cause)}`);
     this.name = 'ChangeDescriptionFailure';
+  }
+}
+
+/**
+ * The facts of the change cannot be copied as plain data (they hold a function, a symbol, a
+ * bigint or a cycle). The original object must never be handed to a gate — a block could
+ * rewrite what the next stage reads — so the stage is blocked technically instead.
+ */
+class FrozenFactsFailure extends Error {
+  constructor(detail: string) {
+    super(`the facts of the change are not plain data and cannot be frozen: ${detail}`);
+    this.name = 'FrozenFactsFailure';
   }
 }
 
@@ -557,8 +570,14 @@ export function createEngine(options: EngineOptions): Engine {
         for (let attempt = 1; ; attempt += 1) {
           try {
             const current = attempt === 1 ? latest : await readStatus();
-            await store.saveStatus(status, current?.version);
-            return { outcome: 'ran', status };
+            // A quarantine in the stored state at this moment is preserved: only the branch
+            // that got an affirmative empty answer from `confirmQuarantine` may drop it.
+            const writing =
+              status.quarantine === undefined && current?.status.quarantine !== undefined
+                ? { ...status, quarantine: current.status.quarantine }
+                : status;
+            await store.saveStatus(writing, current?.version);
+            return { outcome: 'ran', status: writing };
           } catch (error) {
             // Someone wrote between our read and our write. A quarantine is retried by
             // re-reading (its version changed); if it was a stop, honour it for anything else.
@@ -616,25 +635,27 @@ export function createEngine(options: EngineOptions): Engine {
       };
 
       // PLAN-13-R2 §2.2: a stored quarantine is re-asked of the system before any stage runs,
-      // after the lease expired or not. Another machine cannot be asked, a group still alive
-      // and an unreadable quarantine all block; only an affirmative empty answer lifts it, and
-      // it is then cleared from the stored state. Nothing is journalled either way. A dry run
-      // is a rehearsal: it writes nothing at all, not even this cleanup.
-      if (!dryRun && before !== undefined && before.status.quarantine !== undefined) {
+      // after the lease expired or not, and in a rehearsal too. Another machine cannot be
+      // asked, a group still alive and an unreadable quarantine all block; only an affirmative
+      // empty answer lifts it. Nothing is journalled either way. A dry run only asks: it writes
+      // nothing at all, not even the cleanup, and leaves the stored quarantine in place.
+      if (before !== undefined && before.status.quarantine !== undefined) {
         const quarantine = before.status.quarantine;
         const motive = await quarantineMotive(quarantine);
         if (motive !== undefined) {
           // await: a store failure inside finish() must reach the outer catch, not reject run().
           return await finish(blockedStatus(undefined, motive, quarantine));
         }
-        // Confirmed empty: drop it from the stored state so the run can proceed normally.
-        const current = await readStatus();
-        if (current !== undefined && current.status.quarantine !== undefined) {
-          try {
-            const { quarantine: _dropped, ...cleared } = current.status;
-            await store.saveStatus(cleared, current.version);
-          } catch (error) {
-            if (!(error instanceof StaleVersion)) throw error;
+        // Confirmed empty: a real run drops it from the stored state so it can proceed normally.
+        if (!dryRun) {
+          const current = await readStatus();
+          if (current !== undefined && current.status.quarantine !== undefined) {
+            try {
+              const { quarantine: _dropped, ...cleared } = current.status;
+              await store.saveStatus(cleared, current.version);
+            } catch (error) {
+              if (!(error instanceof StaleVersion)) throw error;
+            }
           }
         }
       }
@@ -747,6 +768,10 @@ export function createEngine(options: EngineOptions): Engine {
             stage: stage.name,
             state: 'running',
             startedAt: now(),
+            // A running status must not erase a quarantine: the processes are still out there.
+            ...(current?.status.quarantine === undefined
+              ? {}
+              : { quarantine: current.status.quarantine }),
           };
           try {
             await store.saveStatus(running, current?.version);
@@ -962,12 +987,29 @@ export function createEngine(options: EngineOptions): Engine {
             if (error instanceof ProcessTreeSurvived) {
               // PLAN-13-R2 §2.2: unlike every other failure after a cancellation, this one is
               // always registered as `failed` and leaves the piece blocked with its quarantine
-              // stored, even when the piece was also parked or the run was being cancelled.
-              // Losing track of a live process is worse than losing the parking.
-              const reason =
+              // stored, even when the piece was parked or the run had lost the lease. Losing
+              // track of a live process is worse than losing the parking, so neither write
+              // demands the lease; the status write retries a race and re-reads.
+              let reason =
                 `stage "${stage.name}" left processes that could not be confirmed empty: ` +
                 error.message;
-              await record(stage.name, 'failed', reason);
+              if (!dryRun) {
+                const entry = freezeEntry({
+                  stage: stage.name,
+                  outcome: 'failed',
+                  at: now(),
+                  runId,
+                  pipeline,
+                  reason,
+                });
+                try {
+                  await store.append(piece, entry);
+                } catch (appendError) {
+                  // The quarantine is what stops the next run: a journal that refused the entry
+                  // is reported in the motive rather than allowed to lose the write.
+                  reason += ` (the journal could not record the failure: ${describeUnknown(appendError)})`;
+                }
+              }
               return await finish(
                 blockedStatus(stage.name, reason, error.quarantine),
                 true,

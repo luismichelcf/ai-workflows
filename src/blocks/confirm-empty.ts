@@ -1,5 +1,10 @@
 import { ProcessTreeSurvived } from '../contract.js';
-import type { ProcessGroup, ProcessGroupControl } from '../process-group.js';
+import type {
+  ProcessGroup,
+  ProcessGroupControl,
+  Quarantine,
+  TerminateResult,
+} from '../process-group.js';
 
 // PLAN-13-R2 §11 (review round 1): emptying a group is decided by whoever emptied it. A group
 // that reports an explicit "not empty" is quarantined as it is, whatever the command's own
@@ -15,24 +20,37 @@ export async function confirmEmptyGroup(
 ): Promise<void> {
   const result = await group.terminate();
   if (result.empty) return;
+  // The survivors the launcher named travel with the quarantine, so the later check waits for
+  // exactly those processes and not only for the job name.
+  const quarantine = withSurvivors(group.quarantine, result);
   // An explicit "not empty" is a fact the launcher (or the POSIX kill) observed: it is final
   // and never overruled by a second opinion, which could turn a live process into a pass.
   if (result.lost !== true) {
     throw new ProcessTreeSurvived(
-      group.quarantine,
+      quarantine,
       `the process group of "${program}" is not empty`,
     );
   }
   // The answer was lost, so the system is asked again; only an affirmative "empty" lifts it.
   let confirmed = false;
   try {
-    confirmed = (await control.check(group.quarantine)).empty;
+    confirmed = (await control.check(quarantine)).empty;
   } catch {
     confirmed = false;
   }
   if (confirmed) return;
   throw new ProcessTreeSurvived(
-    group.quarantine,
+    quarantine,
     `the process group of "${program}" is not confirmed empty`,
   );
+}
+
+/** Adds the survivors a launcher named to a Windows quarantine; other platforms have none. */
+function withSurvivors(
+  quarantine: Quarantine,
+  result: TerminateResult,
+): Quarantine {
+  if (result.empty || result.survivors === undefined) return quarantine;
+  if (quarantine.platform !== 'win32') return quarantine;
+  return { ...quarantine, survivors: result.survivors };
 }

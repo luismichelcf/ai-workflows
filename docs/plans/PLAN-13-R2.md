@@ -643,3 +643,40 @@ pierde; `check-reachable` comprueba que el **dominio** responde (con respaldo en
 la página exacta exista; `scope-reconcile` deja la subida en la evidencia, no en un texto para el
 dueño (una etapa aprobada no tiene motivo); la receta de ejemplo de `init` usa `retry`, que
 `compileRecipe` rechaza hasta la rebanada 4.
+
+## 13. Revisión de la parvada (PR #17, ronda 2, sobre las correcciones)
+
+Tres revisores Claude en sesiones frescas revisaron el delta de las correcciones (correctitud y
+seguridad, pruebas con mutantes en Windows y Linux, contrato y documentación). Corregido, cada
+punto con su prueba (`tests/review-round2.test.ts`):
+
+1. **Carrera de tiempos en Windows:** Node dejaba de esperar al lanzador antes que este y perdía
+   la lista de sobrevivientes justo al cancelar o vencer el tiempo; la cuarentena se levantaba por
+   el nombre del trabajo ya cerrado → Node espera más que el lanzador (25 s frente a 10 s) y no
+   borra su carpeta antes de que termine.
+2. **Sobreviviente ilegible leído como muerto** → tres respuestas (vivo, muerto, desconocido);
+   desconocido mantiene la cuarentena; una hora de creación ilegible se guarda como `unknown`,
+   nunca 0; una entrada mal formada no se ignora.
+3. **Un ensayo se saltaba la cuarentena** → la consulta y bloquea sin escribir nada.
+4. **La cuarentena se perdía con el arrendamiento o la pisaba otra escritura** → se guarda sin
+   exigir el arrendamiento, con reintentos; y solo la comprobación de cuarentena la quita: toda
+   otra escritura del motor la conserva.
+5. **Hechos que no se pueden congelar** se rechazan en vez de pasar sin congelar.
+6. **Windows, otra sesión de inicio:** el trabajo vive en el espacio `Local\` de su sesión; la
+   cuarentena guarda la sesión y otra sesión no puede darla por vacía.
+7. **Linux:** un proceso escapado con `setsid` ya no deja esperando al motor para siempre.
+8. **build-verify:** compara ids de blob de git (con `core.autocrlf` y filtros aplicados) en vez
+   del contenido crudo, así los finales de línea de Windows no provocan rechazos falsos; acepta
+   repositorios SHA-256; si no puede quitar el enlace de `node_modules`, no retira la carpeta.
+9. **Git:** se quitan todas las variables `GIT_*` heredadas, no una lista.
+10. **Pruebas que no probaban lo que decían:** nombres de trabajo de Windows sin barras invertidas
+    reales; comparaciones de ruta contra el nombre corto 8.3; un corredor falso que perdía su
+    salida en Linux; CN-04 aceptaba cualquier bloqueo. Además hay pruebas nuevas para: la regla de
+    «la misma prueba, no solo el mismo mensaje» (M09), el informe del lanzador (perdido, sin código
+    de salida, con sobrevivientes), el cableado del revisor en `compileRecipe` y `{tests}` de
+    `command@1`.
+
+**Corrección a §12:** el ensamblado en caché del lanzador se compila de forma atómica y su código
+fuente se compara con el actual, pero el DLL no se verifica criptográficamente: código que corre
+con el mismo usuario podría plantar uno. Es el mismo usuario que ya puede leer y escribir el
+proyecto (nivel A); queda declarado.

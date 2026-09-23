@@ -1,4 +1,4 @@
-import { existsSync } from 'node:fs';
+import { existsSync, realpathSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { afterEach, describe, expect, it } from 'vitest';
@@ -211,7 +211,8 @@ describe('§2.2: a module block knows the folder of the project it judges', () =
     const engine = createEngine({ config: compiled.config, store, describeChange: compiled.describeChange });
     await engine.run('42');
     const entry = (await store.journal('42')).find((item) => item.stage === 'where');
-    const normalize = (path: string) => path.replace(/\\/g, '/').toLowerCase();
+    // The engine resolves the root to its real path (long names, not Windows 8.3 short ones).
+    const normalize = (path: string) => realpathSync.native(path).replace(/\\/g, '/').toLowerCase();
     expect(normalize((entry?.evidence as { block: { root: string } }).block.root)).toBe(normalize(root));
   });
 });
@@ -219,7 +220,7 @@ describe('§2.2: a module block knows the folder of the project it judges', () =
 describe('§2.2: a module block loads from any spelling of the project folder', () => {
   // Windows can name a folder by its old 8.3 short form (`RUNNER~1`), which is what the CI's
   // temporary folder looks like. The block must load from it as from the long form.
-  it.runIf(process.platform === 'win32')('loads when the project root is given in its short form', async () => {
+  it.runIf(process.platform === 'win32')('loads when the project root is given in its short form', async (context) => {
     const { execFileSync } = await import('node:child_process');
     const long = repository();
     write(long, '.ai-workflows/blocks/ok/block.yml', lines('kind: module', 'natures: [recompute]', 'main: index.mjs'));
@@ -230,7 +231,7 @@ describe('§2.2: a module block loads from any spelling of the project folder', 
       '-Command',
       `(New-Object -ComObject Scripting.FileSystemObject).GetFolder('${long}').ShortPath`,
     ], { encoding: 'utf8' }).trim();
-    expect(short).toContain('~');
+    if (!short.includes('~')) context.skip(); // this volume has no 8.3 names: nothing to prove here
     const recipe = recipeOf(lines(
       'version: 1',
       'locale: es',

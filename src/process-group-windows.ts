@@ -7,7 +7,6 @@ import { join } from 'node:path';
 import {
   collectExit,
   DEFAULT_STDOUT_BYTES,
-  TERMINATE_TIMEOUT_MS,
   type GroupExit,
   type LaunchInGroupOptions,
   type ProcessGroup,
@@ -129,6 +128,9 @@ namespace AiWorkflows {
     public static extern bool TerminateJobObject(IntPtr job, uint code);
 
     [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool TerminateProcess(IntPtr process, uint code);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
     public static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
 
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
@@ -216,9 +218,11 @@ namespace AiWorkflows {
           IntPtr slot = new IntPtr(info.ToInt64() + header + i * IntPtr.Size);
           long pid = Marshal.ReadIntPtr(slot).ToInt64();
           if (pid <= 0) continue;
-          long created = 0;
-          try { created = Process.GetProcessById((int)pid).StartTime.ToFileTimeUtc(); } catch (Exception) { }
-          found.Add(pid.ToString() + ":" + created.ToString());
+          // Never 0: a creation time that could not be read is "unknown", so the reader keeps
+          // the quarantine instead of taking the pid as gone.
+          string created = "unknown";
+          try { created = Process.GetProcessById((int)pid).StartTime.ToFileTimeUtc().ToString(); } catch (Exception) { }
+          found.Add(pid.ToString() + ":" + created);
         }
         return found.ToArray();
       } finally {
@@ -290,9 +294,13 @@ namespace AiWorkflows {
         return false;
       }
       if (!AssignProcessToJobObject(job, created.hProcess)) {
+        // The child is still suspended and cannot be in the job, so it would never be killed
+        // with the group. End it here and report a technical failure; no process is left loose.
+        TerminateProcess(created.hProcess, 1);
         CloseHandle(created.hThread);
-        process = created.hProcess;
-        processId = created.dwProcessId;
+        CloseHandle(created.hProcess);
+        process = IntPtr.Zero;
+        processId = 0;
         return false;
       }
       ResumeThread(created.hThread);
@@ -342,6 +350,15 @@ try {
       }
     }
   }
+
+  # Best effort: drop temporary launcher assemblies older than a day. They are only leftovers
+  # of a lost race, never the cached one (whose name starts with "ai-workflows-").
+  try {
+    $launcherDir = [System.IO.Path]::GetDirectoryName($env:AIW_ASSEMBLY)
+    Get-ChildItem -LiteralPath $launcherDir -Filter 'aiw-launcher-*.dll' -ErrorAction SilentlyContinue |
+      Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-1) } |
+      Remove-Item -Force -ErrorAction SilentlyContinue
+  } catch { }
 
   if ($mode -eq 'check') {
     $job = [AiWorkflows.Native]::OpenJob($env:AIW_JOB)
@@ -407,7 +424,10 @@ try {
     }
   }
   $survivors = '[' + ($entries -join ',') + ']'
-  [System.IO.File]::WriteAllText($result, ('{"childExit":' + $code + ',"treeEmpty":' + $empty + ',"survivors":' + $survivors + '}'))
+  # The logon session is reported so a quarantine can tell a group of this session from one
+  # that cannot be asked from here.
+  $session = [System.Diagnostics.Process]::GetCurrentProcess().SessionId
+  [System.IO.File]::WriteAllText($result, ('{"session":' + $session + ',"childExit":' + $code + ',"treeEmpty":' + $empty + ',"survivors":' + $survivors + '}'))
   exit 0
 } catch {
   if ($result) {
@@ -419,6 +439,13 @@ try {
 `;
 
 const POWERSHELL = 'powershell.exe';
+
+/**
+ * How long Node waits for the launcher after a kill order. The launcher itself gives its job ten
+ * seconds to empty, so Node's limit must be clearly longer; otherwise a working launcher is
+ * mistaken for a lost one and its result folder is deleted while it is still writing.
+ */
+const LAUNCHER_SETTLE_MS = 25_000;
 
 function encoded(script: string): string {
   return Buffer.from(script, 'utf16le').toString('base64');
@@ -500,13 +527,15 @@ interface Report {
   readonly treeEmpty?: boolean;
   readonly empty?: boolean;
   readonly error?: string;
+  readonly openError?: number;
+  readonly session?: number;
   readonly survivors: readonly QuarantineSurvivor[];
 }
 
-function readReport(file: string): Report | undefined {
+function parseReport(raw: string): Report | undefined {
   let parsed: unknown;
   try {
-    parsed = JSON.parse(readFileSync(file, 'utf8'));
+    parsed = JSON.parse(raw);
   } catch {
     return undefined;
   }
@@ -517,8 +546,23 @@ function readReport(file: string): Report | undefined {
     ...(typeof record['treeEmpty'] === 'boolean' ? { treeEmpty: record['treeEmpty'] } : {}),
     ...(typeof record['empty'] === 'boolean' ? { empty: record['empty'] } : {}),
     ...(typeof record['error'] === 'string' ? { error: record['error'] } : {}),
+    ...(typeof record['openError'] === 'number' ? { openError: record['openError'] } : {}),
+    ...(typeof record['session'] === 'number' ? { session: record['session'] } : {}),
     survivors: readReportSurvivors(record['survivors']),
   };
+}
+
+function readReportText(file: string): string | undefined {
+  try {
+    return readFileSync(file, 'utf8');
+  } catch {
+    return undefined;
+  }
+}
+
+function readReport(file: string): Report | undefined {
+  const raw = readReportText(file);
+  return raw === undefined ? undefined : parseReport(raw);
 }
 
 function readReportSurvivors(value: unknown): readonly QuarantineSurvivor[] {
@@ -544,10 +588,71 @@ function removeQuietly(directory: string): void {
   }
 }
 
+/**
+ * Reads the launcher's answer to a kill order, or reports it lost. Only a launcher that ended
+ * with 0 and left a readable report can answer: its own failure, a missing or unreadable report
+ * and a report without a verdict (`treeEmpty` absent) are all "lost", never "empty". An
+ * explicit `treeEmpty: false` is a fact and carries the survivors the launcher named.
+ */
+export function terminateResultFromReport(
+  raw: string | undefined,
+  launcherExit: number | null,
+): TerminateResult {
+  if (launcherExit !== 0) return { empty: false, lost: true };
+  const report = typeof raw === 'string' ? parseReport(raw) : undefined;
+  if (report === undefined) return { empty: false, lost: true };
+  if (report.treeEmpty === true) return { empty: true };
+  if (report.treeEmpty === false) return { empty: false, survivors: report.survivors };
+  return { empty: false, lost: true };
+}
+
+/** The command's own output, as read by the engine's collector. */
+export interface LauncherOutput {
+  readonly stdout: string;
+  readonly stderr: string;
+  readonly truncated: boolean;
+}
+
+/**
+ * Reads the launcher's answer after a wait. A group that was never confirmed empty, a lost
+ * report, a launcher error and a report without the command's numeric exit code are all
+ * technical: none of them can be read as a clean exit.
+ */
+export function groupExitFromReport(
+  raw: string | undefined,
+  launcherExit: number | null,
+  output: LauncherOutput,
+): GroupExit {
+  if (launcherExit !== 0) {
+    return { kind: 'technical', reason: 'the launcher did not end cleanly' };
+  }
+  const report = typeof raw === 'string' ? parseReport(raw) : undefined;
+  if (report === undefined) {
+    return { kind: 'technical', reason: 'the launcher did not report a result' };
+  }
+  if (typeof report.error === 'string') {
+    return { kind: 'technical', reason: `the launcher reported an error: ${report.error}` };
+  }
+  if (report.treeEmpty !== true) {
+    return { kind: 'technical', reason: 'the process group was not confirmed empty' };
+  }
+  if (typeof report.childExit !== 'number') {
+    return { kind: 'technical', reason: 'the launcher did not report an exit code' };
+  }
+  return {
+    kind: 'exited',
+    code: report.childExit,
+    stdout: output.stdout,
+    stderr: output.stderr,
+    truncated: output.truncated,
+  };
+}
+
 export function launchWindowsGroup(options: LaunchInGroupOptions): ProcessGroup {
   const job = `Local\\ai-workflows-${randomUUID()}`;
   const baseQuarantine: Quarantine = { host: hostname(), platform: 'win32', job, confirmed: false };
   let survivors: readonly QuarantineSurvivor[] = [];
+  let session: number | undefined;
   const stdoutBytes = options.stdoutBytes ?? DEFAULT_STDOUT_BYTES;
   const directory = mkdtempSync(join(tmpdir(), 'aiw-group-'));
   const stdinFile = join(directory, 'stdin.txt');
@@ -581,8 +686,12 @@ export function launchWindowsGroup(options: LaunchInGroupOptions): ProcessGroup 
   child.stdout?.on('error', () => {});
   child.stderr?.on('error', () => {});
 
+  let launcherExit: number | null = null;
   const exited = new Promise<void>((resolve) => {
-    child.on('close', () => resolve());
+    child.on('close', (code) => {
+      launcherExit = code;
+      resolve();
+    });
     child.on('error', () => resolve());
   });
 
@@ -594,7 +703,10 @@ export function launchWindowsGroup(options: LaunchInGroupOptions): ProcessGroup 
       // The launcher already ended; the result file still says whether the job emptied.
     }
     const timedOut = await new Promise<boolean>((resolve) => {
-      const timer = setTimeout(() => resolve(true), TERMINATE_TIMEOUT_MS);
+      // The launcher gives its own job ten seconds to empty; Node waits clearly longer, so a
+      // launcher still working is never mistaken for one that died and its folder is not
+      // deleted while it is still writing the answer.
+      const timer = setTimeout(() => resolve(true), LAUNCHER_SETTLE_MS);
       timer.unref?.();
       void exited.then(() => {
         clearTimeout(timer);
@@ -602,19 +714,18 @@ export function launchWindowsGroup(options: LaunchInGroupOptions): ProcessGroup 
       });
     });
     if (timedOut) {
-      // The launcher did not answer: its own answer is lost, so the system may be asked again.
+      // The launcher did not answer in time: its own answer is lost, so the system may be
+      // asked again. Only now is the folder removed, with the launcher given up on.
       removeQuietly(directory);
       return { empty: false, lost: true };
     }
-    const report = readReport(resultFile);
+    const raw = readReportText(resultFile);
+    const result = terminateResultFromReport(raw, launcherExit);
+    const report = raw === undefined ? undefined : parseReport(raw);
+    survivors = result.empty ? [] : (result.survivors ?? []);
+    if (report?.session !== undefined) session = report.session;
     removeQuietly(directory);
-    if (report === undefined) return { empty: false, lost: true };
-    survivors = report.survivors;
-    if (report.treeEmpty === true) return { empty: true };
-    if (report.treeEmpty === false) return { empty: false };
-    // A launcher error (the job could not be created or the child could not start) leaves no
-    // emptiness claim to trust: the system is asked again instead.
-    return { empty: false, lost: true };
+    return result;
   };
   const terminate = (): Promise<TerminateResult> => (terminatePromise ??= doTerminate());
 
@@ -637,32 +748,22 @@ export function launchWindowsGroup(options: LaunchInGroupOptions): ProcessGroup 
       if (value.overLimit) {
         return { kind: 'technical', reason: `printed more than ${stdoutBytes} bytes` };
       }
-      const report = readReport(resultFile);
-      if (report === undefined) {
-        return { kind: 'technical', reason: `could not start ${application}: the launcher did not report a result` };
-      }
-      if (typeof report.error === 'string') {
-        return { kind: 'technical', reason: `could not start ${application}: ${report.error}` };
-      }
-      // A launcher result without an exit code is never a clean exit: reading it as 0 would
-      // approve whatever the child printed before dying.
-      if (typeof report.childExit !== 'number') {
-        return { kind: 'technical', reason: `could not start ${application}: the launcher did not report an exit code` };
-      }
-      return {
-        kind: 'exited',
-        code: report.childExit,
+      const reportText = readReportText(resultFile);
+      const report = reportText === undefined ? undefined : parseReport(reportText);
+      if (report?.session !== undefined) session = report.session;
+      return groupExitFromReport(reportText, launcherExit, {
         stdout: value.stdout,
         stderr: value.stderr,
-        truncated: false,
-      };
+        truncated: value.truncated,
+      });
     })();
     return waitPromise;
   };
 
   return {
     get quarantine(): Quarantine {
-      return survivors.length === 0 ? baseQuarantine : { ...baseQuarantine, survivors };
+      const base = session === undefined ? baseQuarantine : { ...baseQuarantine, session };
+      return survivors.length === 0 ? base : { ...base, survivors };
     },
     wait,
     terminate,
@@ -717,34 +818,67 @@ export async function checkWindowsQuarantine(job: string): Promise<{ empty: true
   const report = readReport(resultFile);
   removeQuietly(directory);
   if (report?.empty === true) return { empty: true };
+  // An error other than "no such job" is an answer we do not have: it is reported by its code
+  // rather than dressed up as "still has processes".
+  if (typeof report?.openError === 'number') {
+    return { empty: false, reason: `the job ${job} could not be checked: ${report.openError}` };
+  }
   return { empty: false, reason: `the job object "${job}" still has processes` };
 }
 
+/** What can be said about the survivors a launcher named. */
+export type SurvivorStatus = 'alive' | 'dead' | 'unknown';
+
 /**
- * Whether any of the survivors the launcher named is still the same process: alive, with the
- * very creation time recorded. A pid reused by another process counts as gone — and then only
- * the job name answers, which is the rule for a quarantine without live survivors.
+ * Whether the survivors the launcher named are alive, gone or unknowable. A single live one
+ * makes the group alive; if none is alive but one could not be read (a PowerShell error or
+ * timeout, a missing or malformed creation time, an unreadable pid) the answer is `unknown`, so
+ * the quarantine holds. Only when every survivor is provably a different process is it `dead`,
+ * and then the job name answers.
  */
-export async function windowsSurvivorAlive(
+export async function windowsSurvivorStatus(
   survivors: readonly QuarantineSurvivor[],
-): Promise<boolean> {
+): Promise<SurvivorStatus> {
+  let sawUnknown = false;
   for (const survivor of survivors) {
-    if (await survivorAlive(survivor.pid, survivor.created)) return true;
+    const state = await survivorState(survivor.pid, survivor.created);
+    if (state === 'alive') return 'alive';
+    if (state === 'unknown') sawUnknown = true;
   }
-  return false;
+  return sawUnknown ? 'unknown' : 'dead';
 }
 
-async function survivorAlive(pid: number, created: string): Promise<boolean> {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
+async function survivorState(pid: number, created: string): Promise<SurvivorStatus> {
+  if (!Number.isInteger(pid) || pid <= 0) return 'unknown';
   // Both values come from the launcher itself; the guard keeps a repaired quarantine from
   // turning into a PowerShell injection anyway.
-  if (!/^\d+$/.test(created)) return false;
+  if (!/^\d+$/.test(created)) return 'unknown';
   const script =
     `try { $p = Get-Process -Id ${pid} -ErrorAction Stop; ` +
     `if ($p.StartTime.ToFileTimeUtc().ToString() -eq "${created}") { "alive" } else { "other" } } ` +
     `catch { "dead" }`;
   const output = await runPowershell(script);
-  return output.trim() === 'alive';
+  const answer = output.trim();
+  if (answer === 'alive') return 'alive';
+  if (answer === 'dead' || answer === 'other') return 'dead';
+  // Empty output is a PowerShell error or a timeout: unknown, never gone.
+  return 'unknown';
+}
+
+/**
+ * The logon session of this process, read from PowerShell once and kept. A quarantine recorded
+ * in another session cannot be asked from this one, so the comparison must be stable and cheap.
+ */
+let currentSession: Promise<number | undefined> | undefined;
+
+export function currentWindowsSessionId(): Promise<number | undefined> {
+  currentSession ??= runPowershell(
+    '[System.Diagnostics.Process]::GetCurrentProcess().SessionId',
+  ).then((output) => {
+    const value = Number.parseInt(output.trim(), 10);
+    return Number.isInteger(value) ? value : undefined;
+  });
+  return currentSession;
 }
 
 function runPowershell(script: string): Promise<string> {
