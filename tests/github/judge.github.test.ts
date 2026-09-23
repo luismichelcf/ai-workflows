@@ -365,9 +365,7 @@ describe.sequential('the judge on GitHub (PLAN-13-R3 §7)', () => {
     expect(status, JSON.stringify(status)).toMatchObject({ state: 'success' });
 
     // SV-09: the privileged job checked out main, never the pull request.
-    const judgeRun = runs(WORKFLOW).find((run) => run.event === 'pull_request_target' && run.headSha === good.head)
-      ?? runs(WORKFLOW).find((run) => run.event === 'pull_request_target');
-    expect(judgeRun).toBeDefined();
+    const judgeRun = await waitFor('the finished judge run on the PR', () => runs(WORKFLOW).find((run) => run.event === 'pull_request_target' && run.headSha === good.head && run.status === 'completed'));
     const judgeLog = gh('run', 'view', String(judgeRun?.databaseId), '--repo', REPO, '--log');
     expect(judgeLog).not.toMatch(/refs\/pull\//);
     expect(judgeLog).not.toContain(`HEAD is now at ${good.head.slice(0, 7)}`);

@@ -34,9 +34,12 @@ function conclusionOf(run: CheckRunSummary): string {
 }
 
 /**
- * PLAN-13-R3 §3.4: the exact check `name` over `sha`. Every check-run of that name counts, and
- * only the most recent commit status of that context. Anything still running waits; anything
- * finished that is not `success` rejects; unreadable is technical. The judge never runs a suite.
+ * PLAN-13-R3 §3.4: the exact check `name` over `sha`. The most recent check-run of that name
+ * decides, exactly as the most recent commit status of that context does: a pull request
+ * retargeted from another branch keeps an old red-test run on its head, and that older failure
+ * must not outvote the run of the current attempt. Anything still running waits; anything
+ * finished that is not `success` rejects; unreadable is technical. When a check-run and a
+ * status share the name, both must be green. The judge never runs a suite.
  */
 export async function requireCheck(
   github: JudgeGitHub,
@@ -54,15 +57,26 @@ export async function requireCheck(
     return { outcome: 'technical', reason: reasonOf(error) };
   }
 
+  // The most recent run is the one with the greatest id (GitHub numbers them in order); a run
+  // without an id can only be the single run of that name, so it stands when it is alone.
+  const latestRun = runs.reduce<CheckRunSummary | undefined>((latest, run) => {
+    if (latest === undefined) return run;
+    if (run.id === undefined) return latest;
+    if (latest.id === undefined) return run;
+    return run.id > latest.id ? run : latest;
+  }, undefined);
   const latest = statuses[0];
-  if (runs.length === 0 && latest === undefined) {
+  if (latestRun === undefined && latest === undefined) {
     return {
       outcome: 'waiting',
       reason: spanish ? `Falta el check «${name}».` : `The check "${name}" is missing.`,
     };
   }
 
-  if (runs.some((run) => run.status !== 'completed') || latest?.state === 'pending') {
+  if (
+    (latestRun !== undefined && latestRun.status !== 'completed') ||
+    latest?.state === 'pending'
+  ) {
     return {
       outcome: 'waiting',
       reason: spanish ? `El check «${name}» todavía no terminó.` : `The check "${name}" has not finished yet.`,
@@ -70,13 +84,12 @@ export async function requireCheck(
   }
 
   // Name the check before its conclusion, so the report reads which one failed and how.
-  const failedRun = runs.find((run) => run.status === 'completed' && run.conclusion !== 'success');
-  if (failedRun !== undefined) {
+  if (latestRun !== undefined && latestRun.conclusion !== 'success') {
     return {
       outcome: 'rejected',
       reason: spanish
-        ? `El check ${name} terminó en ${conclusionOf(failedRun)}.`
-        : `The check ${name} ended ${conclusionOf(failedRun)}.`,
+        ? `El check ${name} terminó en ${conclusionOf(latestRun)}.`
+        : `The check ${name} ended ${conclusionOf(latestRun)}.`,
     };
   }
   if (latest !== undefined && latest.state !== 'success') {

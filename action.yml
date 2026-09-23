@@ -105,8 +105,9 @@ runs:
 
         # Si el paso falla después de conocer el SHA y antes de terminar, deja el rojo honesto en
         # el contexto donde iría el veredicto (en `advisory`, el consultivo) y sale con 1, para que
-        # un verde viejo nunca quede. Con el interruptor apagado (`off`, o sin valor) no publica
-        # nada: `off` debe desatascar siempre, incluso si el motor o GitHub fallan.
+        # un verde viejo nunca quede. Con el interruptor apagado (`off`, o sin valor) el trap no
+        # publica nada, ni un error ni un pendiente: si GitHub falla antes de publicar el verde, no
+        # queda ningún estado nuevo.
         on_exit() {
           local code="$1"
           if [ "$decided" = 'true' ] || [ "$armed" != 'true' ]; then

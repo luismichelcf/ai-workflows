@@ -101,9 +101,9 @@ describe('comments', () => {
 
 describe('checks and statuses', () => {
   it('asks only for the latest check runs of that exact name, and reads the app that made them', async () => {
-    const gh = fakeGh([[/check-runs/, ok([{ total_count: 1, check_runs: [{ name: 'todo-verde', status: 'completed', conclusion: 'success', app: { slug: 'github-actions' }, html_url: 'https://github.com/x/runs/1' }] }])]]);
+    const gh = fakeGh([[/check-runs/, ok([{ total_count: 1, check_runs: [{ id: 101, name: 'todo-verde', status: 'completed', conclusion: 'success', app: { slug: 'github-actions' }, html_url: 'https://github.com/x/runs/1' }] }])]]);
     const runs = await createJudgeGitHub({ repository: REPO, runner: gh.runner }).checkRuns('abc', 'todo-verde');
-    expect(runs).toEqual([{ status: 'completed', conclusion: 'success', app: 'github-actions', url: 'https://github.com/x/runs/1' }]);
+    expect(runs).toEqual([{ id: 101, status: 'completed', conclusion: 'success', app: 'github-actions', url: 'https://github.com/x/runs/1' }]);
     const joined = gh.calls[0]?.args.join(' ') ?? '';
     expect(joined).toContain('commits/abc/check-runs');
     expect(joined).toMatch(/check_name=todo-verde/);

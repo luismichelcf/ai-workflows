@@ -818,7 +818,7 @@ export async function runJudge(input: JudgeInput, deps: JudgeDeps): Promise<Judg
       pr = await github.pullRequest(target.pr);
     } catch (error) {
       await publish(targets.sha, targetContext, 'error', reasonOf(error));
-      return finish();
+      return conclude([], 'es');
     }
     if (pr.baseRef !== principal) {
       notes.push(`la rama destino del PR #${target.pr} es "${pr.baseRef}", no la principal: no se juzga`);

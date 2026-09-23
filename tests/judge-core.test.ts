@@ -113,7 +113,7 @@ interface PullRequest {
   headRepo: string;
 }
 
-interface CheckRun { status: string; conclusion: string | null; app: string; url: string | null }
+interface CheckRun { id?: number; status: string; conclusion: string | null; app: string; url: string | null }
 interface Status { context: string; state: string; targetUrl: string | null; createdAt: string }
 
 class FakeGitHub implements JudgeGitHub {
@@ -1700,4 +1700,65 @@ describe('flock 2', () => {
     expect(report.unofficial).toEqual([expect.objectContaining({ url: 'https://example.com/imitado' })]);
   });
 
+});
+
+// ---------------------------------------------------------------------------------------------
+// Flock review, round 3: the most recent check run of a name decides, like the latest status of
+// a context (a PR retargeted from another branch keeps an old failed red-test run on its head).
+
+describe('flock 3: the most recent check run of that name decides', () => {
+  const runOf = (id: number, status: string, conclusion: string | null): CheckRun =>
+    ({ id, status, conclusion, app: 'github-actions', url: null }) as CheckRun;
+
+  async function judgedWith(runs: CheckRun[]) {
+    const w = world();
+    const head = behaviorPr(w);
+    w.green(7, head);
+    w.github.setCheck(head, 'ai-workflows/red-test', runs);
+    w.github.pendingFromConsoleStep(head);
+    const report = await w.judge();
+    return { w, report };
+  }
+
+  it('an older failure superseded by a newer success passes', async () => {
+    const { w, report } = await judgedWith([runOf(10, 'completed', 'failure'), runOf(11, 'completed', 'success')]);
+    expect(stageOf(report, 'red-test')?.outcome).toBe('passed');
+    expect(w.github.on().map((entry) => entry.state)).toEqual(['success']);
+  });
+
+  it('an older success superseded by a newer failure is rejected, whatever the order of the list', async () => {
+    const { report } = await judgedWith([runOf(21, 'completed', 'failure'), runOf(20, 'completed', 'success')]);
+    expect(stageOf(report, 'red-test')?.outcome).toBe('rejected');
+  });
+
+  it('a newer run still in progress waits', async () => {
+    const { report } = await judgedWith([runOf(30, 'completed', 'success'), runOf(31, 'in_progress', null)]);
+    expect(stageOf(report, 'red-test')?.outcome).toBe('waiting');
+  });
+});
+
+describe('flock 3: English reasons when a sign-off is refused', () => {
+  it('an edited sign-off is refused in English', async () => {
+    const w = world({ '.ai-workflows/pipeline.yml': RECIPE.replace('locale: es', 'locale: en') });
+    const head = behaviorPr(w);
+    w.green(7, head);
+    w.github.commentList.set(7, [byOwner(`/visto-bueno ${head.slice(0, 7)}`, { edited: true })]);
+    w.github.pendingFromConsoleStep(head);
+    const report = await w.judge();
+    const reason = stageOf(report, 'owner-approval')?.reason ?? '';
+    expect(reason).toMatch(/edited/i);
+    expect(reason).not.toMatch(/editado|comentario|dueñ|versión/i);
+  });
+
+  it('with same-sha, a sign-off of another version is refused in English', async () => {
+    const recipe = RECIPE.replace('locale: es', 'locale: en').replace('    valid-while: same-fingerprint\n', '    valid-while: same-sha\n');
+    const w = world({ '.ai-workflows/pipeline.yml': recipe });
+    const head = behaviorPr(w);
+    w.green(7, head);
+    w.github.commentList.set(7, [byOwner('/visto-bueno 1234567')]);
+    w.github.pendingFromConsoleStep(head);
+    const report = await w.judge();
+    const reason = stageOf(report, 'owner-approval')?.reason ?? '';
+    expect(reason).not.toMatch(/no es la versión|comentario|dueñ|versión juzgada/i);
+  });
 });

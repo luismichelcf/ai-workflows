@@ -28,6 +28,12 @@ export interface MergeQueueEntry {
 
 /** One check-run of the name the judge asked for. */
 export interface CheckRunSummary {
+  /**
+   * The check-run's own id: among several runs of one name, the most recent is the one with the
+   * greatest id. The GitHub API always sends it; a fixture may omit it, and a run that cannot be
+   * placed by id is only ever tolerated when it is the single run of that name.
+   */
+  readonly id?: number;
   readonly status: string;
   readonly conclusion: string | null;
   readonly app: string;
@@ -401,18 +407,31 @@ export function createJudgeGitHub(options: JudgeGitHubOptions): JudgeGitHub {
           if (status === undefined || app === undefined) {
             throw new Error(`gh returned a check run named ${checkName} without its status or app.`);
           }
+          const rawId = isRecord(runItem) ? runItem['id'] : undefined;
+          if (rawId !== undefined && rawId !== null && (typeof rawId !== 'number' || !Number.isInteger(rawId) || rawId <= 0)) {
+            throw new Error(`gh returned a check run named ${checkName} with an id that is not a positive integer.`);
+          }
+          const id = typeof rawId === 'number' ? rawId : undefined;
           const conclusion = isRecord(runItem) ? runItem['conclusion'] : undefined;
           if (conclusion !== null && conclusion !== undefined && typeof conclusion !== 'string') {
             throw new Error(`gh returned a check run named ${checkName} with a conclusion that is not text.`);
           }
           const url = textField(runItem, 'html_url');
           runs.push({
+            ...(id === undefined ? {} : { id }),
             status,
             conclusion: typeof conclusion === 'string' ? conclusion : null,
             app,
             url: url === undefined ? null : url,
           });
         }
+      }
+      // Several runs of one name must be ordered by id to tell which is the most recent: a run
+      // without an id leaves that undecidable, so the list is refused rather than guessed.
+      if (runs.length > 1 && runs.some((entry) => entry.id === undefined)) {
+        throw new Error(
+          `gh returned several check runs named ${checkName} and at least one without an id: the most recent cannot be decided.`,
+        );
       }
       return runs;
     },

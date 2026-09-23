@@ -666,3 +666,12 @@ juez respondió bien en los tres). Segunda pasada, tras la ronda 1: 11 de 13; lo
 de la prueba, que reusó un nombre de archivo ya fusionado por la primera pasada (ahora cada pasada
 usa nombres propios). En ambas el repositorio de pruebas quedó restaurado: protección, variable y
 workflows como estaban.
+
+**Ronda 3** (un revisor Claude en sesión fresca, sobre el cambio de la ronda 2): confirmó la ronda
+2 y encontró un bloqueante, corregido con su prueba: un PR que apuntaba a otra rama dejaba sobre su
+cabeza una prueba roja vieja en `failure` que, al volver a la principal, convivía con la nueva en
+`success`, y el juez exigía que todas estuvieran en verde → **decide el check-run más reciente con
+ese nombre** (el de mayor número), igual que el último estado de cada contexto (§3.4). Declarados:
+en `on`/`advisory`, si en `workflow_run` falla la lectura de los PRs, el paso publica `error` sobre
+el SHA aunque su PR apunte a otra rama (transitorio, del lado seguro); `edited` también vuelve a
+correr la prueba roja al cambiar el título o la descripción (minutos de CI).
