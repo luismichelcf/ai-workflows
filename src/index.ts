@@ -115,11 +115,17 @@ export { classifyFiles } from './recipe/glob.js';
 export { effectiveKind, type EffectiveKind } from './recipe/kind.js';
 export {
   describeChangeFromGit,
+  describeChangeFromCommits,
+  gitProjectFiles,
+  diskProjectFiles,
   type ChangeFacts,
   type ChangeBuilder,
   type ChangeDeclared,
   type DescribeChangeFromGitOptions,
+  type DescribeChangeFromCommitsOptions,
+  type ProjectFiles,
 } from './recipe/facts.js';
+export { pieceOfBranch, readDeclaredKind } from './judge/pieces.js';
 export { appliesIfFor } from './recipe/applies.js';
 export { explainRecipe } from './recipe/explain.js';
 export { recipeCommand } from './recipe/command.js';

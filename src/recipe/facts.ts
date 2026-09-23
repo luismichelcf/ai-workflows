@@ -1,8 +1,8 @@
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 
 import { classifyFiles } from './glob.js';
 import { effectiveKind } from './kind.js';
@@ -139,6 +139,40 @@ async function fingerprintOf(root: string, mergeBase: string, snapshot: string):
   return raw.length === 0 ? '' : createHash('sha256').update(raw).digest('hex');
 }
 
+export interface DescribeChangeFromCommitsOptions {
+  readonly root: string;
+  readonly base: string;
+  readonly head: string;
+  readonly recipe: Recipe;
+  readonly piece: string;
+  readonly declaredKind?: string;
+}
+
+/** The files the server judge reads: from the judged commit, never from the working tree. */
+export interface ProjectFiles {
+  read(path: string): Promise<string | undefined>;
+  list(): Promise<string[]>;
+}
+
+/** PLAN-13-R3 §1.3: a project file is read whole, and 1 MB is the most that is read. */
+const MAX_PROJECT_FILE_BYTES = 1024 * 1024;
+const DRIVE_LETTER = /^[A-Za-z]:/;
+
+/**
+ * A path a block or a declaration may read stays inside the project: no absolute path, no drive
+ * letter and no `..` segment. Anything else is refused before a single file is opened.
+ */
+function requireProjectPath(path: string): void {
+  const segments = path.split(/[\\/]+/);
+  if (isAbsolute(path) || path.startsWith('/') || DRIVE_LETTER.test(path) || segments.includes('..')) {
+    throw new Error(`invalid path "${path}": it must stay inside the project`);
+  }
+}
+
+function isMissing(error: unknown): boolean {
+  return error instanceof Error && (error as NodeJS.ErrnoException).code === 'ENOENT';
+}
+
 export async function describeChangeFromGit(
   options: DescribeChangeFromGitOptions,
 ): Promise<ChangeFacts> {
@@ -186,5 +220,132 @@ export async function describeChangeFromGit(
     ...(effective.lane === undefined ? {} : { lane: effective.lane }),
     clean: snapshot === headTree,
     ...(builder === undefined ? {} : { builder }),
+  };
+}
+
+/**
+ * PLAN-13-R3 §2: the same facts of a change, computed from commit objects only, because on
+ * GitHub the judge never has the piece's working tree. `snapshot` is the tree of `head`, the
+ * fingerprint covers `<mergeBase> <head>` with the very same bytes function, and the working
+ * tree and the active branch are never read.
+ */
+export async function describeChangeFromCommits(
+  options: DescribeChangeFromCommitsOptions,
+): Promise<ChangeFacts> {
+  const { root, base, head, recipe, piece, declaredKind } = options;
+
+  requirePieceId(piece);
+
+  let headSha: string;
+  try {
+    headSha = text(await runGit(root, ['rev-parse', '--verify', `${head}^{commit}`]));
+  } catch (error) {
+    throw new Error(`cannot resolve head "${head}": ${reasonOf(error)}`);
+  }
+
+  let baseSha: string;
+  try {
+    baseSha = text(await runGit(root, ['rev-parse', '--verify', `${base}^{commit}`]));
+  } catch (error) {
+    throw new Error(`cannot resolve base "${base}": ${reasonOf(error)}`);
+  }
+
+  const mergeBase = text(await runGit(root, ['merge-base', baseSha, headSha]));
+  const snapshot = text(await runGit(root, ['rev-parse', `${headSha}^{tree}`]));
+  const files = await changedFiles(root, mergeBase, headSha);
+  const fingerprint = await fingerprintOf(root, mergeBase, headSha);
+
+  const classes = classifyFiles(recipe.classify, files);
+  const effective = effectiveKind(recipe, declaredKind, files);
+
+  return {
+    piece,
+    sha: headSha,
+    snapshot,
+    base: baseSha,
+    mergeBase,
+    files,
+    fingerprint,
+    classes,
+    ...(declaredKind === undefined ? {} : { declaredKind }),
+    kind: effective.kind,
+    ...(effective.lane === undefined ? {} : { lane: effective.lane }),
+    clean: true,
+  };
+}
+
+/** Size of a blob at `<sha>:<path>`, or `undefined` when that path is not in the commit. */
+async function blobSize(root: string, spec: string): Promise<number | undefined> {
+  try {
+    return Number.parseInt(text(await runGit(root, ['cat-file', '-s', spec])), 10);
+  } catch {
+    return undefined;
+  }
+}
+
+function splitNullNames(raw: Buffer): string[] {
+  return raw
+    .toString('utf8')
+    .split('\0')
+    .filter((name) => name.length > 0)
+    .sort();
+}
+
+/** PLAN-13-R3 §1.3: the project files at a commit, read with git, never from the disk. */
+export function gitProjectFiles(root: string, sha: string): ProjectFiles {
+  return {
+    async read(path: string): Promise<string | undefined> {
+      requireProjectPath(path);
+      const spec = `${sha}:${path}`;
+      const size = await blobSize(root, spec);
+      if (size === undefined) return undefined;
+      if (size > MAX_PROJECT_FILE_BYTES) {
+        throw new Error(`file "${path}" is larger than 1 MB`);
+      }
+      return (await runGit(root, ['cat-file', 'blob', spec])).toString('utf8');
+    },
+    async list(): Promise<string[]> {
+      const raw = await runGit(root, ['ls-tree', '-r', '-z', '--full-tree', '--name-only', sha]);
+      return splitNullNames(raw);
+    },
+  };
+}
+
+/** PLAN-13-R3 §1.3: the project files of the working tree, with the same reading rules. */
+export function diskProjectFiles(root: string): ProjectFiles {
+  return {
+    async read(path: string): Promise<string | undefined> {
+      requireProjectPath(path);
+      const full = join(root, path);
+      let info;
+      try {
+        info = await stat(full);
+      } catch (error) {
+        if (isMissing(error)) return undefined;
+        throw error;
+      }
+      if (!info.isFile()) return undefined;
+      if (info.size > MAX_PROJECT_FILE_BYTES) {
+        throw new Error(`file "${path}" is larger than 1 MB`);
+      }
+      return await readFile(full, 'utf8');
+    },
+    async list(): Promise<string[]> {
+      const found: string[] = [];
+      const walk = async (directory: string, prefix: string): Promise<void> => {
+        const entries = await readdir(join(root, directory), { withFileTypes: true });
+        for (const entry of entries) {
+          const relative = prefix.length === 0 ? entry.name : `${prefix}/${entry.name}`;
+          if (entry.isDirectory()) {
+            if (entry.name === '.git' || entry.name === 'node_modules') continue;
+            await walk(join(directory, entry.name), relative);
+          } else if (entry.isFile()) {
+            found.push(relative);
+          }
+        }
+      };
+      await walk('', '');
+      return found.sort();
+    },
   };
 }
