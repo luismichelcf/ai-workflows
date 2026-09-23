@@ -122,7 +122,12 @@ export type {
   EngineBlockDeps,
   ProviderRunner,
   ProviderRunOptions,
+  ServerCapability,
+  ServerContext,
+  ServerAttestContext,
+  ServerResult,
 } from './blocks/definition.js';
+export type { Unofficial } from './judge/checks.js';
 export {
   compileRecipe,
   runProviderInGroup,

@@ -134,19 +134,28 @@ export async function approvalCommentAttestation(
     }
   }
 
+  // A comment that cannot be resolved is remembered, not returned at once: a later comment may
+  // still be the valid order, and a genuine one must not lose to an older unreadable candidate.
   const unresolved: string[] = [];
+  let firstError: string | undefined;
   for (const entry of evaluations) {
     if (!entry.order.ok) continue;
     const resolution = await resolve(entry.order.code, context, previousHeads, sameFingerprint);
-    if (resolution.error !== undefined) return { outcome: 'technical', reason: resolution.error };
     if (resolution.ok) return { outcome: 'passed' };
+    if (resolution.error !== undefined) {
+      if (firstError === undefined) firstError = resolution.error;
+      continue;
+    }
     if (resolution.reason !== undefined) unresolved.push(`«${entry.order.code}»: ${resolution.reason}.`);
   }
+  if (firstError !== undefined) return { outcome: 'technical', reason: firstError };
 
+  // The order's command can be a project value and may itself read as another language, so the
+  // English motive says what is needed without pasting it; the Spanish one spells it out.
   const wanted = `${order} ${context.head.slice(0, codeLength)}`;
   const base = spanish
     ? `Falta el visto bueno del dueño: se necesita un comentario con la orden ${wanted} para la versión juzgada.`
-    : `The owner's approval is missing: a comment with the order ${wanted} for the judged version is needed.`;
+    : `The owner's approval is missing: a comment with the owner's order for the judged version is needed.`;
   const refusals = evaluations
     .filter((entry) => entry.order.hadOrder && !entry.order.ok)
     .map((entry) => entry.order.reason);

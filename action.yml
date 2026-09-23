@@ -39,6 +39,13 @@ runs:
     # con `gh api` y variables de entorno. Con la procedencia fallida no publica nada y termina en
     # 0 después de dejar un `::error::` en el registro: la corrida queda sin veredicto, nunca en
     # verde. Con `off` termina aquí y no se instala ni compila nada.
+    #
+    # La cabeza y la rama destino del PR se releen por API para `issue_comment` y
+    # `workflow_dispatch`; un PR hacia otra rama no se juzga. El número de PR de esos eventos debe
+    # ser un número, o nada se publica. En `workflow_run` de un `pull_request` solo se publica si
+    # hay un PR abierto con esa cabeza hacia la principal; de un `merge_group`, sobre su SHA. Un
+    # `trap` deja el rojo honesto si el paso falla después de conocer el SHA: un verde viejo nunca
+    # queda.
     - name: Decidir el objetivo y publicar el estado inicial
       id: decide
       shell: bash
@@ -55,6 +62,8 @@ runs:
         sha=''
         default_branch=''
         status_context="$INPUT_CONTEXT"
+        armed='false'
+        decided='false'
 
         emit() {
           {
@@ -66,20 +75,77 @@ runs:
           } >> "$GITHUB_OUTPUT"
         }
 
-        # Procedencia fallida: se registra el motivo, no se publica nada y la corrida termina en 0.
+        # Procedencia fallida o destino equivocado: se registra el motivo, no se publica nada y la
+        # corrida termina en 0. Nunca un verde sin decidir.
         stop() {
           echo "::error::$1"
           publish='false'
           continue='false'
+          decided='true'
           emit
           exit 0
+        }
+
+        # Publica un estado con 3 intentos y espera creciente; si no lo logra, devuelve 1.
+        publish_status() {
+          local state="$1" context="$2" description="$3"
+          local target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          local attempt=1
+          while [ "$attempt" -le 3 ]; do
+            if gh api "repos/$GITHUB_REPOSITORY/statuses/$sha" \
+              -f state="$state" -f context="$context" \
+              -f description="$description" -f target_url="$target_url"; then
+              return 0
+            fi
+            sleep "$((attempt * 2))"
+            attempt=$((attempt + 1))
+          done
+          return 1
+        }
+
+        # Si el paso falla después de conocer el SHA y antes de terminar, deja el rojo honesto en
+        # el contexto donde iría el veredicto (en `advisory`, el consultivo) y sale con 1, para que
+        # un verde viejo nunca quede.
+        on_exit() {
+          local code="$1"
+          if [ "$decided" = 'true' ] || [ "$armed" != 'true' ]; then
+            exit "$code"
+          fi
+          publish_status error "$status_context" 'el juez no pudo decidir' || true
+          exit 1
+        }
+        trap 'on_exit "$?"' EXIT
+
+        # La cabeza y la rama destino del PR vivo, para un comentario o un despacho. El número
+        # debe ser un número o nada se publica; un PR hacia otra rama no se juzga.
+        read_live_pr() {
+          local n="$1"
+          if ! printf '%s' "$n" | grep -Eq '^[0-9]+$'; then
+            stop "el número de PR no es un número: $n"
+          fi
+          local live
+          live="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$n")"
+          local base
+          base="$(printf '%s' "$live" | jq -r '.base.ref // empty')"
+          if [ "$base" != "$default_branch" ]; then
+            stop "la rama destino es «$base», no $default_branch"
+          fi
+          sha="$(printf '%s' "$live" | jq -r '.head.sha // empty')"
         }
 
         # Con `red-test` no hay estado que publicar: solo se deja seguir a los pasos siguientes.
         if [ "$INPUT_TASK" = 'red-test' ]; then
           publish='false'
+          decided='true'
           emit
           exit 0
+        fi
+
+        # El modo se normaliza igual que en el juez: solo se quitan los espacios de alrededor y las
+        # mayúsculas. Sin valor es `off`.
+        mode="$(printf '%s' "$INPUT_MODE" | tr '[:upper:]' '[:lower:]' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+        if [ "$mode" = 'advisory' ]; then
+          status_context='ai-workflows/advisory'
         fi
 
         # La rama principal nunca se supone: la dice la API.
@@ -105,29 +171,37 @@ runs:
           fi
         fi
 
-        # Rama destino (§3.1): un PR hacia otra rama no se juzga ni recibe estado.
-        if [ "$GITHUB_EVENT_NAME" = 'pull_request_target' ]; then
-          base="$(jq -r '.pull_request.base.ref // empty' "$GITHUB_EVENT_PATH")"
-          if [ "$base" != "$default_branch" ]; then
-            stop "la rama destino es «$base», no $default_branch"
-          fi
-        fi
-
-        # SHA sobre el que se publica cada evento (§3.2). La cabeza viva del PR se relee por API.
+        # SHA sobre el que se publica, y rama destino, por evento (§3.1 y §3.2). La cabeza viva del
+        # PR se relee por API; un PR hacia otra rama no se juzga ni recibe estado.
         case "$GITHUB_EVENT_NAME" in
           pull_request_target)
+            base="$(jq -r '.pull_request.base.ref // empty' "$GITHUB_EVENT_PATH")"
+            if [ "$base" != "$default_branch" ]; then
+              stop "la rama destino es «$base», no $default_branch"
+            fi
             sha="$(jq -r '.pull_request.head.sha // empty' "$GITHUB_EVENT_PATH")"
             ;;
           issue_comment)
-            n="$(jq -r '.issue.number // empty' "$GITHUB_EVENT_PATH")"
-            sha="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$n" --jq .head.sha)"
+            read_live_pr "$(jq -r '.issue.number // empty' "$GITHUB_EVENT_PATH")"
             ;;
           workflow_dispatch)
-            n="$(jq -r '.inputs.pr // empty' "$GITHUB_EVENT_PATH")"
-            sha="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$n" --jq .head.sha)"
+            read_live_pr "$(jq -r '.inputs.pr // empty' "$GITHUB_EVENT_PATH")"
             ;;
           workflow_run)
             sha="$(jq -r '.workflow_run.head_sha // empty' "$GITHUB_EVENT_PATH")"
+            run_event="$(jq -r '.workflow_run.event // empty' "$GITHUB_EVENT_PATH")"
+            if [ "$run_event" = 'merge_group' ]; then
+              :
+            elif [ "$run_event" = 'pull_request' ]; then
+              match="$(gh api "repos/$GITHUB_REPOSITORY/commits/${sha}/pulls" \
+                | jq -r --arg head "$sha" --arg base "$default_branch" \
+                  '[.[] | select(.state == "open" and .head.sha == $head and .base.ref == $base)] | length')"
+              if [ "$match" = '0' ]; then
+                stop "no hay un PR abierto con la cabeza $sha hacia $default_branch"
+              fi
+            else
+              stop "workflow_run de un evento no juzgado: $run_event"
+            fi
             ;;
           merge_group)
             sha="$(jq -r '.merge_group.head_sha // empty' "$GITHUB_EVENT_PATH")"
@@ -140,25 +214,9 @@ runs:
           stop "no se pudo calcular el SHA a marcar ($GITHUB_EVENT_NAME)"
         fi
 
-        # Publica un estado con 3 intentos y espera creciente; si no lo logra, la corrida sale 1.
-        publish_status() {
-          local state="$1" context="$2" description="$3"
-          local target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
-          local attempt=1
-          while [ "$attempt" -le 3 ]; do
-            if gh api "repos/$GITHUB_REPOSITORY/statuses/$sha" \
-              -f state="$state" -f context="$context" \
-              -f description="$description" -f target_url="$target_url"; then
-              return 0
-            fi
-            sleep "$((attempt * 2))"
-            attempt=$((attempt + 1))
-          done
-          return 1
-        }
+        # Desde aquí el SHA se conoce: cualquier fallo deja el rojo honesto en vez de un verde viejo.
+        armed='true'
 
-        # El modo se lee sin espacios alrededor y sin distinguir mayúsculas; sin valor es `off`.
-        mode="$(printf '%s' "$INPUT_MODE" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
         case "$mode" in
           ''|off)
             publish_status success "$INPUT_CONTEXT" 'motor apagado' \
@@ -186,6 +244,7 @@ runs:
         esac
 
         emit
+        decided='true'
 
     - name: Preparar pnpm
       if: steps.decide.outputs.continue == 'true'

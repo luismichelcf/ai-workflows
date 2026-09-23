@@ -54,6 +54,8 @@ export interface InputSpecGlobList {
   readonly type: 'glob-list';
   readonly required?: boolean;
   readonly default?: readonly string[];
+  /** PLAN-13-R3 §1.1: only a block that substitutes `{piece}` may accept it in its globs. */
+  readonly piece?: boolean;
 }
 
 export interface InputSpecObject {

@@ -434,10 +434,10 @@ function validateInput(
       if (typeof yamlValue(node) !== 'boolean') add(issues, node, `${subject} must be true or false`);
       return;
     case 'string-list':
-      validateListInput(node, subject, false, issues);
+      validateListInput(node, subject, false, false, issues);
       return;
     case 'glob-list':
-      validateListInput(node, subject, true, issues);
+      validateListInput(node, subject, true, spec.piece === true, issues);
       return;
     case 'command':
       validateCommandInput(node, spec, inputName, subject, issues);
@@ -493,6 +493,7 @@ function validateListInput(
   node: YamlNode,
   subject: string,
   globs: boolean,
+  allowPiece: boolean,
   issues: LocatedIssue[],
 ): void {
   const list = yamlSeq(node);
@@ -506,7 +507,7 @@ function validateListInput(
       add(issues, item, `${subject} must be a list of strings`);
       continue;
     }
-    if (globs && !validGlob(value, true)) {
+    if (globs && !validGlob(value, allowPiece)) {
       add(issues, item, `unsupported glob "${value}": only *, ** and ? are allowed`);
     }
   }

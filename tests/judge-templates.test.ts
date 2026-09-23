@@ -175,3 +175,34 @@ describe('SV-08 and §3.1: what the judge may import', () => {
     }
   });
 });
+
+describe('flock 1: the first step of the action', () => {
+  const decide = String(steps(ACTION['runs']).find((step) => step['id'] === 'decide')?.['run'] ?? '');
+
+  it('accepts only a number as the pull request of a dispatch or a comment', () => {
+    expect(decide).toMatch(/\^\[0-9\]\+\$/);
+  });
+
+  it('reads the live target branch of the PR for a comment or a dispatch before publishing', () => {
+    expect((decide.match(/base\.ref/g) ?? []).length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('for workflow_run, publishes only after finding an open PR on that head into main (or the queue)', () => {
+    expect(decide).toMatch(/commits\/\$\{?sha\}?\/pulls/);
+  });
+
+  it('publishes error when it fails after knowing the SHA, so an old green never stays', () => {
+    expect(decide).toMatch(/trap /);
+  });
+
+  it('reads the mode like the judge does: only the spaces around it are ignored', () => {
+    expect(decide).not.toContain("tr -d '[:space:]'");
+  });
+});
+
+describe('flock 1: the command never leaks the token', () => {
+  it('a failed fetch is reported without the command line that carries the token', () => {
+    const cli = readFileSync(new URL('../src/judge/cli.ts', import.meta.url), 'utf8');
+    expect(cli).not.toMatch(/\|\|\s*error\.message/);
+  });
+});

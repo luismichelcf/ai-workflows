@@ -71,8 +71,17 @@ function fetcher(root: string, token: string): (shas: string[]) => Promise<void>
           env: gitEnvironment(),
         },
         (error, _stdout, stderr) => {
-          if (error === null) resolve();
-          else reject(new Error(`git fetch failed: ${stderr.trim() || error.message}`));
+          if (error === null) {
+            resolve();
+            return;
+          }
+          // Never `error.message`: Node builds it from the whole command line, token header
+          // included. The exit code or the signal, plus stderr, say what happened without it.
+          const status =
+            error.signal !== null && error.signal !== undefined
+              ? `signal ${error.signal}`
+              : `exit ${String(error.code ?? 'unknown')}`;
+          reject(new Error(`git fetch failed (${status}): ${stderr.trim()}`));
         },
       );
     });

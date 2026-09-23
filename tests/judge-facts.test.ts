@@ -255,4 +255,14 @@ describe('R19: the declared kind comes from a line of the plan', () => {
       rejected: expect.stringContaining('1 MB'),
     });
   });
+
+  it('any other failure to read is not an answer: it throws (the judge makes it technical)', async () => {
+    const broken: ProjectFiles = {
+      read: async () => {
+        throw new Error('fatal: Needed a single revision');
+      },
+      list: async () => [],
+    };
+    await expect(readDeclaredKind(RECIPE, '13', broken)).rejects.toThrow(/Needed a single revision/);
+  });
 });

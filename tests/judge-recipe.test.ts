@@ -156,6 +156,16 @@ describe('R19: the pieces section', () => {
     }
   });
 
+  it('rejects a star that touches {piece}: the piece would not be one whole number', () => {
+    for (const bad of ['*{piece}', 'feat/{piece}*', 'x/*{piece}-*']) {
+      const rows = withPieces(['pieces:', `  branch: ["${bad}"]`]);
+      expect(parseErrors(rows), bad).toContainEqual(
+        at(place(rows, 7, `"${bad}"`), /a star cannot touch \{piece\}/),
+      );
+    }
+    expect(parsed(withPieces(['pieces:', '  branch: ["*/{piece}-*"]'])).pieces?.branch).toEqual(['*/{piece}-*']);
+  });
+
   it('rejects an empty branch list', () => {
     const rows = withPieces(['pieces:', '  branch: []']);
     expect(parseErrors(rows).length).toBeGreaterThan(0);

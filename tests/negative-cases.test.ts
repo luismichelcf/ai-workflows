@@ -15,12 +15,15 @@ import {
   requireSameFiles,
   requireSections,
   requireSources,
+  runJudge,
   type ExecutionIdentity,
+  type JudgeGitHub,
+  type PullRequestComment,
   type Verdict,
 } from '../src/index.js';
 
 import { runBlock } from './block-harness.js';
-import { commit, removeRepositories, repository, write } from './git-fixtures.js';
+import { commit, git, removeRepositories, repository, write } from './git-fixtures.js';
 import { chain, pipeline, recorder, stage } from './helpers.js';
 
 // The thirteen attempts to get around the process. These are not a trial run: they are the
@@ -38,9 +41,7 @@ import { chain, pipeline, recorder, stage } from './helpers.js';
 
 /** Cases that cannot run yet, and what each is waiting for. */
 export const NOT_YET_EXECUTABLE: Record<string, string> = {
-  'CN-05': 'needs the sign-off check on a real pull request (slice 4)',
   'CN-07': 'needs the editor hooks installed in a project (slice 4)',
-  'CN-08': 'needs the server-side check enforced by a branch ruleset (slice 6)',
 };
 
 const ALL = Array.from({ length: 13 }, (_, index) => `CN-${String(index + 1).padStart(2, '0')}`);
@@ -394,6 +395,116 @@ describe('CN-13 · dying after an external effect and resuming', () => {
   });
 });
 
+// CN-05 and CN-08 run against the judge (PLAN-13-R3 §3): the server check that a pull request
+// cannot skip. The repository is real; GitHub is a minimal fake port (its external edge). The
+// full set of judge cases lives in tests/judge-core.test.ts and on GitHub in tests/github/.
+
+const JUDGE_RECIPE = [
+  'version: 1',
+  'locale: es',
+  'owner: duena',
+  'classify:',
+  '  visible: ["app/**"]',
+  'kinds:',
+  '  names: [behavior, docs]',
+  '  default: behavior',
+  'pieces:',
+  '  branch: ["*/{piece}-*"]',
+  '  exclude-branches: ["libre/*"]',
+  'stages:',
+  '  - id: owner-approval',
+  '    summary: "La dueña aprueba lo que se ve"',
+  '    nature: attest',
+  '    needs-human: true',
+  '    applies-if: { touches-any: [visible] }',
+  '    gate:',
+  '      uses: ai-workflows/approval-comment@1',
+  '      with: { command: /visto-bueno }',
+  '    server: attestation',
+  '  - id: merge',
+  '    summary: "Se une"',
+  '    after: owner-approval',
+  '    phase: merge',
+  '    nature: recompute',
+  '    gate:',
+  '      uses: ai-workflows/github-merge@1',
+  '',
+].join('\n');
+
+async function judgeOnce(branch: string, comments: (head: string) => PullRequestComment[]) {
+  const root = repository({ '.ai-workflows/pipeline.yml': JUDGE_RECIPE, 'app/page.tsx': 'uno\n' });
+  write(root, 'app/page.tsx', 'dos\n');
+  const head = commit(root, 'visible');
+  git(root, 'switch', '-q', 'main');
+  const main = git(root, 'rev-parse', 'HEAD');
+  const url = 'https://github.com/duena/proyecto/actions/runs/1';
+  const published: { sha: string; state: string; description: string }[] = [];
+  const statuses = [{ context: 'ai-workflows', state: 'pending', targetUrl: url, createdAt: '2026-09-23T12:00:00Z' }];
+  const pr = { number: 7, state: 'open', headSha: head, headRef: branch, baseRef: 'main', headRepo: 'duena/proyecto' };
+  const github: JudgeGitHub = {
+    defaultBranch: async () => 'main',
+    branchHead: async () => main,
+    pullRequest: async () => pr,
+    openPullRequestsWithHead: async () => [7],
+    mergeQueue: async () => [],
+    comments: async () => comments(head),
+    checkRuns: async () => [],
+    statuses: async () => statuses,
+    workflowRun: async () => ({ path: '.github/workflows/ai-workflows.yml', event: 'pull_request_target', headBranch: branch }),
+    forcePushedHeads: async () => [],
+    publishStatus: async (sha, status) => {
+      published.push({ sha, state: status.state, description: status.description });
+    },
+    upsertTraceComment: async () => {},
+  };
+  await runJudge({
+    eventName: 'pull_request_target',
+    event: { pull_request: { number: 7, head: { sha: head, ref: branch, repo: { full_name: 'duena/proyecto' } }, base: { sha: main, ref: 'main' } } },
+    mode: 'on',
+    context: 'ai-workflows',
+    repository: 'duena/proyecto',
+    workflowRef: 'duena/proyecto/.github/workflows/ai-workflows.yml@refs/heads/main',
+    actionRef: 'a'.repeat(40),
+    runId: 1,
+    serverUrl: 'https://github.com',
+    alsoProtect: [],
+    root,
+  }, { github, fetchObjects: async () => {} });
+  return { head, published };
+}
+
+const signOff = (head: string): PullRequestComment[] => [
+  { body: `/visto-bueno ${head.slice(0, 7)}`, author: 'duena', authorType: 'User', performedViaApp: false, edited: false },
+];
+
+describe('CN-05 closing without the owner sign-off', () => {
+  ran('CN-05');
+
+  it('the judge leaves a visible change pending without the sign-off, saying what to write', async () => {
+    const { head, published } = await judgeOnce('feat/13-boton', () => []);
+    expect(published).toEqual([{ sha: head, state: 'pending', description: expect.stringContaining(`/visto-bueno ${head.slice(0, 7)}`) }]);
+  });
+
+  it('positive control: with the sign-off of the owner for this head, it passes', async () => {
+    const { published } = await judgeOnce('feat/13-boton', signOff);
+    expect(published.map((entry) => entry.state)).toEqual(['success']);
+  });
+});
+
+describe('CN-08 merging from a free folder', () => {
+  ran('CN-08');
+
+  it('the judge rejects a pull request from a libre/ branch, even with the sign-off', async () => {
+    const { published } = await judgeOnce('libre/prueba', signOff);
+    expect(published).toEqual([expect.objectContaining({ state: 'failure', description: expect.stringMatching(/pieza/) })]);
+  });
+
+  it('positive control: the same change from a branch with a piece passes', async () => {
+    const { published } = await judgeOnce('feat/13-boton', signOff);
+    expect(published.map((entry) => entry.state)).toEqual(['success']);
+  });
+});
+
 describe('the report of the thirteen', () => {
   it('declares a reason for each pending case', () => {
     for (const [name, waiting] of Object.entries(NOT_YET_EXECUTABLE)) {
@@ -401,8 +512,8 @@ describe('the report of the thirteen', () => {
     }
   });
 
-  it('has exactly three pending cases', () => {
-    expect(Object.keys(NOT_YET_EXECUTABLE)).toHaveLength(3);
+  it('has exactly one pending case', () => {
+    expect(Object.keys(NOT_YET_EXECUTABLE)).toHaveLength(1);
   });
 });
 

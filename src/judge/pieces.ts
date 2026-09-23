@@ -46,10 +46,15 @@ export function pieceOfBranch(
 ): { piece: string } | { none: string } {
   const pieces = recipe.pieces;
   if (pieces === undefined) return { piece: String(prNumber) };
+  const spanish = languageOf(recipe.locale) === 'es';
 
   for (const pattern of pieces.excludeBranches) {
     if (patternToRegExp(pattern).test(branch)) {
-      return { none: `branch "${branch}" is excluded by "${pattern}"` };
+      return {
+        none: spanish
+          ? `la rama "${branch}" está excluida por "${pattern}" y no nombra ninguna pieza`
+          : `the branch "${branch}" is excluded by "${pattern}" and names no piece`,
+      };
     }
   }
 
@@ -59,7 +64,11 @@ export function pieceOfBranch(
     if (found !== undefined) return { piece: found };
   }
 
-  return { none: `branch "${branch}" does not name a piece` };
+  return {
+    none: spanish
+      ? `la rama "${branch}" no nombra ninguna pieza`
+      : `the branch "${branch}" does not name a piece`,
+  };
 }
 
 function reasonOf(error: unknown): string {
@@ -120,7 +129,12 @@ export async function readDeclaredKind(
   try {
     content = await files.read(path);
   } catch (error) {
-    return { rejected: reasonOf(error) };
+    // Only a file that is too big is a rejection of the piece; any other failure to read is not
+    // an answer about the declared kind, so it propagates and the judge makes the run technical.
+    if (error instanceof Error && /larger than 1 MB/.test(error.message)) {
+      return { rejected: reasonOf(error) };
+    }
+    throw error;
   }
   if (content === undefined) return {};
 

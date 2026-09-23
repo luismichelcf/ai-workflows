@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import { runJudge, type JudgeGitHub, type JudgeInput, type PullRequestComment } from '../src/index.js';
 
-import { commit, git, removeRepositories, repository, write } from './git-fixtures.js';
+import { commit, emptyFolder, git, removeRepositories, repository, write } from './git-fixtures.js';
 
 // PLAN-13-R3 §3 and §4: the judge. Git is real (a temporary repository plays the checkout of the
 // trusted commit, and already holds every object a pull request would bring); GitHub is the
@@ -126,7 +126,13 @@ class FakeGitHub implements JudgeGitHub {
   readonly commentList = new Map<number, PullRequestComment[] | Error>();
   readonly checks = new Map<string, CheckRun[] | Error>();
   readonly statusList = new Map<string, Status[]>();
-  readonly runs = new Map<number, { path: string; event: string }>();
+  readonly runs = new Map<number, { path: string; event: string; headBranch?: string } | Error>();
+  /** Successive answers for the base branch of a PR: the last one repeats. */
+  readonly baseSequence = new Map<number, string[]>();
+  /** When set, every status publication fails with it. */
+  publishError: Error | undefined;
+  /** When set, every read of the statuses fails with it. */
+  statusesError: Error | undefined;
   readonly openWithHead = new Map<string, number[] | Error>();
   readonly forcePushed = new Map<number, string[] | Error>();
   queue: { position: number; headSha: string; baseSha: string; prNumber: number }[] | Error = [];
@@ -174,12 +180,16 @@ class FakeGitHub implements JudgeGitHub {
     this.calls.push(`pullRequest ${n}`);
     const pr = this.prs.get(n);
     if (pr === undefined) throw new Error(`no PR ${n}`);
+    const answer = { ...pr };
     const sequence = this.headSequence.get(n);
     if (sequence !== undefined && sequence.length > 0) {
-      const head = sequence.length > 1 ? sequence.shift() : sequence[0];
-      return { ...pr, headSha: head as string };
+      answer.headSha = (sequence.length > 1 ? sequence.shift() : sequence[0]) as string;
     }
-    return { ...pr };
+    const bases = this.baseSequence.get(n);
+    if (bases !== undefined && bases.length > 0) {
+      answer.baseRef = (bases.length > 1 ? bases.shift() : bases[0]) as string;
+    }
+    return answer;
   }
 
   async openPullRequestsWithHead(sha: string): Promise<number[]> {
@@ -211,12 +221,15 @@ class FakeGitHub implements JudgeGitHub {
 
   async statuses(sha: string): Promise<Status[]> {
     this.calls.push(`statuses ${sha}`);
+    if (this.statusesError !== undefined) throw this.statusesError;
     return [...(this.statusList.get(sha) ?? [])];
   }
 
   async workflowRun(id: number) {
     this.calls.push(`workflowRun ${id}`);
-    return this.runs.get(id);
+    const run = this.runs.get(id);
+    if (run instanceof Error) throw run;
+    return run;
   }
 
   async forcePushedHeads(n: number): Promise<string[]> {
@@ -227,6 +240,7 @@ class FakeGitHub implements JudgeGitHub {
   }
 
   async publishStatus(sha: string, status: { context: string; state: string; description: string; targetUrl: string }) {
+    if (this.publishError !== undefined) throw this.publishError;
     this.published.push({ sha, ...status });
     this.addStatus(sha, { context: status.context, state: status.state, targetUrl: status.targetUrl });
   }
@@ -255,6 +269,8 @@ const byOwner = (body: string, extra: Partial<PullRequestComment> = {}): PullReq
 
 interface World {
   readonly root: string;
+  /** Where pull requests are committed: the root itself, or a separate remote (option `remote`). */
+  readonly work: string;
   readonly main: string;
   readonly github: FakeGitHub;
   readonly fetched: string[];
@@ -268,7 +284,7 @@ interface World {
   judge(overrides?: Partial<JudgeInput>): ReturnType<typeof runJudge>;
 }
 
-function world(mainFiles: Readonly<Record<string, string>> = {}): World {
+function world(mainFiles: Readonly<Record<string, string>> = {}, options: { readonly remote?: boolean } = {}): World {
   const root = repository({
     '.ai-workflows/pipeline.yml': RECIPE,
     'ran.mjs': MARKER,
@@ -279,21 +295,34 @@ function world(mainFiles: Readonly<Record<string, string>> = {}): World {
   git(root, 'switch', '-q', 'main');
   const main = git(root, 'rev-parse', 'HEAD');
   const github = new FakeGitHub(main);
+  // With `remote`, the checkout holds only main, as on GitHub: pull requests and groups live in
+  // another repository and reach the checkout only when the judge fetches them.
+  let work = root;
+  if (options.remote === true) {
+    work = emptyFolder();
+    // The same line endings as the root, or every file would look changed after a commit here.
+    git(work, 'clone', '-q', '-c', 'core.autocrlf=false', root, '.');
+    git(work, 'config', 'user.email', 'test@example.com');
+    git(work, 'config', 'user.name', 'Test');
+    git(work, 'config', 'core.autocrlf', 'false');
+    git(work, 'config', 'uploadpack.allowAnySHA1InWant', 'true');
+  }
   const fetched: string[] = [];
   const gone = new Set<string>();
   let current: { n: number; head: string } | undefined;
 
   const self: World = {
     root,
+    work,
     main,
     github,
     fetched,
     gone,
     pr(n, branch, files) {
-      git(root, 'switch', '-q', '-c', `pr-${n}`, main);
-      for (const [path, content] of Object.entries(files)) write(root, path, content);
-      const head = commit(root, `PR ${n}`);
-      git(root, 'switch', '-q', 'main');
+      git(work, 'switch', '-q', '-c', `pr-${n}`, main);
+      for (const [path, content] of Object.entries(files)) write(work, path, content);
+      const head = commit(work, `PR ${n}`);
+      git(work, 'switch', '-q', 'main');
       github.prs.set(n, { number: n, state: 'open', headSha: head, headRef: branch, baseRef: 'main', headRepo: REPO });
       current = { n, head };
       return head;
@@ -333,6 +362,7 @@ function world(mainFiles: Readonly<Record<string, string>> = {}): World {
         fetchObjects: async (shas) => {
           const missing = shas.filter((sha) => gone.has(sha));
           if (missing.length > 0) throw new Error(`fatal: remote error: upload-pack: not our ref ${missing.join(' ')}`);
+          if (work !== root) git(root, 'fetch', '-q', '--no-tags', work, ...shas);
           fetched.push(...shas);
         },
       });
@@ -969,14 +999,14 @@ describe('SV-03: one pull request failing does not take the others down', () => 
 function mergeGroup(w: World, prs: number[]): string {
   let base = w.main;
   const entries: { position: number; headSha: string; baseSha: string; prNumber: number }[] = [];
-  git(w.root, 'switch', '-q', '--detach', w.main);
+  git(w.work, 'switch', '-q', '--detach', w.main);
   prs.forEach((n, index) => {
-    git(w.root, 'merge', '-q', '--no-ff', '--no-edit', `pr-${n}`);
-    const head = git(w.root, 'rev-parse', 'HEAD');
+    git(w.work, 'merge', '-q', '--no-ff', '--no-edit', `pr-${n}`);
+    const head = git(w.work, 'rev-parse', 'HEAD');
     entries.push({ position: index + 1, headSha: head, baseSha: base, prNumber: n });
     base = head;
   });
-  git(w.root, 'switch', '-q', 'main');
+  git(w.work, 'switch', '-q', 'main');
   w.github.queue = entries;
   return base;
 }
@@ -1193,5 +1223,429 @@ describe('the summary', () => {
     const report = await w.judge();
     expect(report.summary).not.toContain('<script>');
     expect(report.summary).not.toMatch(/ma\|gia/);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Flock review of slice 3, round 1: every case below was a verified finding.
+
+const green = (): CheckRun[] => [{ status: 'completed', conclusion: 'success', app: 'github-actions', url: null }];
+
+describe('flock 1: an imitated status never silences the judge (§3.8 c, R13)', () => {
+  it('a foreign status after our pending: the verdict is still published and the imitation is traced', async () => {
+    const w = world();
+    const head = behaviorPr(w);
+    w.green(7, head);
+    w.github.pendingFromConsoleStep(head);
+    w.github.addStatus(head, { context: 'ai-workflows', state: 'success', targetUrl: 'https://example.com/imitado' });
+
+    const report = await w.judge();
+
+    expect(w.github.on()).toEqual([expect.objectContaining({ sha: head, state: 'success', targetUrl: RUN_URL })]);
+    expect(report.unofficial).toEqual([expect.objectContaining({ url: 'https://example.com/imitado', kind: 'status' })]);
+    expect(w.github.traces).toHaveLength(1);
+  });
+
+  it('a newer status of an older official run does not silence a newer run', async () => {
+    const w = world();
+    const head = behaviorPr(w);
+    w.green(7, head);
+    w.github.pendingFromConsoleStep(head);
+    w.github.runs.set(100, { path: WORKFLOW, event: 'pull_request_target', headBranch: 'feat/13-algo' });
+    w.github.addStatus(head, { context: 'ai-workflows', state: 'pending', targetUrl: `https://github.com/${REPO}/actions/runs/100` });
+    await w.judge();
+    expect(w.github.on().map((entry) => entry.state)).toEqual(['success']);
+  });
+
+  it('when a newer official run owns the status, this one stays quiet but still reports what it saw', async () => {
+    const w = world();
+    const head = behaviorPr(w);
+    w.green(7, head);
+    w.github.addStatus(head, { context: 'ai-workflows', state: 'success', targetUrl: 'https://example.com/imitado' });
+    w.github.pendingFromConsoleStep(head);
+    w.github.runs.set(222, { path: WORKFLOW, event: 'issue_comment', headBranch: 'main' });
+    w.github.addStatus(head, { context: 'ai-workflows', state: 'pending', targetUrl: `https://github.com/${REPO}/actions/runs/222` });
+
+    const report = await w.judge();
+
+    expect(w.github.published).toEqual([]);
+    expect(report.unofficial).toEqual([expect.objectContaining({ url: 'https://example.com/imitado' })]);
+    expect(report.summary).toContain('https://example.com/imitado');
+  });
+});
+
+describe('flock 1: an official run comes from the main branch (§3.7)', () => {
+  it('a copy of the judge dispatched from another branch is reported, not trusted', async () => {
+    const w = world();
+    const head = behaviorPr(w);
+    w.green(7, head);
+    w.github.runs.set(444, { path: WORKFLOW, event: 'workflow_dispatch', headBranch: 'feat/13-algo' });
+    w.github.addStatus(head, { context: 'ai-workflows', state: 'success', targetUrl: `https://github.com/${REPO}/actions/runs/444` });
+    w.github.pendingFromConsoleStep(head);
+    const report = await w.judge();
+    expect(report.unofficial).toEqual([expect.objectContaining({ url: `https://github.com/${REPO}/actions/runs/444` })]);
+  });
+
+  it('positive: dispatched from main, and a merge group run from the queue branch, are official', async () => {
+    const w = world();
+    const head = behaviorPr(w);
+    w.green(7, head);
+    w.github.runs.set(445, { path: WORKFLOW, event: 'workflow_dispatch', headBranch: 'main' });
+    w.github.runs.set(446, { path: WORKFLOW, event: 'merge_group', headBranch: `gh-readonly-queue/main/pr-7-${w.main}` });
+    w.github.addStatus(head, { context: 'ai-workflows', state: 'failure', targetUrl: `https://github.com/${REPO}/actions/runs/445` });
+    w.github.addStatus(head, { context: 'ai-workflows', state: 'failure', targetUrl: `https://github.com/${REPO}/actions/runs/446` });
+    w.github.pendingFromConsoleStep(head);
+    const report = await w.judge();
+    expect(report.unofficial).toEqual([]);
+  });
+
+  it('an official path with an event outside §3.2 is not official', async () => {
+    const w = world();
+    const head = behaviorPr(w);
+    w.green(7, head);
+    w.github.runs.set(447, { path: WORKFLOW, event: 'push', headBranch: 'main' });
+    w.github.addStatus(head, { context: 'ai-workflows', state: 'success', targetUrl: `https://github.com/${REPO}/actions/runs/447` });
+    w.github.pendingFromConsoleStep(head);
+    const report = await w.judge();
+    expect(report.unofficial).toEqual([expect.objectContaining({ url: `https://github.com/${REPO}/actions/runs/447` })]);
+  });
+
+  it('a trace that cannot be read is said in the notes and the summary, and the verdict stands', async () => {
+    const w = world();
+    const head = behaviorPr(w);
+    w.green(7, head);
+    w.github.runs.set(448, new Error('HTTP 403: Resource not accessible by integration'));
+    w.github.addStatus(head, { context: 'ai-workflows', state: 'success', targetUrl: `https://github.com/${REPO}/actions/runs/448` });
+    w.github.addStatus(head, { context: 'ai-workflows', state: 'success', targetUrl: 'https://example.com/otro' });
+    w.github.pendingFromConsoleStep(head);
+    const report = await w.judge();
+    expect(w.github.on().map((entry) => entry.state)).toEqual(['success']);
+    expect(report.notes.join(' ')).toContain('403');
+    expect(report.summary).toContain('403');
+    // The failure on one status does not stop the others from being checked.
+    expect(report.unofficial).toEqual(expect.arrayContaining([expect.objectContaining({ url: 'https://example.com/otro' })]));
+  });
+
+  it('escapes what an imitator controls in the summary and in the trace comment', async () => {
+    const w = world();
+    const head = behaviorPr(w);
+    w.green(7, head);
+    const hostile = 'https://example.com/x)<img src=x onerror=alert(1)>[pulsa](https://evil.test)';
+    w.github.addStatus(head, { context: 'ai-workflows', state: 'success', targetUrl: hostile });
+    w.github.pendingFromConsoleStep(head);
+    const report = await w.judge();
+    expect(report.summary).not.toContain('<img');
+    expect(w.github.traces[0]?.body ?? '').not.toContain('<img');
+    expect(w.github.traces[0]?.body ?? '').not.toContain('](https://evil.test)');
+  });
+});
+
+describe('flock 1: objects are fetched before they are read', () => {
+  it('a pull request whose head is only on the remote is judged, not rejected', async () => {
+    const w = world({}, { remote: true });
+    const head = behaviorPr(w);
+    w.green(7, head);
+    w.github.pendingFromConsoleStep(head);
+    const report = await w.judge();
+    expect(report.pieces[0]?.verdict).toBe('passed');
+    expect(w.github.on().map((entry) => entry.state)).toEqual(['success']);
+  });
+
+  it('a merge group that is only on the remote is judged', async () => {
+    const w = world({}, { remote: true });
+    const seven = behaviorPr(w, 7, 'feat/13-a');
+    w.green(7, seven);
+    const group = mergeGroup(w, [7]);
+    w.github.setCheck(group, 'todo-verde', green());
+    w.github.setCheck(group, 'ai-workflows/red-test', green());
+    w.github.pendingFromConsoleStep(group);
+    await w.judge(groupInput(w, group));
+    expect(w.github.on()).toEqual([expect.objectContaining({ sha: group, state: 'success' })]);
+  });
+
+  it('a head that cannot be fetched is technical (error), never a rejection', async () => {
+    const w = world({}, { remote: true });
+    const head = behaviorPr(w);
+    w.green(7, head);
+    w.gone.add(head);
+    w.github.pendingFromConsoleStep(head);
+    await w.judge();
+    expect(w.github.on().map((entry) => entry.state)).toEqual(['error']);
+  });
+
+  it('a fork is judged the same way (its head reaches the checkout as objects)', async () => {
+    const w = world({}, { remote: true });
+    const head = behaviorPr(w);
+    w.green(7, head);
+    const pr = w.github.prs.get(7);
+    if (pr) pr.headRepo = 'alguien/fork';
+    w.github.pendingFromConsoleStep(head);
+    const input = w.input();
+    (input.event as { pull_request: { head: { repo: { full_name: string } } } }).pull_request.head.repo.full_name = 'alguien/fork';
+    await runJudge(input, { github: w.github, fetchObjects: async (shas) => { git(w.root, 'fetch', '-q', '--no-tags', w.work, ...shas); } });
+    expect(w.github.on().map((entry) => entry.state)).toEqual(['success']);
+  });
+});
+
+describe('flock 1: failures are technical, never a rejection or a green', () => {
+  it('comments that cannot be read for the judge files attestation: error', async () => {
+    const w = world();
+    const head = w.pr(7, 'feat/13', { 'docs/plans/PLAN-13.md': PLAN('comportamiento'), '.ai-workflows/blocks/x/block.yml': 'x\n', 'tests/x.test.ts': 't\n' });
+    w.green(7, head);
+    w.github.commentList.set(7, new Error('HTTP 502 Bad Gateway'));
+    w.github.pendingFromConsoleStep(head);
+    await w.judge();
+    expect(w.github.on().map((entry) => entry.state)).toEqual(['error']);
+  });
+
+  it('a stage whose server part throws is technical, the others are judged, and error is published', async () => {
+    const w = world({
+      '.ai-workflows/pipeline.yml': RECIPE.replace('with: { file: "docs/plans/PLAN-{piece}.md", sections: ["En tres líneas"] }', 'with: { file: "docs/specs/SPEC-{piece}.md", sections: ["En tres líneas"] }'),
+    });
+    const head = w.pr(7, 'feat/13', {
+      'docs/plans/PLAN-13.md': PLAN('comportamiento'),
+      'docs/specs/SPEC-13.md': 'x'.repeat(1024 * 1024 + 10),
+      'app/page.tsx': 'x\n',
+    });
+    w.green(7, head);
+    w.github.pendingFromConsoleStep(head);
+    const report = await w.judge();
+    expect(stageOf(report, 'spec')?.outcome).toBe('technical');
+    expect(stageOf(report, 'checks')?.outcome).toBe('passed');
+    expect(stageOf(report, 'owner-approval')?.outcome).toBe('passed');
+    expect(w.github.on().map((entry) => entry.state)).toEqual(['error']);
+  });
+
+  it('a pull request without any change is judged, not a crash: the stages that need files are technical', async () => {
+    const w = world();
+    git(w.work, 'switch', '-q', '-c', 'pr-7', w.main);
+    const head = commit(w.work, 'nothing');
+    git(w.work, 'switch', '-q', 'main');
+    w.github.prs.set(7, { number: 7, state: 'open', headSha: head, headRef: 'feat/13', baseRef: 'main', headRepo: REPO });
+    w.green(7, head);
+    w.github.pendingFromConsoleStep(head);
+    const input = w.input();
+    (input as { event: unknown }).event = {
+      pull_request: { number: 7, head: { sha: head, ref: 'feat/13', repo: { full_name: REPO } }, base: { sha: w.main, ref: 'main' } },
+      repository: { full_name: REPO, default_branch: 'main' },
+    };
+    await runJudge(input, { github: w.github, fetchObjects: async () => {} });
+    expect(w.github.on().map((entry) => entry.state)).toEqual(['error']);
+  });
+
+  it('a status that cannot be published makes the run fail, so the action closes with error', async () => {
+    const w = world();
+    const head = behaviorPr(w);
+    w.green(7, head);
+    w.github.pendingFromConsoleStep(head);
+    w.github.publishError = new Error('HTTP 403: Resource not accessible by integration');
+    await expect(w.judge()).rejects.toThrow(/403/);
+    expect(w.github.published).toEqual([]);
+  });
+
+  it('statuses that cannot be read before publishing: nothing is published and the run fails', async () => {
+    const w = world();
+    const head = behaviorPr(w);
+    w.green(7, head);
+    w.github.pendingFromConsoleStep(head);
+    w.github.statusesError = new Error('HTTP 502 Bad Gateway');
+    await expect(w.judge()).rejects.toThrow(/502/);
+    expect(w.github.published).toEqual([]);
+  });
+
+  it('technical wins over rejected', async () => {
+    const w = world();
+    const head = w.pr(7, 'feat/13', { 'docs/plans/PLAN-13.md': lines('# sin secciones', 'Tipo de cambio: comportamiento'), 'app/page.tsx': 'x\n' });
+    w.green(7, head);
+    w.github.commentList.set(7, new Error('HTTP 502 Bad Gateway'));
+    w.github.pendingFromConsoleStep(head);
+    const report = await w.judge();
+    expect(stageOf(report, 'spec')?.outcome).toBe('rejected');
+    expect(report.pieces[0]?.verdict).toBe('technical');
+    expect(w.github.on().map((entry) => entry.state)).toEqual(['error']);
+  });
+
+  it('a commit status still pending waits', async () => {
+    const w = world();
+    const head = behaviorPr(w);
+    w.green(7, head);
+    w.github.setCheck(head, 'todo-verde', []);
+    w.github.addStatus(head, { context: 'todo-verde', state: 'pending', targetUrl: null });
+    w.github.pendingFromConsoleStep(head);
+    const report = await w.judge();
+    expect(stageOf(report, 'checks')?.outcome).toBe('waiting');
+  });
+
+  it('an optional stage that fails is reported and does not block', async () => {
+    const w = world({
+      '.ai-workflows/pipeline.yml': RECIPE.replace(
+        '  - id: owner-approval',
+        '  - id: extra\n    summary: "Informativa"\n    after: checks\n    required: false\n    nature: recompute\n    gate:\n      run: node ran.mjs\n    server: { require-check: extra }\n  - id: owner-approval',
+      ).replace('    after: checks\n    nature: attest', '    after: extra\n    nature: attest'),
+    });
+    const head = behaviorPr(w);
+    w.green(7, head);
+    w.github.setCheck(head, 'extra', [{ status: 'completed', conclusion: 'failure', app: 'github-actions', url: null }]);
+    w.github.pendingFromConsoleStep(head);
+    const report = await w.judge();
+    expect(stageOf(report, 'extra')?.outcome).toBe('informative');
+    expect(report.pieces[0]?.verdict).toBe('passed');
+    expect(w.github.on().map((entry) => entry.state)).toEqual(['success']);
+  });
+});
+
+describe('flock 1: the target branch, checked again before publishing (§3.1)', () => {
+  it('a PR retargeted while it is judged publishes nothing', async () => {
+    const w = world();
+    const head = behaviorPr(w);
+    w.green(7, head);
+    w.github.baseSequence.set(7, ['main', 'develop']);
+    w.github.pendingFromConsoleStep(head);
+    const report = await w.judge();
+    expect(w.github.published).toEqual([]);
+    expect(report.notes.join(' ')).toMatch(/develop/);
+  });
+
+  it('an event that says develop is enough, even if the live base says main', async () => {
+    const w = world();
+    const head = behaviorPr(w);
+    w.green(7, head);
+    w.github.pendingFromConsoleStep(head);
+    const input = w.input();
+    (input.event as { pull_request: { base: { ref: string } } }).pull_request.base.ref = 'develop';
+    await runJudge(input, { github: w.github, fetchObjects: async () => {} });
+    expect(w.github.published).toEqual([]);
+  });
+
+  it('a PR into another branch receives nothing, not even an error for a broken recipe', async () => {
+    const w = world({ '.ai-workflows/pipeline.yml': 'version: 2\n' });
+    const head = behaviorPr(w);
+    const pr = w.github.prs.get(7);
+    if (pr) pr.baseRef = 'develop';
+    w.github.runs.set(RUN, { path: WORKFLOW, event: 'issue_comment', headBranch: 'main' });
+    w.github.pendingFromConsoleStep(head);
+    await w.judge({ eventName: 'issue_comment', event: { issue: { number: 7, pull_request: {} }, comment: { body: '/x' }, repository: { full_name: REPO } } });
+    expect(w.github.published).toEqual([]);
+  });
+
+  it('workflow_run with PRs on one head judges each, skipping one into another branch', async () => {
+    const w = world();
+    const head = behaviorPr(w);
+    w.green(7, head);
+    w.github.prs.set(8, { number: 8, state: 'open', headSha: head, headRef: 'feat/13-algo', baseRef: 'main', headRepo: REPO });
+    w.github.prs.set(9, { number: 9, state: 'open', headSha: head, headRef: 'feat/13-algo', baseRef: 'develop', headRepo: REPO });
+    w.github.commentList.set(8, []);
+    w.github.openWithHead.set(head, [7, 8, 9]);
+    w.github.runs.set(RUN, { path: WORKFLOW, event: 'workflow_run', headBranch: 'main' });
+    w.github.pendingFromConsoleStep(head);
+    const report = await w.judge({ eventName: 'workflow_run', event: { workflow_run: { event: 'pull_request', head_sha: head, pull_requests: [] }, repository: { full_name: REPO } } });
+    expect(report.pieces.map((piece) => [piece.pr, piece.verdict])).toEqual([[7, 'passed'], [8, 'waiting']]);
+    expect(w.github.on()).toEqual([expect.objectContaining({ sha: head, state: 'pending' })]);
+  });
+});
+
+describe('flock 1: main moves, and the queue', () => {
+  it('SV-05(b): judged again with the recipe of the new main', async () => {
+    const w = world();
+    const head = behaviorPr(w);
+    w.green(7, head);
+    w.github.setCheck(head, 'todo-verde', []);
+    write(w.root, '.ai-workflows/pipeline.yml', RECIPE.replace(/ {2}- id: checks[\s\S]*?server: \{ require-check: todo-verde \}\n/, '').replace('    after: checks\n', '    after: red-test\n'));
+    const newer = commit(w.root, 'main drops checks');
+    w.github.mainHeads = [w.main, newer, newer];
+    w.github.pendingFromConsoleStep(head);
+    const report = await w.judge();
+    expect(stageOf(report, 'checks')).toBeUndefined();
+    expect(w.github.on().map((entry) => entry.state)).toEqual(['success']);
+  });
+
+  it('after main moves during a merge group, the new main must still be an ancestor of the group', async () => {
+    const w = world();
+    const seven = behaviorPr(w, 7, 'feat/13-a');
+    w.green(7, seven);
+    const group = mergeGroup(w, [7]);
+    w.github.setCheck(group, 'todo-verde', green());
+    w.github.setCheck(group, 'ai-workflows/red-test', green());
+    write(w.root, 'README.md', 'elsewhere\n');
+    const elsewhere = commit(w.root, 'main moves elsewhere');
+    w.github.mainHeads = [w.main, elsewhere, elsewhere];
+    w.github.pendingFromConsoleStep(group);
+    await w.judge(groupInput(w, group));
+    expect(w.github.on()).toEqual([expect.objectContaining({ sha: group, state: 'error' })]);
+  });
+
+  it('workflow_run of a merge group also requires main to be an ancestor of the group', async () => {
+    const w = world();
+    const seven = behaviorPr(w, 7, 'feat/13-a');
+    w.green(7, seven);
+    const group = mergeGroup(w, [7]);
+    w.github.setCheck(group, 'todo-verde', green());
+    w.github.setCheck(group, 'ai-workflows/red-test', green());
+    write(w.root, 'README.md', 'elsewhere\n');
+    w.github.mainHeads = [commit(w.root, 'main moves elsewhere')];
+    w.github.runs.set(RUN, { path: WORKFLOW, event: 'workflow_run', headBranch: 'main' });
+    w.github.pendingFromConsoleStep(group);
+    await w.judge({ eventName: 'workflow_run', event: { workflow_run: { event: 'merge_group', head_sha: group, head_branch: `gh-readonly-queue/main/pr-7-${w.main}`, pull_requests: [] }, repository: { full_name: REPO } } });
+    expect(w.github.on()).toEqual([expect.objectContaining({ sha: group, state: 'error' })]);
+  });
+
+  it('only the PRs of the queue up to the group are judged', async () => {
+    const w = world();
+    const seven = behaviorPr(w, 7, 'feat/13-a');
+    const eight = w.pr(8, 'feat/14-b', { 'lib/b.ts': 'b\n' });
+    w.green(7, seven);
+    w.green(8, eight);
+    mergeGroup(w, [7, 8]);
+    const first = (w.github.queue as { headSha: string }[])[0]?.headSha as string;
+    w.github.setCheck(first, 'todo-verde', green());
+    w.github.setCheck(first, 'ai-workflows/red-test', green());
+    w.github.pendingFromConsoleStep(first);
+    const report = await w.judge(groupInput(w, first));
+    expect(report.pieces.map((piece) => piece.pr)).toEqual([7]);
+  });
+});
+
+describe('flock 1: the validity of an approval on the server (§3.6)', () => {
+  for (const validity of ['same-sha', 'same-fingerprint-or-clean-update']) {
+    it(`${validity}: a sign-off of an earlier commit with the same changes does not count; one of the head does`, async () => {
+      const recipe = RECIPE.replace('    valid-while: same-fingerprint\n', `    valid-while: ${validity}\n`);
+      for (const signHead of [false, true]) {
+        const w = world({ '.ai-workflows/pipeline.yml': recipe });
+        const first = behaviorPr(w);
+        git(w.work, 'switch', '-q', 'pr-7');
+        const next = commit(w.work, 'empty');
+        git(w.work, 'switch', '-q', 'main');
+        const pr = w.github.prs.get(7);
+        if (pr) pr.headSha = next;
+        w.green(7, next);
+        w.github.commentList.set(7, [byOwner(`/visto-bueno ${(signHead ? next : first).slice(0, 7)}`)]);
+        w.github.pendingFromConsoleStep(next);
+        const input = w.input();
+        (input.event as { pull_request: { head: { sha: string } } }).pull_request.head.sha = next;
+        const report = await runJudge(input, { github: w.github, fetchObjects: async () => {} });
+        expect(stageOf(report, 'owner-approval')?.outcome, `${validity} ${String(signHead)}`).toBe(signHead ? 'passed' : 'waiting');
+      }
+    });
+  }
+});
+
+describe('flock 1: the language of the recipe (§3.8)', () => {
+  it('with locale: en, what is published is in English', async () => {
+    const w = world({ '.ai-workflows/pipeline.yml': RECIPE.replace('locale: es', 'locale: en') });
+    const free = w.pr(7, 'libre/x', { 'docs/x.md': 'x\n' });
+    w.github.pendingFromConsoleStep(free);
+    const report = await w.judge();
+    const description = w.github.on()[0]?.description ?? '';
+    expect(description).toMatch(/piece/i);
+    expect(description).not.toMatch(/pieza|rama|no pertenece/i);
+    expect(report.summary).not.toMatch(/pieza|Etapa|Resultado/);
+
+    const w2 = world({ '.ai-workflows/pipeline.yml': RECIPE.replace('locale: es', 'locale: en') });
+    const head = behaviorPr(w2);
+    w2.green(7, head);
+    w2.github.commentList.set(7, []);
+    w2.github.pendingFromConsoleStep(head);
+    await w2.judge();
+    expect(w2.github.on()[0]?.description ?? '').not.toMatch(/Falta|dueñ|visto/i);
   });
 });

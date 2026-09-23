@@ -4,13 +4,21 @@
 
 import { safeTerminalText } from '../safe-text.js';
 
-/** Escapes one piece of text for Markdown: controls, HTML and the table cell separator. */
+/**
+ * Escapes one piece of text for Markdown: controls, HTML, the table cell separator and the
+ * brackets and parentheses of a link, so nothing that came from outside can inject markup or a
+ * clickable link.
+ */
 export function escapeReportText(text: string): string {
   return safeTerminalText(text)
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
     .replace(/\|/g, '\\|')
+    .replace(/\[/g, '\\[')
+    .replace(/\]/g, '\\]')
+    .replace(/\(/g, '\\(')
+    .replace(/\)/g, '\\)')
     .replace(/\r?\n/g, ' ');
 }
 
@@ -45,6 +53,7 @@ export function buildSummary(
   pieces: readonly SummaryPiece[],
   unofficial: readonly SummaryUnofficial[],
   locale: string,
+  notes: readonly string[] = [],
 ): string {
   const spanish = isSpanish(locale);
   const lines: string[] = [spanish ? '# Juez de ai-workflows' : '# ai-workflows judge', ''];
@@ -66,8 +75,16 @@ export function buildSummary(
     lines.push(spanish ? '## Estados de origen no oficial' : '## Statuses of unofficial origin');
     for (const entry of unofficial) {
       const detail = entry.app === undefined ? '' : ` (${escapeReportText(entry.app)})`;
-      lines.push(`- ${escapeReportText(entry.context)} [${entry.kind}]${detail}: ${entry.url ?? ''}`);
+      lines.push(
+        `- ${escapeReportText(entry.context)} [${entry.kind}]${detail}: ${escapeReportText(entry.url ?? '')}`,
+      );
     }
+    lines.push('');
+  }
+
+  if (notes.length > 0) {
+    lines.push(spanish ? '## Notas' : '## Notes');
+    for (const note of notes) lines.push(`- ${escapeReportText(note)}`);
     lines.push('');
   }
 

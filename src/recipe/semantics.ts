@@ -360,6 +360,9 @@ function validateBranchPattern(item: YamlNode, requirePiece: boolean): string | 
   if (!BRANCH_CHARS.test(pattern.split('{piece}').join(''))) {
     return `unsupported character in branch pattern "${pattern}"`;
   }
+  if (pattern.includes('*{piece}') || pattern.includes('{piece}*')) {
+    return `a star cannot touch {piece} in branch pattern "${pattern}"`;
+  }
   return undefined;
 }
 

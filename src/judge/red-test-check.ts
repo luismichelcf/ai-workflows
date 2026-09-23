@@ -8,7 +8,7 @@ import { filesMatching, runTests } from '../blocks/test-run.js';
 import { isGreenRun, isRedEvidence, parseTestRun, type TestRunSummary } from '../commands.js';
 import type { GateContext } from '../contract.js';
 import { gitEnvironment } from '../git-env.js';
-import { appliesIfFor } from '../recipe/applies.js';
+import { appliesIfFor, languageOf } from '../recipe/applies.js';
 import { checkRecipe } from '../recipe/blocks.js';
 import {
   describeChangeFromCommits,
@@ -18,6 +18,7 @@ import {
 import type { Recipe, RecipeStage } from '../recipe/types.js';
 import { pieceOfBranch, readDeclaredKind } from './pieces.js';
 import type { JudgeGitHub, MergeQueueEntry } from './port.js';
+import { escapeReportText } from './summary.js';
 
 // PLAN-13-R3 §5: the unprivileged job `ai-workflows/red-test`. For every piece the `red-test`
 // stage applies to, the new or changed tests are copied from the head into a throwaway worktree
@@ -39,6 +40,15 @@ const FORBIDDEN_ENV = /TOKEN|SECRET|PASSWORD|KEY|^ACTIONS_|^GH_/i;
 
 function reasonOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * PLAN-13-R3 §5: everything that came from the pull request (branches, paths, declared values,
+ * motives) is sanitised and escaped before it reaches the summary: no raw controls, HTML, table
+ * separators or link brackets.
+ */
+function escapeText(text: string): string {
+  return escapeReportText(text).replace(/\[/g, '\\[').replace(/\]/g, '\\]');
 }
 
 function recordOf(value: unknown): Record<string, unknown> | undefined {
@@ -134,6 +144,8 @@ interface CheckPr {
   /** The head of the pull request itself; the change and its declared kind are read from it. */
   readonly headSha: string;
   readonly headRef: string;
+  /** The branch the pull request targets; one that does not target the main branch is not judged. */
+  readonly baseRef: string;
   /** The commit the tests run against. */
   readonly baseSha: string;
   /** The commit the tests are copied from and must pass against. */
@@ -156,11 +168,19 @@ async function collectPullRequests(
     const head = fieldOf(pull, 'head');
     const headSha = stringOf(fieldOf(head, 'sha'));
     const headRef = stringOf(fieldOf(head, 'ref'));
-    const baseSha = stringOf(fieldOf(fieldOf(pull, 'base'), 'sha'));
-    if (number === undefined || headSha === undefined || headRef === undefined || baseSha === undefined) {
+    const base = fieldOf(pull, 'base');
+    const baseSha = stringOf(fieldOf(base, 'sha'));
+    const baseRef = stringOf(fieldOf(base, 'ref'));
+    if (
+      number === undefined ||
+      headSha === undefined ||
+      headRef === undefined ||
+      baseSha === undefined ||
+      baseRef === undefined
+    ) {
       return { ok: false, reason: 'La carga del evento no trae el PR con su cabeza y su base.' };
     }
-    return { ok: true, prs: [{ number, headSha, headRef, baseSha, runHead: headSha }] };
+    return { ok: true, prs: [{ number, headSha, headRef, baseRef, baseSha, runHead: headSha }] };
   }
 
   if (eventName === 'merge_group') {
@@ -191,6 +211,7 @@ async function collectPullRequests(
         number: entry.prNumber,
         headSha: pr.headSha,
         headRef: pr.headRef,
+        baseRef: pr.baseRef,
         baseSha: entry.baseSha,
         runHead: groupSha,
       });
@@ -202,20 +223,38 @@ async function collectPullRequests(
 }
 
 // The motives of the `red-test` block (PLAN-13-R2 §3.4), in the recipe's locale.
-function noTestsReason(): string {
-  return 'La pieza no trae pruebas: sin una prueba que falle por su aserción no hay autorización para construir.';
+function noTestsReason(spanish: boolean): string {
+  return spanish
+    ? 'La pieza no trae pruebas: sin una prueba que falle por su aserción no hay autorización para construir.'
+    : 'The piece brings no tests: without a test that fails by its own assertion there is no authorisation to build.';
 }
 
-function greenReason(): string {
-  return 'La prueba pasó: no está roja.';
+function greenReason(spanish: boolean): string {
+  return spanish ? 'La prueba pasó: no está roja.' : 'The test passed: it is not red.';
 }
 
-function brokenReason(): string {
-  return 'La prueba falló por importación o entorno, no por su aserción.';
+function brokenReason(spanish: boolean): string {
+  return spanish
+    ? 'La prueba falló por importación o entorno, no por su aserción.'
+    : 'The test failed by import or environment, not by its assertion.';
 }
 
-function headFailedReason(): string {
-  return 'La prueba no pasó contra la cabeza.';
+function headFailedReason(spanish: boolean): string {
+  return spanish ? 'La prueba no pasó contra la cabeza.' : 'The test did not pass against the head.';
+}
+
+function noCommandReason(spanish: boolean): string {
+  return spanish ? 'La etapa no trae un comando que correr.' : 'The stage brings no command to run.';
+}
+
+function passedReason(spanish: boolean): string {
+  return spanish
+    ? 'La prueba falla contra la base y pasa contra la cabeza.'
+    : 'The test fails against the base and passes against the head.';
+}
+
+function couldNotRunReason(spanish: boolean, detail: string): string {
+  return spanish ? `No se pudo correr la prueba: ${detail}` : `The test could not be run: ${detail}`;
 }
 
 interface StageOutcome {
@@ -226,8 +265,11 @@ interface StageOutcome {
 
 interface PrOutcome {
   readonly number: number;
+  readonly headRef?: string;
   readonly piece?: string;
   readonly failure?: string;
+  /** Something to say about a PR that was not judged (a target branch other than the main one). */
+  readonly note?: string;
   readonly stages: readonly StageOutcome[];
 }
 
@@ -289,6 +331,7 @@ async function checkStage(
   pr: CheckPr,
   piece: string,
 ): Promise<StageOutcome> {
+  const spanish = languageOf(context.recipe.locale) === 'es';
   const applies = appliesIfFor(context.recipe, stage.id);
   const gateContext: GateContext = {
     piece,
@@ -312,7 +355,7 @@ async function checkStage(
 
   const command = asString(withField(stage, 'command'));
   if (command === undefined || command.length === 0) {
-    return { id: stage.id, outcome: 'failed', reason: 'La etapa no trae un comando que correr.' };
+    return { id: stage.id, outcome: 'failed', reason: noCommandReason(spanish) };
   }
   const providedTests = asStringList(withField(stage, 'tests'));
   const testsGlobs = providedTests.length > 0 ? providedTests : stageTests();
@@ -326,7 +369,7 @@ async function checkStage(
   for (const file of candidates) {
     if (await existsAt(context.root, pr.headSha, file)) testFiles.push(file);
   }
-  if (testFiles.length === 0) return { id: stage.id, outcome: 'failed', reason: noTestsReason() };
+  if (testFiles.length === 0) return { id: stage.id, outcome: 'failed', reason: noTestsReason(spanish) };
 
   const timeoutMs = timeoutMinutes * MINUTES_MS;
 
@@ -334,13 +377,13 @@ async function checkStage(
   try {
     redSummary = await runOnce(context, pr.baseSha, pr.runHead, testFiles, command, timeoutMs, piece);
   } catch (error) {
-    return { id: stage.id, outcome: 'failed', reason: `No se pudo correr la prueba: ${reasonOf(error)}` };
+    return { id: stage.id, outcome: 'failed', reason: couldNotRunReason(spanish, reasonOf(error)) };
   }
   if (!isRedEvidence(redSummary)) {
     return {
       id: stage.id,
       outcome: 'failed',
-      reason: isGreenRun(redSummary) ? greenReason() : brokenReason(),
+      reason: isGreenRun(redSummary) ? greenReason(spanish) : brokenReason(spanish),
     };
   }
 
@@ -348,11 +391,11 @@ async function checkStage(
   try {
     greenSummary = await runOnce(context, pr.runHead, pr.runHead, testFiles, command, timeoutMs, piece);
   } catch (error) {
-    return { id: stage.id, outcome: 'failed', reason: `No se pudo correr la prueba: ${reasonOf(error)}` };
+    return { id: stage.id, outcome: 'failed', reason: couldNotRunReason(spanish, reasonOf(error)) };
   }
-  if (!isGreenRun(greenSummary)) return { id: stage.id, outcome: 'failed', reason: headFailedReason() };
+  if (!isGreenRun(greenSummary)) return { id: stage.id, outcome: 'failed', reason: headFailedReason(spanish) };
 
-  return { id: stage.id, outcome: 'passed', reason: 'La prueba falla contra la base y pasa contra la cabeza.' };
+  return { id: stage.id, outcome: 'passed', reason: passedReason(spanish) };
 }
 
 async function checkPullRequest(
@@ -360,8 +403,16 @@ async function checkPullRequest(
   pr: CheckPr,
   trusted: string,
 ): Promise<PrOutcome> {
-  const base: { number: number; piece?: string; failure?: string; stages: StageOutcome[] } = {
+  const base: {
+    number: number;
+    headRef?: string;
+    piece?: string;
+    failure?: string;
+    note?: string;
+    stages: StageOutcome[];
+  } = {
     number: pr.number,
+    headRef: pr.headRef,
     stages: [],
   };
 
@@ -408,27 +459,50 @@ async function checkPullRequest(
 
 function renderSummary(
   prs: readonly PrOutcome[],
-  anyStage: boolean,
+  locale: string,
   detail: string | undefined,
 ): string {
-  const lines: string[] = ['# Prueba roja en GitHub', ''];
+  const spanish = languageOf(locale) === 'es';
+  const lines: string[] = [
+    spanish ? '# Prueba roja en GitHub' : '# Red test on GitHub',
+    '',
+  ];
   if (detail !== undefined) {
-    lines.push(detail, '');
+    lines.push(escapeText(detail), '');
     return lines.join('\n');
   }
-  if (!anyStage) lines.push('Ninguna etapa `red-test` aplicó a esta corrida.', '');
+  const applied = prs.some((pr) => pr.stages.some((stage) => stage.outcome !== 'skipped'));
+  if (!applied) {
+    lines.push(
+      spanish
+        ? 'Ninguna etapa `red-test` aplicó a esta corrida.'
+        : 'No `red-test` stage applied to this run.',
+      '',
+    );
+  }
   for (const pr of prs) {
     lines.push(`## #${pr.number}`);
-    if (pr.piece !== undefined) lines.push(`Pieza: ${pr.piece}.`);
+    if (pr.headRef !== undefined) {
+      lines.push(`${spanish ? 'Rama' : 'Branch'}: ${escapeText(pr.headRef)}.`);
+    }
+    if (pr.piece !== undefined) {
+      lines.push(`${spanish ? 'Pieza' : 'Piece'}: ${escapeText(pr.piece)}.`);
+    }
+    if (pr.note !== undefined) lines.push(`- ${escapeText(pr.note)}`);
     if (pr.stages.length === 0 && pr.failure !== undefined) {
-      lines.push(`- No se pudo juzgar: ${pr.failure}`);
+      lines.push(
+        `- ${spanish ? 'No se pudo juzgar' : 'Could not be judged'}: ${escapeText(pr.failure)}`,
+      );
     }
     for (const stage of pr.stages) {
-      if (stage.outcome === 'passed') lines.push(`- ${stage.id}: pasó.`);
-      else lines.push(`- ${stage.id}: ${stage.reason}`);
+      if (stage.outcome === 'passed') {
+        lines.push(`- ${escapeText(stage.id)}: ${spanish ? 'pasó' : 'passed'}.`);
+      } else {
+        lines.push(`- ${escapeText(stage.id)}: ${escapeText(stage.reason)}`);
+      }
     }
     if (pr.stages.length > 0 && pr.failure !== undefined) {
-      lines.push(`- Resultado: rechazado.`);
+      lines.push(`- ${spanish ? 'Resultado: rechazado.' : 'Result: rejected.'}`);
     }
     lines.push('');
   }
@@ -454,7 +528,7 @@ export async function runRedTestCheck(
   try {
     branch = await deps.github.defaultBranch();
   } catch (error) {
-    return { ok: false, summary: renderSummary([], false, `No se pudo leer la rama principal: ${reasonOf(error)}`) };
+    return { ok: false, summary: renderSummary([], 'es', `No se pudo leer la rama principal: ${reasonOf(error)}`) };
   }
 
   let trusted: string;
@@ -463,12 +537,12 @@ export async function runRedTestCheck(
   } catch (error) {
     return {
       ok: false,
-      summary: renderSummary([], false, `No se pudo leer la punta de ${branch}: ${reasonOf(error)}`),
+      summary: renderSummary([], 'es', `No se pudo leer la punta de ${branch}: ${reasonOf(error)}`),
     };
   }
 
   const collected = await collectPullRequests(eventName, event, deps.github, branch);
-  if (!collected.ok) return { ok: false, summary: renderSummary([], false, collected.reason) };
+  if (!collected.ok) return { ok: false, summary: renderSummary([], 'es', collected.reason) };
 
   const shas = new Set<string>([trusted]);
   for (const pr of collected.prs) {
@@ -479,17 +553,36 @@ export async function runRedTestCheck(
   try {
     await deps.fetchObjects([...shas]);
   } catch (error) {
-    return { ok: false, summary: renderSummary([], false, `No se pudieron traer los commits a juzgar: ${reasonOf(error)}`) };
+    return { ok: false, summary: renderSummary([], 'es', `No se pudieron traer los commits a juzgar: ${reasonOf(error)}`) };
   }
 
   const recipeText = await showFile(root, trusted, RECIPE_PATH);
   if (recipeText === undefined) {
-    return { ok: false, summary: renderSummary([], false, `No hay receta legible en ${trusted}:${RECIPE_PATH}.`) };
+    return { ok: false, summary: renderSummary([], 'es', `No hay receta legible en ${trusted}:${RECIPE_PATH}.`) };
   }
   const checked = await checkRecipe(recipeText, RECIPE_PATH, { root });
   if (!checked.ok) {
     const first = checked.errors[0];
-    return { ok: false, summary: renderSummary([], false, `La receta de ${trusted} no es válida: ${first?.message ?? 'error desconocido'}`) };
+    return { ok: false, summary: renderSummary([], 'es', `La receta de ${trusted} no es válida: ${first?.message ?? 'error desconocido'}`) };
+  }
+
+  const spanish = languageOf(checked.recipe.locale) === 'es';
+
+  // §5: the recipe comes from the live head of the main branch, which in a merge group must be an
+  // ancestor of the group's SHA. Bringing the objects first is what makes this checkable.
+  if (eventName === 'merge_group') {
+    const groupSha = stringOf(fieldOf(fieldOf(event, 'merge_group'), 'head_sha'));
+    if (groupSha !== undefined) {
+      const ancestor = await runGit(root, ['merge-base', '--is-ancestor', trusted, groupSha]);
+      if (!ancestor.ok) {
+        return {
+          ok: false,
+          summary: renderSummary([], checked.recipe.locale, spanish
+            ? `La punta de ${branch} (${trusted}) no es ancestro del grupo ${groupSha}.`
+            : `The head of ${branch} (${trusted}) is not an ancestor of the group ${groupSha}.`),
+        };
+      }
+    }
   }
 
   const context: RunContext = {
@@ -500,14 +593,23 @@ export async function runRedTestCheck(
   };
 
   const outcomes: PrOutcome[] = [];
-  let anyStage = false;
   let allOk = true;
   for (const pr of collected.prs) {
+    if (pr.baseRef !== branch) {
+      outcomes.push({
+        number: pr.number,
+        headRef: pr.headRef,
+        note: spanish
+          ? `No se prueba: la rama destino es «${pr.baseRef}», no ${branch}.`
+          : `Not tested: the target branch is "${pr.baseRef}", not ${branch}.`,
+        stages: [],
+      });
+      continue;
+    }
     const outcome = await checkPullRequest(context, pr, trusted);
     outcomes.push(outcome);
-    if (outcome.stages.length > 0) anyStage = true;
     if (outcome.failure !== undefined) allOk = false;
   }
 
-  return { ok: allOk, summary: renderSummary(outcomes, anyStage, undefined) };
+  return { ok: allOk, summary: renderSummary(outcomes, checked.recipe.locale, undefined) };
 }

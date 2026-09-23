@@ -64,6 +64,16 @@ function reasonOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/** A git command that failed, carrying the exit code so a caller can tell "no" from "broken". */
+export class GitCommandError extends Error {
+  readonly exitCode: number | undefined;
+  constructor(message: string, exitCode: number | undefined) {
+    super(message);
+    this.name = 'GitCommandError';
+    this.exitCode = exitCode;
+  }
+}
+
 /** Raw bytes of `git <args>`, so the fingerprint never depends on decoding. */
 function runGit(root: string, args: readonly string[], extraEnv?: NodeJS.ProcessEnv): Promise<Buffer> {
   const options = {
@@ -78,7 +88,8 @@ function runGit(root: string, args: readonly string[], extraEnv?: NodeJS.Process
     execFile('git', [...args], options, (error, stdout, stderr) => {
       if (error !== null) {
         const reason = stderr.length > 0 ? stderr.toString('utf8').trim() : error.message;
-        reject(new Error(reason));
+        const code = (error as { code?: unknown }).code;
+        reject(new GitCommandError(reason, typeof code === 'number' ? code : undefined));
         return;
       }
       resolve(stdout);
@@ -108,7 +119,14 @@ async function snapshotTree(root: string): Promise<string> {
 
 /** Committed, unsaved and new files, once each, in the default sort order, without renames. */
 async function changedFiles(root: string, mergeBase: string, snapshot: string): Promise<string[]> {
-  const raw = await runGit(root, ['diff', '--name-only', '-z', '--no-renames', mergeBase, snapshot]);
+  const raw = await runGit(root, [
+    'diff',
+    '--name-only',
+    '-z',
+    '--no-renames',
+    mergeBase,
+    snapshot,
+  ]);
   const paths = raw.toString('utf8').split('\0').filter((path) => path.length > 0);
   return [...new Set(paths)].sort();
 }
@@ -368,7 +386,11 @@ export async function gitCheckoutDetach(root: string, sha: string): Promise<void
   await runGit(root, ['checkout', '--detach', '-q', sha]);
 }
 
-/** Whether `ancestor` is reachable from `descendant`. A failure to tell is not an answer. */
+/**
+ * Whether `ancestor` is reachable from `descendant`. A clean "not an ancestor" is git exiting 1;
+ * anything else (an unknown commit, a broken repository) throws, because a failure to tell is not
+ * an answer.
+ */
 export async function gitIsAncestor(
   root: string,
   ancestor: string,
@@ -377,8 +399,9 @@ export async function gitIsAncestor(
   try {
     await runGit(root, ['merge-base', '--is-ancestor', ancestor, descendant]);
     return true;
-  } catch {
-    return false;
+  } catch (error) {
+    if (error instanceof GitCommandError && error.exitCode === 1) return false;
+    throw error;
   }
 }
 

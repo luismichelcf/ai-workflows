@@ -146,10 +146,11 @@ describe('pull requests and runs', () => {
   });
 
   it('reads a run path and event', async () => {
-    const gh = fakeGh([[/actions\/runs\/5/, ok({ path: '.github/workflows/ai-workflows.yml', event: 'pull_request_target' })]]);
+    const gh = fakeGh([[/actions\/runs\/5/, ok({ path: '.github/workflows/ai-workflows.yml', event: 'pull_request_target', head_branch: 'feat/13-algo' })]]);
     expect(await createJudgeGitHub({ repository: REPO, runner: gh.runner }).workflowRun(5)).toEqual({
       path: '.github/workflows/ai-workflows.yml',
       event: 'pull_request_target',
+      headBranch: 'feat/13-algo',
     });
   });
 
@@ -231,5 +232,15 @@ describe('publishing', () => {
     const post = fresh.calls.at(-1);
     expect(post?.args).toEqual(expect.arrayContaining(['--method', 'POST']));
     expect(JSON.stringify(post)).toContain('ai-workflows:trace');
+  });
+
+  it('a comment with the mark written by someone else is not the trace: a new one is created', async () => {
+    const planted = fakeGh([
+      [/issues\/7\/comments --paginate/, ok([[{ id: 45, body: '<!-- ai-workflows:trace -->\nsembrado', user: { login: 'otra', type: 'User' }, performed_via_github_app: null, created_at: 'a', updated_at: 'a' }]])],
+      [/issues\/7\/comments/, ok({})],
+    ]);
+    await createJudgeGitHub({ repository: REPO, runner: planted.runner }).upsertTraceComment(7, 'nuevo');
+    expect(planted.calls.some((call) => call.args.join(' ').includes('issues/comments/45'))).toBe(false);
+    expect(planted.calls.at(-1)?.args).toEqual(expect.arrayContaining(['--method', 'POST']));
   });
 });

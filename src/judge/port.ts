@@ -57,7 +57,7 @@ export interface JudgeGitHub {
   checkRuns(sha: string, name: string): Promise<CheckRunSummary[]>;
   /** Newest first, by `created_at`. */
   statuses(sha: string): Promise<CommitStatus[]>;
-  workflowRun(id: number): Promise<{ path: string; event: string } | undefined>;
+  workflowRun(id: number): Promise<{ path: string; event: string; headBranch?: string } | undefined>;
   /** Throws when the timeline cannot be confirmed. */
   forcePushedHeads(n: number): Promise<string[]>;
   publishStatus(
@@ -196,10 +196,12 @@ export function createJudgeGitHub(options: JudgeGitHubOptions): JudgeGitHub {
   const run = options.runner ?? createGhRunner();
   const base = `repos/${owner}/${name}`;
 
-  /** The raw comment, with its id: `comments` drops the id, but the trace comment needs it. */
+  /** The raw comment, with its id and author: `comments` drops both, but the trace needs them. */
   interface RawComment {
     readonly id: string;
     readonly body: string;
+    readonly author: string | undefined;
+    readonly authorType: string | undefined;
   }
 
   async function readRawComments(n: number): Promise<RawComment[]> {
@@ -217,7 +219,13 @@ export function createJudgeGitHub(options: JudgeGitHubOptions): JudgeGitHub {
       if (typeof id !== 'number' && typeof id !== 'string') {
         throw new Error(`gh returned a comment on pull request ${String(n)} without an id.`);
       }
-      comments.push({ id: String(id), body });
+      const user = recordField(item, 'user');
+      comments.push({
+        id: String(id),
+        body,
+        author: user === undefined ? undefined : textField(user, 'login'),
+        authorType: user === undefined ? undefined : textField(user, 'type'),
+      });
     }
     return comments;
   }
@@ -434,7 +442,7 @@ export function createJudgeGitHub(options: JudgeGitHubOptions): JudgeGitHub {
       return statuses;
     },
 
-    async workflowRun(id: number): Promise<{ path: string; event: string } | undefined> {
+    async workflowRun(id: number): Promise<{ path: string; event: string; headBranch?: string } | undefined> {
       const result = await run(['api', `${base}/actions/runs/${String(id)}`]);
       if (result.exitCode !== 0) {
         const detail = result.stderr;
@@ -447,7 +455,8 @@ export function createJudgeGitHub(options: JudgeGitHubOptions): JudgeGitHub {
       if (path === undefined || event === undefined) {
         throw new Error(`gh did not report the path and event of run ${String(id)}.`);
       }
-      return { path, event };
+      const headBranch = textField(parsed, 'head_branch');
+      return headBranch === undefined ? { path, event } : { path, event, headBranch };
     },
 
     async forcePushedHeads(n: number): Promise<string[]> {
@@ -520,7 +529,14 @@ export function createJudgeGitHub(options: JudgeGitHubOptions): JudgeGitHub {
 
     async upsertTraceComment(n: number, body: string): Promise<void> {
       const fullBody = `${TRACE_MARKER}\n${body}`;
-      const existing = (await readRawComments(n)).find((comment) => comment.body.startsWith(TRACE_MARKER));
+      // Only the judge's own comment (the mark, written by the Actions bot) is reused; a planted
+      // comment with the mark is ignored and a new one is created.
+      const existing = (await readRawComments(n)).find(
+        (comment) =>
+          comment.body.startsWith(TRACE_MARKER) &&
+          comment.author === 'github-actions[bot]' &&
+          comment.authorType === 'Bot',
+      );
       if (existing !== undefined) {
         ensureOk(
           await run([

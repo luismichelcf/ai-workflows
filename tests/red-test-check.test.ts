@@ -357,3 +357,74 @@ describe('§5: a merge group', () => {
     expect(result.ok).toBe(false);
   });
 });
+
+describe('flock 1: red-test-check', () => {
+  const groupEvent = (p: ReturnType<typeof project>, head: string, base: string) => ({
+    eventName: 'merge_group',
+    event: { merge_group: { head_sha: head, base_sha: base } },
+    root: p.root,
+    repository: 'duena/proyecto',
+  });
+
+  function queueOf(p: ReturnType<typeof project>, prs: number[]): string[] {
+    git(p.root, 'switch', '-q', '--detach', p.main);
+    const heads: string[] = [];
+    let base = p.main;
+    p.github.queue = [];
+    prs.forEach((n, index) => {
+      git(p.root, 'merge', '-q', '--no-ff', '--no-edit', `pr-${n}`);
+      const head = git(p.root, 'rev-parse', 'HEAD');
+      p.github.queue.push({ position: index + 1, headSha: head, baseSha: base, prNumber: n });
+      heads.push(head);
+      base = head;
+    });
+    git(p.root, 'switch', '-q', 'main');
+    return heads;
+  }
+
+  it('a PR whose test needs what an earlier PR of the queue brought is tested against its own entry base', async () => {
+    const p = project();
+    p.pr(7, 'feat/13-base', { 'src/rate.mjs': 'export const rate = () => 3;\n', 'src/bonus.mjs': BONUS(1000), 'tests/bonus.test.mjs': BONUS_TEST });
+    p.pr(8, 'feat/14-uso', {
+      'src/fee.mjs': 'import { rate } from "./rate.mjs";\nexport const fee = () => rate() * 10;\n',
+      'tests/fee.test.mjs': lines(
+        'import assert from "node:assert/strict";',
+        'import { rate } from "../src/rate.mjs";',
+        'import { fee } from "../src/fee.mjs";',
+        'export const cases = { "cobra por tasa": () => assert.equal(fee(), rate() * 10, `expected ${fee()}`) };',
+      ),
+    });
+    const [g1, g2] = queueOf(p, [7, 8]);
+    p.checkout(g2 as string);
+    const result = await runRedTestCheck(groupEvent(p, g2 as string, g1 as string), p.deps());
+    expect(result, result.summary).toEqual({ ok: true, summary: expect.any(String) });
+  });
+
+  it('in a merge group, main must be an ancestor of the group', async () => {
+    const p = project();
+    p.pr(7, 'feat/13-bono', { 'src/bonus.mjs': BONUS(1000), 'tests/bonus.test.mjs': BONUS_TEST });
+    const [g1] = queueOf(p, [7]);
+    write(p.root, 'README.md', 'otra\n');
+    p.github.mainHead = commit(p.root, 'main moves elsewhere');
+    p.checkout(g1 as string);
+    const result = await runRedTestCheck(groupEvent(p, g1 as string, p.main), p.deps());
+    expect(result).toEqual({ ok: false, summary: expect.stringMatching(/ancestro|ancestor/) });
+  });
+
+  it('with locale: en, the summary is in English', async () => {
+    const p = project({ '.ai-workflows/pipeline.yml': RECIPE.replace('locale: es', 'locale: en') });
+    const head = p.pr(7, 'feat/13-docs', { 'docs/nota.md': 'nota\n' });
+    p.checkout(head);
+    const result = await runRedTestCheck(p.pullRequestEvent(7), p.deps());
+    expect(result.summary).toMatch(/Does not apply/);
+    expect(result.summary).not.toMatch(/No aplica|Etapa/);
+  });
+
+  it('escapes what comes from the pull request in the summary', async () => {
+    const p = project();
+    const head = p.pr(7, 'feat/13-x|<b>y', { 'src/bonus.mjs': BONUS(1000) });
+    p.checkout(head);
+    const result = await runRedTestCheck(p.pullRequestEvent(7), p.deps());
+    expect(result.summary).not.toContain('<b>');
+  });
+});

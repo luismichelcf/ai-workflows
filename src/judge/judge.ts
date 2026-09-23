@@ -7,7 +7,7 @@
 // stage by stage; trace the states that imitate its name; and only then publish, after checking
 // that neither the head nor main moved and that no newer official run went first.
 
-import type { GateContext } from '../contract.js';
+import type { GateContext, JsonValue } from '../contract.js';
 import type {
   BlockDefinition,
   ServerAttestContext,
@@ -28,10 +28,15 @@ import {
 } from '../recipe/facts.js';
 import { blockInputs } from '../recipe/inputs.js';
 import type { Recipe, RecipeStage } from '../recipe/types.js';
-import { collectUnofficial, requireCheck, type Unofficial } from './checks.js';
+import {
+  collectUnofficial,
+  officialRunId,
+  requireCheck,
+  type Unofficial,
+} from './checks.js';
 import { pieceOfBranch, readDeclaredKind } from './pieces.js';
 import type { JudgeGitHub } from './port.js';
-import { buildSummary, type SummaryPiece } from './summary.js';
+import { buildSummary, escapeReportText, type SummaryPiece } from './summary.js';
 
 // ---------------------------------------------------------------------------------------------
 // The signatures the tests fix (PLAN-13-R3 §6.1).
@@ -66,6 +71,8 @@ export interface JudgeStageReport {
   readonly id: string;
   readonly outcome: StageOutcome;
   readonly reason?: string;
+  /** What a `recompute` proved, when the server part left any. */
+  readonly evidence?: JsonValue;
 }
 
 export interface JudgePieceReport {
@@ -126,6 +133,11 @@ function isSpanish(locale: string): boolean {
   return locale.toLowerCase().startsWith('es');
 }
 
+/** The text of the recipe's language. Before a recipe is read, everything stays in Spanish. */
+function pick(spanish: boolean, es: string, en: string): string {
+  return spanish ? es : en;
+}
+
 const FULL_SHA = /^[0-9a-f]{40}$/i;
 
 // ---------------------------------------------------------------------------------------------
@@ -169,7 +181,11 @@ async function mergeGroupTargets(
   return { ok: true, sha, targets };
 }
 
-/** PLAN-13-R3 §3.2: the SHA to judge and the pull requests to judge for this event. */
+/**
+ * PLAN-13-R3 §3.2: the SHA to judge and the pull requests to judge for this event. The live head
+ * of the pull request is read, and only the re-read before publishing decides whether a verdict
+ * may still be written for it (a head the event named but the branch moved past is not judged).
+ */
 async function resolveTargets(
   input: JudgeInput,
   github: JudgeGitHub,
@@ -183,8 +199,8 @@ async function resolveTargets(
       if (number === undefined) {
         return { ok: 'technical', sha: '', reason: 'el evento no nombra el pull request' };
       }
-      // The head is read live, not taken from the event: the event may name a commit the branch
-      // already moved past, and only the live one is judged (and re-read before publishing).
+      // The head is read live: the event may name a commit the branch already moved past, and the
+      // re-read before publishing decides whether this run may still write a verdict.
       try {
         const pr = await github.pullRequest(number);
         return { ok: true, sha: pr.headSha, targets: [{ pr: number, head: pr.headSha }] };
@@ -305,15 +321,31 @@ function verdictOf(stages: readonly JudgedStage[]): JudgeVerdict {
   return verdict;
 }
 
-function fromServer(stage: RecipeStage, result: ServerResult): JudgedStage {
-  const outcome: StageOutcome = result.outcome;
-  const reason = 'reason' in result ? result.reason : undefined;
+/**
+ * A stage as it appears in the report. A `required: false` stage that would fail is informative
+ * and never blocks (§3.3.4): it still says why, but it does not count against the pull request.
+ */
+function present(
+  stage: RecipeStage,
+  outcome: StageOutcome,
+  reason: string | undefined,
+  evidence: JsonValue | undefined = undefined,
+): JudgedStage {
+  const failing = outcome === 'rejected' || outcome === 'waiting' || outcome === 'technical';
+  const shown: StageOutcome = !stage.required && failing ? 'informative' : outcome;
   return {
     id: stage.id,
-    outcome,
+    outcome: shown,
     ...(reason === undefined ? {} : { reason }),
+    ...(evidence === undefined ? {} : { evidence }),
     required: stage.required,
   };
+}
+
+function fromServer(stage: RecipeStage, result: ServerResult): JudgedStage {
+  const reason = 'reason' in result ? result.reason : undefined;
+  const evidence = 'evidence' in result ? result.evidence : undefined;
+  return present(stage, result.outcome, reason, evidence);
 }
 
 function serverContext(work: StageWork): ServerContext {
@@ -342,51 +374,64 @@ function serverAttestContext(stage: RecipeStage, work: StageWork): ServerAttestC
 }
 
 async function judgeStage(stage: RecipeStage, work: StageWork): Promise<JudgedStage> {
-  const applies = appliesIfFor(work.recipe, stage.id);
-  if (applies !== undefined) {
-    const context = {
-      change: { files: work.facts.files, kind: work.facts.kind, lane: work.facts.lane },
-    } as unknown as GateContext;
-    const applicability = applies(context);
-    if (applicability !== true) {
-      const reason =
-        typeof applicability === 'object' && applicability !== null && 'skip' in applicability
-          ? applicability.skip
-          : 'No aplica.';
-      return { id: stage.id, outcome: 'skipped', reason, required: stage.required };
-    }
-  }
-
-  const server = stage.server;
-  const uses = stage.gate.uses;
-  const definition: BlockDefinition | undefined = uses === undefined ? undefined : engineBlock(uses);
-
+  const spanish = isSpanish(work.recipe.locale);
   try {
+    // Deciding whether a stage applies, and running its server part, are one unit: a failure in
+    // either leaves only this stage technical, and the rest are still judged (§3.3).
+    const applies = appliesIfFor(work.recipe, stage.id);
+    if (applies !== undefined) {
+      const context = {
+        change: { files: work.facts.files, kind: work.facts.kind, lane: work.facts.lane },
+      } as unknown as GateContext;
+      const applicability = applies(context);
+      if (applicability !== true) {
+        const reason =
+          typeof applicability === 'object' && applicability !== null && 'skip' in applicability
+            ? applicability.skip
+            : pick(spanish, 'No aplica.', 'Does not apply.');
+        return present(stage, 'skipped', reason);
+      }
+    }
+
+    const server = stage.server;
+    const uses = stage.gate.uses;
+    const definition: BlockDefinition | undefined = uses === undefined ? undefined : engineBlock(uses);
+
     if (server === 'local-only' || server === undefined) {
       return server === undefined && stage.required
-        ? { id: stage.id, outcome: 'technical', reason: 'la etapa no dice cómo comprobarla en GitHub', required: true }
-        : { id: stage.id, outcome: 'informative', reason: 'solo se comprueba junto al agente', required: stage.required };
+        ? present(
+            stage,
+            'technical',
+            pick(
+              spanish,
+              'la etapa no dice cómo comprobarla en GitHub',
+              'the stage does not say how to check it on GitHub',
+            ),
+          )
+        : present(
+            stage,
+            'informative',
+            pick(spanish, 'solo se comprueba junto al agente', 'it is only checked next to the agent'),
+          );
     }
 
     if (typeof server === 'object') {
       const result = await requireCheck(work.github, work.judgedSha, server.requireCheck, work.recipe.locale);
-      return {
-        id: stage.id,
-        outcome: result.outcome,
-        ...(result.reason === undefined ? {} : { reason: result.reason }),
-        required: stage.required,
-      };
+      return present(stage, result.outcome, result.reason);
     }
 
     if (server === 'recompute') {
       const recompute = definition?.server?.recompute;
       if (definition === undefined || recompute === undefined) {
-        return {
-          id: stage.id,
-          outcome: 'technical',
-          reason: `el bloque «${uses ?? stage.id}» no se puede recomprobar en el servidor`,
-          required: stage.required,
-        };
+        return present(
+          stage,
+          'technical',
+          pick(
+            spanish,
+            `el bloque «${uses ?? stage.id}» no se puede recomprobar en el servidor`,
+            `the block "${uses ?? stage.id}" cannot be recomputed on the server`,
+          ),
+        );
       }
       const inputs = blockInputs(definition.manifest, stage.gate.with);
       return fromServer(stage, await recompute(inputs, serverContext(work)));
@@ -394,17 +439,20 @@ async function judgeStage(stage: RecipeStage, work: StageWork): Promise<JudgedSt
 
     const attest = definition?.server?.attestation;
     if (definition === undefined || attest === undefined) {
-      return {
-        id: stage.id,
-        outcome: 'technical',
-        reason: 'la comprobación del servidor de este bloque llega en la rebanada 4',
-        required: stage.required,
-      };
+      return present(
+        stage,
+        'technical',
+        pick(
+          spanish,
+          'la comprobación del servidor de este bloque llega en la rebanada 4',
+          'the server check of this block arrives in slice 4',
+        ),
+      );
     }
     const inputs = blockInputs(definition.manifest, stage.gate.with);
     return fromServer(stage, await attest(inputs, serverAttestContext(stage, work)));
   } catch (error) {
-    return { id: stage.id, outcome: 'technical', reason: reasonOf(error), required: stage.required };
+    return present(stage, 'technical', reasonOf(error));
   }
 }
 
@@ -420,20 +468,34 @@ function isProtectedFile(file: string, judgePath: string, alsoProtect: readonly 
   );
 }
 
+interface FilesNote {
+  /** The rejection motive: the pull request changes the judge and lacks the owner's order. */
+  readonly note?: string;
+  /** The pull request is technical: the comments could not be read to decide the attestation. */
+  readonly error?: string;
+}
+
 async function judgeFilesNote(
   work: StageWork,
   judgePath: string,
   alsoProtect: readonly string[],
-): Promise<string | undefined> {
+): Promise<FilesNote> {
+  const spanish = isSpanish(work.recipe.locale);
   const touched = work.facts.files.filter((file) => isProtectedFile(file, judgePath, alsoProtect));
-  if (touched.length === 0) return undefined;
+  if (touched.length === 0) return {};
 
   const owners = work.recipe.owner === undefined ? [] : [work.recipe.owner];
   let comments;
   try {
     comments = await work.github.comments(work.target.pr);
   } catch (error) {
-    return `No se pudieron leer los comentarios del PR para la atestación del juez: ${reasonOf(error)}`;
+    return {
+      error: pick(
+        spanish,
+        `No se pudieron leer los comentarios del PR para la atestación del juez: ${reasonOf(error)}`,
+        `The pull request comments could not be read for the judge's attestation: ${reasonOf(error)}`,
+      ),
+    };
   }
   const valid = comments.some((comment) => {
     const order = evaluateOwnerOrder(comment, {
@@ -443,10 +505,16 @@ async function judgeFilesNote(
     });
     return order.ok && work.target.head.toLowerCase().startsWith(order.code.toLowerCase());
   });
-  if (valid) return undefined;
+  if (valid) return {};
 
   const wanted = `/approve-judge-change ${work.target.head.slice(0, 7)}`;
-  return `El PR cambia archivos del juez; hace falta un comentario ${wanted} del dueño para esta versión.`;
+  return {
+    note: pick(
+      spanish,
+      `El PR cambia archivos del juez; hace falta un comentario ${wanted} del dueño para esta versión.`,
+      `The pull request changes the judge's files; a comment ${wanted} by the owner is needed for this version.`,
+    ),
+  };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -464,16 +532,26 @@ async function judgeOne(
   info: PrInfo,
   work: Omit<StageWork, 'target' | 'piece' | 'facts' | 'trusted'>,
 ): Promise<JudgedPr> {
+  const spanish = isSpanish(recipe.locale);
   const piece = pieceOfBranch(recipe, info.headRef, target.pr);
   if ('none' in piece) {
     return {
       pr: target.pr,
       verdict: 'rejected',
       stages: [],
-      note: `Sin pieza: la rama "${info.headRef}" no nombra ninguna pieza.`,
+      note: pick(spanish, `Sin pieza: ${piece.none}.`, `No piece: ${piece.none}.`),
     };
   }
   const pieceId = piece.piece;
+
+  // §3.1: the head's objects come before anything is read from it — a declared kind, a project
+  // file, an ancestor. An un-fetchable head makes the pull request technical, never rejected.
+  try {
+    await work.fetchObjects([target.head]);
+  } catch (error) {
+    return { pr: target.pr, piece: pieceId, verdict: 'technical', stages: [], note: reasonOf(error) };
+  }
+
   const files = gitProjectFiles(work.root, target.head);
 
   let declaredKind: string | undefined;
@@ -485,16 +563,14 @@ async function judgeOne(
         piece: pieceId,
         verdict: 'rejected',
         stages: [],
-        note: `Tipo declarado inválido: ${declared.rejected}`,
+        note: pick(
+          spanish,
+          `Tipo declarado inválido: ${declared.rejected}.`,
+          `Invalid declared kind: ${declared.rejected}.`,
+        ),
       };
     }
     declaredKind = declared.kind;
-  } catch (error) {
-    return { pr: target.pr, piece: pieceId, verdict: 'technical', stages: [], note: reasonOf(error) };
-  }
-
-  try {
-    await work.fetchObjects([target.head]);
   } catch (error) {
     return { pr: target.pr, piece: pieceId, verdict: 'technical', stages: [], note: reasonOf(error) };
   }
@@ -527,10 +603,12 @@ async function judgeOne(
     stages.push(await judgeStage(stage, stageWork));
   }
 
-  const note = await judgeFilesNote(stageWork, work.judgePath, work.alsoProtect);
+  const filesCheck = await judgeFilesNote(stageWork, work.judgePath, work.alsoProtect);
   let verdict = verdictOf(stages);
-  if (note !== undefined) verdict = worse(verdict, 'rejected');
+  if (filesCheck.error !== undefined) verdict = worse(verdict, 'technical');
+  else if (filesCheck.note !== undefined) verdict = worse(verdict, 'rejected');
 
+  const note = filesCheck.error ?? filesCheck.note;
   return {
     pr: target.pr,
     piece: pieceId,
@@ -539,6 +617,7 @@ async function judgeOne(
       id: stage.id,
       outcome: stage.outcome,
       ...(stage.reason === undefined ? {} : { reason: stage.reason }),
+      ...(stage.evidence === undefined ? {} : { evidence: stage.evidence }),
     })),
     ...(note === undefined ? {} : { note }),
   };
@@ -650,6 +729,7 @@ export async function runJudge(input: JudgeInput, deps: JudgeDeps): Promise<Judg
     return finish();
   }
   const targetContext = mode === 'advisory' ? 'ai-workflows/advisory' : input.context;
+  const traceContexts = [input.context, 'ai-workflows/advisory'];
 
   if (!FULL_SHA.test(input.actionRef)) {
     await publish(initialSha(input), targetContext, 'error', 'el juez no está fijado por SHA');
@@ -666,10 +746,48 @@ export async function runJudge(input: JudgeInput, deps: JudgeDeps): Promise<Judg
     return finish();
   }
 
+  // §3.1 rama destino: before publishing anything, not even an error. A pull request whose base
+  // is not the principal receives nothing; among several, the ones into another branch are
+  // dropped and the rest are judged.
+  const eventBase = text(field(field(input.event, 'pull_request'), 'base'), 'ref');
+  if (input.eventName === 'pull_request_target' && eventBase !== undefined && eventBase !== principal) {
+    notes.push(`la rama destino del PR es "${eventBase}", no la principal: nada se publica`);
+    return finish();
+  }
+  const infos = new Map<number, PrInfo>();
+  const targetList: Target[] = [];
+  for (const target of targets.targets) {
+    let pr;
+    try {
+      pr = await github.pullRequest(target.pr);
+    } catch (error) {
+      await publish(targets.sha, targetContext, 'error', reasonOf(error));
+      return finish();
+    }
+    if (pr.baseRef !== principal) {
+      notes.push(`la rama destino del PR #${target.pr} es "${pr.baseRef}", no la principal: no se juzga`);
+      continue;
+    }
+    infos.set(target.pr, { headRef: pr.headRef, baseRef: pr.baseRef });
+    targetList.push(target);
+  }
+  if (targetList.length === 0) return finish();
+
   // §3.1 commit confiable: the live head of main, read once, checked out and read from.
   let trusted = await github.branchHead(principal);
   await deps.fetchObjects([trusted]);
   await checkout(input.root, trusted);
+
+  // §3.1: bring every object the run will read — the group's SHA and each judged head — before
+  // reading a declared kind, a file or an ancestor. An un-fetchable object is technical.
+  const toFetch = new Set<string>([trusted, targets.sha]);
+  for (const target of targetList) toFetch.add(target.head);
+  try {
+    await deps.fetchObjects([...toFetch]);
+  } catch (error) {
+    await publish(targets.sha, targetContext, 'error', reasonOf(error));
+    return finish();
+  }
 
   const readRecipeAt = async (sha: string): Promise<{ ok: true; recipe: Recipe } | { ok: false; reason: string }> => {
     let content: string | undefined;
@@ -696,47 +814,35 @@ export async function runJudge(input: JudgeInput, deps: JudgeDeps): Promise<Judg
   }
   let recipe = read.recipe;
 
-  // §3.1 rama destino: the event's base and the live one must both be the principal.
-  const infos = new Map<number, PrInfo>();
-  const eventBase = text(field(field(input.event, 'pull_request'), 'base'), 'ref');
-  if (input.eventName === 'pull_request_target' && eventBase !== undefined && eventBase !== principal) {
-    notes.push(`la rama destino del PR es "${eventBase}", no la principal: nada se publica`);
-    return finish();
-  }
-  for (const target of targets.targets) {
-    let pr;
-    try {
-      pr = await github.pullRequest(target.pr);
-    } catch (error) {
-      await publish(targets.sha, targetContext, 'error', reasonOf(error));
-      return finish();
-    }
-    if (pr.baseRef !== principal) {
-      notes.push(`la rama destino del PR #${target.pr} es "${pr.baseRef}", no la principal: nada se publica`);
-      return finish();
-    }
-    infos.set(target.pr, { headRef: pr.headRef, baseRef: pr.baseRef });
-  }
-
-  // §3.1: in a group, the trusted commit must be an ancestor of the group SHA.
-  const isGroup = input.eventName === 'merge_group';
-  if (isGroup) {
+  // §3.1 and §3.8(b): a group's trusted commit must be an ancestor of the group, and again every
+  // time the principal moves while the run is judging.
+  const runEvent =
+    input.eventName === 'workflow_run'
+      ? text(field(input.event, 'workflow_run'), 'event') ?? ''
+      : input.eventName;
+  const isGroup = runEvent === 'merge_group';
+  const ancestorProblem = async (current: string): Promise<string | undefined> => {
     let ancestor: boolean;
     try {
-      ancestor = await gitIsAncestor(input.root, trusted, targets.sha);
+      ancestor = await gitIsAncestor(input.root, current, targets.sha);
     } catch (error) {
-      ancestor = false;
-      void error;
+      return reasonOf(error);
     }
-    if (!ancestor) {
-      await publish(targets.sha, targetContext, 'error', 'la rama principal no es ancestro del grupo');
+    return ancestor
+      ? undefined
+      : pick(isSpanish(recipe.locale), 'la rama principal no es ancestro del grupo', 'the main branch is not an ancestor of the group');
+  };
+  if (isGroup) {
+    const problem = await ancestorProblem(trusted);
+    if (problem !== undefined) {
+      await publish(targets.sha, targetContext, 'error', problem);
       return finish();
     }
   }
 
   const judgeAll = async (currentRecipe: Recipe, currentTrusted: string): Promise<JudgedPr[]> => {
     const judged: JudgedPr[] = [];
-    for (const target of targets.targets) {
+    for (const target of targetList) {
       const info = infos.get(target.pr);
       if (info === undefined) continue;
       judged.push(
@@ -754,18 +860,70 @@ export async function runJudge(input: JudgeInput, deps: JudgeDeps): Promise<Judg
     return judged;
   };
 
+  // §3.7 rastro de estados imitados: collected on every path that does not publish a verdict, and
+  // after publishing, when the judge's own status is already official. A read failure is a note.
+  const traceComment = (unofficial: readonly Unofficial[], locale: string): string => {
+    const spanish = isSpanish(locale);
+    const heading = pick(
+      spanish,
+      'Estados con el nombre del juez que no salieron de su corrida oficial:',
+      'Statuses named like the judge that did not come from its official run:',
+    );
+    const lines = unofficial.map((entry) => {
+      const detail = entry.app === undefined ? '' : ` (${escapeReportText(entry.app)})`;
+      return `- ${escapeReportText(entry.context)} [${entry.kind}]${detail}: ${escapeReportText(entry.url ?? '')}`;
+    });
+    return [heading, ...lines].join('\n');
+  };
+  const conclude = async (judged: readonly JudgedPr[], locale: string): Promise<JudgeReport> => {
+    const collected = await collectUnofficial(
+      github,
+      targets.sha,
+      input.repository,
+      judgePath,
+      principal,
+      input.serverUrl,
+      traceContexts,
+    );
+    notes.push(...collected.notes);
+    if (collected.unofficial.length > 0) {
+      const body = traceComment(collected.unofficial, locale);
+      for (const target of targetList) {
+        try {
+          await github.upsertTraceComment(target.pr, body);
+        } catch (error) {
+          notes.push(
+            pick(
+              isSpanish(locale),
+              `No se pudo escribir el rastro en el PR #${target.pr}: ${reasonOf(error)}`,
+              `The trace could not be written on pull request #${target.pr}: ${reasonOf(error)}`,
+            ),
+          );
+        }
+      }
+    }
+    const summary: SummaryPiece[] = judged.map((piece) => ({
+      pr: piece.pr,
+      ...(piece.piece === undefined ? {} : { piece: piece.piece }),
+      verdict: piece.verdict,
+      stages: piece.stages,
+      ...(piece.note === undefined ? {} : { note: piece.note }),
+    }));
+    return finish(judged, collected.unofficial, buildSummary(summary, collected.unofficial, locale, notes));
+  };
+
   let pieces = await judgeAll(recipe, trusted);
 
   // §3.8 corridas que se cruzan: (a) head, (b) main, (c) another official run.
   for (let attempt = 0; ; attempt += 1) {
     let moved = false;
-    for (const target of targets.targets) {
+    for (const target of targetList) {
       let live;
       try {
         live = await github.pullRequest(target.pr);
       } catch (error) {
         notes.push(`no se pudo releer el PR #${target.pr}: ${reasonOf(error)}`);
-        return finish();
+        return conclude(pieces, recipe.locale);
       }
       if (live.headSha !== target.head) {
         notes.push(`la cabeza del PR #${target.pr} cambió antes de publicar (${live.headSha}); no se publica veredicto`);
@@ -776,13 +934,18 @@ export async function runJudge(input: JudgeInput, deps: JudgeDeps): Promise<Judg
         moved = true;
       }
     }
-    if (moved) return finish();
+    if (moved) return conclude(pieces, recipe.locale);
 
     const nowMain = await github.branchHead(principal);
     if (nowMain !== trusted) {
       if (attempt >= 1) {
-        await publish(targets.sha, targetContext, 'error', 'la rama principal cambió mientras se juzgaba');
-        return finish();
+        await publish(
+          targets.sha,
+          targetContext,
+          'error',
+          pick(isSpanish(recipe.locale), 'la rama principal cambió mientras se juzgaba', 'the main branch changed while the run was judging'),
+        );
+        return conclude(pieces, recipe.locale);
       }
       trusted = nowMain;
       await deps.fetchObjects([trusted]);
@@ -790,18 +953,43 @@ export async function runJudge(input: JudgeInput, deps: JudgeDeps): Promise<Judg
       read = await readRecipeAt(trusted);
       if (!read.ok) {
         await publish(targets.sha, targetContext, 'error', `La receta de la rama principal no se pudo leer: ${read.reason}`);
-        return finish();
+        return conclude(pieces, recipe.locale);
       }
       recipe = read.recipe;
+      if (isGroup) {
+        const problem = await ancestorProblem(trusted);
+        if (problem !== undefined) {
+          await publish(targets.sha, targetContext, 'error', problem);
+          return conclude(pieces, recipe.locale);
+        }
+      }
       pieces = await judgeAll(recipe, trusted);
       continue;
     }
 
+    // §3.8(c): abstain only when the newest state of this context is an official run that started
+    // after this one. A foreign state, or an older official one, never silences the verdict; the
+    // trace of everything seen still goes to the report.
     const statuses = await github.statuses(targets.sha);
-    const ours = statuses.find((status) => status.context === targetContext);
-    if (ours !== undefined && !belongsToThisRun(ours.targetUrl, input)) {
-      notes.push(`otra corrida del juez publicó después ${ours.targetUrl ?? ''}; esta no publica`);
-      return finish();
+    const newest = statuses.find((status) => status.context === targetContext);
+    if (newest !== undefined) {
+      let official: number | undefined;
+      try {
+        official = await officialRunId(github, newest, input.repository, judgePath, principal, input.serverUrl);
+      } catch (error) {
+        notes.push(`no se pudo comprobar el estado más reciente de ${targetContext}: ${reasonOf(error)}`);
+        official = undefined;
+      }
+      if (official !== undefined && official > input.runId) {
+        notes.push(
+          pick(
+            isSpanish(recipe.locale),
+            `otra corrida oficial del juez publicó después (${official}); esta no publica`,
+            `another official judge run published later (${official}); this one stays quiet`,
+          ),
+        );
+        return conclude(pieces, recipe.locale);
+      }
     }
 
     const verdict = pieces.reduce<JudgeVerdict>((acc, piece) => worse(acc, piece.verdict), 'passed');
@@ -814,32 +1002,7 @@ export async function runJudge(input: JudgeInput, deps: JudgeDeps): Promise<Judg
     break;
   }
 
-  // §3.7 rastro de estados imitados, después de publicar: lo propio ya es oficial.
-  const unofficial = await collectUnofficial(github, targets.sha, input.repository, judgePath);
-  if (unofficial.length > 0) {
-    const body = [
-      isSpanish(recipe.locale)
-        ? 'Estados con el nombre del juez que no salieron de su corrida oficial:'
-        : 'Statuses named like the judge that did not come from its official run:',
-      ...unofficial.map((entry) => `- ${entry.context} [${entry.kind}]: ${entry.url ?? ''}`),
-    ].join('\n');
-    for (const target of targets.targets) {
-      try {
-        await github.upsertTraceComment(target.pr, body);
-      } catch (error) {
-        notes.push(`no se pudo escribir el rastro en el PR #${target.pr}: ${reasonOf(error)}`);
-      }
-    }
-  }
-
-  const summary: SummaryPiece[] = pieces.map((piece) => ({
-    pr: piece.pr,
-    ...(piece.piece === undefined ? {} : { piece: piece.piece }),
-    verdict: piece.verdict,
-    stages: piece.stages,
-    ...(piece.note === undefined ? {} : { note: piece.note }),
-  }));
-  return finish(pieces, unofficial, buildSummary(summary, unofficial, recipe.locale));
+  return conclude(pieces, recipe.locale);
 }
 
 /** The SHA a run about to be judged publishes on, before targets are resolved. */
@@ -850,13 +1013,6 @@ function initialSha(input: JudgeInput): string {
   const fromGroup = text(field(event, 'merge_group'), 'head_sha');
   if (fromGroup !== undefined) return fromGroup;
   return text(field(event, 'workflow_run'), 'head_sha') ?? '';
-}
-
-/** Whether a status's link is one of this run (with or without a job), so nobody replaced it. */
-function belongsToThisRun(targetUrl: string | null, input: JudgeInput): boolean {
-  if (targetUrl === null) return false;
-  const base = `${input.serverUrl}/${input.repository}/actions/runs/${input.runId}`;
-  return targetUrl === base || targetUrl.startsWith(`${base}/job/`);
 }
 
 /** Moves the checkout to the trusted commit only when it is somewhere else. */

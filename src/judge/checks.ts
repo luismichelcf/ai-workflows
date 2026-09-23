@@ -104,55 +104,105 @@ function escapeRegExp(text: string): string {
 }
 
 /**
- * One is official if its `target_url` is this repository's run link (with or without a job), that
- * run exists, its path is the judge's workflow and its event is one of §3.2. The judge itself
- * never creates a check-run under its own name, so every such check-run is reported.
+ * PLAN-13-R3 §3.7: whether a run of one of §3.2's events came from the main branch. A merge queue
+ * run's head branch is `gh-readonly-queue/<principal>/…`; every other event runs from the
+ * principal. `pull_request_target` is not required, because GitHub always runs that workflow from
+ * the principal. A missing head branch cannot be checked, so it is trusted.
  */
-async function isOfficialStatus(
+function headBranchIsOfficial(
+  event: string,
+  headBranch: string | undefined,
+  principal: string,
+): boolean {
+  if (headBranch === undefined) return true;
+  if (event === 'merge_group') return headBranch.startsWith(`gh-readonly-queue/${principal}/`);
+  if (event === 'pull_request_target') return true;
+  return headBranch === principal;
+}
+
+/**
+ * One status is official if its `target_url` is this repository's run link (with or without a
+ * job), that run exists, its path is the judge's workflow, its event is one of §3.2 and it came
+ * from the main branch. The id of that run is returned so a caller can compare it with its own.
+ */
+export async function officialRunId(
   github: JudgeGitHub,
   status: CommitStatus,
   repository: string,
   judgePath: string,
-): Promise<boolean> {
+  principal: string,
+  serverUrl: string,
+): Promise<number | undefined> {
   const url = status.targetUrl;
-  if (url === null) return false;
+  if (url === null) return undefined;
   const pattern = new RegExp(
-    `^https://github\\.com/${escapeRegExp(repository)}/actions/runs/(\\d+)(?:/job/\\d+)?/?$`,
+    `^${escapeRegExp(serverUrl)}/${escapeRegExp(repository)}/actions/runs/(\\d+)(?:/job/\\d+)?/?$`,
   );
   const match = pattern.exec(url);
-  if (match?.[1] === undefined) return false;
-  const run = await github.workflowRun(Number.parseInt(match[1], 10));
-  return run !== undefined && run.path === judgePath && JUDGE_EVENTS.includes(run.event);
+  if (match?.[1] === undefined) return undefined;
+  const id = Number.parseInt(match[1], 10);
+  const run = await github.workflowRun(id);
+  if (run === undefined || run.path !== judgePath || !JUDGE_EVENTS.includes(run.event)) {
+    return undefined;
+  }
+  return headBranchIsOfficial(run.event, run.headBranch, principal) ? id : undefined;
 }
 
-/** The states and check-runs of §3.7 that did not come from the judge's own official run. */
+export interface TraceCollection {
+  readonly unofficial: Unofficial[];
+  /** What could not be read while looking for the trace, with its motive. */
+  readonly notes: string[];
+}
+
+/**
+ * PLAN-13-R3 §3.7: the states and check-runs that did not come from the judge's own official run.
+ * A failure to read the states, the check-runs or one run is reported in `notes` and never stops
+ * the other states from being checked; it never changes the verdict either.
+ */
 export async function collectUnofficial(
   github: JudgeGitHub,
   sha: string,
   repository: string,
   judgePath: string,
-): Promise<Unofficial[]> {
-  const found: Unofficial[] = [];
+  principal: string,
+  serverUrl: string,
+  contexts: readonly string[] = JUDGE_CONTEXTS,
+): Promise<TraceCollection> {
+  const unofficial: Unofficial[] = [];
+  const notes: string[] = [];
+
+  let statuses: CommitStatus[];
   try {
-    const statuses = await github.statuses(sha);
-    for (const status of statuses) {
-      if (!JUDGE_CONTEXTS.includes(status.context)) continue;
-      if (await isOfficialStatus(github, status, repository, judgePath)) continue;
-      found.push({ sha, context: status.context, kind: 'status', url: status.targetUrl });
-    }
-  } catch {
-    // The trace is a side report: a state list that cannot be read adds nothing, and never
-    // changes the verdict, which only depends on the checks the stages require.
+    statuses = await github.statuses(sha);
+  } catch (error) {
+    notes.push(`No se pudieron leer los estados de ${sha}: ${reasonOf(error)}`);
+    return { unofficial, notes };
   }
-  for (const name of JUDGE_CONTEXTS) {
+  for (const status of statuses) {
+    if (!contexts.includes(status.context)) continue;
+    let official: number | undefined;
     try {
-      const runs = await github.checkRuns(sha, name);
-      for (const run of runs) {
-        found.push({ sha, context: name, kind: 'check-run', url: run.url, app: run.app });
-      }
-    } catch {
-      // Same as above: unreadable check-runs are not a verdict.
+      official = await officialRunId(github, status, repository, judgePath, principal, serverUrl);
+    } catch (error) {
+      notes.push(`No se pudo comprobar el estado ${status.context} de ${sha}: ${reasonOf(error)}`);
+      continue;
+    }
+    if (official !== undefined) continue;
+    unofficial.push({ sha, context: status.context, kind: 'status', url: status.targetUrl });
+  }
+
+  for (const name of contexts) {
+    let runs;
+    try {
+      runs = await github.checkRuns(sha, name);
+    } catch (error) {
+      notes.push(`No se pudieron leer los check-runs «${name}» de ${sha}: ${reasonOf(error)}`);
+      continue;
+    }
+    for (const run of runs) {
+      unofficial.push({ sha, context: name, kind: 'check-run', url: run.url, app: run.app });
     }
   }
-  return found;
+
+  return { unofficial, notes };
 }

@@ -27,7 +27,7 @@ export const manifest: BlockManifest = {
   natures: ['structure'],
   server: ['recompute', 'require-check'],
   inputs: {
-    files: { type: 'glob-list', required: true },
+    files: { type: 'glob-list', required: true, piece: true },
     categories: {
       type: 'object-list',
       items: {
@@ -419,7 +419,15 @@ async function recompute(
     }
     if (text === undefined) continue;
     const result = await evaluateFile(file, text, sections, categories, minTotal, false, spanish);
-    if (result.ok) return { outcome: 'passed', evidence: result.evidence };
+    if (result.ok) {
+      // On the server the sources are never asked to answer: the evidence says so, so nobody
+      // reads this pass as proof that they respond.
+      const evidence =
+        typeof result.evidence === 'object' && result.evidence !== null
+          ? { ...result.evidence, 'check-reachable': false }
+          : result.evidence;
+      return { outcome: 'passed', evidence };
+    }
     lastReason = result.reason;
   }
 

@@ -590,3 +590,60 @@ de la historia actual del PR (§3.6).
 **Ronda 6 — misma sesión (versión 6):** **APPROVED**, sin bloqueantes. No bloqueante aplicado: el
 motivo de §3.6 usa la longitud `code-length`, no «los 7 primeros». Aprobación del diseño; la
 implementación se verifica aparte (puerta del orquestador, parvada y recorrido real).
+
+## 11. Desviaciones durante la construcción
+
+Decididas por el orquestador al verificar cada parte; ninguna cambia lo que decidió el dueño.
+
+- **Sin tabla de nombres en el motor (R05):** un constructor añadió al motor una tabla fija de
+  nombres en español para los tipos («comportamiento» → `behavior`); se retiró. Cada proyecto los
+  declara en `labels:` de su receta, y la receta de ejemplo lo muestra.
+- **El entorno de las pruebas rojas** se entrega entero al grupo de procesos (opción
+  `environment` de `launchInGroup`), nunca cambiando `process.env` del motor, ni por un instante.
+- **Leer un archivo de un commit** distingue «no está en ese commit» (`undefined`) de «git no pudo
+  responder» (error).
+- **Corrida oficial (§3.7):** además de la ruta y el evento, sale de la principal (`head_branch`),
+  o de `gh-readonly-queue/<principal>/` en la cola. En `pull_request_target` no se exige: GitHub
+  corre ese evento con el workflow de la principal; el juez depende de esa regla de GitHub y se
+  declara.
+- **Re-evaluación en la cola:** la corrida de `workflow_run` que dispara el fin de la prueba roja de
+  un grupo comparte turno con la corrida de `merge_group` del mismo SHA y la cancela; el veredicto lo
+  publica la de `workflow_run` (observado en el recorrido real, §13).
+
+## 12. Revisión de la parvada (ronda 1)
+
+Cuatro revisores Claude en sesiones frescas (correctitud, seguridad, contrato del motor y pruebas,
+este último con 29 mutantes: 18 sobrevivían) pidieron cambios. Bloqueantes, todos con su prueba:
+
+1. **Un estado imitado callaba al juez** (los tres primeros revisores): la corrida se abstenía ante
+   cualquier estado más nuevo que su `pending`, y en ese camino no recogía el rastro → solo se
+   abstiene ante una corrida oficial más nueva; el rastro se recoge en todos los caminos.
+2. **Una copia del juez lanzada desde otra rama contaba como oficial** → la corrida debe salir de la
+   principal (§11).
+3. **El rastro se tragaba sus errores** → van a las notas y al resumen, sin cortar la revisión.
+4. **Se leía la cabeza del PR antes de traerla** (un PR de un fork o un empujón a destiempo daban un
+   rechazo falso) → se traen los objetos antes de leer; un fallo de git es técnico, nunca rechazo.
+5. **Un fallo al leer los comentarios de la atestación del juez daba `failure`** → técnico.
+6. **Los textos publicados no respetaban el idioma de la receta** → es/en en todo lo publicado.
+7. **El primer paso de la acción publicaba antes de confirmar la rama destino** en comentarios y
+   corridas a mano, y sobre un SHA sin PR en `workflow_run` → lee el PR vivo o busca el PR antes;
+   si falla después de conocer el SHA, publica `error`.
+8. **Faltaba la comprobación de ancestro** en `workflow_run` de un grupo, tras avanzar la principal
+   y en `red-test-check`.
+9. **§7 incompleto:** CN-05 y CN-08 pasan a la suite permanente (`tests/negative-cases.test.ts`),
+   caso de fork, y pruebas para cada mutante sobreviviente (re-juicio con la receta nueva, fallo al
+   publicar o al releer, cambio de destino durante el juicio, varios PRs en una cabeza, fallo
+   interno en una etapa, vigencias `same-sha` y `same-fingerprint-or-clean-update`, base de cada
+   entrada de la cola, solo los PRs hasta el grupo, saneado).
+
+Menores aplicados: número de PR validado, el token nunca aparece en un mensaje de error, el
+comentario de rastro solo se reutiliza si es del bot de Actions, `*` no puede tocar `{piece}`,
+`{piece}` solo en las entradas que lo sustituyen, modo leído igual en la consola y en el juez,
+etapas opcionales informativas, evidencia del servidor en el informe, tipos exportados.
+
+Declarado en esta ronda: en `pull_request_target` el juez juzga la cabeza viva del PR y publica
+sobre ella; si ya no es la del evento, el `pending` del primer paso queda en el SHA viejo, que ya no
+se puede fusionar. El comentario de rastro no se borra cuando los estados imitados desaparecen (el
+resumen de cada corrida sí lo dice). Un constructor añadió al listado de archivos que ignorara los
+cambios de fin de línea para que pasara una prueba; se retiró (dejaba al juez ciego a un cambio
+real) y se corrigió la prueba, que clonaba con otra configuración de fin de línea.
