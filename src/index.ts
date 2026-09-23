@@ -83,6 +83,14 @@ export { parseRecipe } from './recipe/parse.js';
 export { checkRecipe } from './recipe/blocks.js';
 export { engineBlockManifest } from './blocks/registry.js';
 export { classifyFiles } from './recipe/glob.js';
+export { effectiveKind, type EffectiveKind } from './recipe/kind.js';
+export {
+  describeChangeFromGit,
+  type ChangeFacts,
+  type ChangeBuilder,
+  type ChangeDeclared,
+  type DescribeChangeFromGitOptions,
+} from './recipe/facts.js';
 export { appliesIfFor } from './recipe/applies.js';
 export { explainRecipe } from './recipe/explain.js';
 export { recipeCommand } from './recipe/command.js';
