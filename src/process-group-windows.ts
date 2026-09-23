@@ -694,7 +694,7 @@ export function launchWindowsGroup(options: LaunchInGroupOptions): ProcessGroup 
   const application = options.command;
   const commandLine = [application, ...options.args].map(quoteWindowsArgument).join(' ');
   const environment: NodeJS.ProcessEnv = {
-    ...process.env,
+    ...(options.environment ?? process.env),
     ...(options.env ?? {}),
     AIW_MODE: 'launch',
     AIW_JOB: job,

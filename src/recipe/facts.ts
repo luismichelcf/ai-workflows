@@ -274,13 +274,14 @@ export async function describeChangeFromCommits(
   };
 }
 
-/** Size of a blob at `<sha>:<path>`, or `undefined` when that path is not in the commit. */
-async function blobSize(root: string, spec: string): Promise<number | undefined> {
-  try {
-    return Number.parseInt(text(await runGit(root, ['cat-file', '-s', spec])), 10);
-  } catch {
-    return undefined;
-  }
+/**
+ * Whether `<sha>:<path>` names an entry in the commit's own tree. The commit is verified first,
+ * so the only thing this answer can mean when it is empty is that the path is not in that tree:
+ * an unresolvable commit, or a folder that is not a repository, throws before this is ever asked.
+ */
+async function pathInTree(root: string, sha: string, path: string): Promise<boolean> {
+  const raw = await runGit(root, ['ls-tree', '-z', sha, '--', `:(literal)${path}`]);
+  return raw.length > 0;
 }
 
 function splitNullNames(raw: Buffer): string[] {
@@ -296,9 +297,11 @@ export function gitProjectFiles(root: string, sha: string): ProjectFiles {
   return {
     async read(path: string): Promise<string | undefined> {
       requireProjectPath(path);
+      // The commit must exist: a git failure to resolve it is an error, never an absent file.
+      await runGit(root, ['rev-parse', '--verify', `${sha}^{commit}`]);
+      if (!(await pathInTree(root, sha, path))) return undefined;
       const spec = `${sha}:${path}`;
-      const size = await blobSize(root, spec);
-      if (size === undefined) return undefined;
+      const size = Number.parseInt(text(await runGit(root, ['cat-file', '-s', spec])), 10);
       if (size > MAX_PROJECT_FILE_BYTES) {
         throw new Error(`file "${path}" is larger than 1 MB`);
       }
