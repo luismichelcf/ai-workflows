@@ -79,10 +79,16 @@ function missingFact(stageId: string, fact: 'files' | 'kind' | 'lane'): Error {
 
 function requireFiles(context: GateContext, stageId: string): string[] {
   const files = changeFact(context, 'files');
-  if (!Array.isArray(files) || !files.every((file) => typeof file === 'string')) {
+  if (!Array.isArray(files) || !files.every(isCanonicalFile)) {
     throw missingFact(stageId, 'files');
   }
   return files;
+}
+
+function isCanonicalFile(file: unknown): file is string {
+  if (typeof file !== 'string' || file.length === 0) return false;
+  if (file.startsWith('/') || file.startsWith('"') || file.endsWith('/')) return false;
+  return file.split('/').every((segment) => segment !== '' && segment !== '.' && segment !== '..');
 }
 
 function requireTextFact(

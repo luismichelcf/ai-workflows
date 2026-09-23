@@ -1,7 +1,7 @@
 import { isMap, isScalar, isSeq, type Node, type YAMLMap, type YAMLSeq } from 'yaml';
 
 import { recipeSchema } from './schema.js';
-import { hasUnsafeText } from './safe-text.js';
+import { hasUnsafeText } from '../safe-text.js';
 
 export type YamlNode = Node | null;
 

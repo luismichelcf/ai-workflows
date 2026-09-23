@@ -411,3 +411,141 @@ describe('status options', () => {
     expect(whole.text).toContain(`  - mutants — ${reason}`);
   });
 });
+
+// Built from code points so no editor or tool can turn them into the raw characters.
+const cp = (...codes: number[]) => String.fromCodePoint(...codes);
+const ESC = cp(0x1b);
+const RLO = cp(0x202e);
+const BEL = cp(0x07);
+
+/** Every line a person reads must be free of controls, format characters and separators. */
+const unsafeLine = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u;
+
+describe('status never passes on what a piece declares about itself', () => {
+  const recipeStages = (): StageConfig[] => {
+    const parsed = parseRecipe(
+      lines(
+        'version: 1',
+        'locale: es',
+        'stages:',
+        '  - id: a',
+        '    summary: "Paso A"',
+        '    nature: recompute',
+        '    gate:',
+        '      run: node a.mjs',
+        '  - id: b',
+        '    summary: "Solo para comportamiento"',
+        '    after: a',
+        '    nature: recompute',
+        '    applies-if: { kind-any: [behavior] }',
+        '    gate:',
+        '      run: node b.mjs',
+      ),
+      FILE,
+    );
+    if (!parsed.ok) throw new Error('fixture must be valid');
+    return parsed.recipe.stages.map((stage) => {
+      const appliesWhen = appliesIfFor(parsed.recipe, stage.id);
+      return {
+        name: stage.id,
+        summary: stage.summary,
+        nature: stage.nature,
+        ...(stage.after === undefined ? {} : { after: stage.after }),
+        ...(appliesWhen === undefined ? {} : { appliesWhen }),
+        gate: () => ({ ok: true }),
+      };
+    });
+  };
+
+  it('neutralises controls and direction marks in a skip reason built from the declared kind', async () => {
+    const store = createMemoryStore();
+    const config = { locale: 'es', stages: recipeStages() };
+    const kind = `x${ESC}[2J${ESC}]0;pwned${BEL}${RLO}roivaheb\n  - Revisión — aprobada`;
+    const { createEngine } = await import('../src/index.js');
+    const engine = createEngine({ config, store, describeChange: () => ({ files: [], kind }) });
+    await engine.run('p1');
+
+    const output = await runCommand(['status', 'p1'], { config, store });
+    const shown = output.text.split('\n');
+    for (const line of shown) expect(line).not.toMatch(unsafeLine);
+    expect(shown).not.toContain('  - Revisión — aprobada');
+    expect(output.text).toContain('Pasos omitidos');
+  });
+
+  it('neutralises them in the reason of the piece line too', async () => {
+    const store = createMemoryStore();
+    await store.saveStatus(
+      { piece: 'p1', state: 'blocked:technical', stage: 'a', reason: `fallo${ESC}[2J${RLO}\nfalso` },
+      undefined,
+    );
+    const output = await runCommand(['status', 'p1'], { config: { locale: 'es', stages: recipeStages() }, store });
+    for (const line of output.text.split('\n')) expect(line).not.toMatch(unsafeLine);
+    expect(output.text.split('\n')).not.toContain('falso');
+
+    const all = await runCommand(['status'], { config: { locale: 'es', stages: recipeStages() }, store });
+    for (const line of all.text.split('\n')) expect(line).not.toMatch(unsafeLine);
+  });
+});
+
+describe('invisible and look-alike characters never reach a recipe', () => {
+  const withSummary = (summary: string) =>
+    lines(
+      'version: 1',
+      'locale: es',
+      'stages:',
+      '  - id: a',
+      `    summary: ${JSON.stringify(summary)}`,
+      '    nature: recompute',
+      '    gate:',
+      '      run: node a.mjs',
+    );
+
+  for (const [name, code] of [
+    ['zero width space', 0x200b],
+    ['byte order mark inside text', 0xfeff],
+    ['word joiner', 0x2060],
+    ['soft hyphen', 0x00ad],
+    ['interlinear annotation', 0xfff9],
+    ['tag character', 0xe0041],
+  ] as const) {
+    it(`refuses a ${name} in text`, () => {
+      const errors = errorsOf(withSummary(`Paso${cp(code)}A`));
+      expect(errors).toContainEqual(at(5, 14, /characters are not allowed/));
+      for (const error of errors) expect(error.message).not.toMatch(unsafeLine);
+    });
+  }
+
+  it('refuses a full-width slash that only looks like a folder separator in a glob', () => {
+    const errors = errorsOf(
+      lines(
+        'version: 1',
+        'locale: es',
+        'classify:',
+        `  money: ["lib/pay${cp(0xff0f)}x/**"]`,
+        'stages:',
+        '  - id: a',
+        '    summary: "Paso A"',
+        '    nature: recompute',
+        '    gate:',
+        '      run: node a.mjs',
+      ),
+    );
+    expect(errors).toContainEqual(at(4, 11, /^unsupported glob /));
+  });
+
+  it('positive: accents and spaces are ordinary text', () => {
+    expect(parseRecipe(withSummary('Revisión del cálculo de nómina'), FILE).ok).toBe(true);
+  });
+});
+
+describe('each problem is reported once', () => {
+  it('never repeats the same error at the same place', () => {
+    for (const text of ['a: [[\n', `a: 1\n---\n${'['.repeat(70)}\n`, '? : v\n']) {
+      const result = parseRecipe(text, FILE);
+      expect(result.ok).toBe(false);
+      if (result.ok) continue;
+      const seen = result.errors.map((e) => `${e.line}:${e.column}:${e.message}`);
+      expect(new Set(seen).size).toBe(seen.length);
+    }
+  });
+});

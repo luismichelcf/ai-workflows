@@ -180,6 +180,29 @@ describe('a fact the condition needs and the change lacks never exempts', () => 
     await expect(ask('es', '{ lane-any: [fast] }', { files: [] })).rejects.toThrow(/"s0"/);
   });
 
+  it('blocks on a file path git would never list, instead of leaving it without a class', async () => {
+    const odd = [
+      './app/a.tsx',
+      'app//a.tsx',
+      '/app/a.tsx',
+      'app/../lib/calc/a.ts',
+      'app/./a.tsx',
+      'app/',
+      '',
+      '"lib/calc/c\\303\\241lculo.ts"',
+    ];
+    for (const file of odd) {
+      await expect(ask('es', '{ touches-any: [money] }', { files: ['lib/calc/ok.ts', file] })).rejects.toThrow(
+        /files/,
+      );
+    }
+  });
+
+  it('positive: accents, spaces and backslashes inside a name are ordinary characters', async () => {
+    expect(await ask('es', '{ touches-any: [money] }', { files: ['lib/calc/cálculo final.ts'] })).toBe(true);
+    expect(await ask('es', '{ touches-any: [money] }', { files: ['lib/calc/a\\b.ts'] })).toBe(true);
+  });
+
   it('does not need facts that no clause asks for', async () => {
     expect(await ask('es', '{ kind-any: [behavior] }', { kind: 'behavior' })).toBe(true);
   });

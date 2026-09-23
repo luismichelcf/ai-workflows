@@ -10,6 +10,7 @@ import {
 } from './contract.js';
 import { validateConfig } from './config.js';
 import { createEngine, InvalidCancellationPoll, InvalidLease, MIN_LEASE_MS } from './engine.js';
+import { safeTerminalText } from './safe-text.js';
 
 export interface CommandOptions {
   readonly config: PipelineConfig;
@@ -143,16 +144,20 @@ function clampLine(line: string): string {
 
 /** One human-readable line for one piece: its number, its step, its state, and its reason. */
 function renderPieceLine(status: PieceStatus, words: StatusWords, verbose: boolean): string {
-  const stagePart = status.stage === undefined ? '' : ` · ${words.stageLabel} "${status.stage}"`;
+  // Clean data fields before layout so stored line breaks cannot forge status rows.
+  const piece = safeTerminalText(status.piece);
+  const stage = status.stage === undefined ? undefined : safeTerminalText(status.stage);
+  const reason = status.reason === undefined ? undefined : safeTerminalText(status.reason);
+  const stagePart = stage === undefined ? '' : ` · ${words.stageLabel} "${stage}"`;
   const stateText = words.state[status.state];
   const guidance = words.guidance[status.state];
-  const base = `- ${status.piece}${stagePart} · ${stateText}`;
+  const base = `- ${piece}${stagePart} · ${stateText}`;
 
-  if (status.reason === undefined) {
+  if (reason === undefined) {
     return clampLine(guidance.length === 0 ? base : `${base} — ${guidance}`);
   }
 
-  const withReason = `${base}: ${status.reason}`;
+  const withReason = `${base}: ${reason}`;
   const tail = guidance.length === 0 ? '' : `. ${guidance}`;
   if (verbose) return withReason + tail;
   if (withReason.length + tail.length <= MAX_LINE_WIDTH) return withReason + tail;
@@ -167,7 +172,7 @@ function renderPieceLine(status: PieceStatus, words: StatusWords, verbose: boole
   // error that says only what broke, with no way out, is the screen this CLI exists to avoid.
   const budget = MAX_LINE_WIDTH - base.length - 2 - tail.length - 1;
   if (budget <= 0) return clampLine(withReason + tail);
-  return `${base}: ${status.reason.slice(0, budget)}…${tail}`;
+  return `${base}: ${reason.slice(0, budget)}…${tail}`;
 }
 
 /**
@@ -203,7 +208,7 @@ function renderSkippedSteps(
   const words = STATUS_WORDS[languageOf(options.locale)];
   const lines = skipped.map((entry) => {
     const name = stages.find((stage) => stage.name === entry.stage)?.summary ?? entry.stage;
-    const line = `  - ${name} — ${entry.reason ?? ''}`;
+    const line = `  - ${safeTerminalText(name)} — ${safeTerminalText(entry.reason ?? '')}`;
     return options.verbose ? line : clampLine(line);
   });
   return [words.skippedLabel, ...lines].join('\n');
@@ -617,7 +622,9 @@ export async function runCommand(argv: readonly string[], options: CommandOption
       if (status === undefined) {
         return {
           ok: true,
-          text: languageOf(locale) === 'es' ? `La pieza ${piece} no está registrada.` : `Piece ${piece} is not registered.`,
+          text: languageOf(locale) === 'es'
+            ? `La pieza ${safeTerminalText(piece)} no está registrada.`
+            : `Piece ${safeTerminalText(piece)} is not registered.`,
         };
       }
       const verbose = args.includes('--verbose');

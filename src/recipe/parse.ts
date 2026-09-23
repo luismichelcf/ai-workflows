@@ -1,7 +1,7 @@
 import { LineCounter, Parser, parseAllDocuments, type Node } from 'yaml';
 
 import { constructRecipe } from './construct.js';
-import { safeTerminalText } from './safe-text.js';
+import { safeTerminalText } from '../safe-text.js';
 import { validateSemantics } from './semantics.js';
 import type { Recipe, RecipeError } from './types.js';
 import {
@@ -124,8 +124,17 @@ export function parseRecipe(text: string, file: string): RecipeParseResult {
   if (issues.length === 0) issues.push(...validateSemantics(root));
 
   if (issues.length > 0) {
-    issues.sort((left, right) => left.offset - right.offset);
-    const errors = issues.map((issue): RecipeError => {
+    // The CST and AST may report the same fault; keep distinct faults at one location.
+    const seen = new Map<number, Set<string>>();
+    const unique = issues.filter((issue) => {
+      const messages = seen.get(issue.offset) ?? new Set<string>();
+      if (messages.has(issue.message)) return false;
+      messages.add(issue.message);
+      seen.set(issue.offset, messages);
+      return true;
+    });
+    unique.sort((left, right) => left.offset - right.offset);
+    const errors = unique.map((issue): RecipeError => {
       const position = lineCounter.linePos(issue.offset);
       return {
         file,

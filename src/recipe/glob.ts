@@ -1,7 +1,7 @@
 /** The recipe deliberately supports only path segments, not shell glob extensions. */
 export function validGlob(pattern: string): boolean {
   if (pattern.length === 0 || pattern.startsWith('/') || pattern.startsWith('!')) return false;
-  if (/[{}[\]\\]/.test(pattern)) return false;
+  if (/[{}[\]\\\uFF01-\uFF60]/u.test(pattern)) return false;
 
   return pattern.split('/').every((segment) => {
     if (segment.length === 0 || segment === '.' || segment === '..') return false;
@@ -81,7 +81,7 @@ export function classifyFiles(
   classify: Readonly<Record<string, readonly string[]>>,
   files: readonly string[],
 ): string[] {
-  const paths = files.map((file) => file.replace(/\\/g, '/').split('/'));
+  const paths = files.map((file) => file.split('/'));
   const buffers: [boolean[], boolean[]] = [[], []];
   const touched: string[] = [];
 

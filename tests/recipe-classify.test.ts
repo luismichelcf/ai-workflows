@@ -48,8 +48,11 @@ describe('which classes a change touches', () => {
     expect(classifyFiles(classify, ['App/page.tsx'])).toEqual([]);
   });
 
-  it('reads Windows separators as folders', () => {
-    expect(classifyFiles(classify, ['app\\page.tsx'])).toEqual(['visible']);
+  it('reads a backslash as part of a name, as git does on Linux: only / separates folders', () => {
+    // `a\b.ts` is a legal file name inside lib/money/ on Linux. Reading it as two folders
+    // would move it out of a fixed-depth class. Paths reach the engine the way git lists them.
+    expect(classifyFiles({ money: ['lib/money/*.ts'] }, ['lib/money/a\\b.ts'])).toEqual(['money']);
+    expect(classifyFiles(classify, ['app\\page.tsx'])).toEqual([]);
   });
 
   it('treats regular-expression characters in a pattern as literal', () => {

@@ -4,7 +4,7 @@ import { dirname, isAbsolute, join } from 'node:path';
 import type { CommandOutput } from '../cli.js';
 import { explainRecipe } from './explain.js';
 import { parseRecipe } from './parse.js';
-import { safeTerminalText } from './safe-text.js';
+import { safeTerminalText } from '../safe-text.js';
 
 const DEFAULT_RECIPE = '.ai-workflows/pipeline.yml';
 const USAGE = 'Usage: ai-workflows <validate|explain|init> [file]';
