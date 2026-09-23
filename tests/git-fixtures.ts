@@ -11,7 +11,8 @@ const created: string[] = [];
 
 /** Removes every repository made since the last call. Call it from `afterEach`. */
 export function removeRepositories(): void {
-  for (const root of created.splice(0)) rmSync(root, { recursive: true, force: true });
+  // Windows may still hold a file of a process that just ended: retry instead of failing.
+  for (const root of created.splice(0)) rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 }
 
 export function git(root: string, ...args: string[]): string {

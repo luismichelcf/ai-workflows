@@ -4,6 +4,8 @@ import { benchmarkSourcesBlock } from './benchmark-sources.js';
 import { buildVerifyBlock } from './build-verify.js';
 import { commandBlock } from './command.js';
 import { redTestBlock } from './red-test.js';
+import { sandboxedReviewBlock } from './sandboxed-review.js';
+import { scopeReconcileBlock } from './scope-reconcile.js';
 import { specStructureBlock } from './spec-structure.js';
 
 // PLAN-13-R2 §2.1, §3 and §3.8: the manifests of this slice's engine blocks. They declare
@@ -11,40 +13,12 @@ import { specStructureBlock } from './spec-structure.js';
 // blocks of slice 4 (`independent-review`, `approval-comment`, `preview-deployment`,
 // `browser-qa`, `github-merge`, `post-merge`, `cleanup`) carry only a manifest here.
 //
-// `spec-structure`, `benchmark-sources`, `command`, `red-test` and `build-verify` are built:
-// their definitions — manifest included — live in their own files, so there is one source of
-// truth for each. Every other block is a `BlockDefinition` whose `create` reports it is not
-// built yet.
+// `spec-structure`, `benchmark-sources`, `command`, `red-test`, `build-verify`,
+// `sandboxed-review` and `scope-reconcile` are built: their definitions — manifest included —
+// live in their own files, so there is one source of truth for each. Every other block is a
+// `BlockDefinition` whose `create` reports it is not built yet.
 
 const MANIFESTS: Readonly<Record<string, BlockManifest>> = {
-  'sandboxed-review': {
-    name: 'sandboxed-review',
-    kind: 'module',
-    natures: ['recompute', 'attest'],
-    validWhile: ['same-sha', 'same-fingerprint-or-clean-update'],
-    inputs: {
-      reviewer: {
-        type: 'object',
-        fields: {
-          provider: { type: 'string', required: true },
-          model: { type: 'string', required: true },
-          effort: { type: 'string' },
-        },
-      },
-      prompt: { type: 'string', required: true },
-      angle: { type: 'string', required: true },
-      'forbid-same-family': { type: 'boolean', default: true },
-      'timeout-minutes': { type: 'integer', min: 1, max: 120, default: 30 },
-    },
-  },
-
-  'scope-reconcile': {
-    name: 'scope-reconcile',
-    kind: 'module',
-    natures: ['recompute'],
-    inputs: {},
-  },
-
   'independent-review': {
     name: 'independent-review',
     kind: 'module',
@@ -136,6 +110,8 @@ const BUILT: Readonly<Record<string, BlockDefinition>> = {
   command: commandBlock,
   'red-test': redTestBlock,
   'build-verify': buildVerifyBlock,
+  'sandboxed-review': sandboxedReviewBlock,
+  'scope-reconcile': scopeReconcileBlock,
 };
 
 export const ENGINE_BLOCKS: Readonly<Record<string, BlockDefinition>> = Object.fromEntries([

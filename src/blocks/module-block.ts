@@ -17,6 +17,7 @@ import {
 
 export interface ModuleGateOptions {
   readonly mainPath: string;
+  readonly root: string;
   readonly store: Store;
   readonly inputs: Record<string, unknown>;
 }
@@ -26,14 +27,28 @@ interface BlockModule {
   readonly reconcile?: unknown;
 }
 
-type BlockHandler = (context: GateContext, inputs: Record<string, unknown>) => GateResult | Promise<GateResult>;
-type Reconciler = (operationId: string, context: GateContext) => Promise<unknown> | unknown;
+/** The project a module block judges: its absolute root, and nothing else. */
+export interface ModuleProject {
+  readonly root: string;
+}
+
+type BlockHandler = (
+  context: GateContext,
+  inputs: Record<string, unknown>,
+  project: ModuleProject,
+) => GateResult | Promise<GateResult>;
+type Reconciler = (
+  operationId: string,
+  context: GateContext,
+  project: ModuleProject,
+) => Promise<unknown> | unknown;
 
 function cannotReconcile(operationId: string): Error {
   return new Error(`effect "${operationId}" is in doubt and the block cannot reconcile it`);
 }
 
 export function createModuleGate(options: ModuleGateOptions): Gate {
+  const project: ModuleProject = Object.freeze({ root: options.root });
   let loaded: Promise<BlockModule> | undefined;
   const load = (): Promise<BlockModule> =>
     (loaded ??= import(pathToFileURL(options.mainPath).href) as Promise<BlockModule>);
@@ -44,7 +59,7 @@ export function createModuleGate(options: ModuleGateOptions): Gate {
     if (typeof handler !== 'function') {
       throw new Error(`the module block "${options.mainPath}" has no default export`);
     }
-    return await (handler as BlockHandler)(context, options.inputs);
+    return await (handler as BlockHandler)(context, options.inputs, project);
   };
 
   return async (context): Promise<GateResult> => {
@@ -59,7 +74,7 @@ export function createModuleGate(options: ModuleGateOptions): Gate {
 
       let answer: unknown;
       try {
-        answer = await (reconcile as Reconciler)(error.operationId, context);
+        answer = await (reconcile as Reconciler)(error.operationId, context, project);
       } catch (failure) {
         const message = failure instanceof Error ? failure.message : String(failure);
         throw new Error(`effect "${error.operationId}" is in doubt and reconciling it failed: ${message}`);

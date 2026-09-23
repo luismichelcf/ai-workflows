@@ -33,7 +33,7 @@ function recipeOf(text: string): Recipe {
 const BLOCK_YML = lines(
   'kind: module',
   'natures: [recompute]',
-  'inputs: { remote: { type: string, required: true } }',
+  'inputs: { remote: { type: string, required: true }, dir: { type: string, required: true } }',
   'main: index.mjs',
 );
 
@@ -48,7 +48,7 @@ const OPENER = (withReconcile: boolean) => [
   'const branch = (piece) => `refs/heads/rc09-${piece}`;',
   'export default async function (context, inputs) {',
   '  const pushed = await context.runEffect("open-pr", async () => {',
-  '    execFileSync("git", ["push", "-q", inputs.remote, `HEAD:${branch(context.piece)}`]);',
+  '    execFileSync("git", ["push", "-q", inputs.remote, `HEAD:${branch(context.piece)}`], { cwd: inputs.dir });',
   '    const crash = process.env.AIW_TEST_CRASH;',
   '    if (crash && existsSync(crash)) { rmSync(crash); throw new Error("the engine died here"); }',
   '    return { branch: branch(context.piece) };',
@@ -90,7 +90,7 @@ async function setUp(withReconcile: boolean, crash: boolean) {
     '    nature: recompute',
     '    gate:',
     '      uses: ./.ai-workflows/blocks/opener',
-    `      with: { remote: "${remote.replace(/\\/g, '/')}" }`,
+    `      with: { remote: "${remote.replace(/\\/g, '/')}", dir: "${root.replace(/\\/g, '/')}" }`,
     '  - id: merge',
     '    summary: "Se une"',
     '    after: open',
@@ -182,5 +182,32 @@ describe('§2.2: a module block that throws', () => {
       outcome: 'ran',
       status: { state: 'blocked:technical', stage: 'boom', reason: expect.stringMatching(/se rompió/) },
     });
+  });
+});
+
+describe('§2.2: a module block knows the folder of the project it judges', () => {
+  it('receives the project root, so its commands never act on another repository', async () => {
+    const root = repository();
+    write(root, '.ai-workflows/blocks/where/block.yml', lines('kind: module', 'natures: [recompute]', 'main: index.mjs'));
+    write(root, '.ai-workflows/blocks/where/index.mjs', 'export default (context, inputs, project) => ({ ok: true, evidence: { root: project.root } });\n');
+    commit(root, 'block');
+    const recipe = recipeOf(lines(
+      'version: 1',
+      'locale: es',
+      'stages:',
+      '  - id: where',
+      '    summary: "Dónde"',
+      '    phase: merge',
+      '    nature: recompute',
+      '    gate:',
+      '      uses: ./.ai-workflows/blocks/where',
+    ));
+    const store = createMemoryStore();
+    const compiled = await compileRecipe(recipe, { root, baseRef: 'main', declared: () => ({}), store });
+    const engine = createEngine({ config: compiled.config, store, describeChange: compiled.describeChange });
+    await engine.run('42');
+    const entry = (await store.journal('42')).find((item) => item.stage === 'where');
+    const normalize = (path: string) => path.replace(/\\/g, '/').toLowerCase();
+    expect(normalize((entry?.evidence as { block: { root: string } }).block.root)).toBe(normalize(root));
   });
 });

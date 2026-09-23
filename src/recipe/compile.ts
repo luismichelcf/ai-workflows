@@ -12,7 +12,7 @@ import type {
   Store,
 } from '../contract.js';
 import { createCommandGate } from '../blocks/command-block.js';
-import type { BlockDefinition, EngineBlockDeps } from '../blocks/definition.js';
+import type { BlockDefinition, EngineBlockDeps, ProviderRunner } from '../blocks/definition.js';
 import type { BlockManifest, InputSpec, ValidWhile } from '../blocks/manifest.js';
 import { createModuleGate } from '../blocks/module-block.js';
 import { engineBlock } from '../blocks/registry.js';
@@ -53,6 +53,8 @@ export interface CompileRecipeDeps {
   readonly extraBlocks?: Readonly<Record<string, BlockDefinition>>;
   /** How a command block's group is launched and re-checked. Defaults to the real mechanism. */
   readonly processGroups?: ProcessGroupControl;
+  /** How a block runs a coding CLI. Defaults to the real process group. */
+  readonly providers?: ProviderRunner;
   readonly limits?: CompileLimits;
 }
 
@@ -332,7 +334,8 @@ async function resolveStageBlock(
       const mainPath = resolve(block.blockDir, block.main);
       return {
         manifest: block.manifest,
-        create: (inputs, engineDeps) => createModuleGate({ mainPath, store: engineDeps.store, inputs }),
+        create: (inputs, engineDeps) =>
+          createModuleGate({ mainPath, root: engineDeps.root, store: engineDeps.store, inputs }),
       };
     }
     if (block.run === undefined) throw new Error(`project block "${uses}" has no run`);
@@ -364,6 +367,26 @@ export async function compileRecipe(
 ): Promise<CompiledRecipe> {
   const stages: StageConfig[] = [];
   const groups = deps.processGroups ?? DEFAULT_GROUPS;
+  // The default runs a coding CLI the same way a command block runs: inside a group of its
+  // own, without a console, with the prompt on stdin, and the group always terminated.
+  const providers: ProviderRunner =
+    deps.providers ?? {
+      run: async (invocation) => {
+        const group = groups.launch({
+          command: invocation.command,
+          args: invocation.args,
+          cwd: invocation.cwd,
+          stdin: invocation.stdin ?? '',
+        });
+        try {
+          const exit = await group.wait();
+          if (exit.kind === 'technical') throw new Error(exit.reason);
+          return { output: exit.stdout, exitCode: exit.code };
+        } finally {
+          await group.terminate();
+        }
+      },
+    };
 
   for (const stage of recipe.stages) {
     if (stage.retry !== undefined) {
@@ -379,6 +402,8 @@ export async function compileRecipe(
       root: deps.root,
       baseRef: deps.baseRef,
       store: deps.store,
+      providers,
+      recipe,
       recordCleanUpdate: (update) =>
         recordCleanUpdate({
           store: deps.store,
