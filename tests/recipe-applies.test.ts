@@ -201,6 +201,22 @@ describe('a fact the condition needs and the change lacks never exempts', () => 
     }
   });
 
+  it('blocks on drive letters, control characters and holes, which git never lists either', async () => {
+    const cr = String.fromCharCode(13);
+    const lf = String.fromCharCode(10);
+    const nul = String.fromCharCode(0);
+    const odd = ['C:/repo/lib/calc/x.ts', 'c:lib/calc/x.ts', 'C:', `app/a.tsx${cr}`, `lib/calc${lf}/x.ts`, `a${nul}b`];
+    for (const file of odd) {
+      await expect(ask('es', '{ touches-any: [money] }', { files: [file] })).rejects.toThrow(/files/);
+      await expect(ask('es', '{ touches-none: [money] }', { files: [file] })).rejects.toThrow(/files/);
+    }
+    // eslint-disable-next-line no-sparse-arrays
+    for (const files of [new Array<string>(1), [, 'README.md']]) {
+      await expect(ask('es', '{ touches-any: [money] }', { files })).rejects.toThrow(/files/);
+      await expect(ask('es', '{ touches-none: [money] }', { files })).rejects.toThrow(/files/);
+    }
+  });
+
   it('blocks on an empty list of files: a change touches at least one, so it is a broken description', async () => {
     await expect(ask('es', '{ touches-any: [money] }', { files: [] })).rejects.toThrow(/files/);
     await expect(ask('es', '{ touches-none: [money] }', { files: [] })).rejects.toThrow(/files/);

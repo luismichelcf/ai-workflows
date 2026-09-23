@@ -619,6 +619,12 @@ Rebanadas 1 → 2 → 3 → 4 en orden; 5 puede empezar tras 3; 6 tras 4 y 5; 7 
     `applies-if` sobre la etapa de fusión (a proponer).
   - **`{tests}` en `with.command`:** el bloque debe pasar los archivos como argumentos, nunca
     armados dentro de un texto de consola (§3.4).
+  - **Salida saneada en todo el CLI (rebanada 4, mensajes al dueño):** `status`, `validate` y
+    `explain` ya no pueden imprimir caracteres de control, de formato ni separadores; `pause`,
+    `resume`, `stop` y `doctor` (heredados de v0.3.0) todavía repiten nombres de pieza y motivos
+    tal cual. Se cierra con las plantillas de mensajes.
+  - **Costo aceptado del saneado:** una receta rechaza emojis compuestos (👩‍💻), banderas con
+    etiquetas y el guion suave que deja Word; los acentos, «», —, ¿¡ y los emojis simples pasan.
   - **Propuesta al dueño:** que `explain` muestre las clases y los tipos con un nombre en español
     (hoy dice «toca «security»»). Sería un campo nuevo de la receta; no se añade sin su visto
     bueno.

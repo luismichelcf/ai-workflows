@@ -79,8 +79,9 @@ function missingFact(stageId: string, fact: 'files' | 'kind' | 'lane'): Error {
 
 function requireFiles(context: GateContext, stageId: string): string[] {
   const files = changeFact(context, 'files');
-  // A touched-path condition cannot exempt a stage from an empty or unmatchable change.
-  if (!Array.isArray(files) || files.length === 0 || !files.every(isCanonicalFile)) {
+  // Check path shape, not its root; a well-formed path from another root is undetectable here.
+  // Array.from turns holes into undefined so a sparse list cannot silently exempt a stage.
+  if (!Array.isArray(files) || files.length === 0 || !Array.from(files).every(isCanonicalFile)) {
     throw missingFact(stageId, 'files');
   }
   return files;
@@ -92,6 +93,7 @@ function isCanonicalFile(file: unknown): file is string {
   if (file.startsWith('/') || file.startsWith('"') || file.endsWith('/') || file.includes('\\')) {
     return false;
   }
+  if (/^[A-Za-z]:/.test(file) || /\p{Cc}/u.test(file)) return false;
   return file.split('/').every((segment) => segment !== '' && segment !== '.' && segment !== '..');
 }
 
