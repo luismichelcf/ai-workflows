@@ -215,6 +215,13 @@ export interface PieceStatus {
    */
   readonly startedAt?: number;
   readonly updatedAt?: number;
+  /**
+   * How to ask the operating system again whether a process group a stage left behind is
+   * empty. It is not a list of processes: it names the job object (Windows) or the process
+   * group (POSIX) and the machine, so lifting it is always an affirmative answer from the
+   * system, never an absence of evidence. Present only while the piece is in quarantine.
+   */
+  readonly quarantine?: JsonValue;
 }
 
 // ---------------------------------------------------------------------------------------
@@ -255,6 +262,22 @@ export class EffectRefusedBecauseParked extends Error {
   constructor(readonly piece: PieceId) {
     super(`effect of piece ${piece} was not started because the piece is parked`);
     this.name = 'EffectRefusedBecauseParked';
+  }
+}
+
+/**
+ * Thrown when a stage could not confirm that the process group it launched is empty. Unlike
+ * every other failure after a cancellation, this one is always registered as `failed` and
+ * leaves the piece `blocked:technical` with the `quarantine` stored: a process nobody can
+ * account for must never be forgotten because the piece was also being stopped.
+ */
+export class ProcessTreeSurvived extends Error {
+  constructor(
+    readonly quarantine: JsonValue,
+    message = 'the process group survived and could not be confirmed empty',
+  ) {
+    super(message);
+    this.name = 'ProcessTreeSurvived';
   }
 }
 
@@ -401,6 +424,13 @@ export interface EngineOptions {
    * leaves the piece `blocked:technical`, never `done`. Only consulted in `run` mode.
    */
   readonly confirmFacts?: (change: unknown) => Promise<string | undefined>;
+  /**
+   * Before a run touches a piece whose stored state carries a `quarantine`, the project asks
+   * the system again whether that group is empty. It returns the motive to stay blocked while
+   * it is not, and `undefined` once it is — which is the only thing that lifts the quarantine.
+   * Without it a quarantined piece cannot be checked and stays blocked.
+   */
+  readonly confirmQuarantine?: (quarantine: JsonValue) => Promise<string | undefined>;
   /** Injected so runs are reproducible and tests do not depend on the wall clock. */
   readonly now?: () => number;
   readonly leaseMs?: number;

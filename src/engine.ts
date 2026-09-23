@@ -1,6 +1,7 @@
 import {
   EffectRefusedBecauseParked,
   InvalidPipeline,
+  ProcessTreeSurvived,
   StaleVersion,
   type Engine,
   type EngineOptions,
@@ -353,6 +354,7 @@ export function createEngine(options: EngineOptions): Engine {
   const cancellationPollMs = options.cancellationPollMs ?? DEFAULT_CANCELLATION_POLL_MS;
   const describeChange = options.describeChange;
   const confirmFacts = options.confirmFacts;
+  const confirmQuarantine = options.confirmQuarantine;
   // Computed once: a pipeline cannot change under a live engine, so its fingerprint is fixed.
   const pipeline = fingerprint(config);
 
@@ -389,11 +391,16 @@ export function createEngine(options: EngineOptions): Engine {
   ): Promise<RunOutcome> => {
     const dryRun = mode === 'dry-run';
 
-    const blockedStatus = (stage: string | undefined, reason: string): PieceStatus => ({
+    const blockedStatus = (
+      stage: string | undefined,
+      reason: string,
+      quarantine?: JsonValue,
+    ): PieceStatus => ({
       piece,
       ...(stage === undefined ? {} : { stage }),
       state: 'blocked:technical',
       reason,
+      ...(quarantine === undefined ? {} : { quarantine }),
     });
 
     // Reads are external like writes: a store that cannot answer is a technical block, not
@@ -416,6 +423,17 @@ export function createEngine(options: EngineOptions): Engine {
         );
       }
     };
+    // The stored quarantine names how to ask the system again. No checker means the question
+    // cannot be asked at all, which is a block, never a silent pass.
+    const quarantineMotive = async (quarantine: JsonValue): Promise<string | undefined> => {
+      if (confirmQuarantine === undefined) return 'the quarantine cannot be checked';
+      try {
+        return await confirmQuarantine(quarantine);
+      } catch (error) {
+        return `the quarantine could not be checked: ${describeUnknown(error)}`;
+      }
+    };
+
     const renewLease = async (): Promise<Reservation> => {
       try {
         return await store.renew(piece, leaseId, requestedLeaseMs);
@@ -498,7 +516,7 @@ export function createEngine(options: EngineOptions): Engine {
       // ran must win over this write, so the parked status is returned untouched instead.
       // The lease is re-checked too: work done after losing the piece is worthless, and
       // writing over whoever holds it now would be worse.
-      const finish = async (status: PieceStatus): Promise<RunOutcome> => {
+      const finish = async (status: PieceStatus, overParked = false): Promise<RunOutcome> => {
         if (dryRun) return { outcome: 'ran', status };
 
         const held = await renewLease();
@@ -507,7 +525,10 @@ export function createEngine(options: EngineOptions): Engine {
         }
 
         const latest = await readStatus();
-        if (latest !== undefined && latest.status.state === 'parked') {
+        // A stop that landed while the gates ran wins over this write. The one exception is a
+        // quarantine (`overParked`): a process nobody can account for must not be forgotten
+        // because the piece was also being stopped, so its blocked status is written anyway.
+        if (!overParked && latest !== undefined && latest.status.state === 'parked') {
           return { outcome: 'parked', status: latest.status };
         }
 
@@ -518,7 +539,7 @@ export function createEngine(options: EngineOptions): Engine {
           // other lost race is reported rather than thrown out of run.
           if (error instanceof StaleVersion) {
             const current = await readStatus();
-            if (current !== undefined && current.status.state === 'parked') {
+            if (!overParked && current !== undefined && current.status.state === 'parked') {
               return { outcome: 'parked', status: current.status };
             }
           }
@@ -567,6 +588,29 @@ export function createEngine(options: EngineOptions): Engine {
         }
         journal.push(entry);
       };
+
+      // PLAN-13-R2 §2.2: a stored quarantine is re-asked of the system before any stage runs,
+      // after the lease expired or not. Another machine cannot be asked, a group still alive
+      // and an unreadable quarantine all block; only an affirmative empty answer lifts it, and
+      // it is then cleared from the stored state. Nothing is journalled either way.
+      if (before !== undefined && before.status.quarantine !== undefined) {
+        const quarantine = before.status.quarantine;
+        const motive = await quarantineMotive(quarantine);
+        if (motive !== undefined) {
+          // await: a store failure inside finish() must reach the outer catch, not reject run().
+          return await finish(blockedStatus(undefined, motive, quarantine));
+        }
+        // Confirmed empty: drop it from the stored state so the run can proceed normally.
+        const current = await readStatus();
+        if (current !== undefined && current.status.quarantine !== undefined) {
+          try {
+            const { quarantine: _dropped, ...cleared } = current.status;
+            await store.saveStatus(cleared, current.version);
+          } catch (error) {
+            if (!(error instanceof StaleVersion)) throw error;
+          }
+        }
+      }
 
       const knownStages = new Set(config.stages.map((stage) => stage.name));
 
@@ -888,6 +932,20 @@ export function createEngine(options: EngineOptions): Engine {
           try {
             raw = await stage.gate(context);
           } catch (error) {
+            if (error instanceof ProcessTreeSurvived) {
+              // PLAN-13-R2 §2.2: unlike every other failure after a cancellation, this one is
+              // always registered as `failed` and leaves the piece blocked with its quarantine
+              // stored, even when the piece was also parked or the run was being cancelled.
+              // Losing track of a live process is worse than losing the parking.
+              const reason =
+                `stage "${stage.name}" left processes that could not be confirmed empty: ` +
+                error.message;
+              await record(stage.name, 'failed', reason);
+              return await finish(
+                blockedStatus(stage.name, reason, error.quarantine),
+                true,
+              );
+            }
             if (error instanceof DryRunEffectRefused) {
               // The stage could not be evaluated without acting. A healthy pipeline in dry
               // mode is not broken: note it as not evaluated, keep checking the rest, and
@@ -1182,6 +1240,8 @@ export function createEngine(options: EngineOptions): Engine {
           state: 'parked',
           reason,
           ...(previous === undefined ? {} : { previous }),
+          // Parking must not erase a quarantine: the processes are still out there.
+          ...(current?.status.quarantine === undefined ? {} : { quarantine: current.status.quarantine }),
         };
         try {
           await store.saveStatus(parked, current?.version);
@@ -1214,7 +1274,12 @@ export function createEngine(options: EngineOptions): Engine {
               state: previous.state,
               ...(previous.reason === undefined ? {} : { reason: previous.reason }),
             };
-      await store.saveStatus(restored, current.version);
+      // Un-parking restores the diagnosis, not the quarantine: it is a fact about the system.
+      const withQuarantine: PieceStatus =
+        current.status.quarantine === undefined
+          ? restored
+          : { ...restored, quarantine: current.status.quarantine };
+      await store.saveStatus(withQuarantine, current.version);
       return restored;
     },
   };

@@ -22,6 +22,17 @@ export {
 } from './gh-runner.js';
 export { createEngine } from './engine.js';
 export {
+  launchInGroup,
+  checkQuarantine,
+  DEFAULT_STDOUT_BYTES,
+  type GroupExit,
+  type LaunchInGroupOptions,
+  type ProcessGroup,
+  type ProcessGroupControl,
+  type Quarantine,
+  type QuarantineCheck,
+} from './process-group.js';
+export {
   runCommand,
   renderStatus,
   renderDoctor,
@@ -87,6 +98,7 @@ export {
   compileRecipe,
   type CompiledRecipe,
   type CompileRecipeDeps,
+  type CompileLimits,
 } from './recipe/compile.js';
 export { classifyFiles } from './recipe/glob.js';
 export { effectiveKind, type EffectiveKind } from './recipe/kind.js';
