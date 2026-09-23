@@ -352,6 +352,7 @@ export function createEngine(options: EngineOptions): Engine {
   const reserveLeaseMs = Math.max(requestedLeaseMs, MIN_LEASE_MS);
   const cancellationPollMs = options.cancellationPollMs ?? DEFAULT_CANCELLATION_POLL_MS;
   const describeChange = options.describeChange;
+  const confirmFacts = options.confirmFacts;
   // Computed once: a pipeline cannot change under a live engine, so its fingerprint is fixed.
   const pipeline = fingerprint(config);
 
@@ -572,8 +573,11 @@ export function createEngine(options: EngineOptions): Engine {
       // Renaming or removing a stage makes old evidence name something that no longer exists.
       // Resuming blindly from there would either skip a stage or repeat external effects.
       // `store.forget` is the way out: it drops the retired stage's entries and the next run
-      // resumes by what remains.
-      const gone = journal.find((entry) => !knownStages.has(entry.stage));
+      // resumes by what remains. An entry whose stage starts with `@` is a record the engine
+      // itself wrote (e.g. `@clean-update`): it is not a stage and blocks nothing.
+      const gone = journal.find(
+        (entry) => !entry.stage.startsWith('@') && !knownStages.has(entry.stage),
+      );
       if (gone !== undefined) {
         // await: a store failure inside finish() must reach the outer catch, not reject run().
         return await finish(
@@ -991,6 +995,23 @@ export function createEngine(options: EngineOptions): Engine {
           state: 'waiting:decision',
           reason: `dry-run could not check ${unchecked.length === 1 ? 'stage' : 'stages'} ${named} without performing external effects`,
         });
+      }
+
+      // The facts the run judged must still hold before a piece is called `done`. The project
+      // reads the world again and returns the motive to block with when they moved (the tree
+      // changed while the stages ran); a failure to confirm is the same technical block. Only
+      // a real run confirms — a rehearse must not read the world it refused to touch.
+      if (!dryRun && confirmFacts !== undefined) {
+        let reason: string | undefined;
+        try {
+          reason = await confirmFacts(await getChange());
+        } catch (error) {
+          reason = `the facts of the piece could not be confirmed: ${describeUnknown(error)}`;
+        }
+        if (reason !== undefined) {
+          // await: a store failure inside finish() must reach the outer catch, not reject run().
+          return await finish(blockedStatus(undefined, reason));
+        }
       }
 
       // await: a store failure inside finish() must reach the outer catch, not reject run().

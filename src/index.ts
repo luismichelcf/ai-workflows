@@ -82,6 +82,12 @@ export { recipeSchema } from './recipe/schema.js';
 export { parseRecipe } from './recipe/parse.js';
 export { checkRecipe } from './recipe/blocks.js';
 export { engineBlockManifest } from './blocks/registry.js';
+export type { BlockDefinition, EngineBlockDeps } from './blocks/definition.js';
+export {
+  compileRecipe,
+  type CompiledRecipe,
+  type CompileRecipeDeps,
+} from './recipe/compile.js';
 export { classifyFiles } from './recipe/glob.js';
 export { effectiveKind, type EffectiveKind } from './recipe/kind.js';
 export {

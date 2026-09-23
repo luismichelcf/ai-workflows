@@ -395,6 +395,12 @@ export interface EngineOptions {
   readonly runId?: RunId;
   /** How the project describes what a piece changes. Fed to every gate as `change`. */
   readonly describeChange?: (piece: PieceId) => unknown | Promise<unknown>;
+  /**
+   * The final check before a piece is left in `done`: re-read the facts and return the motive
+   * to block on when they no longer hold, or `undefined` when they do. A text — or a failure —
+   * leaves the piece `blocked:technical`, never `done`. Only consulted in `run` mode.
+   */
+  readonly confirmFacts?: (change: unknown) => Promise<string | undefined>;
   /** Injected so runs are reproducible and tests do not depend on the wall clock. */
   readonly now?: () => number;
   readonly leaseMs?: number;

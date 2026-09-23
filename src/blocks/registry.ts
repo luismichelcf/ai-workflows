@@ -1,11 +1,16 @@
+import type { BlockDefinition } from './definition.js';
 import type { BlockManifest } from './manifest.js';
 
 // PLAN-13-R2 §2.1, §3 and §3.8: the manifests of this slice's engine blocks. They declare
 // what each block permits — natures, validity and inputs — before any of them is built. The
-// four blocks of slice 4 (`independent-review`, `approval-comment`, `preview-deployment`,
+// blocks of slice 4 (`independent-review`, `approval-comment`, `preview-deployment`,
 // `browser-qa`, `github-merge`, `post-merge`, `cleanup`) carry only a manifest here.
+//
+// Every block is a `BlockDefinition` whose `create` builds a gate that reports it is not
+// built yet. The behaviour of the blocks of this slice arrives in later parts; the ones of
+// slice 4 keep this gate.
 
-export const ENGINE_BLOCKS: Readonly<Record<string, BlockManifest>> = {
+const MANIFESTS: Readonly<Record<string, BlockManifest>> = {
   'spec-structure': {
     name: 'spec-structure',
     kind: 'module',
@@ -193,11 +198,42 @@ export const ENGINE_BLOCKS: Readonly<Record<string, BlockManifest>> = {
 const ENGINE_MAJOR = 1;
 const ENGINE_USES = /^ai-workflows\/([a-z][a-z0-9-]*)@([1-9][0-9]*)$/;
 
-/** The manifest of `ai-workflows/<name>@<major>`, or undefined when it does not exist. */
-export function engineBlockManifest(uses: string): BlockManifest | undefined {
+/** The blocks of slice 4. Until they are built their gate blocks the piece saying so. */
+const SLICE_FOUR: ReadonlySet<string> = new Set([
+  'independent-review',
+  'approval-comment',
+  'preview-deployment',
+  'browser-qa',
+  'github-merge',
+  'post-merge',
+  'cleanup',
+]);
+
+/** A gate that always blocks, naming the slice that will build it. */
+function notBuilt(name: string): BlockDefinition {
+  const slice = SLICE_FOUR.has(name) ? 4 : 2;
+  return {
+    manifest: MANIFESTS[name] as BlockManifest,
+    create: () => () => {
+      throw new Error(`block "ai-workflows/${name}@1" is not built yet (slice ${slice})`);
+    },
+  };
+}
+
+export const ENGINE_BLOCKS: Readonly<Record<string, BlockDefinition>> = Object.fromEntries(
+  Object.keys(MANIFESTS).map((name) => [name, notBuilt(name)]),
+);
+
+/** The definition of `ai-workflows/<name>@<major>`, or undefined when it does not exist. */
+export function engineBlock(uses: string): BlockDefinition | undefined {
   const match = ENGINE_USES.exec(uses);
   if (!match) return undefined;
   const [, name, major] = match;
   if (name === undefined || Number(major) !== ENGINE_MAJOR) return undefined;
   return Object.hasOwn(ENGINE_BLOCKS, name) ? ENGINE_BLOCKS[name] : undefined;
+}
+
+/** The manifest of `ai-workflows/<name>@<major>`, or undefined when it does not exist. */
+export function engineBlockManifest(uses: string): BlockManifest | undefined {
+  return engineBlock(uses)?.manifest;
 }
