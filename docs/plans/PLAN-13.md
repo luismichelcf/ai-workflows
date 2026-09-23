@@ -581,7 +581,7 @@ Una rama y un PR por rebanada en este repositorio. Prueba roja primero en cada c
 comportamiento; el orquestador escribe las pruebas rojas y el constructor las pone verdes.
 
 - [x] **1. Receta:** lector estricto, esquema, `validate`, `explain`, `init`. (RC-01, 02, 04, 05)
-- [ ] **2. Bloques:** registro de bloques, manifiestos, bloques módulo y comando, vigencias de §3.3
+- [x] **2. Bloques:** registro de bloques, manifiestos, bloques módulo y comando, vigencias de §3.3
       y los bloques genéricos de §4.1 portados desde las compuertas existentes. (RC-03, RC-07…RC-10,
       CN-01…CN-04, CN-09…CN-11)
 - [ ] **3. El juez:** acción reutilizable y plantilla de workflow, procedencia desde la base,
@@ -636,6 +636,7 @@ Rebanadas 1 → 2 → 3 → 4 en orden; 5 puede empezar tras 3; 6 tras 4 y 5; 7 
   - **Después de v1, a proponer al dueño:** un modelo de decisión rápido (p. ej. Jev de
     TypeSafe) solo como alarma que sube la exigencia, nunca la baja, y primero en modo sombra;
     implica un servicio y un gasto nuevos (conversación del 22-sep).
+- Notas menores de la última revisión de la rebanada 2 (no bloquean): endurecer dos pruebas propias de `tests/review-round5.test.ts` (fijar la respuesta exacta de arrendamiento vencido y hacer fallar la relectura después del tercer intento); el motivo de una renovación fallida al escribir «en curso» dice primero «save»; cada etapa hace una renovación de arrendamiento más (en el almacén de GitHub es un commit); investigar la prueba inestable de `tests/integrity.test.ts` sobre el latido del arrendamiento.
 - Límites declarados en la rebanada 2: en Linux, un proceso que crea a propósito su propia sesión
   sale del grupo del bloque (nivel A); una prueba editada y restaurada sin commit no se detecta
   (nivel A, CN-11); la identidad del constructor es declarada por la pieza (nivel A, CN-02);
