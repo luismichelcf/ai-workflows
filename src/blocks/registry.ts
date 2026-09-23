@@ -1,72 +1,19 @@
 import type { BlockDefinition } from './definition.js';
 import type { BlockManifest } from './manifest.js';
+import { benchmarkSourcesBlock } from './benchmark-sources.js';
+import { commandBlock } from './command.js';
+import { specStructureBlock } from './spec-structure.js';
 
 // PLAN-13-R2 §2.1, §3 and §3.8: the manifests of this slice's engine blocks. They declare
 // what each block permits — natures, validity and inputs — before any of them is built. The
 // blocks of slice 4 (`independent-review`, `approval-comment`, `preview-deployment`,
 // `browser-qa`, `github-merge`, `post-merge`, `cleanup`) carry only a manifest here.
 //
-// Every block is a `BlockDefinition` whose `create` builds a gate that reports it is not
-// built yet. The behaviour of the blocks of this slice arrives in later parts; the ones of
-// slice 4 keep this gate.
+// `spec-structure`, `benchmark-sources` and `command` are built: their definitions — manifest
+// included — live in their own files, so there is one source of truth for each. Every other
+// block is a `BlockDefinition` whose `create` reports it is not built yet.
 
 const MANIFESTS: Readonly<Record<string, BlockManifest>> = {
-  'spec-structure': {
-    name: 'spec-structure',
-    kind: 'module',
-    natures: ['structure'],
-    inputs: {
-      file: { type: 'string', required: true },
-      sections: { type: 'string-list' },
-      summary: {
-        type: 'object',
-        fields: {
-          section: { type: 'string', required: true },
-          labels: { type: 'string-list', required: true },
-        },
-      },
-      criteria: {
-        type: 'object',
-        fields: {
-          section: { type: 'string', required: true },
-          'id-prefix': { type: 'string', required: true },
-          words: { type: 'string-list' },
-        },
-      },
-      decisions: {
-        type: 'object',
-        fields: {
-          section: { type: 'string', required: true },
-          'pending-markers': {
-            type: 'string-list',
-            default: ['[ ]', 'pendiente', 'por decidir', 'TBD'],
-          },
-        },
-      },
-    },
-  },
-
-  'benchmark-sources': {
-    name: 'benchmark-sources',
-    kind: 'module',
-    natures: ['structure'],
-    inputs: {
-      files: { type: 'glob-list', required: true },
-      categories: {
-        type: 'object-list',
-        items: {
-          heading: { type: 'string', required: true },
-          min: { type: 'integer', required: true, min: 0, max: 100 },
-        },
-      },
-      'min-total': { type: 'integer', min: 0, max: 1000, default: 0 },
-      sections: { type: 'string-list' },
-      waiver: { type: 'string' },
-      spec: { type: 'string' },
-      'check-reachable': { type: 'boolean', default: false },
-    },
-  },
-
   'sandboxed-review': {
     name: 'sandboxed-review',
     kind: 'module',
@@ -111,21 +58,6 @@ const MANIFESTS: Readonly<Record<string, BlockManifest>> = {
       'red-stage': { type: 'string', required: true },
       'implementation-exclude': { type: 'glob-list', default: ['docs/**'] },
       'timeout-minutes': { type: 'integer', min: 1, max: 120, default: 30 },
-    },
-  },
-
-  command: {
-    name: 'command',
-    kind: 'module',
-    natures: ['recompute'],
-    inputs: {
-      command: { type: 'command', required: true },
-      'timeout-minutes': { type: 'integer', min: 1, max: 120, default: 30 },
-      reader: {
-        type: 'string',
-        enum: ['exit-code', 'vitest'],
-        default: 'exit-code',
-      },
     },
   },
 
@@ -220,9 +152,17 @@ function notBuilt(name: string): BlockDefinition {
   };
 }
 
-export const ENGINE_BLOCKS: Readonly<Record<string, BlockDefinition>> = Object.fromEntries(
-  Object.keys(MANIFESTS).map((name) => [name, notBuilt(name)]),
-);
+/** The blocks of this slice that are actually built, with their definitions and manifests. */
+const BUILT: Readonly<Record<string, BlockDefinition>> = {
+  'spec-structure': specStructureBlock,
+  'benchmark-sources': benchmarkSourcesBlock,
+  command: commandBlock,
+};
+
+export const ENGINE_BLOCKS: Readonly<Record<string, BlockDefinition>> = Object.fromEntries([
+  ...Object.keys(MANIFESTS).map((name) => [name, notBuilt(name)] as const),
+  ...Object.entries(BUILT),
+]);
 
 /** The definition of `ai-workflows/<name>@<major>`, or undefined when it does not exist. */
 export function engineBlock(uses: string): BlockDefinition | undefined {

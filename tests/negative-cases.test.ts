@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 
 import {
   EffectNeedsReconciliation,
@@ -19,6 +19,8 @@ import {
   type Verdict,
 } from '../src/index.js';
 
+import { runBlock } from './block-harness.js';
+import { commit, removeRepositories, repository, write } from './git-fixtures.js';
 import { chain, pipeline, recorder, stage } from './helpers.js';
 
 // The thirteen attempts to get around the process. These are not a trial run: they are the
@@ -39,7 +41,6 @@ export const NOT_YET_EXECUTABLE: Record<string, string> = {
   'CN-05': 'needs the sign-off check on a real pull request (slice 4)',
   'CN-07': 'needs the editor hooks installed in a project (slice 4)',
   'CN-08': 'needs the server-side check enforced by a branch ruleset (slice 6)',
-  'CN-09': 'needs the module boundary lint of a real project (slice 5)',
 };
 
 const ALL = Array.from({ length: 13 }, (_, index) => `CN-${String(index + 1).padStart(2, '0')}`);
@@ -176,6 +177,46 @@ describe('CN-06 · interrupting mid-write and resuming', () => {
     const result = await createEngine({ config, store }).run('997');
 
     expect(result.outcome === 'ran' && result.status.state).toBe('done');
+  });
+});
+
+describe('CN-09 · crossing a module boundary', () => {
+  ran('CN-09');
+
+  // The engine knows no module rules: the project's own boundary check runs as a command@1
+  // stage (PLAN-13-R2 §3.6). Here that check forbids anything under app/ from importing lib/db.
+  const BOUNDARIES = [
+    'import { readdirSync, readFileSync } from "node:fs";',
+    'import { join } from "node:path";',
+    'const walk = (dir) => readdirSync(dir, { withFileTypes: true }).flatMap((entry) =>',
+    '  entry.isDirectory() ? walk(join(dir, entry.name)) : [join(dir, entry.name)]);',
+    'const offenders = walk("app").filter((file) => /from ["\'].*lib\\/db/.test(readFileSync(file, "utf8")));',
+    'if (offenders.length > 0) { console.error(`app no puede importar lib/db: ${offenders.join(", ")}`); process.exit(1); }',
+    '',
+  ].join('\n');
+
+  const STAGE = [
+    '    nature: recompute',
+    '    gate:',
+    '      uses: ai-workflows/command@1',
+    '      with: { command: "node boundaries.mjs" }',
+  ];
+
+  afterEach(removeRepositories);
+
+  it('is refused by the project boundary check, naming the file that crossed', async () => {
+    const root = repository({ 'boundaries.mjs': BOUNDARIES, 'lib/db/client.ts': 'export const db = 1;\n', 'app/page.ts': 'export const page = 1;\n' });
+    write(root, 'app/page.ts', 'import { db } from "../lib/db/client";\nexport const page = db;\n');
+    commit(root, 'crosses the boundary');
+    const result = await runBlock(root, STAGE);
+    expect(result.outcome).toMatchObject({ status: { state: 'blocked:rejected', stage: 'check', reason: expect.stringMatching(/app[\\/]page\.ts/) } });
+  });
+
+  it('positive control: a change that respects the boundary advances', async () => {
+    const root = repository({ 'boundaries.mjs': BOUNDARIES, 'lib/db/client.ts': 'export const db = 1;\n', 'app/page.ts': 'export const page = 1;\n' });
+    write(root, 'app/page.ts', 'export const page = 2;\n');
+    commit(root, 'stays inside');
+    expect((await runBlock(root, STAGE)).outcome).toMatchObject({ status: { state: 'blocked:rejected', stage: 'merge' } });
   });
 });
 
@@ -360,8 +401,8 @@ describe('the report of the thirteen', () => {
     }
   });
 
-  it('has exactly four pending cases', () => {
-    expect(Object.keys(NOT_YET_EXECUTABLE)).toHaveLength(4);
+  it('has exactly three pending cases', () => {
+    expect(Object.keys(NOT_YET_EXECUTABLE)).toHaveLength(3);
   });
 });
 
