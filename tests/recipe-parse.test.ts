@@ -257,6 +257,12 @@ describe('RC-02: YAML 1.2 keeps words as words', () => {
         'owner: yes',
         'classify:',
         '  on: ["NO"]',
+        'kinds:',
+        '  names: [feature, fix]',
+        '  default: feature',
+        'lanes:',
+        '  off: [feature]',
+        '  y: [fix]',
         'stages:',
         '  - id: a',
         '    summary: NO',
@@ -265,6 +271,13 @@ describe('RC-02: YAML 1.2 keeps words as words', () => {
         '    gate:',
         '      run: node a.mjs',
         '      with: { flag: on, answer: no, count: 3 }',
+        '  - id: merge',
+        '    summary: "Se une a la versión principal"',
+        '    after: a',
+        '    phase: merge',
+        '    nature: recompute',
+        '    gate:',
+        '      run: node m.mjs',
       ),
     );
     expect(recipe.locale).toBe('no');
@@ -311,7 +324,7 @@ describe('RC-02: YAML 1.2 keeps words as words', () => {
 });
 
 describe('what a valid recipe reads as', () => {
-  it('fills the defaults a stage may omit and leaves validity undecided when not written', () => {
+  it('fills the defaults a stage may omit, validity same-sha included, when not written', () => {
     const recipe = recipeOf(
       lines(
         'version: 1',
@@ -322,6 +335,13 @@ describe('what a valid recipe reads as', () => {
         '    nature: recompute',
         '    gate:',
         '      run: node a.mjs',
+        '  - id: merge',
+        '    summary: "Se une a la versión principal"',
+        '    after: a',
+        '    phase: merge',
+        '    nature: recompute',
+        '    gate:',
+        '      run: node m.mjs',
       ),
     );
     expect(recipe.version).toBe(1);
@@ -336,7 +356,19 @@ describe('what a valid recipe reads as', () => {
         required: true,
         needsHuman: false,
         nature: 'recompute',
+        validWhile: 'same-sha',
         gate: { run: 'node a.mjs' },
+      },
+      {
+        id: 'merge',
+        summary: 'Se une a la versión principal',
+        after: 'a',
+        phase: 'merge',
+        required: true,
+        needsHuman: false,
+        nature: 'recompute',
+        validWhile: 'same-sha',
+        gate: { run: 'node m.mjs' },
       },
     ]);
   });
@@ -351,9 +383,17 @@ describe('what a valid recipe reads as', () => {
       production: ['.github/workflows/**'],
     });
     expect(recipe.kinds).toEqual({
+      names: ['behavior', 'docs'],
       default: 'behavior',
       fromPaths: { docs: ['docs/**', '**/*.md'] },
       elevate: [{ when: { touchesAny: ['security'], kindNone: ['behavior'] }, to: 'behavior' }],
+    });
+    expect(recipe.labels).toEqual({
+      security: 'seguridad y permisos',
+      visible: 'lo que se ve',
+      production: 'producción',
+      behavior: 'comportamiento',
+      docs: 'documentación',
     });
 
     const byId = new Map(recipe.stages.map((stage) => [stage.id, stage]));
@@ -364,12 +404,20 @@ describe('what a valid recipe reads as', () => {
       required: true,
       needsHuman: false,
       nature: 'structure',
-      gate: { uses: 'ai-workflows/spec-structure@1' },
+      validWhile: 'same-sha',
+      gate: {
+        uses: 'ai-workflows/spec-structure@1',
+        with: {
+          file: 'docs/plans/PLAN-{piece}.md',
+          sections: ['En tres líneas', 'Casos de aceptación'],
+        },
+      },
       server: 'recompute',
     });
     expect(byId.get('red-test')?.server).toEqual({ requireCheck: 'ai-workflows/red-test' });
     expect(byId.get('red-test')?.after).toBe('spec');
     expect(byId.get('red-test')?.appliesIf).toEqual({ kindAny: ['behavior'] });
+    expect(byId.get('red-test')?.validWhile).toBe('forever');
     expect(byId.get('owner-approval')?.needsHuman).toBe(true);
     expect(byId.get('owner-approval')?.validWhile).toBe('same-fingerprint');
     expect(byId.get('owner-approval')?.gate).toEqual({
@@ -462,8 +510,8 @@ describe('shape of each field', () => {
   });
 
   it('accepts engine blocks with a major version and project blocks by folder', () => {
-    recipeOf(oneStage('    nature: recompute', '    gate:', '      uses: ai-workflows/red-test@12'));
-    recipeOf(oneStage('    nature: recompute', '    gate:', '      uses: ./.ai-workflows/blocks/fila'));
+    recipeOf(oneStage('    nature: recompute', '    phase: merge', '    gate:', '      uses: ai-workflows/red-test@12'));
+    recipeOf(oneStage('    nature: recompute', '    phase: merge', '    gate:', '      uses: ./.ai-workflows/blocks/fila'));
   });
 
   it('refuses a condition over a class that classify does not declare', () => {
@@ -486,6 +534,7 @@ describe('shape of each field', () => {
         'classify:',
         '  money: ["lib/calc/**"]',
         'kinds:',
+        '  names: [behavior]',
         '  default: behavior',
         '  elevate:',
         '    - when: { touches-any: [security] }',
@@ -498,7 +547,7 @@ describe('shape of each field', () => {
         '      run: node a.mjs',
       ),
     );
-    expect(errors).toContainEqual(at(8, 29, /unknown class "security"/));
+    expect(errors).toContainEqual(at(9, 29, /unknown class "security"/));
   });
 
   it('refuses an empty condition', () => {

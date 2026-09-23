@@ -1,4 +1,5 @@
 import { validGlob } from './glob.js';
+import { validateCommandLine } from './command-line.js';
 import {
   nodeStart,
   type LocatedIssue,
@@ -6,6 +7,7 @@ import {
   yamlField,
   yamlMap,
   yamlSeq,
+  yamlValue,
   yamlWord,
 } from './validation.js';
 
@@ -13,9 +15,13 @@ function add(issues: LocatedIssue[], node: YamlNode, message: string): void {
   issues.push({ offset: nodeStart(node), message });
 }
 
+function listNodes(node: YamlNode): readonly YamlNode[] {
+  return yamlSeq(node)?.items ?? [];
+}
+
 function validateGlobs(group: YamlNode, issues: LocatedIssue[]): void {
   for (const pair of yamlMap(group)?.items ?? []) {
-    for (const item of yamlSeq(pair.value)?.items ?? []) {
+    for (const item of listNodes(pair.value)) {
       const pattern = yamlWord(item);
       if (!validGlob(pattern)) {
         add(issues, item, `unsupported glob "${pattern}": only *, ** and ? are allowed`);
@@ -30,10 +36,220 @@ function validateClasses(
   issues: LocatedIssue[],
 ): void {
   for (const key of ['touches-any', 'touches-none']) {
-    for (const item of yamlSeq(yamlField(condition, key))?.items ?? []) {
+    for (const item of listNodes(yamlField(condition, key))) {
       const name = yamlWord(item);
       if (!declared.has(name)) add(issues, item, `unknown class "${name}"`);
     }
+  }
+}
+
+/** R15: every kind reference must be in `kinds.names`; without kinds, none is. */
+function validateKindRefs(
+  condition: YamlNode,
+  vocabulary: ReadonlySet<string>,
+  issues: LocatedIssue[],
+): void {
+  for (const key of ['kind-any', 'kind-none']) {
+    for (const item of listNodes(yamlField(condition, key))) {
+      const name = yamlWord(item);
+      if (!vocabulary.has(name)) add(issues, item, `unknown kind "${name}"`);
+    }
+  }
+}
+
+function validateLaneRefs(
+  condition: YamlNode,
+  lanes: ReadonlySet<string>,
+  issues: LocatedIssue[],
+): void {
+  for (const item of listNodes(yamlField(condition, 'lane-any'))) {
+    const name = yamlWord(item);
+    if (!lanes.has(name)) add(issues, item, `unknown lane "${name}"`);
+  }
+}
+
+/** R15: `lanes:` must hold every declared kind in exactly one lane. */
+function validateVocabulary(
+  root: YamlNode,
+  stages: readonly YamlNode[],
+  declared: ReadonlySet<string>,
+  issues: LocatedIssue[],
+): void {
+  const kinds = yamlField(root, 'kinds');
+  const vocabulary = new Set(listNodes(yamlField(kinds, 'names')).map((item) => yamlWord(item)));
+
+  const defaultNode = yamlField(kinds, 'default');
+  if (defaultNode !== null && !vocabulary.has(yamlWord(defaultNode))) {
+    add(issues, defaultNode, `unknown kind "${yamlWord(defaultNode)}"`);
+  }
+
+  for (const pair of yamlMap(yamlField(kinds, 'from-paths'))?.items ?? []) {
+    const name = yamlWord(pair.key);
+    if (!vocabulary.has(name)) add(issues, pair.key, `unknown kind "${name}"`);
+  }
+
+  for (const elevation of listNodes(yamlField(kinds, 'elevate'))) {
+    validateKindRefs(yamlField(elevation, 'when'), vocabulary, issues);
+    const to = yamlField(elevation, 'to');
+    if (to !== null && !vocabulary.has(yamlWord(to))) {
+      add(issues, to, `unknown kind "${yamlWord(to)}"`);
+    }
+  }
+
+  const lanesNode = yamlField(root, 'lanes');
+  const lanePairs = yamlMap(lanesNode)?.items ?? [];
+  const laneNames = new Set(lanePairs.map((pair) => yamlWord(pair.key)));
+  const assigned = new Map<string, string>();
+  for (const pair of lanePairs) {
+    const lane = yamlWord(pair.key);
+    for (const item of listNodes(pair.value)) {
+      const name = yamlWord(item);
+      if (!vocabulary.has(name)) {
+        add(issues, item, `unknown kind "${name}"`);
+        continue;
+      }
+      const prior = assigned.get(name);
+      if (prior === undefined) assigned.set(name, lane);
+      else if (prior !== lane) {
+        add(issues, item, `kind "${name}" is in lanes "${prior}" and "${lane}"`);
+      }
+    }
+  }
+  if (lanesNode !== null) {
+    for (const name of vocabulary) {
+      if (!assigned.has(name)) add(issues, lanesNode, `kind "${name}" has no lane`);
+    }
+  }
+
+  for (const stage of stages) {
+    const condition = yamlField(stage, 'applies-if');
+    validateKindRefs(condition, vocabulary, issues);
+    validateLaneRefs(condition, laneNames, issues);
+  }
+
+  // R16: a label names a declared class, kind or lane.
+  const labelNames = new Set<string>([...vocabulary, ...laneNames, ...declared]);
+  for (const pair of yamlMap(yamlField(root, 'labels'))?.items ?? []) {
+    const name = yamlWord(pair.key);
+    if (!labelNames.has(name)) add(issues, pair.key, `unknown name "${name}" in labels`);
+  }
+}
+
+/** The stages in execution order, or undefined when the chain is not a single line. */
+function stageOrder(stages: readonly YamlNode[]): Map<string, number> | undefined {
+  const ids: string[] = [];
+  const known = new Set<string>();
+  for (const stage of stages) {
+    const id = yamlWord(yamlField(stage, 'id'));
+    if (known.has(id)) return undefined;
+    known.add(id);
+    ids.push(id);
+  }
+
+  const after = new Map<string, string | undefined>();
+  const successors = new Map<string, string>();
+  let roots = 0;
+  for (const stage of stages) {
+    const id = yamlWord(yamlField(stage, 'id'));
+    const afterNode = yamlField(stage, 'after');
+    if (afterNode === null) {
+      after.set(id, undefined);
+      roots += 1;
+      continue;
+    }
+    const prior = yamlWord(afterNode);
+    if (!known.has(prior) || successors.has(prior)) return undefined;
+    successors.set(prior, id);
+    after.set(id, prior);
+  }
+  if (roots !== 1) return undefined;
+
+  const ordered = new Map<string, number>();
+  let cursor: string | undefined = ids.find((id) => after.get(id) === undefined);
+  while (cursor !== undefined && !ordered.has(cursor)) {
+    ordered.set(cursor, ordered.size);
+    cursor = successors.get(cursor);
+  }
+  return ordered.size === stages.length ? ordered : undefined;
+}
+
+/** RC-08 §1.3 rules 1 and 2: exactly one merge, in its place. */
+function validatePhases(
+  stages: readonly YamlNode[],
+  stagesNode: YamlNode,
+  issues: LocatedIssue[],
+): void {
+  const idOf = (stage: YamlNode): string => yamlWord(yamlField(stage, 'id'));
+  const phaseOf = (stage: YamlNode): string => yamlWord(yamlField(stage, 'phase')) || 'pre-merge';
+
+  const merges = stages.filter((stage) => phaseOf(stage) === 'merge');
+  if (merges.length === 0) {
+    add(issues, stagesNode, 'exactly one stage must have phase: merge; found none');
+  } else if (merges.length > 1) {
+    const first = idOf(merges[0] as YamlNode);
+    for (const extra of merges.slice(1)) {
+      add(
+        issues,
+        yamlField(extra, 'phase'),
+        `only one stage may have phase: merge; "${first}" already does`,
+      );
+    }
+  }
+
+  if (merges.length !== 1) return;
+  const order = stageOrder(stages);
+  if (order === undefined) return;
+
+  const mergeId = idOf(merges[0] as YamlNode);
+  const mergeAt = order.get(mergeId);
+  if (mergeAt === undefined) return;
+
+  for (const stage of stages) {
+    const id = idOf(stage);
+    const at = order.get(id);
+    if (at === undefined) continue;
+    if (phaseOf(stage) === 'pre-merge' && at > mergeAt) {
+      add(
+        issues,
+        yamlField(stage, 'id'),
+        `stage "${id}" is pre-merge but comes after the merge stage "${mergeId}"`,
+      );
+    }
+    if (phaseOf(stage) === 'post-merge' && at < mergeAt) {
+      add(
+        issues,
+        yamlField(stage, 'phase'),
+        `stage "${id}" is post-merge but comes before the merge stage "${mergeId}"`,
+      );
+    }
+  }
+}
+
+/** RC-08 §1.3 rules 3 and 4, plus the command text of §1.4. */
+function validateStageRules(stages: readonly YamlNode[], issues: LocatedIssue[]): void {
+  for (const stage of stages) {
+    const phase = yamlWord(yamlField(stage, 'phase')) || 'pre-merge';
+    const required = yamlValue(yamlField(stage, 'required')) !== false;
+
+    const server = yamlField(stage, 'server');
+    if (server !== null && yamlMap(server) === undefined && yamlWord(server) === 'local-only') {
+      if ((phase === 'pre-merge' || phase === 'merge') && required) {
+        add(
+          issues,
+          server,
+          'local-only is only allowed in post-merge stages or with required: false',
+        );
+      }
+    }
+
+    const run = yamlField(yamlField(stage, 'gate'), 'run');
+    if (run === null) continue;
+
+    const nature = yamlWord(yamlField(stage, 'nature'));
+    if (nature !== 'recompute' && nature !== 'structure') {
+      add(issues, yamlField(stage, 'nature'), 'a command (run:) can only be recompute or structure');
+    }
+    validateCommandLine(run, issues);
   }
 }
 
@@ -123,19 +339,24 @@ export function validateSemantics(root: YamlNode): LocatedIssue[] {
   const issues: LocatedIssue[] = [];
   const classify = yamlField(root, 'classify');
   const kinds = yamlField(root, 'kinds');
-  const stages = yamlSeq(yamlField(root, 'stages'))?.items ?? [];
+  const stagesNode = yamlField(root, 'stages');
+  const stages = listNodes(stagesNode);
   const declared = new Set(
     (yamlMap(classify)?.items ?? []).map((pair) => yamlWord(pair.key)),
   );
 
   validateGlobs(classify, issues);
   validateGlobs(yamlField(kinds, 'from-paths'), issues);
-  for (const elevation of yamlSeq(yamlField(kinds, 'elevate'))?.items ?? []) {
+  for (const elevation of listNodes(yamlField(kinds, 'elevate'))) {
     validateClasses(yamlField(elevation, 'when'), declared, issues);
   }
   for (const stage of stages) {
     validateClasses(yamlField(stage, 'applies-if'), declared, issues);
   }
+
+  validateVocabulary(root, stages, declared, issues);
+  validatePhases(stages, stagesNode, issues);
+  validateStageRules(stages, issues);
   validateStageLinks(stages, issues);
   return issues;
 }

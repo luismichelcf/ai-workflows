@@ -98,6 +98,8 @@ interface Section {
   readonly title: string;
   readonly level: number;
   hasContent: boolean;
+  /** Visible prose lines belonging to this section or any subsection inside it. */
+  readonly lines: string[];
 }
 
 interface Analysis {
@@ -105,6 +107,32 @@ interface Analysis {
   readonly sections: readonly Section[];
   /** Lines outside any code fence, comments stripped: what a source scan sees. */
   readonly visible: readonly string[];
+}
+
+/** A section as seen from outside, for blocks that read a document's structure. */
+export interface DocumentSection {
+  readonly title: string;
+  readonly level: number;
+  readonly hasContent: boolean;
+  /** Visible prose lines belonging to this section or any subsection inside it. */
+  readonly lines: readonly string[];
+}
+
+/** The whole walk of a document: its headings, its sections and its visible prose. */
+export interface DocumentAnalysis {
+  readonly headings: readonly string[];
+  readonly sections: readonly DocumentSection[];
+  readonly visible: readonly string[];
+}
+
+/** The analysis `requireSections` uses, so a block can read a document the same way it does. */
+export function analyzeDocument(document: string): DocumentAnalysis {
+  return analyze(document);
+}
+
+/** Accent-folded and lowercased, the form the engine compares titles and labels in. */
+export function canonicalText(text: string): string {
+  return canonical(text);
 }
 
 /** Pops every open section that the new heading closes (same or shallower level). */
@@ -174,7 +202,7 @@ function analyze(document: string): Analysis {
       const level = atx[1].length;
       const title = normalizeTitle((atx[2] ?? '').replace(ATX_CLOSING, ''));
       closeSections(open, level);
-      const section: Section = { title, level, hasContent: false };
+      const section: Section = { title, level, hasContent: false, lines: [] };
       headings.push(title);
       sections.push(section);
       open.push(section);
@@ -189,7 +217,7 @@ function analyze(document: string): Analysis {
       const level = underline[1][0] === '=' ? 1 : 2;
       const title = normalizeTitle(line.trim());
       closeSections(open, level);
-      const section: Section = { title, level, hasContent: false };
+      const section: Section = { title, level, hasContent: false, lines: [] };
       headings.push(title);
       sections.push(section);
       open.push(section);
@@ -197,6 +225,7 @@ function analyze(document: string): Analysis {
       continue;
     }
 
+    for (const section of open) section.lines.push(line);
     if (hasRealContent(line)) markContent();
     index += 1;
   }
@@ -322,6 +351,29 @@ function collectDomains(document: string): Set<string> {
 /** Distinct providers linked from the document. Two links to one provider count once. */
 export function countDistinctSources(document: string): number {
   return collectDomains(document).size;
+}
+
+/** One URL read from a document, with the provider domain it belongs to. */
+export interface SourceUrl {
+  readonly url: string;
+  readonly domain: string;
+}
+
+/**
+ * Every URL read from the document that counts as a source, in the order it appears. Two
+ * links to one provider are both returned; collapsing them is the caller's decision.
+ */
+export function collectSourceUrls(document: string): readonly SourceUrl[] {
+  const urls: SourceUrl[] = [];
+  const visible = analyze(document).visible.join('\n');
+  for (const match of visible.matchAll(URL_CANDIDATE)) {
+    const candidate = match[0];
+    if (!candidate) continue;
+    const domain = domainOf(candidate);
+    if (domain === undefined) continue;
+    urls.push({ url: trimWrappers(candidate), domain });
+  }
+  return urls;
 }
 
 /** Requires enough distinct sources, and optionally enough from outside a known list. */

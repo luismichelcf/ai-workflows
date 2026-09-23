@@ -45,8 +45,12 @@ describe('telling one execution from another', () => {
     expect(sameExecution(builder, { ...builder, session: 's-9' })).toBe(false);
   });
 
-  it('a different model of the same provider is a different execution', () => {
-    expect(sameExecution(builder, { ...builder, model: 'deepseek-pro' })).toBe(false);
+  it('R18: another model in the same session is the same execution: it already knows what it wrote', () => {
+    expect(sameExecution(builder, { ...builder, model: 'deepseek-pro' })).toBe(true);
+  });
+
+  it('another model in another session is a different execution', () => {
+    expect(sameExecution(builder, { ...builder, model: 'deepseek-pro', session: 's-9' })).toBe(false);
   });
 
   it('a different provider is a different execution', () => {

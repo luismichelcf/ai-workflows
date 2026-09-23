@@ -56,8 +56,70 @@ rejected, and `NO` stays text. Its JSON Schema (`schema/recipe.schema.json`) is 
 `validate` enforces, so the editor and the engine agree. A stage's `applies-if` is a structured
 condition (`touches-any`, `touches-none`, `kind-any`, `kind-none`, `lane-any`), never an
 expression; a stage that does not apply is recorded as skipped with its reason, and
-`status <piece>` lists it that way. Blocks, the server check and running a recipe arrive in the
-next slices.
+`status <piece>` lists it that way. The server check arrives in slice 3.
+
+## Blocks
+
+A stage's `gate` names a **block**. Engine blocks are `uses: ai-workflows/<name>@<major>`;
+project blocks live in `.ai-workflows/blocks/<name>/` with a `block.yml` manifest. Every block
+declares the natures it may claim, the validity rules it accepts and its typed inputs, and
+`validate` checks each stage against that manifest before anything runs.
+
+| Block | Checks | Nature |
+|---|---|---|
+| `spec-structure` | Required sections, a labelled summary, identified criteria, no pending decisions | structure |
+| `benchmark-sources` | Distinct sources per category, optionally that each source's domain answers; a written waiver skips it | structure |
+| `sandboxed-review` | Runs a reviewer read-only, observes its identity, the tree before and after, and its verdict | recompute + attest |
+| `red-test` | The new tests fail by their assertion, not by an import or the environment | recompute + execution record |
+| `build-verify` | Tests green, untouched since the red run (also in history), and red again with only the implementation retired | recompute + execution record |
+| `command` | A project command within a time limit; optionally reads a Vitest run | recompute |
+| `scope-reconcile` | Records when the real files raise the kind (and so the lane) above what was declared | recompute |
+
+`independent-review`, `approval-comment`, `preview-deployment`, `browser-qa`, `github-merge`,
+`post-merge` and `cleanup` have manifests already and are built in slice 4; a recipe that uses
+them validates, and running them blocks with that reason.
+
+**Project blocks.** A *module* block (`kind: module`, `main: index.mjs`) is imported and called
+with the same context as any gate — journal, locale, mode, cancellation signal and `runEffect` —
+and may export `reconcile(operationId, context)` so an effect left in doubt by a crash is checked
+against the outside world instead of repeated. It runs in the engine's process, so it only runs
+next to the agent, never in the server check. A *command* block (`kind: command`, or `run:` in
+the recipe) is a separate program with no effects: it reads the change as JSON on stdin and
+prints exactly `{ "ok": true | false | "skipped", "reason", "evidence" }`. Anything else — a
+non-zero exit, extra text, a missing or unknown key, running out of time, printing more than
+1 MB — blocks the piece technically; it never passes. Command lines are split on spaces and never
+reach a shell; `{tests}` and `{piece}` are the only placeholders.
+
+**Processes.** A command block runs inside a group the operating system keeps together: a job
+object on Windows (created suspended, no breakaway, killed as a whole) and a process group
+elsewhere. When a piece is cancelled or the block ends, the engine empties the group and
+confirms it is empty before letting go. If it cannot confirm that, the piece stays in quarantine
+— no stage of it runs, from any controller, even after its lease expires — until the system
+itself answers that the group is gone.
+
+**Evidence and validity.** The engine seals every passing stage with what it judged — the
+commit, the exact snapshot of the working tree (unsaved and new files included) and the
+fingerprint of the piece's own changes — and a block cannot write that part. A stage keeps its
+evidence while its `valid-while` rule holds (`same-sha` by default, `same-fingerprint`,
+`same-fingerprint-or-clean-update`, `forever`). A clean update with the base only keeps a review
+alive when the engine recorded it and git confirms it again on every read: a merge of exactly the
+old head and a base commit whose tree is what a three-way merge produces. If the working tree
+changes while a stage runs, or before a piece would be called done, the piece is blocked instead.
+
+The facts of a change come from git, never from the piece: files, snapshot, fingerprint, and the
+effective kind — forced by `from-paths`, else declared, then raised by `elevate` rules in order —
+with the lane following the kind (`lanes:`). The recipe declares its kinds and lanes once
+(`kinds.names`, `lanes`), and any other word is rejected. `labels` gives classes, kinds and lanes
+the owner's words for `explain`.
+
+`compileRecipe(recipe, deps)` turns a recipe into the engine's configuration and re-checks it against
+the manifests on its own; `deps.root` must be the top of the repository. Pass everything it
+returns to `createEngine` — `config`, `describeChange`, `confirmFacts` (the final check before a
+piece is done) and `confirmQuarantine` (without it a quarantined piece cannot be released).
+Wiring `run`, `status` and `stop` of the command line to the recipe arrives in slice 4.
+
+The independence of a review is judged by provider and session: the same session under another
+model is still the builder (PLAN-13 R18).
 
 ## Where progress lives on GitHub
 

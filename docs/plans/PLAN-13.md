@@ -56,7 +56,7 @@ que no pudo correr queda `blocked:technical`, nunca «atestiguado».
 
 **Identidad.** Publicador (cuenta de GitHub) ≠ ejecución (proveedor + modelo + esfuerzo + sesión)
 ≠ pieza (repo, pieza, base, SHA). La independencia de un revisor se juzga por la identidad de
-ejecución y la familia, nunca por la cuenta de GitHub.
+ejecución y la familia, nunca por la cuenta de GitHub. Dos ejecuciones de la misma sesión son la misma aunque cambie el modelo (R18).
 
 **Pipeline lineal.** Una etapa tiene como máximo un predecesor; dos etapas con el mismo `after`
 se rechazan. Si una pieza necesita paralelismo, se parte en dos piezas.
@@ -99,6 +99,11 @@ permanente (§8.2).
 | R11 | **Se integra solo cuando se cumplan las condiciones de ADR 0219** (§7) y el dueño lo apruebe en un único cambio. |
 | R12 | **Modelos de esta pieza:** constructor GPT-6 Sol `high`; relevo DeepSeek V4.1 Flash `high` por OpenCode; revisión del spec GPT-6 Sol `high`; revisión del código, parvada de revisores Claude especializados en sesiones frescas. |
 | R13 | **Se acepta el riesgo de que un workflow deliberado imite el estado del juez** (decisión del 22-sep, tras la ronda 2 de revisión), igual que ADR 0214 lo aceptó para `visto-bueno`. Se declara y se deja rastro; no se crea una app propia ni se paga el plan Enterprise por esto. Alternativas descartadas: app de GitHub propia (gratis, más montaje) y flujos obligatorios de Enterprise (~21 USD por persona al mes tras la prueba). |
+| R14 | **Vigencia por omisión: `same-sha`** (22-sep, al abrir la rebanada 2). Una etapa que no escribe `valid-while` pierde su evidencia en cuanto cambia el SHA. Descartado: hacerlo obligatorio (una línea más por etapa sin ganar seguridad). |
+| R15 | **La receta declara su vocabulario de tipos y carriles** (22-sep). `kinds.names` lista una vez los tipos válidos y `lanes:` reparte cada tipo en un carril; `validate` rechaza cualquier tipo o carril fuera de esa lista en `applies-if`, `default`, `from-paths` y `elevate`. El carril no se declara: sale del tipo efectivo, así que sube cuando sube el riesgo (detalle en [PLAN-13-R2](PLAN-13-R2.md) §1.1). Descartado: una lista fija dentro del motor (otro proyecto no podría usar sus propios tipos, contra R05). |
+| R16 | **Nombres en el idioma del dueño para clases y tipos** (22-sep). Cada clase de `classify` y cada tipo o carril puede llevar un nombre legible que `explain` usa en lugar de la palabra en inglés («toca permisos y datos» en vez de «toca security»). Opcional: sin nombre, `explain` muestra la palabra en inglés. |
+| R17 | **Constructor desde la rebanada 2: DeepSeek V4.1 Flash `high`** por OpenCode (22-sep, porque se agota la cuota de ChatGPT). Relevo: GPT-6 Sol `high`, por cuota, autenticación o dos intentos fallidos. La revisión del spec sigue con Sol y la del código con la parvada Claude (R12). |
+| R18 | **La misma conversación es el mismo revisor, aunque cambie de modelo** (23-sep, en la revisión del PR #17). Un modelo que construyó y luego, en la misma sesión, cambia de modelo para revisar, no cuenta como independiente: ya sabe lo que escribió. La identidad de ejecución para juzgar independencia es proveedor + sesión; el modelo y el esfuerzo se siguen registrando, pero no separan dos ejecuciones de la misma sesión. Precisa §1.1 («Identidad»). |
 
 Decisiones de construcción tomadas por el orquestador (el dueño decide qué, el orquestador cómo):
 YAML 1.2 con esquema publicado (§3.2), condiciones estructuradas sin lenguaje de expresiones en v1
@@ -149,7 +154,8 @@ classify:                           # tablas de rutas: datos, no código
   visible:    ["app/**", "components/**", "public/**", "electron/**"]
   production: [".github/workflows/**", "scripts/fila/**"]
 
-kinds:                              # tipos de cambio que declara cada pieza
+kinds:                              # tipos de cambio que declara cada pieza (ejemplo parcial)
+  names: [behavior, ui-behavior, visual-only, prod-config, config-no-prod, generated, docs, prototype]
   default: behavior
   from-paths:                       # si TODOS los archivos caen aquí, ese es el tipo
     docs: ["docs/**"]
@@ -159,6 +165,14 @@ kinds:                              # tipos de cambio que declara cada pieza
       to: behavior
     - when: { touches-any: [production], kind-any: [visual-only, config-no-prod, generated] }
       to: prod-config
+
+lanes:                              # el carril sale del tipo efectivo (R15)
+  full: [behavior, ui-behavior, prod-config]
+  light: [visual-only, config-no-prod, generated, docs, prototype]
+
+labels:                             # nombres para el dueño en `explain` (R16)
+  money: "dinero"
+  security: "permisos y datos"
 
 stages:
   - id: red-test
@@ -567,7 +581,7 @@ Una rama y un PR por rebanada en este repositorio. Prueba roja primero en cada c
 comportamiento; el orquestador escribe las pruebas rojas y el constructor las pone verdes.
 
 - [x] **1. Receta:** lector estricto, esquema, `validate`, `explain`, `init`. (RC-01, 02, 04, 05)
-- [ ] **2. Bloques:** registro de bloques, manifiestos, bloques módulo y comando, vigencias de §3.3
+- [x] **2. Bloques:** registro de bloques, manifiestos, bloques módulo y comando, vigencias de §3.3
       y los bloques genéricos de §4.1 portados desde las compuertas existentes. (RC-03, RC-07…RC-10,
       CN-01…CN-04, CN-09…CN-11)
 - [ ] **3. El juez:** acción reutilizable y plantilla de workflow, procedencia desde la base,
@@ -605,29 +619,28 @@ Rebanadas 1 → 2 → 3 → 4 en orden; 5 puede empezar tras 3; 6 tras 4 y 5; 7 
 
 - Qué proyecto de base de datos de prueba usar (gratuito o del plan Pro), según límites vigentes
   al abrir la rebanada 6.
-- Que salieron de la parvada de la rebanada 1 y se resuelven al abrir la rebanada 2, antes de
-  construir las vigencias y los tipos:
-  - **Vigencia por omisión.** La receta leída deja `valid-while` sin valor si no se escribe; al
-    traducirla al motor, «sin valor» no puede significar «nunca caduca» (eso conservaría la puerta
-    tras un commit nuevo, contra §1.1). Opciones: hacerlo obligatorio o un valor conservador
-    (`same-sha`).
-  - **Tipos y carriles con vocabulario cerrado.** Hoy un error de escritura en `kind-any` o
-    `lane-any` valida y deja la etapa omitida para siempre. Se cierra junto con RC-07.
-  - **Reglas de `validate` diferidas:** exactamente una etapa `phase: merge`, `local-only` solo
-    fuera de `pre-merge` obligatoria, bloques comando sin `attest` ni `execution-record` (RC-08);
-    QA solo con `same-sha`; toda etapa `pre-merge` con `server:` (rebanada 3); orden de fases y
-    `applies-if` sobre la etapa de fusión (a proponer).
-  - **`{tests}` en `with.command`:** el bloque debe pasar los archivos como argumentos, nunca
-    armados dentro de un texto de consola (§3.4).
-  - **Salida saneada en todo el CLI (rebanada 4, mensajes al dueño):** `status`, `validate` y
-    `explain` ya no pueden imprimir caracteres de control, de formato ni separadores; `pause`,
-    `resume`, `stop` y `doctor` (heredados de v0.3.0) todavía repiten nombres de pieza y motivos
-    tal cual. Se cierra con las plantillas de mensajes.
+- Resueltos al construir la rebanada 2 ([PLAN-13-R2](PLAN-13-R2.md)): vigencia por omisión
+  (R14), vocabulario cerrado de tipos y carriles (R15), nombres en español (R16), las reglas de
+  `validate` de RC-08 más el orden de fases y la validación contra manifiestos, y `{tests}` como
+  argumentos sin consola.
+- Siguen abiertos:
+  - **Rebanada 3:** toda etapa `pre-merge` con `server:`; el juez no corre bloques módulo del
+    proyecto (corren en el proceso del motor).
+  - **Rebanada 4:** `required: false` y `retry` en ejecución (hoy `compileRecipe` los rechaza);
+    conectar `run`, `status` y `stop` del binario a la receta, y de dónde toma el CLI el tipo
+    declarado y el constructor de una pieza; publicar el veredicto de `sandboxed-review` como
+    evento autenticado; salida saneada en `pause`, `resume`, `stop` y `doctor`.
+  - **A proponer al dueño:** `applies-if` sobre la etapa de fusión.
   - **Costo aceptado del saneado:** una receta rechaza emojis compuestos (👩‍💻), banderas con
     etiquetas y el guion suave que deja Word; los acentos, «», —, ¿¡ y los emojis simples pasan.
-  - **Propuesta al dueño:** que `explain` muestre las clases y los tipos con un nombre en español
-    (hoy dice «toca «security»»). Sería un campo nuevo de la receta; no se añade sin su visto
-    bueno.
+  - **Después de v1, a proponer al dueño:** un modelo de decisión rápido (p. ej. Jev de
+    TypeSafe) solo como alarma que sube la exigencia, nunca la baja, y primero en modo sombra;
+    implica un servicio y un gasto nuevos (conversación del 22-sep).
+- Notas menores de la última revisión de la rebanada 2 (no bloquean): endurecer dos pruebas propias de `tests/review-round5.test.ts` (fijar la respuesta exacta de arrendamiento vencido y hacer fallar la relectura después del tercer intento); el motivo de una renovación fallida al escribir «en curso» dice primero «save»; cada etapa hace una renovación de arrendamiento más (en el almacén de GitHub es un commit); investigar la prueba inestable de `tests/integrity.test.ts` sobre el latido del arrendamiento.
+- Límites declarados en la rebanada 2: en Linux, un proceso que crea a propósito su propia sesión
+  sale del grupo del bloque (nivel A); una prueba editada y restaurada sin commit no se detecta
+  (nivel A, CN-11); la identidad del constructor es declarada por la pieza (nivel A, CN-02);
+  `same-fingerprint` caduca si una actualización con la base desplaza líneas (del lado seguro).
 
 ---
 

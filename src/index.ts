@@ -22,6 +22,20 @@ export {
 } from './gh-runner.js';
 export { createEngine } from './engine.js';
 export {
+  launchInGroup,
+  checkQuarantine,
+  DEFAULT_STDOUT_BYTES,
+  DEFAULT_PROCESS_GROUPS,
+  type GroupExit,
+  type LaunchInGroupOptions,
+  type ProcessGroup,
+  type ProcessGroupControl,
+  type Quarantine,
+  type QuarantineCheck,
+  type QuarantineSurvivor,
+  type TerminateResult,
+} from './process-group.js';
+export {
   runCommand,
   renderStatus,
   renderDoctor,
@@ -80,12 +94,38 @@ export {
 export { resolveExecutable, type ExecutableEnvironment, type ResolvedExecutable } from './exec.js';
 export { recipeSchema } from './recipe/schema.js';
 export { parseRecipe } from './recipe/parse.js';
+export { checkRecipe } from './recipe/blocks.js';
+export type { CheckRecipeResult } from './recipe/blocks.js';
+export { engineBlockManifest } from './blocks/registry.js';
+export type {
+  BlockDefinition,
+  EngineBlockDeps,
+  ProviderRunner,
+  ProviderRunOptions,
+} from './blocks/definition.js';
+export {
+  compileRecipe,
+  runProviderInGroup,
+  type CompiledRecipe,
+  type CompileRecipeDeps,
+  type CompileLimits,
+  type ProviderRunInGroupOptions,
+} from './recipe/compile.js';
 export { classifyFiles } from './recipe/glob.js';
+export { effectiveKind, type EffectiveKind } from './recipe/kind.js';
+export {
+  describeChangeFromGit,
+  type ChangeFacts,
+  type ChangeBuilder,
+  type ChangeDeclared,
+  type DescribeChangeFromGitOptions,
+} from './recipe/facts.js';
 export { appliesIfFor } from './recipe/applies.js';
 export { explainRecipe } from './recipe/explain.js';
 export { recipeCommand } from './recipe/command.js';
 export { DEFAULT_BANNED_TERMS, findBannedTerms } from './messages.js';
 export type { Recipe, RecipeStage, RecipeCondition, RecipeError } from './recipe/types.js';
+export type { BlockManifest, InputSpec, ValidWhile } from './blocks/manifest.js';
 export {
   parseHookInput,
   decideToolUse,

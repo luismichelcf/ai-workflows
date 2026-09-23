@@ -39,6 +39,7 @@ const stageWith = (...extra: string[]) =>
     '    summary: "Paso A"',
     '    nature: recompute',
     ...extra,
+    '    phase: merge',
     '    gate:',
     '      run: node a.mjs',
   );
@@ -154,6 +155,7 @@ describe('names inherited by every object are not fields', () => {
         'stages:',
         '  - id: a',
         '    summary: "Paso A"',
+        '    phase: merge',
         '    nature: recompute',
         '    applies-if: { touches-any: [constructor] }',
         '    gate:',
@@ -198,6 +200,7 @@ describe('globs the engine cannot honour are refused, never silently unmatched',
         'version: 1',
         'locale: es',
         'kinds:',
+        '  names: [behavior, docs]',
         '  default: behavior',
         '  from-paths:',
         '    docs: ["./docs/**"]',
@@ -209,7 +212,7 @@ describe('globs the engine cannot honour are refused, never silently unmatched',
         '      run: node a.mjs',
       ),
     );
-    expect(errors).toContainEqual(at(6, 12, /^unsupported glob "\.\/docs\/\*\*"/));
+    expect(errors).toContainEqual(at(7, 12, /^unsupported glob "\.\/docs\/\*\*"/));
   });
 
   it('checks the classes of touches-none too', () => {
@@ -427,6 +430,9 @@ describe('status never passes on what a piece declares about itself', () => {
       lines(
         'version: 1',
         'locale: es',
+        'kinds:',
+        '  names: [behavior]',
+        '  default: behavior',
         'stages:',
         '  - id: a',
         '    summary: "Paso A"',
@@ -440,6 +446,13 @@ describe('status never passes on what a piece declares about itself', () => {
         '    applies-if: { kind-any: [behavior] }',
         '    gate:',
         '      run: node b.mjs',
+        '  - id: merge',
+        '    summary: "Se une a la versión principal"',
+        '    after: b',
+        '    phase: merge',
+        '    nature: recompute',
+        '    gate:',
+        '      run: node m.mjs',
       ),
       FILE,
     );
@@ -496,6 +509,7 @@ describe('invisible and look-alike characters never reach a recipe', () => {
       '  - id: a',
       `    summary: ${JSON.stringify(summary)}`,
       '    nature: recompute',
+      '    phase: merge',
       '    gate:',
       '      run: node a.mjs',
     );

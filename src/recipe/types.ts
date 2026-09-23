@@ -32,8 +32,8 @@ export interface RecipeStage {
   readonly required: boolean;
   readonly nature: GateNature;
   readonly appliesIf?: RecipeCondition;
-  /** Absent until the recipe explicitly declares a validity rule. */
-  readonly validWhile?:
+  /** Always present: an absent valid-while reads as `same-sha` (R14). */
+  readonly validWhile:
     | 'same-sha'
     | 'same-fingerprint'
     | 'same-fingerprint-or-clean-update'
@@ -55,6 +55,8 @@ export interface Recipe {
   /** Named file classes retain declaration order for condition messages. */
   readonly classify: Readonly<Record<string, readonly string[]>>;
   readonly kinds?: {
+    /** The closed vocabulary of change kinds (R15). */
+    readonly names: readonly string[];
     readonly default: string;
     readonly fromPaths: Readonly<Record<string, readonly string[]>>;
     readonly elevate: readonly {
@@ -62,5 +64,9 @@ export interface Recipe {
       readonly to: string;
     }[];
   };
+  /** Every declared kind in exactly one lane (R15). */
+  readonly lanes?: Readonly<Record<string, readonly string[]>>;
+  /** Owner-facing names for classes, kinds and lanes (R16). */
+  readonly labels?: Readonly<Record<string, string>>;
   readonly stages: readonly RecipeStage[];
 }
