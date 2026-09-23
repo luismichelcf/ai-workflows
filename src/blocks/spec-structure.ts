@@ -16,6 +16,7 @@ export const manifest: BlockManifest = {
   name: 'spec-structure',
   kind: 'module',
   natures: ['structure'],
+  server: ['recompute', 'require-check'],
   inputs: {
     file: { type: 'string', required: true },
     sections: { type: 'string-list' },

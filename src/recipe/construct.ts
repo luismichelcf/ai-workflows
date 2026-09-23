@@ -1,6 +1,6 @@
 import { isMap, type Node } from 'yaml';
 
-import type { Recipe, RecipeCondition, RecipeStage } from './types.js';
+import type { Recipe, RecipeCondition, RecipePieces, RecipeStage } from './types.js';
 import { yamlField, yamlMap, yamlSeq, yamlValue, yamlWord, type YamlNode } from './validation.js';
 
 function camel(key: string): string {
@@ -57,11 +57,23 @@ function constructStage(node: Node): RecipeStage {
   };
 }
 
+function constructPieces(node: YamlNode): RecipePieces {
+  const declaredKind = yamlField(node, 'declared-kind');
+  const file = yamlWord(yamlField(declaredKind, 'file'));
+  const line = yamlWord(yamlField(declaredKind, 'line'));
+  return {
+    branch: (yamlValue(yamlField(node, 'branch')) ?? []) as string[],
+    excludeBranches: (yamlValue(yamlField(node, 'exclude-branches')) ?? []) as string[],
+    ...(declaredKind === null ? {} : { declaredKind: { file, line } }),
+  };
+}
+
 export function constructRecipe(root: Node): Recipe {
   const classify = yamlField(root, 'classify');
   const kinds = yamlField(root, 'kinds');
   const lanes = yamlField(root, 'lanes');
   const labels = yamlField(root, 'labels');
+  const pieces = yamlField(root, 'pieces');
   const stageNodes = yamlSeq(yamlField(root, 'stages'))?.items ?? [];
   const owner = yamlField(root, 'owner');
   const elevations = yamlSeq(yamlField(kinds, 'elevate'))?.items ?? [];
@@ -88,5 +100,6 @@ export function constructRecipe(root: Node): Recipe {
     ...(labels === null ? {} : {
       labels: yamlValue(labels) as Record<string, string>,
     }),
+    ...(pieces === null ? {} : { pieces: constructPieces(pieces) }),
   };
 }

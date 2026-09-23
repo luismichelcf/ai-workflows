@@ -45,6 +45,9 @@ function recipe(stageRows: readonly string[]): string[] {
     '  - id: check', //                                       4
     '    summary: "Comprobación"', //                        5
     ...stageRows, //                                          6…
+    // PLAN-13-R3 §1.2: a pre-merge stage says how GitHub checks it. Added last, so the rows
+    // the tests point at keep their numbers.
+    ...(stageRows.some((row) => row.trimStart().startsWith('server:')) ? [] : ['    server: { require-check: ci }']),
     '  - id: merge',
     '    summary: "Se une a la versión principal"',
     '    after: check',

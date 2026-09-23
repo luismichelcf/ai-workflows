@@ -94,7 +94,10 @@ export async function checkRecipe(
   for (const stage of stages) {
     const gate = yamlField(stage, 'gate');
     const usesNode = yamlField(gate, 'uses');
-    if (usesNode === null) continue;
+    if (usesNode === null) {
+      checkRunServer(stage, location);
+      continue;
+    }
     await checkStageBlock(stage, gate, usesNode, stages, location);
   }
 
@@ -124,6 +127,77 @@ async function checkStageBlock(
   checkNature(stage, uses, manifest, location.recipeIssues);
   checkValidity(stage, usesNode, uses, manifest, location.recipeIssues);
   checkInputs(gate, usesNode, uses, manifest, stage, stages, location.recipeIssues);
+  checkServerMode(stage, gate, uses, manifest, location.recipeIssues);
+}
+
+function stagePhase(stage: YamlNode): string {
+  return yamlWord(yamlField(stage, 'phase')) || 'pre-merge';
+}
+
+/** The written `server:` value, or `'require-check'` when it is a map. */
+function serverMode(serverNode: YamlNode): string {
+  return yamlMap(serverNode) !== undefined ? 'require-check' : yamlWord(serverNode);
+}
+
+/** §1.2 rule 1: a pre-merge stage says how GitHub checks it. */
+function checkPreMergeServerPresent(stage: YamlNode, issues: LocatedIssue[]): void {
+  const idNode = yamlField(stage, 'id');
+  add(issues, idNode, `stage "${yamlWord(idNode)}" is pre-merge and needs server:`);
+}
+
+/** §1.2 rule 3, for a `run:` stage: only `require-check` (or local-only when optional). */
+function checkRunServer(stage: YamlNode, location: Location): void {
+  if (stagePhase(stage) !== 'pre-merge') return;
+  const serverNode = yamlField(stage, 'server');
+  if (serverNode === null) {
+    checkPreMergeServerPresent(stage, location.recipeIssues);
+    return;
+  }
+  const mode = serverMode(serverNode);
+  if (mode === 'local-only' || mode === 'require-check') return;
+  add(location.recipeIssues, serverNode, 'a project block or run: only takes server: require-check');
+}
+
+/** §1.2 rules 1, 3 and 6 for a stage whose gate names a block. */
+function checkServerMode(
+  stage: YamlNode,
+  gate: YamlNode,
+  uses: string,
+  manifest: BlockManifest,
+  issues: LocatedIssue[],
+): void {
+  if (stagePhase(stage) !== 'pre-merge') return;
+  const serverNode = yamlField(stage, 'server');
+  if (serverNode === null) {
+    checkPreMergeServerPresent(stage, issues);
+    return;
+  }
+  const mode = serverMode(serverNode);
+  if (mode === 'local-only') return;
+
+  if (!ENGINE_USES.test(uses)) {
+    if (mode !== 'require-check') {
+      add(issues, serverNode, 'a project block or run: only takes server: require-check');
+    }
+    return;
+  }
+
+  if (!manifest.server.includes(mode as (typeof manifest.server)[number])) {
+    add(
+      issues,
+      serverNode,
+      `block "${uses}" cannot use server: ${mode}; it allows: ${manifest.server.join(', ')}`,
+    );
+    return;
+  }
+
+  if (
+    mode === 'recompute' &&
+    uses === 'ai-workflows/benchmark-sources@1' &&
+    yamlValue(yamlField(yamlField(gate, 'with'), 'check-reachable')) === true
+  ) {
+    add(issues, serverNode, 'check-reachable cannot be recomputed on GitHub; use require-check');
+  }
 }
 
 /** Engine or project block; adds the reason and returns undefined when it cannot be read. */
@@ -432,7 +506,7 @@ function validateListInput(
       add(issues, item, `${subject} must be a list of strings`);
       continue;
     }
-    if (globs && !validGlob(value)) {
+    if (globs && !validGlob(value, true)) {
       add(issues, item, `unsupported glob "${value}": only *, ** and ? are allowed`);
     }
   }
@@ -680,6 +754,8 @@ function constructBlockManifest(name: string, root: YamlNode): BlockManifest {
     kind,
     natures,
     ...(validWhiles.length === 0 ? {} : { validWhile: validWhiles }),
+    // PLAN-13-R3 §1.3: a project block never declares server modes; it can only be a check.
+    server: ['require-check'],
     inputs,
   };
 }

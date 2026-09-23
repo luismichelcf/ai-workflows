@@ -13,6 +13,7 @@ export const manifest: BlockManifest = {
   name: 'scope-reconcile',
   kind: 'module',
   natures: ['recompute'],
+  server: ['recompute', 'require-check'],
   inputs: {},
 };
 

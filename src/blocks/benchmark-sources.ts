@@ -25,6 +25,7 @@ export const manifest: BlockManifest = {
   name: 'benchmark-sources',
   kind: 'module',
   natures: ['structure'],
+  server: ['recompute', 'require-check'],
   inputs: {
     files: { type: 'glob-list', required: true },
     categories: {

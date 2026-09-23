@@ -79,6 +79,9 @@ export type InputSpec =
   | InputSpecObject
   | InputSpecObjectList;
 
+/** PLAN-13-R3 §1.3: the ways the judge on GitHub may check a block. */
+export type ServerMode = 'recompute' | 'require-check' | 'attestation';
+
 /** PLAN-13-R2 §2.1: what a block declares before anything runs against it. */
 export interface BlockManifest {
   /** `'red-test'` for an engine block, or the project block path it was read from. */
@@ -87,5 +90,7 @@ export interface BlockManifest {
   readonly natures: readonly GateNature[];
   /** Absent means every validity rule is allowed. */
   readonly validWhile?: readonly ValidWhile[];
+  /** PLAN-13-R3 §1.3: the server modes this block allows; a project block takes `require-check`. */
+  readonly server: readonly ServerMode[];
   readonly inputs: Readonly<Record<string, InputSpec>>;
 }

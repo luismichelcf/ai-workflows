@@ -29,6 +29,7 @@ export const manifest: BlockManifest = {
   name: 'command',
   kind: 'module',
   natures: ['recompute'],
+  server: ['require-check'],
   inputs: {
     command: { type: 'command', required: true },
     'timeout-minutes': { type: 'integer', min: 1, max: 120, default: 30 },

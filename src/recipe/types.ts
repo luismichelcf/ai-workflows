@@ -48,10 +48,24 @@ export interface RecipeStage {
   readonly retry?: { readonly attempts: number; readonly waitSeconds: number };
 }
 
+/** R19: how a branch names its piece, and where the piece declares its kind. */
+export interface RecipePieces {
+  /** Branch patterns; `{piece}` appears exactly once in each. */
+  readonly branch: readonly string[];
+  /** Branches that never join the main line; absent reads as empty. */
+  readonly excludeBranches: readonly string[];
+  readonly declaredKind?: {
+    readonly file: string;
+    readonly line: string;
+  };
+}
+
 export interface Recipe {
   readonly version: 1;
   readonly locale: string;
   readonly owner?: string;
+  /** R19: optional; without it the piece of a change is the pull request number. */
+  readonly pieces?: RecipePieces;
   /** Named file classes retain declaration order for condition messages. */
   readonly classify: Readonly<Record<string, readonly string[]>>;
   readonly kinds?: {

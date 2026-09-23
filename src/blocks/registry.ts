@@ -24,6 +24,7 @@ const MANIFESTS: Readonly<Record<string, BlockManifest>> = {
     kind: 'module',
     natures: ['execution-record', 'attest'],
     validWhile: ['same-sha', 'same-fingerprint', 'same-fingerprint-or-clean-update'],
+    server: ['attestation', 'require-check'],
     inputs: {
       'forbid-same-family': { type: 'boolean', default: true },
       angles: { type: 'string-list' },
@@ -35,6 +36,7 @@ const MANIFESTS: Readonly<Record<string, BlockManifest>> = {
     kind: 'module',
     natures: ['attest', 'recompute'],
     validWhile: ['same-sha', 'same-fingerprint', 'same-fingerprint-or-clean-update'],
+    server: ['attestation', 'require-check'],
     inputs: {
       command: { type: 'string', default: '/approve' },
       'code-length': { type: 'integer', min: 4, max: 40, default: 7 },
@@ -45,6 +47,7 @@ const MANIFESTS: Readonly<Record<string, BlockManifest>> = {
     name: 'preview-deployment',
     kind: 'module',
     natures: ['recompute'],
+    server: ['require-check'],
     inputs: {},
   },
 
@@ -53,6 +56,7 @@ const MANIFESTS: Readonly<Record<string, BlockManifest>> = {
     kind: 'module',
     natures: ['recompute'],
     validWhile: ['same-sha'],
+    server: ['require-check'],
     inputs: {
       command: { type: 'command' },
     },
@@ -62,6 +66,7 @@ const MANIFESTS: Readonly<Record<string, BlockManifest>> = {
     name: 'github-merge',
     kind: 'module',
     natures: ['recompute'],
+    server: [],
     inputs: {},
   },
 
@@ -69,6 +74,7 @@ const MANIFESTS: Readonly<Record<string, BlockManifest>> = {
     name: 'post-merge',
     kind: 'module',
     natures: ['recompute'],
+    server: [],
     inputs: {},
   },
 
@@ -76,6 +82,7 @@ const MANIFESTS: Readonly<Record<string, BlockManifest>> = {
     name: 'cleanup',
     kind: 'module',
     natures: ['recompute'],
+    server: [],
     inputs: {},
   },
 };

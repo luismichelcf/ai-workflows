@@ -291,7 +291,13 @@ async function readProjectBlock(root: string, name: string): Promise<ProjectBloc
 
 /** The synthetic manifest of a stage written with `run:`: never a module, only recompute/structure. */
 function runManifest(name: string): BlockManifest {
-  return { name, kind: 'command', natures: ['recompute', 'structure'], inputs: {} };
+  return {
+    name,
+    kind: 'command',
+    natures: ['recompute', 'structure'],
+    server: ['require-check'],
+    inputs: {},
+  };
 }
 
 /**
@@ -381,7 +387,13 @@ async function resolveStageBlock(
 
   if (run !== undefined) {
     return {
-      manifest: { name: stage.id, kind: 'command', natures: ['recompute', 'structure'], inputs: {} },
+      manifest: {
+        name: stage.id,
+        kind: 'command',
+        natures: ['recompute', 'structure'],
+        server: ['require-check'],
+        inputs: {},
+      },
       create: (_inputs, engineDeps) =>
         createCommandGate({ run, root: engineDeps.root, groups, limits: deps.limits ?? {}, withValue }),
     };
