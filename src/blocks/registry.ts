@@ -1,7 +1,9 @@
 import type { BlockDefinition } from './definition.js';
 import type { BlockManifest } from './manifest.js';
 import { benchmarkSourcesBlock } from './benchmark-sources.js';
+import { buildVerifyBlock } from './build-verify.js';
 import { commandBlock } from './command.js';
+import { redTestBlock } from './red-test.js';
 import { specStructureBlock } from './spec-structure.js';
 
 // PLAN-13-R2 §2.1, §3 and §3.8: the manifests of this slice's engine blocks. They declare
@@ -9,9 +11,10 @@ import { specStructureBlock } from './spec-structure.js';
 // blocks of slice 4 (`independent-review`, `approval-comment`, `preview-deployment`,
 // `browser-qa`, `github-merge`, `post-merge`, `cleanup`) carry only a manifest here.
 //
-// `spec-structure`, `benchmark-sources` and `command` are built: their definitions — manifest
-// included — live in their own files, so there is one source of truth for each. Every other
-// block is a `BlockDefinition` whose `create` reports it is not built yet.
+// `spec-structure`, `benchmark-sources`, `command`, `red-test` and `build-verify` are built:
+// their definitions — manifest included — live in their own files, so there is one source of
+// truth for each. Every other block is a `BlockDefinition` whose `create` reports it is not
+// built yet.
 
 const MANIFESTS: Readonly<Record<string, BlockManifest>> = {
   'sandboxed-review': {
@@ -31,32 +34,6 @@ const MANIFESTS: Readonly<Record<string, BlockManifest>> = {
       prompt: { type: 'string', required: true },
       angle: { type: 'string', required: true },
       'forbid-same-family': { type: 'boolean', default: true },
-      'timeout-minutes': { type: 'integer', min: 1, max: 120, default: 30 },
-    },
-  },
-
-  'red-test': {
-    name: 'red-test',
-    kind: 'module',
-    natures: ['recompute', 'execution-record'],
-    validWhile: ['forever'],
-    inputs: {
-      command: { type: 'command', required: true, requireTests: true },
-      tests: { type: 'glob-list', default: ['**/*.test.ts', '**/*.test.tsx'] },
-      'timeout-minutes': { type: 'integer', min: 1, max: 120, default: 30 },
-    },
-  },
-
-  'build-verify': {
-    name: 'build-verify',
-    kind: 'module',
-    natures: ['recompute', 'execution-record'],
-    validWhile: ['same-sha'],
-    inputs: {
-      command: { type: 'command', required: true, requireTests: true },
-      tests: { type: 'glob-list', default: ['**/*.test.ts', '**/*.test.tsx'] },
-      'red-stage': { type: 'string', required: true },
-      'implementation-exclude': { type: 'glob-list', default: ['docs/**'] },
       'timeout-minutes': { type: 'integer', min: 1, max: 120, default: 30 },
     },
   },
@@ -157,6 +134,8 @@ const BUILT: Readonly<Record<string, BlockDefinition>> = {
   'spec-structure': specStructureBlock,
   'benchmark-sources': benchmarkSourcesBlock,
   command: commandBlock,
+  'red-test': redTestBlock,
+  'build-verify': buildVerifyBlock,
 };
 
 export const ENGINE_BLOCKS: Readonly<Record<string, BlockDefinition>> = Object.fromEntries([
