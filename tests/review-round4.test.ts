@@ -192,9 +192,12 @@ describe('compileRecipe asks about every quarantine of a list', () => {
 });
 
 describe('on Windows a live process whose start time cannot be read is not gone', () => {
-  it.runIf(process.platform === 'win32')('a survivor that exists but cannot be inspected keeps the quarantine', async () => {
+  it.runIf(process.platform === 'win32')('a survivor that exists but cannot be inspected keeps the quarantine', async (context) => {
     const pid = Number(execFileSync('powershell', ['-NoProfile', '-Command', '(Get-Process csrss | Select-Object -First 1).Id'], { encoding: 'utf8' }).trim());
     expect(pid).toBeGreaterThan(0);
+    // An administrator can read a system process's start time; then there is no unreadable case here.
+    const readable = execFileSync('powershell', ['-NoProfile', '-Command', `$null -ne (Get-Process -Id ${pid}).StartTime`], { encoding: 'utf8' }).trim();
+    if (readable === 'True') context.skip();
     const job = String.raw`Local\ai-workflows-00000000-0000-0000-0000-000000000010`;
     const quarantine = { host: hostname(), platform: 'win32', job, confirmed: false, survivors: [{ pid, created: '1' }] };
     expect(await checkQuarantine(quarantine)).toMatchObject({ empty: false });
