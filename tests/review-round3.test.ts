@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import { ProcessTreeSurvived, createEngine, createMemoryStore, type JsonValue } from '../src/index.js';
 import { checkQuarantine, launchInGroup } from '../src/process-group.js';
-import { terminateResultFromReport } from '../src/process-group-windows.js';
+import { groupExitFromReport, terminateResultFromReport } from '../src/process-group-windows.js';
 
 import { passed, runBlock } from './block-harness.js';
 import { commit, git, removeRepositories, repository, write } from './git-fixtures.js';
@@ -192,5 +192,97 @@ describe('build-verify does not depend on a git identity being configured', () =
         else process.env[key] = value;
       }
     }
+  });
+});
+
+// ---------------------------------------------------------------------------------------
+// Review round 3, tests: claims that were true but unproven
+// ---------------------------------------------------------------------------------------
+
+describe('every inherited git variable is removed, whatever its name or case', () => {
+  it('drops GIT_CONFIG_* and lowercase git_ variables, keeps the rest and what the engine adds', async () => {
+    const { gitEnvironment } = await import('../src/git-env.js');
+    const saved = { ...process.env };
+    process.env.GIT_CONFIG_PARAMETERS = "'core.fsmonitor=evil'";
+    process.env.GIT_CONFIG_COUNT = '1';
+    process.env.git_lower = 'x';
+    process.env.AIW_KEEP = 'kept';
+    try {
+      const environment = gitEnvironment({ GIT_INDEX_FILE: '/tmp/index' });
+      expect(Object.keys(environment).filter((key) => key.toUpperCase().startsWith('GIT_'))).toEqual(['GIT_INDEX_FILE']);
+      expect(environment.AIW_KEEP).toBe('kept');
+    } finally {
+      for (const key of ['GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_COUNT', 'git_lower', 'AIW_KEEP']) delete process.env[key];
+      Object.assign(process.env, saved);
+    }
+  });
+
+  it('a git setting injected through GIT_CONFIG_COUNT does not redirect the facts', async () => {
+    const { describeChangeFromGit, parseRecipe } = await import('../src/index.js');
+    const parsed = parseRecipe('version: 1\nlocale: es\nstages:\n  - id: m\n    summary: "M"\n    phase: merge\n    nature: recompute\n    gate:\n      run: node m.mjs\n', 'r.yml');
+    if (!parsed.ok) throw new Error('fixture');
+    const root = repository();
+    write(root, 'app/page.tsx', 'x\n');
+    commit(root, 'c');
+    const other = repository();
+    const saved = { count: process.env.GIT_CONFIG_COUNT, key: process.env.GIT_CONFIG_KEY_0, value: process.env.GIT_CONFIG_VALUE_0 };
+    process.env.GIT_CONFIG_COUNT = '1';
+    process.env.GIT_CONFIG_KEY_0 = 'core.worktree';
+    process.env.GIT_CONFIG_VALUE_0 = other;
+    try {
+      const facts = await describeChangeFromGit({ root, baseRef: 'main', recipe: parsed.recipe, piece: '42', declared: {} });
+      expect(facts.files).toEqual(['app/page.tsx']);
+    } finally {
+      for (const [key, value] of [['GIT_CONFIG_COUNT', saved.count], ['GIT_CONFIG_KEY_0', saved.key], ['GIT_CONFIG_VALUE_0', saved.value]] as const) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  });
+});
+
+describe('the session a Windows group records is the session it runs in', () => {
+  it.runIf(process.platform === 'win32')('after a normal end, the quarantine names the current session', async () => {
+    const { currentWindowsSessionId } = await import('../src/process-group-windows.js');
+    const root = mkdtempSync(join(tmpdir(), 'aiw-session-'));
+    const group = launchInGroup({ command: process.execPath, args: ['-e', ''], cwd: root, stdin: '' });
+    await group.wait();
+    await group.terminate();
+    const current = await currentWindowsSessionId();
+    expect(current).toEqual(expect.any(Number));
+    expect(group.quarantine).toMatchObject({ session: current });
+  }, 30_000);
+});
+
+describe('the launcher report, the remaining guards', () => {
+  it('a launcher that did not end cleanly never yields a clean exit of the command', () => {
+    const report = JSON.stringify({ childExit: 0, treeEmpty: true });
+    expect(groupExitFromReport(report, 1, { stdout: '{"ok":true}', stderr: '', truncated: false })).toMatchObject({ kind: 'technical' });
+  });
+});
+
+describe('the failure behind a quarantine is journalled even without the lease', () => {
+  it('records the failed stage as well as the quarantine', async () => {
+    let clock = 1_000_000;
+    const store = createMemoryStore({ now: () => clock });
+    const engine = createEngine({
+      config: {
+        locale: 'es',
+        stages: [{
+          name: 'only',
+          nature: 'recompute',
+          gate: async () => {
+            clock += 10 * 60_000;
+            await store.reserve('42', 'thief', 30_000);
+            throw new ProcessTreeSurvived(QA, 'the process group of "x" is not confirmed empty');
+          },
+        }],
+      },
+      store,
+      now: () => clock,
+      leaseMs: 30_000,
+    });
+    await engine.run('42');
+    expect((await store.journal('42')).filter((entry) => entry.stage === 'only' && entry.outcome === 'failed')).toHaveLength(1);
   });
 });

@@ -426,7 +426,9 @@ describe('every git call of the engine ignores inherited git variables', () => {
     const root = repository({ 'runner.mjs': RUNNER, 'src/bonus.mjs': value('bonus', 800) });
     write(root, 'tests/pay.test.mjs', ONE_CASE);
     commit(root, 'red');
-    const first = await runBlock(root, BUILD, { before: RED });
+    // The red run records blob ids with git too, so it runs under the foreign variables as well.
+    const first = await withForeignGit(() => runBlock(root, BUILD, { before: RED }));
+    expect(first.journal.find((entry) => entry.stage === 'red')?.outcome).toBe('passed');
     write(root, 'src/bonus.mjs', value('bonus', 1000));
     commit(root, 'implementation');
     const second = await withForeignGit(() => first.again());
@@ -444,7 +446,9 @@ describe('every git call of the engine ignores inherited git variables', () => {
     git(root, 'switch', '-q', 'piece');
     git(root, 'merge', '-q', '--no-ff', '--no-edit', 'main');
     const to = git(root, 'rev-parse', 'HEAD');
-    await withForeignGit(() => recordCleanUpdate({ store: createMemoryStore(), root, baseRef: 'main', piece: '42', from, to }));
+    const store = createMemoryStore();
+    await expect(withForeignGit(() => recordCleanUpdate({ store, root, baseRef: 'main', piece: '42', from, to }))).resolves.toBeUndefined();
+    expect((await store.journal('42')).filter((entry) => entry.stage === '@clean-update')).toHaveLength(1);
   });
 });
 
