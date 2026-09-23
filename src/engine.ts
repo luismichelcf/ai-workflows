@@ -231,11 +231,18 @@ function classifyApplicability(value: unknown): ApplicabilityVerdict {
   };
 }
 
-/** Recursively freezes a JSON value so nested evidence is as immutable as the entry holding it. */
-function deepFreeze(value: JsonValue): void {
+/**
+ * Recursively freezes a JSON value so nested evidence is as immutable as the entry holding it.
+ * `seen` remembers every object already frozen: a value that appears twice (a shared reference,
+ * which `structuredClone` preserves) is frozen once instead of once per path, so a deep graph
+ * with shared branches costs time proportional to its distinct size, not to the number of paths.
+ */
+function deepFreeze(value: JsonValue, seen: Set<object> = new Set()): void {
   if (value === null || typeof value !== 'object') return;
+  if (seen.has(value)) return;
+  seen.add(value);
   const nested = Array.isArray(value) ? value : Object.values(value);
-  for (const item of nested) deepFreeze(item);
+  for (const item of nested) deepFreeze(item, seen);
   Object.freeze(value);
 }
 
@@ -249,7 +256,7 @@ function frozenFacts(change: unknown): unknown {
   // `structuredClone` copies a cycle happily, but `deepFreeze` would then recurse into it
   // forever and overflow the stack. The cycle is refused here, with a readable motive, before
   // anything is cloned or frozen.
-  if (hasCycle(change, new Set())) {
+  if (hasCycle(change, new Set(), new Set())) {
     throw new FrozenFactsFailure('a value refers back to itself');
   }
   let copy: unknown;
@@ -265,19 +272,23 @@ function frozenFacts(change: unknown): unknown {
 }
 
 /**
- * Whether the value refers back to itself on its own path. The visited set is released on the
- * way out, so two branches sharing one object are not mistaken for a cycle: a shared reference
- * is plain data (JSON duplicates it), a back edge is not.
+ * Whether the value refers back to itself on its own path. A depth-first walk that remembers
+ * both the nodes on the current path (`inProgress`) and the ones already fully explored
+ * (`done`): an edge to a node on the path is a cycle, an edge to a finished node is a shared
+ * reference (plain data — JSON duplicates it) and is never explored twice. Remembering finished
+ * nodes is what makes a graph whose branches share a deep subtree linear instead of exponential.
  */
-function hasCycle(value: unknown, path: Set<object>): boolean {
+function hasCycle(value: unknown, inProgress: Set<object>, done: Set<object>): boolean {
   if (value === null || typeof value !== 'object') return false;
-  if (path.has(value)) return true;
-  path.add(value);
+  if (inProgress.has(value)) return true;
+  if (done.has(value)) return false;
+  inProgress.add(value);
   const nested = Array.isArray(value) ? value : Object.values(value as Record<string, unknown>);
   for (const item of nested) {
-    if (hasCycle(item, path)) return true;
+    if (hasCycle(item, inProgress, done)) return true;
   }
-  path.delete(value);
+  inProgress.delete(value);
+  done.add(value);
   return false;
 }
 
@@ -297,6 +308,123 @@ function mergeQuarantine(existing: JsonValue | undefined, incoming: JsonValue): 
     if (!parts.some((seen) => isDeepStrictEqual(seen, candidate))) parts.push(candidate);
   }
   return parts.length === 1 ? (parts[0] as JsonValue) : parts;
+}
+
+/**
+ * What a caller wants to happen to the stored quarantine. Every read and write of the
+ * quarantine in the engine goes through `updateQuarantined` with one of these:
+ *
+ * - `carry`: write `status`. A new quarantine in it joins whatever is stored (never replaces
+ *   it); a status without one keeps the stored one. The owner's stop (`previous`) is preserved
+ *   from what was read while a quarantine remains. `keepStop: false` is the one exception, used
+ *   by `resume`, which is deliberately undoing the stop.
+ * - `lift`: the quarantine `checked` was just confirmed empty. It is removed only if what is
+ *   stored right now is deep-equal to it; otherwise nothing runs and the piece stays blocked.
+ *   If the owner had parked the piece while it was quarantined, lifting restores that park.
+ * - `none`: nothing is written.
+ */
+type QuarantineAction =
+  | { readonly kind: 'none' }
+  | { readonly kind: 'carry'; readonly status: PieceStatus; readonly keepStop?: boolean }
+  | { readonly kind: 'lift'; readonly checked: JsonValue };
+
+/** Every action that actually writes something; `none` never does. */
+type QuarantineMove = Exclude<QuarantineAction, { readonly kind: 'none' }>;
+
+/** What a quarantine write should store, and what it means for the run. */
+interface QuarantinePlan {
+  readonly status: PieceStatus;
+  readonly lifted: boolean;
+  readonly parked: boolean;
+  readonly changed: boolean;
+}
+
+/** The outcome of an actual (or rehearsed) quarantine write. */
+interface QuarantineUpdate extends QuarantinePlan {
+  readonly wrote: boolean;
+  /** The write kept losing its race and was given up on: nothing ran. */
+  readonly stale: boolean;
+}
+
+/** The owner's stop, read from the state as it is now: the current park, or the one it carries. */
+function stopOf(current: VersionedStatus | undefined): PieceStatus['previous'] | undefined {
+  if (current === undefined) return undefined;
+  if (current.status.state === 'parked') {
+    return {
+      state: 'parked',
+      ...(current.status.reason === undefined ? {} : { reason: current.status.reason }),
+    };
+  }
+  return current.status.previous;
+}
+
+/** Re-attaches the owner's stop to a status that keeps a quarantine. */
+function withStop(
+  status: PieceStatus,
+  current: VersionedStatus | undefined,
+): PieceStatus {
+  if (current === undefined) return status;
+  const previous = stopOf(current) ?? status.previous;
+  return previous === undefined ? status : { ...status, previous };
+}
+
+/**
+ * The one decision the quarantine helper applies before every write: merge, keep, or lift.
+ * Pure, so it can be tested by reading it; the version-checked read/write loop lives in
+ * `updateQuarantined`.
+ */
+function planQuarantine(
+  piece: PieceId,
+  current: VersionedStatus | undefined,
+  action: QuarantineMove,
+): QuarantinePlan {
+  const existing = current?.status.quarantine;
+
+  if (action.kind === 'lift') {
+    // Only the quarantine that was actually checked may be lifted. If what is stored now is
+    // different — a second quarantine joined, or someone replaced it — nothing runs and the
+    // quarantine that is really there stays, stop included.
+    if (existing === undefined || !isDeepStrictEqual(existing, action.checked)) {
+      const blocked: PieceStatus = {
+        piece,
+        state: 'blocked:technical',
+        reason: 'the quarantine changed while it was being checked',
+        ...(existing === undefined ? {} : { quarantine: existing }),
+      };
+      return { status: withStop(blocked, current), lifted: false, parked: false, changed: true };
+    }
+    // The owner parked the piece while its processes were quarantined: lifting the quarantine
+    // must not undo that stop. The piece goes back to parked with its original reason.
+    const previous = current?.status.previous;
+    if (previous !== undefined && previous.state === 'parked') {
+      return {
+        status: {
+          piece,
+          state: 'parked',
+          ...(previous.reason === undefined ? {} : { reason: previous.reason }),
+        },
+        lifted: true,
+        parked: true,
+        changed: false,
+      };
+    }
+    // Confirmed empty: the quarantine goes, the rest of the stored status stays.
+    const source: PieceStatus = current?.status ?? { piece, state: 'running' };
+    const { quarantine: _dropped, ...cleared } = source;
+    return { status: cleared, lifted: true, parked: false, changed: false };
+  }
+
+  // `carry`: a new quarantine merges with the stored one; a status without one keeps it.
+  const incoming = action.status.quarantine;
+  const quarantine = incoming === undefined ? existing : mergeQuarantine(existing, incoming);
+  if (quarantine === undefined) {
+    return { status: action.status, lifted: false, parked: false, changed: false };
+  }
+  const carried: PieceStatus = { ...action.status, quarantine };
+  if (action.keepStop === false) {
+    return { status: carried, lifted: false, parked: false, changed: false };
+  }
+  return { status: withStop(carried, current), lifted: false, parked: false, changed: false };
 }
 
 /**
@@ -459,6 +587,68 @@ export function createEngine(options: EngineOptions): Engine {
     });
   };
 
+  /**
+   * PLAN-13-R2 §2.2: the single place the stored quarantine is read and written. It reads the
+   * status with its version, lets `decide` turn that read into an action, applies the merge /
+   * keep / lift rules (`planQuarantine`) and saves with the version it read. On `StaleVersion`
+   * it reads and decides again, up to `attempts`; when those run out the caller is told
+   * (`stale`) so a run can end as a technical block without touching a stage. In a rehearsal
+   * nothing is written and the plan is returned, so a `dry-run` sees exactly what a real run
+   * would have done.
+   */
+  const updateQuarantined = async (
+    target: PieceId,
+    decide: (current: VersionedStatus | undefined) => QuarantineAction,
+    settings: {
+      readonly dryRun: boolean;
+      readonly attempts?: number;
+      /** Defaults to the raw store read; a run passes its error-wrapping reader. */
+      readonly read?: (piece: PieceId) => Promise<VersionedStatus | undefined>;
+    },
+  ): Promise<QuarantineUpdate> => {
+    const read = settings.read ?? ((piece: PieceId) => store.loadStatus(piece));
+    const attempts = settings.attempts ?? 1;
+    let current = await read(target);
+    for (let attempt = 1; ; attempt += 1) {
+      const action = decide(current);
+      if (action.kind === 'none') {
+        return {
+          status: current?.status ?? { piece: target, state: 'running' },
+          lifted: false,
+          parked: false,
+          changed: false,
+          wrote: false,
+          stale: false,
+        };
+      }
+      const plan = planQuarantine(target, current, action);
+      if (settings.dryRun) return { ...plan, wrote: false, stale: false };
+      try {
+        await store.saveStatus(plan.status, current?.version);
+        return { ...plan, wrote: true, stale: false };
+      } catch (error) {
+        if (error instanceof StaleVersion && attempt < attempts) {
+          current = await read(target);
+          continue;
+        }
+        if (error instanceof StaleVersion) {
+          // Someone kept writing. Re-read once so the caller can honour a park that landed,
+          // or report the block against the quarantine that is really there.
+          const fresh = await read(target).catch(() => undefined);
+          return {
+            status: fresh?.status ?? plan.status,
+            lifted: false,
+            parked: false,
+            changed: plan.changed,
+            wrote: false,
+            stale: true,
+          };
+        }
+        throw error;
+      }
+    }
+  };
+
   const runReserved = async (
     piece: PieceId,
     mode: 'run' | 'dry-run',
@@ -609,65 +799,50 @@ export function createEngine(options: EngineOptions): Engine {
           }
         }
 
-        const latest = await readStatus();
-        // A stop that landed while the gates ran wins over this write, unless it is a quarantine.
-        if (!overParked && latest !== undefined && latest.status.state === 'parked') {
-          return { outcome: 'parked', status: latest.status };
-        }
-
-        const attempts = overParked ? 3 : 1;
-        for (let attempt = 1; ; attempt += 1) {
-          try {
-            const current = attempt === 1 ? latest : await readStatus();
-            let writing: PieceStatus;
-            if (incoming !== undefined) {
-              // A new quarantine never replaces one already stored: a different one joins it.
-              const merged = mergeQuarantine(current?.status.quarantine, incoming);
-              // An owner's stop that landed while the processes were quarantined is kept as
-              // `previous`, so lifting the quarantine later can restore it instead of losing it.
-              const previous =
-                current?.status.state === 'parked'
-                  ? {
-                      state: 'parked' as const,
-                      ...(current.status.reason === undefined
-                        ? {}
-                        : { reason: current.status.reason }),
-                    }
-                  : status.previous;
-              writing = {
-                ...status,
-                quarantine: merged,
-                ...(previous === undefined ? {} : { previous }),
-              };
-            } else if (status.quarantine === undefined && current?.status.quarantine !== undefined) {
-              // A quarantine in the stored state at this moment is preserved: only the branch
-              // that got an affirmative empty answer from `confirmQuarantine` may drop it.
-              writing = { ...status, quarantine: current.status.quarantine };
-            } else {
-              writing = status;
-            }
-            await store.saveStatus(writing, current?.version);
-            return { outcome: 'ran', status: writing };
-          } catch (error) {
-            // Someone wrote between our read and our write. A quarantine is retried by
-            // re-reading (its version changed); if it was a stop, honour it for anything else.
-            if (error instanceof StaleVersion && attempt < attempts) continue;
-            if (error instanceof StaleVersion) {
-              const current = await readStatus().catch(() => undefined);
+        // The decision runs inside `updateQuarantined`, against the state actually read: a stop
+        // that landed while the gates ran wins over this write, so its parked status is returned
+        // untouched instead. A new quarantine in the verdict joins whatever is already stored,
+        // and an owner's stop is kept as `previous` while the quarantine remains. `overParked`
+        // is the exception to the stop and the lease: the processes must be written regardless.
+        const decided: PieceStatus =
+          incoming === undefined ? status : { ...status, quarantine: incoming };
+        let parked: PieceStatus | undefined;
+        let update: QuarantineUpdate;
+        try {
+          update = await updateQuarantined(
+            piece,
+            (current) => {
               if (!overParked && current !== undefined && current.status.state === 'parked') {
-                return { outcome: 'parked', status: current.status };
+                parked = current.status;
+                return { kind: 'none' };
               }
-            }
-            // Saving the failure must not recurse into saving another failure.
-            return {
-              outcome: 'ran',
-              status: blockedStatus(
-                undefined,
-                `store failed to save the piece status: ${describeUnknown(error)}`,
-              ),
-            };
-          }
+              return { kind: 'carry', status: decided };
+            },
+            { dryRun: false, attempts: overParked ? 3 : 1, read: readStatus },
+          );
+        } catch (error) {
+          // Saving the failure must not recurse into saving another failure.
+          return {
+            outcome: 'ran',
+            status: blockedStatus(
+              undefined,
+              `store failed to save the piece status: ${describeUnknown(error)}`,
+            ),
+          };
         }
+        if (parked !== undefined) return { outcome: 'parked', status: parked };
+        if (update.wrote) return { outcome: 'ran', status: update.status };
+        // The write lost its races. A park that landed is honoured; anything else is a block.
+        if (!overParked && update.status !== undefined && update.status.state === 'parked') {
+          return { outcome: 'parked', status: update.status };
+        }
+        return {
+          outcome: 'ran',
+          status: blockedStatus(
+            undefined,
+            'store failed to save the piece status: the piece changed while it was being saved',
+          ),
+        };
       };
 
       // Writes one append-only observation. A dry run leaves no trace at all.
@@ -707,57 +882,60 @@ export function createEngine(options: EngineOptions): Engine {
       // PLAN-13-R2 §2.2: a stored quarantine is re-asked of the system before any stage runs,
       // after the lease expired or not, and in a rehearsal too. Another machine cannot be
       // asked, a group still alive and an unreadable quarantine all block; only an affirmative
-      // empty answer lifts it. Nothing is journalled either way. A dry run only asks: it writes
-      // nothing at all, not even the cleanup, and leaves the stored quarantine in place.
+      // empty answer lifts it. Every read and write here goes through `updateQuarantined`, so a
+      // quarantine stored meanwhile is never erased and the owner's stop survives. A dry run
+      // writes nothing at all, not even the cleanup.
       if (before !== undefined && before.status.quarantine !== undefined) {
         const quarantine = before.status.quarantine;
         const motive = await quarantineMotive(quarantine);
-        if (motive !== undefined) {
-          // await: a store failure inside finish() must reach the outer catch, not reject run().
-          return await finish(blockedStatus(undefined, motive, quarantine));
-        }
-        // The answer is affirmative only for THAT quarantine. If the stored one changed while
-        // it was being checked, the run stops without touching a stage and keeps what is there:
-        // the next run will ask about it in turn.
-        const current = await readStatus();
-        if (current !== undefined && current.status.quarantine !== undefined) {
-          if (!isDeepStrictEqual(current.status.quarantine, quarantine)) {
-            return await finish(
-              blockedStatus(
-                undefined,
-                'the quarantine changed while it was being checked',
-                current.status.quarantine,
-              ),
-            );
-          }
-          // The owner parked the piece while its processes were quarantined: lifting the
-          // quarantine must not undo that stop. The piece goes back to parked and no stage runs.
-          const previous = current.status.previous;
-          if (previous !== undefined && previous.state === 'parked') {
-            const parked: PieceStatus = {
+        let update: QuarantineUpdate;
+        try {
+          if (motive !== undefined) {
+            // Still not confirmed empty: keep the quarantine — merging any that arrived while
+            // it was checked — and block without running a stage.
+            update = await updateQuarantined(
               piece,
-              state: 'parked',
-              ...(previous.reason === undefined ? {} : { reason: previous.reason }),
-            };
-            if (!dryRun) {
-              try {
-                await store.saveStatus(parked, current.version);
-              } catch (error) {
-                if (!(error instanceof StaleVersion)) throw error;
-              }
-            }
-            return { outcome: 'parked', status: parked };
+              () => ({ kind: 'carry', status: blockedStatus(undefined, motive, quarantine) }),
+              { dryRun, attempts: 3, read: readStatus },
+            );
+          } else {
+            // Affirmative empty: lift ONLY the quarantine that was actually checked.
+            update = await updateQuarantined(piece, () => ({ kind: 'lift', checked: quarantine }), {
+              dryRun,
+              attempts: 3,
+              read: readStatus,
+            });
           }
-          // Confirmed empty: a real run drops it so it can proceed normally.
-          if (!dryRun) {
-            try {
-              const { quarantine: _dropped, ...cleared } = current.status;
-              await store.saveStatus(cleared, current.version);
-            } catch (error) {
-              if (!(error instanceof StaleVersion)) throw error;
-            }
-          }
+        } catch (error) {
+          return {
+            outcome: 'ran',
+            status: blockedStatus(
+              undefined,
+              `the quarantine could not be checked: ${describeUnknown(error)}`,
+            ),
+          };
         }
+        if (update.parked || (update.stale && update.status.state === 'parked')) {
+          // The owner parked the piece while its processes were quarantined: the stop wins.
+          return { outcome: 'parked', status: update.status };
+        }
+        if (motive !== undefined) {
+          return { outcome: 'ran', status: update.status };
+        }
+        if (update.changed || update.stale) {
+          // Nothing may run against a quarantine that is not the one checked, or whose lift
+          // could not be committed.
+          const blocked: PieceStatus =
+            update.status.state === 'blocked:technical'
+              ? update.status
+              : {
+                  ...update.status,
+                  state: 'blocked:technical',
+                  reason: 'the quarantine could not be lifted while it was being checked',
+                };
+          return { outcome: 'ran', status: blocked };
+        }
+        // Lifted with no stop: a real run already dropped it, a rehearsal goes on.
       }
 
       const knownStages = new Set(config.stages.map((stage) => stage.name));
@@ -856,32 +1034,27 @@ export function createEngine(options: EngineOptions): Engine {
       };
 
       // Writes live state before a gate runs, so `status` from another terminal shows the
-      // stage in progress. A StaleVersion here is a stop that landed in between; that stop
-      // wins, so the write is dropped rather than overwriting it.
+      // stage in progress. A stop that landed in between wins, so the write is dropped rather
+      // than overwriting it; a quarantine already stored is carried, never erased. Every write
+      // goes through `updateQuarantined`, which retries a stale version.
       const writeRunning = async (stage: StageConfig): Promise<void> => {
         if (dryRun) return;
-        for (let attempt = 0; attempt < 3; attempt += 1) {
-          const current = await readStatus();
-          if (current !== undefined && current.status.state === 'parked') return;
-          const running: PieceStatus = {
+        try {
+          await updateQuarantined(
             piece,
-            stage: stage.name,
-            state: 'running',
-            startedAt: now(),
-            // A running status must not erase a quarantine: the processes are still out there.
-            ...(current?.status.quarantine === undefined
-              ? {}
-              : { quarantine: current.status.quarantine }),
-          };
-          try {
-            await store.saveStatus(running, current?.version);
-            return;
-          } catch (error) {
-            if (error instanceof StaleVersion) continue;
-            throw new StoreWriteFailure(
-              `store failed to save the running status of stage "${stage.name}": ${describeUnknown(error)}`,
-            );
-          }
+            (current) =>
+              current !== undefined && current.status.state === 'parked'
+                ? { kind: 'none' }
+                : {
+                    kind: 'carry',
+                    status: { piece, stage: stage.name, state: 'running', startedAt: now() },
+                  },
+            { dryRun: false, attempts: 3, read: readStatus },
+          );
+        } catch (error) {
+          throw new StoreWriteFailure(
+            `store failed to save the running status of stage "${stage.name}": ${describeUnknown(error)}`,
+          );
         }
       };
 
@@ -1366,90 +1539,95 @@ export function createEngine(options: EngineOptions): Engine {
         if (active !== undefined) controllers.get(active.key)?.abort();
       };
 
-      // The stored park is the source of truth, so the active run is aborted only once
-      // `saveStatus(parked, …)` has succeeded. Aborting first would cancel a gate for a stop
-      // that never landed, leaving the piece still running but its work thrown away.
-      //
-      // `stop` reads, then writes with the version it read. Over a remote those are two
-      // round trips and a write in between makes the write stale — losing the owner's brake.
-      // Re-read and retry a few times before giving up.
-      for (let attempt = 1; ; attempt += 1) {
-        const current = await store.loadStatus(piece);
-
-        if (onlyWhenUnfinished) {
-          // Decided against the same read the write will be committed against, and re-decided on
-          // every retry: a piece that finished in between is left exactly as it is, and a gate
-          // still working on it is not aborted for a pause that will not happen.
-          const excluded =
+      // The stored park is the source of truth, so the active run is aborted only once the
+      // park has been committed. The read and the write go through `updateQuarantined`, so the
+      // decision is made from the same read the write is committed against, a race is retried,
+      // and a quarantine already stored is carried along rather than erased.
+      let decided: PieceStatus | undefined;
+      const update = await updateQuarantined(
+        piece,
+        (current) => {
+          if (
+            onlyWhenUnfinished &&
             current !== undefined &&
-            (current.status.state === 'done' || current.status.state === 'parked');
-          if (excluded) return current.status;
-        }
-
-        if (current === undefined && active === undefined) {
-          // A stop is a fact about a piece, not a piece. Parking one the store has never
-          // seen would invent a phantom that `list` hides, `status` shows and a later run
-          // obeys — three readers, three answers, from one write that should not happen.
-          // The brake is reported; nothing is stored. A piece with a run in flight is a
-          // real piece even before its first write, so that one is parked below.
-          return { piece, state: 'parked', reason };
-        }
-        const previous =
-          current === undefined || current.status.state === 'parked'
-            ? current?.status.previous
-            : {
-                state: current.status.state,
-                ...(current.status.reason === undefined
-                  ? {}
-                  : { reason: current.status.reason }),
-              };
-
-        const parked: PieceStatus = {
-          piece,
-          state: 'parked',
-          reason,
-          ...(previous === undefined ? {} : { previous }),
-          // Parking must not erase a quarantine: the processes are still out there.
-          ...(current?.status.quarantine === undefined ? {} : { quarantine: current.status.quarantine }),
-        };
-        try {
-          await store.saveStatus(parked, current?.version);
-          // Committed: now the gate that is still working learns the piece is stopped.
-          abortActive();
-          return parked;
-        } catch (error) {
-          if (error instanceof StaleVersion && attempt < 3) continue;
-          throw error;
-        }
-      }
+            (current.status.state === 'done' || current.status.state === 'parked')
+          ) {
+            // Decided against the same read the write would commit against: a piece that
+            // finished in between is left exactly as it is.
+            decided = current.status;
+            return { kind: 'none' };
+          }
+          if (current === undefined && active === undefined) {
+            // A stop is a fact about a piece, not a piece. Parking one the store has never
+            // seen would invent a phantom that `list` hides, `status` shows and a later run
+            // obeys. The brake is reported; nothing is stored. A piece with a run in flight is
+            // real even before its first write, so that one is parked below.
+            decided = { piece, state: 'parked', reason };
+            return { kind: 'none' };
+          }
+          const previous =
+            current === undefined || current.status.state === 'parked'
+              ? current?.status.previous
+              : {
+                  state: current.status.state,
+                  ...(current.status.reason === undefined
+                    ? {}
+                    : { reason: current.status.reason }),
+                };
+          return {
+            kind: 'carry',
+            status: { piece, state: 'parked', reason, ...(previous === undefined ? {} : { previous }) },
+            keepStop: false,
+          };
+        },
+        { dryRun: false, attempts: 3 },
+      );
+      if (decided !== undefined) return decided;
+      if (!update.wrote) throw new StaleVersion(piece);
+      // Committed: now the gate that is still working learns the piece is stopped.
+      abortActive();
+      return update.status;
     },
 
     async resume(piece): Promise<PieceStatus> {
-      const current = await store.loadStatus(piece);
-      if (current === undefined) {
-        const status: PieceStatus = { piece, state: 'running' };
-        await store.saveStatus(status, undefined);
-        return status;
-      }
-      if (current.status.state !== 'parked') return current.status;
-
-      // Restore the diagnosis parking preserved; a never-run piece simply becomes runnable.
-      const previous = current.status.previous;
-      const restored: PieceStatus =
-        previous === undefined
-          ? { piece, state: 'running' }
-          : {
-              piece,
-              state: previous.state,
-              ...(previous.reason === undefined ? {} : { reason: previous.reason }),
-            };
-      // Un-parking restores the diagnosis, not the quarantine: it is a fact about the system.
-      const withQuarantine: PieceStatus =
-        current.status.quarantine === undefined
-          ? restored
-          : { ...restored, quarantine: current.status.quarantine };
-      await store.saveStatus(withQuarantine, current.version);
-      return withQuarantine;
+      let decided: PieceStatus | undefined;
+      const update = await updateQuarantined(
+        piece,
+        (current) => {
+          if (current === undefined) {
+            return { kind: 'carry', status: { piece, state: 'running' }, keepStop: false };
+          }
+          if (current.status.state === 'parked') {
+            // Restore the diagnosis parking preserved; a never-run piece simply becomes runnable.
+            // Un-parking restores the diagnosis, not the quarantine: that is a fact about the
+            // system, so it is carried along.
+            const previous = current.status.previous;
+            const restored: PieceStatus =
+              previous === undefined
+                ? { piece, state: 'running' }
+                : {
+                    piece,
+                    state: previous.state,
+                    ...(previous.reason === undefined ? {} : { reason: previous.reason }),
+                  };
+            return { kind: 'carry', status: restored, keepStop: false };
+          }
+          if (current.status.previous !== undefined) {
+            // A stop recorded while the piece was quarantined (ProcessTreeSurvived over a park):
+            // the owner is taking it back. The diagnosis and the quarantine stay; only the
+            // pending park is cleared, so lifting the quarantine later resumes instead of
+            // re-parking a piece the owner already resumed.
+            const { previous: _stop, ...rest } = current.status;
+            return { kind: 'carry', status: rest, keepStop: false };
+          }
+          decided = current.status;
+          return { kind: 'none' };
+        },
+        { dryRun: false, attempts: 1 },
+      );
+      if (decided !== undefined) return decided;
+      if (!update.wrote) throw new StaleVersion(piece);
+      return update.status;
     },
   };
 }

@@ -420,7 +420,13 @@ try {
   $survivors = 'null'
   if ($active -ne 0) {
     $listed = [AiWorkflows.Native]::Survivors($job)
-    if ($null -ne $listed) {
+    if ($null -ne $listed -and @($listed).Count -eq 0) {
+      # The list came back empty: the job may have emptied between the wait and this read. Ask
+      # the system again. Zero active processes means the tree really emptied; anything else
+      # means the list could not be read, which the reader must not mistake for "no survivors".
+      $again = [AiWorkflows.Native]::ActiveProcesses($job)
+      if ($again -eq 0) { $empty = 'true' }
+    } elseif ($null -ne $listed) {
       $entries = @()
       foreach ($pair in $listed) {
         $split = $pair.IndexOf(':')
@@ -875,10 +881,13 @@ export async function windowsSurvivorStatus(
 }
 
 /**
- * Reads every survivor's state in ONE PowerShell call. A survivor recorded with
- * `created: "unknown"` is checked by pid alone: gone is dead, still there is unknown — its
- * creation time cannot be compared, so it is never called alive. An entry whose pid is not a
- * usable id is unknown without asking.
+ * Reads every survivor's state in ONE PowerShell call. Every answer line is labelled with the
+ * pid it belongs to and matched by pid, never by position: a warning, a blank line or any other
+ * stray output cannot shift the answers. A survivor that genuinely EXists but whose start time
+ * cannot be read — a protected process, an access-denied, a null `StartTime` — is `unknown`,
+ * never `dead`: only `Get-Process` not finding the process at all means it is gone. A survivor
+ * recorded with `created: "unknown"` is checked by pid alone: gone is dead, still there is
+ * unknown, because no creation time can be compared.
  */
 async function survivorStates(
   survivors: readonly QuarantineSurvivor[],
@@ -901,23 +910,33 @@ async function survivorStates(
   const script = askable
     .map(({ pid, created }) =>
       created === 'unknown'
-        ? `try { $null = Get-Process -Id ${pid} -ErrorAction Stop; 'exists' } catch { 'dead' }`
-        : `try { $proc = Get-Process -Id ${pid} -ErrorAction Stop; ` +
-          `if ($proc.StartTime.ToFileTimeUtc().ToString() -eq '${created}') { 'alive' } ` +
-          `else { 'other' } } catch { 'dead' }`,
+        ? `try { $null = Get-Process -Id ${pid} -ErrorAction Stop; '${pid}:exists' } catch { '${pid}:dead' }`
+        : `try { $p = Get-Process -Id ${pid} -ErrorAction Stop; ` +
+          `$t = $null; try { $t = $p.StartTime.ToFileTimeUtc().ToString() } catch { }; ` +
+          `if ($t -eq $null) { '${pid}:unknown' } ` +
+          `elseif ($t -eq '${created}') { '${pid}:alive' } ` +
+          `else { '${pid}:other' } } catch { '${pid}:dead' }`,
     )
-    .join('; ');
+    .join('\n');
   const output = await runPowershell(script);
-  const answers = output
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter((line) => line.length > 0);
 
-  askable.forEach(({ index, created }, position) => {
-    const answer = answers[position];
+  // Read the answers by pid, not by position. A line that is missing or unreadable leaves the
+  // survivor unknown, which keeps the quarantine (running more is worse than blocking in excess).
+  const answers = new Map<number, string>();
+  for (const line of output.split(/\r?\n/)) {
+    const match = /^\s*(\d+):([A-Za-z]+)\s*$/.exec(line);
+    if (match === null) continue;
+    const pid = Number.parseInt(match[1] as string, 10);
+    const answer = match[2];
+    if (answer !== undefined) answers.set(pid, answer);
+  }
+
+  askable.forEach(({ index, pid, created }) => {
+    const answer = answers.get(pid);
     if (answer === 'alive') states[index] = 'alive';
     else if (answer === 'dead' || answer === 'other') states[index] = 'dead';
-    // 'exists' on an unknown creation time, or no answer at all: unknown, never gone.
+    // 'exists' with an unknown creation time, 'unknown' when the start time could not be read,
+    // or no answer at all: unknown, never gone.
     else if (answer === 'exists' && created === 'unknown') states[index] = 'unknown';
     else states[index] = 'unknown';
   });

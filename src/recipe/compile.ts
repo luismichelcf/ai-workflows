@@ -529,9 +529,11 @@ export async function compileRecipe(
     },
     async confirmQuarantine(quarantine: JsonValue): Promise<string | undefined> {
       // A stored quarantine is one object or a list of them. Every part is asked; only when
-      // ALL of them are confirmed empty is the quarantine lifted. Otherwise the first motive
-      // wins, so a person reads a reason rather than an aggregate.
+      // ALL of them are confirmed empty is the quarantine lifted. An empty list is not "all
+      // empty": it names no process to confirm, so it can never be an affirmative answer.
+      // Otherwise the first motive wins, so a person reads a reason rather than an aggregate.
       const parts = Array.isArray(quarantine) ? quarantine : [quarantine];
+      if (parts.length === 0) return 'the quarantine names no processes to confirm';
       let firstMotive: string | undefined;
       for (const part of parts) {
         let motive: string | undefined;

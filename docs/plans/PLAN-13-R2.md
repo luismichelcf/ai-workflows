@@ -697,3 +697,18 @@ sobrevivientes ilegible) deja la pieza bloqueada hasta que un operador la libere
 para hacerlo llega con el CLI de la rebanada 4. Correcciones a §13: la carpeta del resultado sí se
 borra a los 25 s si el lanzador sigue vivo (entonces el resultado se da por perdido), y las entradas
 mal formadas del informe del lanzador ahora vuelven ilegible la lista entera.
+
+## 15. Revisión de la parvada (PR #17, ronda 4)
+
+Cuatro rondas de parches en la cuarentena dejaban cada vez un rincón nuevo porque cada camino
+escribía el estado a su manera. Se reorganizó: toda lectura y escritura de la cuarentena pasa por un
+solo ayudante del motor que lee con versión, decide y guarda con comparación de versión, y garantiza
+en cada escritura que la cuarentena guardada se fusiona y nunca se pierde, que la parada del dueño
+(`previous`) se conserva, que levantar solo quita la cuarentena comprobada y, si pierde una carrera,
+no corre ninguna etapa, y que un ensayo no escribe nada. `resume` sobre una pieza en cuarentena
+retira la parada pendiente (el dueño decidió seguir) y conserva la cuarentena. Además: la detección
+de ciclos en los hechos es lineal; una lista de cuarentenas vacía o con un elemento ilegible nunca
+es vacía; en Windows, un proceso que existe pero cuya hora de inicio no se puede leer es
+«desconocido» (solo «no existe» es muerto), la respuesta de PowerShell se lee por pid, y el lanzador
+vuelve a contar los procesos activos antes de declarar ilegible una lista vacía.
+Pruebas: `tests/review-round4.test.ts`, con las sondas del revisor como prueba permanente.
