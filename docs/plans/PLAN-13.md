@@ -566,7 +566,7 @@ Socialabs antes de la rebanada 7.
 Una rama y un PR por rebanada en este repositorio. Prueba roja primero en cada cambio de
 comportamiento; el orquestador escribe las pruebas rojas y el constructor las pone verdes.
 
-- [ ] **1. Receta:** lector estricto, esquema, `validate`, `explain`, `init`. (RC-01, 02, 04, 05)
+- [x] **1. Receta:** lector estricto, esquema, `validate`, `explain`, `init`. (RC-01, 02, 04, 05)
 - [ ] **2. Bloques:** registro de bloques, manifiestos, bloques módulo y comando, vigencias de §3.3
       y los bloques genéricos de §4.1 portados desde las compuertas existentes. (RC-03, RC-07…RC-10,
       CN-01…CN-04, CN-09…CN-11)
