@@ -197,6 +197,7 @@ interface ReviewInputs {
   readonly prompt: string;
   readonly angle: string;
   readonly forbidSameFamily: boolean;
+  readonly timeoutMinutes: number;
 }
 
 function createGate(inputs: ReviewInputs, deps: EngineBlockDeps): Gate {
@@ -231,7 +232,10 @@ function createGate(inputs: ReviewInputs, deps: EngineBlockDeps): Gate {
       prompt: promptText,
       mode: 'review',
     };
-    const raw = await deps.providers.run(buildInvocation(request));
+    const raw = await deps.providers.run(buildInvocation(request), {
+      signal: context.signal,
+      timeoutMs: inputs.timeoutMinutes * 60_000,
+    });
     const report = parseRun(request, raw);
     if (report.status !== 'success' || report.identity === undefined) {
       throw new Error(runNotSuccessfulReason(report.status, report.reason));
@@ -293,6 +297,8 @@ export const sandboxedReviewBlock: BlockDefinition = {
         prompt: asString(inputs['prompt']) ?? '',
         angle: asString(inputs['angle']) ?? '',
         forbidSameFamily: inputs['forbidSameFamily'] !== false,
+        timeoutMinutes:
+          typeof inputs['timeoutMinutes'] === 'number' ? inputs['timeoutMinutes'] : 30,
       },
       deps,
     );

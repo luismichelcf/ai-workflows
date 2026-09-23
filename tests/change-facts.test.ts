@@ -263,3 +263,27 @@ describe('§4.1: facts are whole or not at all', () => {
     await expect(facts(root, { kind: 'feature' })).rejects.toThrow(/unknown kind "feature"/);
   });
 });
+
+describe('review round 1: git variables inherited from a hook never redirect the facts', () => {
+  it('reads the repository it was given, and leaves its index alone', async () => {
+    const root = repository();
+    write(root, 'app/page.tsx', 'x\n');
+    const head = commit(root, 'c');
+    const other = repository();
+    const saved = { dir: process.env.GIT_DIR, index: process.env.GIT_INDEX_FILE, work: process.env.GIT_WORK_TREE };
+    process.env.GIT_DIR = `${other}/.git`;
+    process.env.GIT_INDEX_FILE = `${other}/.git/index`;
+    process.env.GIT_WORK_TREE = other;
+    try {
+      const change = await facts(root);
+      expect(change.sha).toBe(head);
+      expect(change.files).toEqual(['app/page.tsx']);
+    } finally {
+      for (const [key, value] of [['GIT_DIR', saved.dir], ['GIT_INDEX_FILE', saved.index], ['GIT_WORK_TREE', saved.work]] as const) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+    expect(git(other, 'status', '--porcelain')).toBe('');
+  });
+});

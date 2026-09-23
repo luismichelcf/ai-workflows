@@ -6,6 +6,7 @@ import { join } from 'node:path';
 
 import { classifyFiles } from './glob.js';
 import { effectiveKind } from './kind.js';
+import { gitEnvironment } from '../git-env.js';
 import type { Recipe } from './types.js';
 
 // PLAN-13-R2 §4.1: the facts of a change come from git, never from what a piece says about
@@ -50,6 +51,15 @@ export interface DescribeChangeFromGitOptions {
   readonly declared: ChangeDeclared;
 }
 
+/** A piece id that can safely be part of a file path, a branch name or a label. */
+const PIECE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+function requirePieceId(piece: string): void {
+  if (!PIECE_ID.test(piece) || piece.includes('..')) {
+    throw new Error(`invalid piece id "${piece}"`);
+  }
+}
+
 function reasonOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -62,7 +72,7 @@ function runGit(root: string, args: readonly string[], extraEnv?: NodeJS.Process
     maxBuffer: GIT_MAX_BUFFER,
     windowsHide: true,
     encoding: 'buffer' as const,
-    env: extraEnv === undefined ? process.env : { ...process.env, ...extraEnv },
+    env: gitEnvironment(extraEnv),
   };
   return new Promise((resolve, reject) => {
     execFile('git', [...args], options, (error, stdout, stderr) => {
@@ -133,6 +143,10 @@ export async function describeChangeFromGit(
   options: DescribeChangeFromGitOptions,
 ): Promise<ChangeFacts> {
   const { root, baseRef, recipe, piece, declared } = options;
+
+  // Refused before any git command runs: a piece id is a plain identifier (no path pieces, no
+  // `..`, no leading dash), so it can never point a later command somewhere else.
+  requirePieceId(piece);
 
   let sha: string;
   try {

@@ -5,6 +5,7 @@ import { join } from 'node:path';
 
 import type { GateContext, JournalEntry, Store } from '../contract.js';
 import type { ValidWhile } from '../blocks/manifest.js';
+import { gitEnvironment } from '../git-env.js';
 
 // PLAN-13-R2 §6: the four validity rules, and the clean update that keeps one alive. A step
 // `from -> to` is a real merge commit whose second parent is an ancestor of the base and whose
@@ -37,7 +38,7 @@ function runGit(
     maxBuffer: GIT_MAX_BUFFER,
     windowsHide: true,
     encoding: 'utf8' as const,
-    env: extraEnv === undefined ? process.env : { ...process.env, ...extraEnv },
+    env: gitEnvironment(extraEnv),
   };
   return new Promise((resolve) => {
     execFile('git', [...args], options, (error, stdout) => {

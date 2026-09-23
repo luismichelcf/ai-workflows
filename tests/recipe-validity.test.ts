@@ -546,3 +546,18 @@ describe('§5 from the recipe to the engine', () => {
     });
   });
 });
+
+describe('review round 1: a piece is named by a plain identifier', () => {
+  for (const piece of ['../../etc', '-rf', '.hidden', 'a/b', 'a b', '']) {
+    it(`refuses the piece id ${JSON.stringify(piece)} before reading anything`, async () => {
+      const root = repository();
+      write(root, 'app/page.tsx', 'x\n');
+      commit(root, 'c');
+      const { block, calls } = probe();
+      const { engine } = await pieceOver(root, validityRecipe('same-sha'), block);
+      const outcome = await engine.run(piece);
+      expect(outcome).toMatchObject({ outcome: 'ran', status: { state: 'blocked:technical', reason: expect.stringMatching(/piece/) } });
+      expect(calls).toHaveLength(0);
+    });
+  }
+});

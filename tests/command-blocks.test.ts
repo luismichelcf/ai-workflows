@@ -272,3 +272,11 @@ describe('§2.2: a dry run never launches a command block', () => {
     expect(existsSync(join(root, 'ran.txt'))).toBe(false);
   });
 });
+
+describe('review round 1: what a command block may not see', () => {
+  it('gets neither the job name nor the result path of the launcher', async () => {
+    const script = 'process.stdout.write(JSON.stringify({ ok: true, evidence: Object.keys(process.env).filter((k) => /^AIW_(JOB|RESULT)$/i.test(k)) }));\n';
+    const { journal } = await runWith(script);
+    expect(journal.find((entry) => entry.stage === 'check')).toMatchObject({ outcome: 'passed', evidence: { block: [] } });
+  });
+});

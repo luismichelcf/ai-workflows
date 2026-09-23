@@ -25,12 +25,15 @@ export {
   launchInGroup,
   checkQuarantine,
   DEFAULT_STDOUT_BYTES,
+  DEFAULT_PROCESS_GROUPS,
   type GroupExit,
   type LaunchInGroupOptions,
   type ProcessGroup,
   type ProcessGroupControl,
   type Quarantine,
   type QuarantineCheck,
+  type QuarantineSurvivor,
+  type TerminateResult,
 } from './process-group.js';
 export {
   runCommand,
@@ -96,9 +99,11 @@ export { engineBlockManifest } from './blocks/registry.js';
 export type { BlockDefinition, EngineBlockDeps } from './blocks/definition.js';
 export {
   compileRecipe,
+  runProviderInGroup,
   type CompiledRecipe,
   type CompileRecipeDeps,
   type CompileLimits,
+  type ProviderRunInGroupOptions,
 } from './recipe/compile.js';
 export { classifyFiles } from './recipe/glob.js';
 export { effectiveKind, type EffectiveKind } from './recipe/kind.js';

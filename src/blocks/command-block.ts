@@ -2,7 +2,6 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import {
-  ProcessTreeSurvived,
   type Gate,
   type GateContext,
   type GateResult,
@@ -10,6 +9,7 @@ import {
 } from '../contract.js';
 import { resolveExecutable, type ExecutableEnvironment } from '../exec.js';
 import { DEFAULT_STDOUT_BYTES, type GroupExit, type ProcessGroupControl } from '../process-group.js';
+import { confirmEmptyGroup } from './confirm-empty.js';
 
 // PLAN-13-R2 §2.2 (RC-03, RC-10): a command block is a separate program with a strict
 // contract. It is never read by a console: the text is split on spaces, `{tests}` becomes one
@@ -220,24 +220,12 @@ export function createCommandGate(options: CommandGateOptions): Gate {
       context.signal.addEventListener('abort', onAbort, { once: true });
     });
 
-    // Ends the group and confirms it is empty. `terminate` is the first word; when it cannot
-    // confirm, the system is asked again through the control's `check` — never a list of
-    // processes. Only a genuinely live group (or an unanswerable check) raises the survival.
-    const confirmEmpty = async (): Promise<void> => {
-      const { empty } = await group.terminate();
-      if (empty) return;
-      let confirmed = false;
-      try {
-        confirmed = (await options.groups.check(group.quarantine)).empty;
-      } catch {
-        confirmed = false;
-      }
-      if (confirmed) return;
-      throw new ProcessTreeSurvived(
-        group.quarantine,
-        `the process group of "${program}" is not confirmed empty`,
-      );
-    };
+    // Ends the group and confirms it is empty. An explicit "not empty" from a command that did
+    // not end in a clean success (killed, timed out, non-zero) is quarantined at once; only
+    // after a command that exited 0 is the system asked again (PLAN-13-R2 §11).
+    let endedCleanly = false;
+    const confirmEmpty = (): Promise<void> =>
+      confirmEmptyGroup(group, options.groups, program, endedCleanly);
 
     try {
       const raced = await Promise.race([
@@ -252,6 +240,7 @@ export function createCommandGate(options: CommandGateOptions): Gate {
       } else {
         exit = raced.exit;
       }
+      endedCleanly = exit.kind === 'exited' && exit.code === 0;
 
       if (exit.kind === 'technical') throw new Error(exit.reason);
       if (exit.code !== 0) throw new Error(`the command exited with code ${exit.code}`);

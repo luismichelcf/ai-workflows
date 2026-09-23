@@ -1,7 +1,6 @@
 import { existsSync, readFileSync } from 'node:fs';
 
 import {
-  ProcessTreeSurvived,
   type Gate,
   type GateContext,
   type GateResult,
@@ -10,7 +9,8 @@ import type { BlockDefinition, EngineBlockDeps } from './definition.js';
 import type { BlockManifest } from './manifest.js';
 import { isGreenRun, parseTestRun } from '../commands.js';
 import { resolveExecutable, type ExecutableEnvironment } from '../exec.js';
-import { checkQuarantine, DEFAULT_STDOUT_BYTES, launchInGroup } from '../process-group.js';
+import { DEFAULT_PROCESS_GROUPS, DEFAULT_STDOUT_BYTES } from '../process-group.js';
+import { confirmEmptyGroup } from './confirm-empty.js';
 
 // PLAN-13-R2 §3.6 (CN-04, CN-09): the engine's `command@1` runs a command of the project with a
 // time limit. A command that cannot run is a technical block; one that runs and says no is an
@@ -145,7 +145,7 @@ function createGate(
     const resolved = resolveExecutable(program, executableEnvironment());
     if (!resolved.ok) throw new Error(`could not start ${program}: ${resolved.reason}`);
 
-    const group = launchInGroup({
+    const group = DEFAULT_PROCESS_GROUPS.launch({
       command: resolved.command,
       args: [...resolved.prefixArgs, ...args],
       cwd: deps.root,
@@ -167,21 +167,9 @@ function createGate(
       context.signal.addEventListener('abort', onAbort, { once: true });
     });
 
-    const confirmEmpty = async (): Promise<void> => {
-      const { empty } = await group.terminate();
-      if (empty) return;
-      let confirmed = false;
-      try {
-        confirmed = (await checkQuarantine(group.quarantine)).empty;
-      } catch {
-        confirmed = false;
-      }
-      if (confirmed) return;
-      throw new ProcessTreeSurvived(
-        group.quarantine,
-        `the process group of "${program}" is not confirmed empty`,
-      );
-    };
+    let resolvedCleanly = false;
+    const confirmEmpty = (): Promise<void> =>
+      confirmEmptyGroup(group, DEFAULT_PROCESS_GROUPS, program, resolvedCleanly);
 
     try {
       const raced = await Promise.race([
@@ -195,11 +183,13 @@ function createGate(
         await confirmEmpty();
         const exit = await group.wait();
         if (exit.kind === 'technical') throw new Error(exit.reason);
+        resolvedCleanly = exit.code === 0;
         code = exit.code;
         output = combinedOutput(exit.stdout, exit.stderr);
       } else {
         const exit = raced.exit;
         if (exit.kind === 'technical') throw new Error(exit.reason);
+        resolvedCleanly = exit.code === 0;
         code = exit.code;
         output = combinedOutput(exit.stdout, exit.stderr);
       }

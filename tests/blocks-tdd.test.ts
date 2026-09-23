@@ -243,3 +243,19 @@ describe('CN-11 · a builder that edits the test it was given, through build-ver
     expect(second.outcome).toMatchObject(passed);
   });
 });
+
+describe('review round 1: the retirement never touches the project dependencies', () => {
+  it('keeps node_modules intact after retiring the implementation', async () => {
+    const { existsSync } = await import('node:fs');
+    const { join } = await import('node:path');
+    const root = repository({ 'runner.mjs': RUNNER, 'src/bonus.mjs': BONUS(800), '.gitignore': 'node_modules/\n' });
+    write(root, 'node_modules/pkg/index.js', 'module.exports = 1;\n');
+    write(root, 'tests/bonus.test.mjs', TEST);
+    commit(root, 'red test');
+    const first = await runBlock(root, BUILD_STAGE, { before: RED_BEFORE });
+    write(root, 'src/bonus.mjs', BONUS(1000));
+    commit(root, 'implementation');
+    expect((await first.again()).outcome).toMatchObject(passed);
+    expect(existsSync(join(root, 'node_modules/pkg/index.js'))).toBe(true);
+  });
+});

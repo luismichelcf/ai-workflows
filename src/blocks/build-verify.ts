@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { existsSync, symlinkSync } from 'node:fs';
+import { existsSync, lstatSync, rmSync, symlinkSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import type { Gate, GateResult, JournalEntry } from '../contract.js';
 import { isGreenRun, isRedEvidence, parseTestRun } from '../commands.js';
 import { requireSameFiles } from '../gates.js';
+import { gitEnvironment } from '../git-env.js';
 import type { BlockDefinition, EngineBlockDeps } from './definition.js';
 import type { BlockManifest } from './manifest.js';
 import {
@@ -124,7 +125,7 @@ function runGit(
     maxBuffer: GIT_MAX_BUFFER,
     windowsHide: true,
     encoding: 'utf8' as const,
-    env: extraEnv === undefined ? process.env : { ...process.env, ...extraEnv },
+    env: gitEnvironment(extraEnv),
   };
   return new Promise((resolve) => {
     execFile('git', [...args], options, (error, stdout) => {
@@ -206,6 +207,8 @@ async function retireFromSnapshot(
 
   const parent = await mkdtemp(join(tmpdir(), 'aiw-retire-'));
   const worktree = join(parent, 'tree');
+  // The linked `node_modules` is remembered so it can be removed as a LINK, never followed.
+  let modulesLink: string | undefined;
   try {
     const added = await runGit(root, ['worktree', 'add', '--detach', worktree, commit]);
     if (!added.ok) throw new Error('the temporary worktree could not be created');
@@ -225,6 +228,7 @@ async function retireFromSnapshot(
       const link = join(worktree, 'node_modules');
       if (!existsSync(link)) {
         symlinkSync(modules, link, process.platform === 'win32' ? 'junction' : 'dir');
+        modulesLink = link;
       }
     }
 
@@ -250,9 +254,28 @@ async function retireFromSnapshot(
     }
     return { ok: true };
   } finally {
+    // On Windows `git worktree remove --force` follows the `node_modules` junction and deletes
+    // the project's real dependencies. The link is removed first, by its own name only.
+    if (modulesLink !== undefined) removeLink(modulesLink);
     await runGit(root, ['worktree', 'remove', '--force', worktree]);
     await runGit(root, ['worktree', 'prune']);
     await rm(parent, { recursive: true, force: true });
+  }
+}
+
+/** Removes the link itself — never the folder it points at, and never its contents. */
+function removeLink(link: string): void {
+  let isLink = false;
+  try {
+    isLink = lstatSync(link).isSymbolicLink();
+  } catch {
+    return;
+  }
+  if (!isLink) return;
+  try {
+    rmSync(link, { force: true });
+  } catch {
+    // Best effort: the worktree removal follows, and the link cannot be left in the project.
   }
 }
 

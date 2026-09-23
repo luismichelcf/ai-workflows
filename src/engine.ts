@@ -238,6 +238,24 @@ function deepFreeze(value: JsonValue): void {
 }
 
 /**
+ * PLAN-13-R2 §11: every gate gets its own deep copy of the facts, frozen to its roots. A block
+ * that rewrites `change.kind`, `change.files` or `change.fingerprint` changes only its own copy,
+ * never what the next stages read nor what the wrapper seals.
+ */
+function frozenFacts(change: unknown): unknown {
+  if (typeof change !== 'object' || change === null) return change;
+  let copy: unknown;
+  try {
+    copy = structuredClone(change);
+  } catch {
+    // A value structured cloning cannot copy (a function inside it) is left as it came.
+    return change;
+  }
+  deepFreeze(copy as JsonValue);
+  return copy;
+}
+
+/**
  * Freezes an entry — and its evidence in depth — before it enters the run's own journal.
  * The store freezes what it keeps, but the copy the next stage reads was pushed raw: a gate
  * could rewrite its own `skipped` into a `passed` and the following gate would read the
@@ -664,7 +682,7 @@ export function createEngine(options: EngineOptions): Engine {
         return {
           piece,
           stage: stage.name,
-          change: await getChange(),
+          change: frozenFacts(await getChange()),
           journal: Object.freeze([...journal]),
           locale: config.locale,
           mode,

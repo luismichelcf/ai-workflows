@@ -211,3 +211,92 @@ describe('§2.2: a module block knows the folder of the project it judges', () =
     expect(normalize((entry?.evidence as { block: { root: string } }).block.root)).toBe(normalize(root));
   });
 });
+
+describe('§2.2: a module block loads from any spelling of the project folder', () => {
+  // Windows can name a folder by its old 8.3 short form (`RUNNER~1`), which is what the CI's
+  // temporary folder looks like. The block must load from it as from the long form.
+  it.runIf(process.platform === 'win32')('loads when the project root is given in its short form', async () => {
+    const { execFileSync } = await import('node:child_process');
+    const long = repository();
+    write(long, '.ai-workflows/blocks/ok/block.yml', lines('kind: module', 'natures: [recompute]', 'main: index.mjs'));
+    write(long, '.ai-workflows/blocks/ok/index.mjs', 'export default () => ({ ok: true });\n');
+    commit(long, 'block');
+    const short = execFileSync('powershell', [
+      '-NoProfile',
+      '-Command',
+      `(New-Object -ComObject Scripting.FileSystemObject).GetFolder('${long}').ShortPath`,
+    ], { encoding: 'utf8' }).trim();
+    expect(short).toContain('~');
+    const recipe = recipeOf(lines(
+      'version: 1',
+      'locale: es',
+      'stages:',
+      '  - id: ok',
+      '    summary: "Carga"',
+      '    phase: merge',
+      '    nature: recompute',
+      '    gate:',
+      '      uses: ./.ai-workflows/blocks/ok',
+    ));
+    const store = createMemoryStore();
+    const compiled = await compileRecipe(recipe, { root: short, baseRef: 'main', declared: () => ({}), store });
+    const engine = createEngine({ config: compiled.config, store, describeChange: compiled.describeChange });
+    expect(await engine.run('42')).toMatchObject({ outcome: 'ran', status: { state: 'done' } });
+  });
+});
+
+describe('review round 1: a module block cannot rewrite the facts the next stages read', () => {
+  it('leaves kind, files and fingerprint as the engine computed them', async () => {
+    const root = repository();
+    write(root, '.ai-workflows/blocks/liar/block.yml', lines('kind: module', 'natures: [recompute]', 'main: index.mjs'));
+    write(root, '.ai-workflows/blocks/liar/index.mjs', [
+      'export default (context) => {',
+      '  try { context.change.kind = "docs"; } catch {}',
+      '  try { context.change.fingerprint = "forged"; } catch {}',
+      '  try { context.change.files.push("forged.txt"); } catch {}',
+      '  return { ok: true };',
+      '};',
+      '',
+    ].join('\n'));
+    commit(root, 'block');
+    const seen: unknown[] = [];
+    const recipe = recipeOf(lines(
+      'version: 1',
+      'locale: es',
+      'stages:',
+      '  - id: liar',
+      '    summary: "Intenta mentir"',
+      '    nature: recompute',
+      '    gate:',
+      '      uses: ./.ai-workflows/blocks/liar',
+      '  - id: after',
+      '    summary: "Lee los hechos"',
+      '    after: liar',
+      '    phase: merge',
+      '    nature: recompute',
+      '    gate:',
+      '      uses: ai-workflows/witness@1',
+    ));
+    const store = createMemoryStore();
+    const compiled = await compileRecipe(recipe, {
+      root,
+      baseRef: 'main',
+      declared: () => ({}),
+      store,
+      extraBlocks: {
+        'ai-workflows/witness@1': {
+          manifest: { name: 'witness', kind: 'module', natures: ['recompute'], inputs: {} },
+          create: () => (context) => {
+            seen.push(JSON.parse(JSON.stringify(context.change)));
+            return { ok: true };
+          },
+        },
+      },
+    });
+    const engine = createEngine({ config: compiled.config, store, describeChange: compiled.describeChange });
+    await engine.run('42');
+    const real = await compiled.describeChange('42');
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatchObject({ kind: real.kind, fingerprint: real.fingerprint, files: real.files });
+  });
+});

@@ -11,7 +11,13 @@ import type { BlockManifest } from './manifest.js';
 
 /** How an engine block runs one coding CLI: the real process group, or a test's stand-in. */
 export interface ProviderRunner {
-  run(invocation: Invocation): Promise<RawRun>;
+  run(invocation: Invocation, options?: ProviderRunOptions): Promise<RawRun>;
+}
+
+/** The limits the engine hands the runner of a coding CLI (PLAN-13-R2 §11). */
+export interface ProviderRunOptions {
+  readonly signal?: AbortSignal;
+  readonly timeoutMs?: number;
 }
 
 /**

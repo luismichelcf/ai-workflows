@@ -1,3 +1,4 @@
+import { realpathSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 
@@ -12,11 +13,22 @@ import type {
   Store,
 } from '../contract.js';
 import { createCommandGate } from '../blocks/command-block.js';
-import type { BlockDefinition, EngineBlockDeps, ProviderRunner } from '../blocks/definition.js';
+import { confirmEmptyGroup } from '../blocks/confirm-empty.js';
+import type {
+  BlockDefinition,
+  EngineBlockDeps,
+  ProviderRunner,
+} from '../blocks/definition.js';
 import type { BlockManifest, InputSpec, ValidWhile } from '../blocks/manifest.js';
 import { createModuleGate } from '../blocks/module-block.js';
 import { engineBlock } from '../blocks/registry.js';
-import { checkQuarantine, launchInGroup, type ProcessGroupControl } from '../process-group.js';
+import {
+  DEFAULT_PROCESS_GROUPS,
+  DEFAULT_STDOUT_BYTES,
+  type ProcessGroup,
+  type ProcessGroupControl,
+} from '../process-group.js';
+import type { Invocation, RawRun } from '../providers.js';
 import { appliesIfFor } from './applies.js';
 import { describeChangeFromGit, type ChangeDeclared, type ChangeFacts } from './facts.js';
 import { readStrictYaml } from './parse.js';
@@ -67,8 +79,78 @@ export interface CompiledRecipe {
   confirmQuarantine(quarantine: JsonValue): Promise<string | undefined>;
 }
 
-const DEFAULT_GROUPS: ProcessGroupControl = { launch: launchInGroup, check: checkQuarantine };
 const PROJECT_USES = /^\.\/\.ai-workflows\/blocks\/([a-z][a-z0-9-]*)$/;
+
+/** The real path of a folder, so every spelling (8.3 short names included) becomes one. */
+function realRoot(path: string): string {
+  try {
+    return realpathSync.native(path);
+  } catch {
+    // A path that does not exist yet is left as given; a later read reports it honestly.
+    return path;
+  }
+}
+
+/** The limits of one review or build run, handed to whoever runs the coding CLI. */
+export interface ProviderRunInGroupOptions {
+  readonly signal?: AbortSignal;
+  readonly timeoutMs?: number;
+  readonly processGroups?: ProcessGroupControl;
+}
+
+/**
+ * Runs a coding CLI the same way a command block runs: inside a group of its own, without a
+ * console, under a time limit, cancellable at once, and with the group ALWAYS confirmed before
+ * it returns — an explicit "not empty" from a command that did not exit 0 raises
+ * `ProcessTreeSurvived`, and one from a clean exit (or a lost answer) is settled by asking the
+ * system again (PLAN-13-R2 §11). A technical end rejects with its motive.
+ */
+export async function runProviderInGroup(
+  invocation: Invocation,
+  options: ProviderRunInGroupOptions = {},
+): Promise<RawRun> {
+  const groups = options.processGroups ?? DEFAULT_PROCESS_GROUPS;
+  const group: ProcessGroup = groups.launch({
+    command: invocation.command,
+    args: invocation.args,
+    cwd: invocation.cwd,
+    stdin: invocation.stdin ?? '',
+    ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
+    stdoutBytes: DEFAULT_STDOUT_BYTES,
+  });
+
+  // Cancellation must be honoured at once, not when the CLI decides to end: the wait races the
+  // signal, and on abort the group is emptied and confirmed right there.
+  let onAbort: (() => void) | undefined;
+  const aborted = new Promise<'aborted'>((resolve) => {
+    const signal = options.signal;
+    if (signal?.aborted === true) {
+      resolve('aborted');
+      return;
+    }
+    onAbort = () => resolve('aborted');
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+
+  let resolvedCleanly = false;
+  try {
+    const raced = await Promise.race([
+      group.wait().then((exit) => ({ exit })),
+      aborted.then(() => 'aborted' as const),
+    ]);
+    if (raced === 'aborted') {
+      await confirmEmptyGroup(group, groups, invocation.command);
+      throw new Error(`the run of "${invocation.command}" was stopped`);
+    }
+    const exit = raced.exit;
+    if (exit.kind === 'technical') throw new Error(exit.reason);
+    resolvedCleanly = exit.code === 0;
+    return { output: exit.stdout, exitCode: exit.code };
+  } finally {
+    if (onAbort !== undefined) options.signal?.removeEventListener('abort', onAbort);
+    await confirmEmptyGroup(group, groups, invocation.command, resolvedCleanly);
+  }
+}
 
 interface Judged {
   readonly sha: string;
@@ -365,27 +447,24 @@ export async function compileRecipe(
   recipe: Recipe,
   deps: CompileRecipeDeps,
 ): Promise<CompiledRecipe> {
+  // A Windows 8.3 short name (`RUNNER~1`) is a valid spelling of the project folder, but git,
+  // the module loader and the blocks all need one canonical path: the real one. It is resolved
+  // once, here, and every path the engine builds from it is the long form.
+  const root = realRoot(deps.root);
+  const rootDeps: CompileRecipeDeps = { ...deps, root };
   const stages: StageConfig[] = [];
-  const groups = deps.processGroups ?? DEFAULT_GROUPS;
+  const groups = deps.processGroups ?? DEFAULT_PROCESS_GROUPS;
   // The default runs a coding CLI the same way a command block runs: inside a group of its
-  // own, without a console, with the prompt on stdin, and the group always terminated.
+  // own, without a console, with the prompt on stdin, under its time limit, cancellable, and
+  // the group always confirmed empty (PLAN-13-R2 §11).
   const providers: ProviderRunner =
     deps.providers ?? {
-      run: async (invocation) => {
-        const group = groups.launch({
-          command: invocation.command,
-          args: invocation.args,
-          cwd: invocation.cwd,
-          stdin: invocation.stdin ?? '',
-        });
-        try {
-          const exit = await group.wait();
-          if (exit.kind === 'technical') throw new Error(exit.reason);
-          return { output: exit.stdout, exitCode: exit.code };
-        } finally {
-          await group.terminate();
-        }
-      },
+      run: (invocation, options) =>
+        runProviderInGroup(invocation, {
+          ...(options?.signal === undefined ? {} : { signal: options.signal }),
+          ...(options?.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
+          processGroups: groups,
+        }),
     };
 
   for (const stage of recipe.stages) {
@@ -396,10 +475,10 @@ export async function compileRecipe(
       throw new Error(`stage "${stage.id}": required: false is not available until slice 4`);
     }
 
-    const definition = await resolveStageBlock(stage, deps, groups);
+    const definition = await resolveStageBlock(stage, rootDeps, groups);
     const inputs = blockInputs(definition.manifest, stage.gate.with);
     const engineDeps: EngineBlockDeps = {
-      root: deps.root,
+      root,
       baseRef: deps.baseRef,
       store: deps.store,
       providers,
@@ -407,7 +486,7 @@ export async function compileRecipe(
       recordCleanUpdate: (update) =>
         recordCleanUpdate({
           store: deps.store,
-          root: deps.root,
+          root,
           baseRef: deps.baseRef,
           piece: update.piece,
           from: update.from,
@@ -425,11 +504,11 @@ export async function compileRecipe(
       ...(appliesWhen === undefined ? {} : { appliesWhen }),
       stillValid: (entry, context) =>
         stillValidFor(stage.validWhile, entry, context, {
-          root: deps.root,
+          root,
           baseRef: deps.baseRef,
         }),
       ...(stage.needsHuman ? { needsHuman: true } : {}),
-      gate: sealedGate(gate, deps.root),
+      gate: sealedGate(gate, root),
     });
   }
 
@@ -437,7 +516,7 @@ export async function compileRecipe(
     config: { locale: recipe.locale, stages },
     describeChange: (piece) =>
       describeChangeFromGit({
-        root: deps.root,
+        root,
         baseRef: deps.baseRef,
         recipe,
         piece,
@@ -446,7 +525,7 @@ export async function compileRecipe(
     async confirmFacts(change: unknown): Promise<string | undefined> {
       const judged = judgedOf(change);
       if (judged === undefined) return 'the working tree changed during the run';
-      const now = await readJudged(deps.root);
+      const now = await readJudged(root);
       return now.sha === judged.sha && now.snapshot === judged.snapshot
         ? undefined
         : 'the working tree changed during the run';

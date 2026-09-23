@@ -288,3 +288,81 @@ describe('CN-10 · a piece that grows past what it declared', () => {
     expect(calls).toEqual([]);
   });
 });
+
+describe('review round 1: a review is bounded in time and can be stopped', () => {
+  it('hands the provider its time limit: 30 minutes by default, or what the recipe says', async () => {
+    const seen: (number | undefined)[] = [];
+    const providers = {
+      run: async (invocation: Invocation, options?: { timeoutMs?: number }): Promise<RawRun> => {
+        seen.push(options?.timeoutMs);
+        return claude().providers.run(invocation);
+      },
+    };
+    await runBlock(project(), REVIEW_STAGE(), { declared: { builder: BUILDER }, providers });
+    const oneMinute = REVIEW_STAGE().concat('        timeout-minutes: 1');
+    await runBlock(project(), oneMinute, { declared: { builder: BUILDER }, providers });
+    expect(seen).toEqual([30 * 60_000, 60_000]);
+  });
+
+  it('stops the reviewer when the piece is stopped, instead of waiting for it', async () => {
+    let aborted = false;
+    let started = false;
+    const providers = {
+      run: (_invocation: Invocation, options?: { signal?: AbortSignal }): Promise<RawRun> =>
+        new Promise((_resolve, reject) => {
+          started = true;
+          options?.signal?.addEventListener('abort', () => {
+            aborted = true;
+            reject(new Error('stopped'));
+          });
+        }),
+    };
+    const { createEngine, createMemoryStore, compileRecipe, parseRecipe } = await import('../src/index.js');
+    const root = project();
+    const text = [
+      'version: 1',
+      'locale: es',
+      'stages:',
+      '  - id: check',
+      '    summary: "Revisión"',
+      '    phase: merge',
+      ...REVIEW_STAGE(),
+      '',
+    ].join('\n');
+    const parsed = parseRecipe(text, 'receta.yml');
+    if (!parsed.ok) throw new Error('fixture');
+    const store = createMemoryStore();
+    const compiled = await compileRecipe(parsed.recipe, { root, baseRef: 'main', declared: () => ({ builder: BUILDER }), store, providers });
+    const engine = createEngine({ config: compiled.config, store, describeChange: compiled.describeChange, cancellationPollMs: 20 });
+    const running = engine.run('42');
+    while (!started) await new Promise((resolve) => setTimeout(resolve, 20));
+    await createEngine({ config: compiled.config, store }).stop('42', 'the owner stops it');
+    const outcome = await running;
+    expect(aborted).toBe(true);
+    expect(outcome.outcome).toBe('parked');
+  });
+});
+
+describe('review round 1: the reviewer CLI runs like any command of the engine', () => {
+  it('runs out of time, is stopped by the signal, and never leaves processes behind unconfirmed', async () => {
+    const { runProviderInGroup } = await import('../src/recipe/compile.js');
+    const root = project();
+    const hang = { command: process.execPath, args: ['-e', 'setInterval(() => {}, 1000)'], cwd: root, stdin: '' };
+    await expect(runProviderInGroup(hang, { timeoutMs: 500 })).rejects.toThrow(/ran out of time/);
+    const controller = new AbortController();
+    const stopped = runProviderInGroup(hang, { signal: controller.signal, timeoutMs: 60_000 });
+    setTimeout(() => controller.abort(), 300);
+    await expect(stopped).rejects.toThrow();
+    const { ProcessTreeSurvived } = await import('../src/index.js');
+    const { launchInGroup } = await import('../src/process-group.js');
+    const stubborn = {
+      launch: (options: Parameters<typeof launchInGroup>[0]) => {
+        const group = launchInGroup(options);
+        return { ...group, terminate: async () => { await group.terminate(); return { empty: false }; } };
+      },
+      check: async () => ({ empty: false, reason: 'still there' }),
+    };
+    const quick = { command: process.execPath, args: ['-e', 'process.stdout.write("x")'], cwd: root, stdin: '' };
+    await expect(runProviderInGroup(quick, { timeoutMs: 10_000, processGroups: stubborn })).rejects.toBeInstanceOf(ProcessTreeSurvived);
+  });
+});

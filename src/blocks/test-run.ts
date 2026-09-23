@@ -4,16 +4,15 @@ import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import {
-  ProcessTreeSurvived,
   type GateContext,
 } from '../contract.js';
 import { resolveExecutable, type ExecutableEnvironment } from '../exec.js';
 import { classifyFiles } from '../recipe/glob.js';
 import {
-  checkQuarantine,
+  DEFAULT_PROCESS_GROUPS,
   DEFAULT_STDOUT_BYTES,
-  launchInGroup,
 } from '../process-group.js';
+import { confirmEmptyGroup } from './confirm-empty.js';
 
 // PLAN-13-R2 §3.4 and §3.5: `red-test@1` and `build-verify@1` both launch the project's test
 // command over the test files of the change and read what it printed. This module holds the
@@ -140,7 +139,7 @@ export async function runTests(options: RunTestsOptions): Promise<TestGroupResul
   const resolved = resolveExecutable(program, executableEnvironment());
   if (!resolved.ok) return { kind: 'technical', reason: `could not start ${program}: ${resolved.reason}` };
 
-  const group = launchInGroup({
+  const group = DEFAULT_PROCESS_GROUPS.launch({
     command: resolved.command,
     args: [...resolved.prefixArgs, ...args],
     cwd: options.root,
@@ -162,21 +161,9 @@ export async function runTests(options: RunTestsOptions): Promise<TestGroupResul
     options.signal.addEventListener('abort', onAbort, { once: true });
   });
 
-  const confirmEmpty = async (): Promise<void> => {
-    const { empty } = await group.terminate();
-    if (empty) return;
-    let confirmed = false;
-    try {
-      confirmed = (await checkQuarantine(group.quarantine)).empty;
-    } catch {
-      confirmed = false;
-    }
-    if (confirmed) return;
-    throw new ProcessTreeSurvived(
-      group.quarantine,
-      `the process group of "${program}" is not confirmed empty`,
-    );
-  };
+  let resolvedCleanly = false;
+  const confirmEmpty = (): Promise<void> =>
+    confirmEmptyGroup(group, DEFAULT_PROCESS_GROUPS, program, resolvedCleanly);
 
   try {
     const raced = await Promise.race([
@@ -187,6 +174,7 @@ export async function runTests(options: RunTestsOptions): Promise<TestGroupResul
     if (raced === 'aborted') await confirmEmpty();
     const exit = raced === 'aborted' ? await group.wait() : raced.exit;
     if (exit.kind === 'technical') return { kind: 'technical', reason: exit.reason };
+    resolvedCleanly = exit.code === 0;
     return {
       kind: 'exited',
       code: exit.code,

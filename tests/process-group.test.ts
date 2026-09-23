@@ -137,7 +137,10 @@ describe('RC-10: a group the engine cannot confirm empty keeps the piece in quar
       launch: (options) => {
         const group = launchInGroup(options);
         leftRunning.push(group);
-        return { ...group, terminate: async () => ({ empty: false }) };
+        // It fails for the first group only: once the operator has really emptied that group,
+        // a later launch is terminated for real, as it would be on a healthy machine.
+        const first = leftRunning.length === 1;
+        return { ...group, terminate: first ? async () => ({ empty: false }) : group.terminate };
       },
       check: checkQuarantine,
     };
@@ -222,4 +225,85 @@ describe('RC-10: quarantine is lifted only by asking the system', () => {
     expect(await group.terminate()).toEqual({ empty: true });
     expect(readFileSync(join(root, 'echo.mjs'), 'utf8')).toContain('toUpperCase');
   }, 30_000);
+});
+
+describe('review round 1: a process that dies by a signal never counts as success', () => {
+  it('is never read as a clean exit with code 0', async () => {
+    const root = await project('pass');
+    write(root, 'die.mjs', 'process.kill(process.pid, "SIGKILL");\nsetInterval(() => {}, 1000);\n');
+    const group = launchInGroup({ command: process.execPath, args: [join(root, 'die.mjs')], cwd: root, stdin: '' });
+    const exit = await group.wait();
+    await group.terminate();
+    expect(exit).not.toMatchObject({ kind: 'exited', code: 0 });
+    if (process.platform !== 'win32') expect(exit).toMatchObject({ kind: 'technical', reason: expect.stringMatching(/signal/) });
+  }, 30_000);
+});
+
+describe('review round 1: on Windows only "no such job" means empty', () => {
+  it.runIf(process.platform === 'win32')('a job name the system cannot even look up is not empty', async () => {
+    for (const job of ['', 'Local\a\b\c', `Local\${'x'.repeat(40_000)}`]) {
+      expect(await checkQuarantine({ host: hostname(), platform: 'win32', job, confirmed: false })).toMatchObject({ empty: false });
+    }
+  });
+
+  it.runIf(process.platform === 'win32')('a well-formed job that does not exist is empty', async () => {
+    const job = 'Local\ai-workflows-00000000-0000-0000-0000-000000000000';
+    expect(await checkQuarantine({ host: hostname(), platform: 'win32', job, confirmed: false })).toEqual({ empty: true });
+  });
+
+  it.runIf(process.platform === 'win32')('a survivor the launcher named keeps the quarantine while it lives, whatever the job says', async () => {
+    const { execFileSync } = await import('node:child_process');
+    const created = execFileSync('powershell', ['-NoProfile', '-Command', `(Get-Process -Id ${process.pid}).StartTime.ToFileTimeUtc()`], { encoding: 'utf8' }).trim();
+    const job = 'Local\ai-workflows-00000000-0000-0000-0000-000000000001';
+    const alive = { host: hostname(), platform: 'win32', job, confirmed: false, survivors: [{ pid: process.pid, created }] };
+    expect(await checkQuarantine(alive)).toMatchObject({ empty: false });
+    const gone = { ...alive, survivors: [{ pid: process.pid, created: '1' }] };
+    expect(await checkQuarantine(gone)).toEqual({ empty: true });
+  });
+});
+
+describe('review round 1: who decides that a group is empty', () => {
+  // A launcher (or a POSIX kill) that explicitly reports "not empty" is never overruled; only
+  // a LOST report may be settled by asking the system again (PLAN-13-R2 §11).
+  async function runWithTerminator(terminate: 'explicit-false' | 'lost-and-dead' | 'lost-and-alive') {
+    const root = await project('wait');
+    const store = createMemoryStore();
+    const real: { terminate(): Promise<unknown> }[] = [];
+    const control: ProcessGroupControl = {
+      launch: (options) => {
+        const group = launchInGroup(options);
+        real.push(group);
+        return {
+          ...group,
+          terminate: async () => {
+            if (terminate === 'lost-and-dead') await group.terminate();
+            return terminate === 'explicit-false' ? { empty: false } : { empty: false, lost: true };
+          },
+        };
+      },
+      check: checkQuarantine,
+    };
+    const compiled = await compileRecipe(recipe, { root, baseRef: 'main', declared: () => ({}), store, processGroups: control });
+    const options = { config: compiled.config, store, describeChange: compiled.describeChange, confirmQuarantine: compiled.confirmQuarantine, cancellationPollMs: 20 };
+    const running = createEngine({ ...options, runId: 'a' }).run('42');
+    await until(() => size(join(root, 'heartbeat.txt')) > 0);
+    if (terminate === 'explicit-false') await real[0]?.terminate(); // the group is really gone…
+    await createEngine({ ...options, runId: 'b' }).stop('42', 'stop');
+    await running;
+    const status = await createEngine({ ...options, runId: 'c' }).status('42');
+    for (const group of real) await group.terminate();
+    return status;
+  }
+
+  it('an explicit "not empty" is kept even if the system would now say empty', async () => {
+    expect((await runWithTerminator('explicit-false'))?.quarantine).toBeDefined();
+  }, 60_000);
+
+  it('a lost report, with the group really gone, is settled by the system: no quarantine', async () => {
+    expect((await runWithTerminator('lost-and-dead'))?.quarantine).toBeUndefined();
+  }, 60_000);
+
+  it('a lost report, with the group still alive, keeps the quarantine', async () => {
+    expect((await runWithTerminator('lost-and-alive'))?.quarantine).toBeDefined();
+  }, 60_000);
 });

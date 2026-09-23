@@ -1,7 +1,11 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { hostname } from 'node:os';
 
-import { launchWindowsGroup, checkWindowsQuarantine } from './process-group-windows.js';
+import {
+  launchWindowsGroup,
+  checkWindowsQuarantine,
+  windowsSurvivorAlive,
+} from './process-group-windows.js';
 
 // PLAN-13-R2 §2.2 (RC-10): a block's processes live inside one group the operating system
 // keeps together — a named job object on Windows, a process group elsewhere — so ending the
@@ -19,12 +23,36 @@ export type GroupExit =
     }
   | { readonly kind: 'technical'; readonly reason: string };
 
+/** One process the Windows launcher named as still alive when it gave up emptying its job. */
+export type QuarantineSurvivor = {
+  readonly pid: number;
+  /** The process's creation time as FILETIME UTC text, so a reused pid is told apart. */
+  readonly created: string;
+};
+
 /** How to ask the system again whether a group is empty; never a list of processes. */
 export type Quarantine =
-  | { readonly host: string; readonly platform: 'win32'; readonly job: string; readonly confirmed: false }
+  | {
+      readonly host: string;
+      readonly platform: 'win32';
+      readonly job: string;
+      readonly confirmed: false;
+      /** Processes the launcher could not end, with their creation time; absent means none. */
+      readonly survivors?: readonly QuarantineSurvivor[];
+    }
   | { readonly host: string; readonly platform: 'posix'; readonly pgid: number; readonly confirmed: false };
 
 export type QuarantineCheck = { readonly empty: true } | { readonly empty: false; readonly reason: string };
+
+/**
+ * What emptying a group produced. An explicit `empty: false` is a fact the launcher (or the
+ * POSIX kill) observed and is never overruled; `lost: true` means the answer was lost — the
+ * Windows launcher died, left no result, or did not answer in time — so the system may be
+ * asked again before quarantining.
+ */
+export type TerminateResult =
+  | { readonly empty: true }
+  | { readonly empty: false; readonly lost?: boolean };
 
 export interface LaunchInGroupOptions {
   readonly command: string;
@@ -42,13 +70,19 @@ export interface ProcessGroup {
   readonly quarantine: Quarantine;
   wait(): Promise<GroupExit>;
   /** Empties the whole group and confirms it (up to 10 s). Safe to call more than once. */
-  terminate(): Promise<{ readonly empty: boolean }>;
+  terminate(): Promise<TerminateResult>;
 }
 
 export interface ProcessGroupControl {
   launch(options: LaunchInGroupOptions): ProcessGroup;
   check(quarantine: unknown): Promise<QuarantineCheck>;
 }
+
+/** How the engine launches and re-checks groups when the project does not say otherwise. */
+export const DEFAULT_PROCESS_GROUPS: ProcessGroupControl = {
+  launch: (options) => launchInGroup(options),
+  check: (quarantine) => checkQuarantine(quarantine),
+};
 
 /** The command block's default output limit, one mebibyte. */
 export const DEFAULT_STDOUT_BYTES = 1_048_576;
@@ -58,6 +92,8 @@ export const TERMINATE_TIMEOUT_MS = 10_000;
 /** What a launched process left behind, before it is classified per platform. */
 export interface RawExit {
   readonly code: number | null;
+  /** The signal that ended the process, when one did. */
+  readonly signal: NodeJS.Signals | null;
   readonly stdout: string;
   readonly stderr: string;
   readonly truncated: boolean;
@@ -88,12 +124,13 @@ export function collectExit(child: ChildProcess, options: CollectOptions): Promi
     let startError: string | undefined;
     let timer: NodeJS.Timeout | undefined;
 
-    const finish = (code: number | null): void => {
+    const finish = (code: number | null, signal: NodeJS.Signals | null): void => {
       if (settled) return;
       settled = true;
       if (timer !== undefined) clearTimeout(timer);
       resolve({
         code,
+        signal,
         stdout,
         stderr,
         truncated: false,
@@ -122,7 +159,7 @@ export function collectExit(child: ChildProcess, options: CollectOptions): Promi
 
     child.on('error', (error) => {
       startError = error instanceof Error ? error.message : String(error);
-      finish(null);
+      finish(null, null);
     });
     // Node holds the child's stdin pipe open until this side ends it, and `close` waits for
     // every stdio stream. For the Windows launcher, stdin is the kill channel and is never
@@ -134,7 +171,7 @@ export function collectExit(child: ChildProcess, options: CollectOptions): Promi
         // The stream may already be closed or errored; that is the goal either way.
       }
     });
-    child.on('close', (code) => finish(code));
+    child.on('close', (code, signal) => finish(code, signal));
 
     if (options.timeoutMs !== undefined) {
       timer = setTimeout(() => {
@@ -159,9 +196,17 @@ function posixExit(
   if (raw.startError !== undefined) return startFailure(command, raw.startError);
   if (raw.timedOut) return { kind: 'technical', reason: `ran out of time after ${timeoutMs ?? 0} ms` };
   if (raw.overLimit) return { kind: 'technical', reason: `printed more than ${stdoutBytes} bytes` };
+  // A process killed by a signal (OOM, SIGKILL, SIGSEGV) has no exit code, or a null one.
+  // Reading that as 0 would approve whatever it printed before dying.
+  if (raw.signal !== null) {
+    return { kind: 'technical', reason: `the command was killed by signal ${raw.signal}` };
+  }
+  if (raw.code === null) {
+    return { kind: 'technical', reason: 'the command ended without an exit code' };
+  }
   return {
     kind: 'exited',
-    code: raw.code ?? 0,
+    code: raw.code,
     stdout: raw.stdout,
     stderr: raw.stderr,
     truncated: raw.truncated,
@@ -185,8 +230,8 @@ function launchPosix(options: LaunchInGroupOptions): ProcessGroup {
   const pgid = child.pid ?? 0;
   const quarantine: Quarantine = { host: hostname(), platform: 'posix', pgid, confirmed: false };
 
-  let terminatePromise: Promise<{ empty: boolean }> | undefined;
-  const doTerminate = async (): Promise<{ empty: boolean }> => {
+  let terminatePromise: Promise<TerminateResult> | undefined;
+  const doTerminate = async (): Promise<TerminateResult> => {
     if (pgid <= 0) return { empty: true };
     try {
       process.kill(-pgid, 'SIGKILL');
@@ -204,7 +249,7 @@ function launchPosix(options: LaunchInGroupOptions): ProcessGroup {
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
   };
-  const terminate = (): Promise<{ empty: boolean }> => (terminatePromise ??= doTerminate());
+  const terminate = (): Promise<TerminateResult> => (terminatePromise ??= doTerminate());
 
   const raw = collectExit(child, { ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }), stdoutBytes, kill: () => void terminate() });
 
@@ -242,9 +287,32 @@ export async function checkQuarantine(quarantine: unknown): Promise<QuarantineCh
   }
   if (record['platform'] === 'posix') return checkPosix(record['pgid']);
   if (record['platform'] === 'win32' && typeof record['job'] === 'string') {
+    // Survivors the launcher named are checked first, by pid AND creation time: a pid reused
+    // by another process is not the survivor, and while one really lives the quarantine holds
+    // whatever the job name says. Only when none is alive does the job name decide.
+    const survivors = readSurvivors(record['survivors']);
+    if (survivors.length > 0 && (await windowsSurvivorAlive(survivors))) {
+      return { empty: false, reason: `the job object "${record['job']}" still has the processes it named` };
+    }
     return checkWindowsQuarantine(record['job']);
   }
   return { empty: false, reason: 'the quarantine is not readable' };
+}
+
+/** The well-formed survivors of a Windows quarantine, ignoring anything unreadable. */
+function readSurvivors(value: unknown): QuarantineSurvivor[] {
+  if (!Array.isArray(value)) return [];
+  const survivors: QuarantineSurvivor[] = [];
+  for (const item of value) {
+    if (typeof item !== 'object' || item === null) continue;
+    const record = item as Record<string, unknown>;
+    const pid = record['pid'];
+    const created = record['created'];
+    if (typeof pid === 'number' && Number.isInteger(pid) && pid > 0 && typeof created === 'string') {
+      survivors.push({ pid, created });
+    }
+  }
+  return survivors;
 }
 
 function checkPosix(pgid: unknown): QuarantineCheck {
