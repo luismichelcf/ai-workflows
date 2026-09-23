@@ -4,12 +4,13 @@ import { dirname, isAbsolute, join } from 'node:path';
 import type { CommandOutput } from '../cli.js';
 import { explainRecipe } from './explain.js';
 import { parseRecipe } from './parse.js';
+import { safeTerminalText } from './safe-text.js';
 
 const DEFAULT_RECIPE = '.ai-workflows/pipeline.yml';
 const USAGE = 'Usage: ai-workflows <validate|explain|init> [file]';
 
 function errorReason(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return safeTerminalText(error instanceof Error ? error.message : String(error));
 }
 
 function errorCode(error: unknown): string | undefined {
@@ -48,6 +49,7 @@ async function readRecipe(
   cwd: string,
 ): Promise<CommandOutput> {
   const path = isAbsolute(file) ? file : join(cwd, file);
+  const shownFile = safeTerminalText(file);
   let content: string;
   try {
     content = await readFile(path, 'utf8');
@@ -55,16 +57,17 @@ async function readRecipe(
     if (errorCode(error) === 'ENOENT') {
       return {
         ok: false,
-        text: `${file}: not found. Create one with: ai-workflows init`,
+        text: `${shownFile}: not found. Create one with: ai-workflows init`,
       };
     }
-    return { ok: false, text: `${file}: ${errorReason(error)}` };
+    return { ok: false, text: `${shownFile}: ${errorReason(error)}` };
   }
 
   const parsed = parseRecipe(content, file);
   if (!parsed.ok) {
     const text = parsed.errors
-      .map((error) => `${error.file}:${error.line}:${error.column}: ${error.message}`)
+      .map((error) =>
+        `${safeTerminalText(error.file)}:${error.line}:${error.column}: ${error.message}`)
       .join('\n');
     return { ok: false, text };
   }
@@ -72,7 +75,7 @@ async function readRecipe(
   if (action === 'explain') return { ok: true, text: explainRecipe(parsed.recipe) };
   return {
     ok: true,
-    text: `${file}: valid recipe, ${parsed.recipe.stages.length} stages.`,
+    text: `${shownFile}: valid recipe, ${parsed.recipe.stages.length} stages.`,
   };
 }
 

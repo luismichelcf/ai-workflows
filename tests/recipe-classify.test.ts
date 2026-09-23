@@ -58,6 +58,20 @@ describe('which classes a change touches', () => {
     expect(classifyFiles({ dot: ['a.ts'] }, ['abts'])).toEqual([]);
   });
 
+  it('lets a star in the pattern match a star in the file name, as any other character', () => {
+    expect(classifyFiles({ md: ['*.md'] }, ['*notes.md'])).toEqual(['md']);
+    expect(classifyFiles({ ts: ['src/*.ts'] }, ['src/*evil.ts'])).toEqual(['ts']);
+    expect(classifyFiles({ sql: ['**/*.sql'] }, ['m/*drop.sql'])).toEqual(['sql']);
+    expect(classifyFiles({ all: ['*'] }, ['*b'])).toEqual(['all']);
+    expect(classifyFiles({ all: ['**/*'] }, ['*b'])).toEqual(['all']);
+    expect(classifyFiles({ mid: ['a*b*c'] }, ['a*xb*yc'])).toEqual(['mid']);
+  });
+
+  it('lets a question mark match a literal question mark or star', () => {
+    expect(classifyFiles({ q: ['a?c'] }, ['a*c'])).toEqual(['q']);
+    expect(classifyFiles({ q: ['a?c'] }, ['a?c'])).toEqual(['q']);
+  });
+
   it('touches nothing when nothing changed', () => {
     expect(classifyFiles(classify, [])).toEqual([]);
   });

@@ -75,6 +75,43 @@ describe('a key is always text', () => {
   });
 });
 
+describe('one problem never hides another', () => {
+  it('reports an anchor and a non-text key together', () => {
+    const errors = errorsOf(
+      lines(
+        'version: 1',
+        'locale: es',
+        'classify:',
+        '  money: &m ["lib/**"]',
+        '  1: ["a/**"]',
+        'stages:',
+        '  - id: a',
+        '    summary: "Paso A"',
+        '    nature: recompute',
+        '    gate:',
+        '      run: node a.mjs',
+      ),
+    );
+    expect(errors).toContainEqual(at(4, 10, /anchor/));
+    expect(errors).toContainEqual(at(5, 3, /keys must be text/));
+  });
+
+  it('reports a duplicated key and a non-text key together', () => {
+    const errors = errorsOf(
+      lines(
+        'version: 1',
+        'locale: es',
+        'owner: a',
+        'owner: b',
+        '1: x',
+        'stages: []',
+      ),
+    );
+    expect(errors).toContainEqual(at(4, 1, /duplicate key "owner"/));
+    expect(errors).toContainEqual(at(5, 1, /keys must be text/));
+  });
+});
+
 describe('names inherited by every object are not fields', () => {
   it('rejects them as unknown keys at every level', () => {
     expect(errorsOf(stageWith('    constructor: 5'))).toContainEqual(at(9, 5, /unknown key "constructor"/));
@@ -199,6 +236,17 @@ describe('matching a path costs time proportional to the path, whatever the file
     quick(['*a*a*a*a*a*a*a*a*b'], `${'a'.repeat(200)}b`, ['c']);
   });
 
+  it('a realistic recipe against a large pull request of long paths', () => {
+    const classify: Record<string, string[]> = {};
+    for (let i = 0; i < 10; i++) {
+      classify[`c${i}`] = [`lib/m${i}/**`, `**/*n${i}*`, `app/**/*.x${i}`, `docs/**/*-${i}.md`, `k${i}/*/*.ts`];
+    }
+    const files = Array.from({ length: 3000 }, (_, i) => `src/${'a'.repeat(2000)}/f${i}.ts`);
+    const started = performance.now();
+    expect(classifyFiles(classify, files)).toEqual([]);
+    expect(performance.now() - started).toBeLessThan(1500);
+  });
+
   it('many ** segments against a deep path', () => {
     const deep = Array.from({ length: 40 }, (_, i) => `d${i}`).join('/');
     quick(['**/**/**/**/**/**/**/**/**/**/zzz'], `${deep}/x`, []);
@@ -257,6 +305,54 @@ describe('the owner terminal only ever receives plain text', () => {
     const errors = errorsOf(lines('"bad\\x1b[2Jkey": 1', 'version: 1'));
     expect(errors).toContainEqual(at(1, 1, /control characters are not allowed/));
     for (const error of errors) expect(error.message).not.toMatch(escapes);
+  });
+});
+
+describe('nothing in any error or explanation can steer the terminal or reorder what it shows', () => {
+  // C0, DEL, C1, the bidirectional controls and the line/paragraph separators.
+  const unsafe = /[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069\u2028\u2029]/;
+
+  it('never echoes control characters from a second document', () => {
+    const result = parseRecipe('version: 1\n---\n"\\x1b[2J": 1\n"\\x1b[2J": 2\n', FILE);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    for (const error of result.errors) expect(error.message).not.toMatch(unsafe);
+  });
+
+  it('refuses bidirectional and separator characters in text, without echoing them', () => {
+    for (const [line, escape] of [
+      ['    summary: "abc\\u202Edef"', '\u202e'],
+      ['    summary: "abc\\u2028def"', '\u2028'],
+      ['    summary: "abc\\u2066def"', '\u2066'],
+    ] as const) {
+      const errors = errorsOf(
+        lines(
+          'version: 1',
+          'locale: es',
+          'stages:',
+          '  - id: a',
+          line,
+          '    nature: recompute',
+          '    gate:',
+          '      run: node a.mjs',
+        ),
+      );
+      expect(errors).toContainEqual(at(5, 14, /characters are not allowed/));
+      for (const error of errors) expect(error.message).not.toContain(escape);
+    }
+  });
+
+  it('refuses a bidirectional character in a key, without echoing it', () => {
+    const errors = errorsOf(lines('"\\u202Eevil": 1', 'version: 1'));
+    expect(errors).toContainEqual(at(1, 1, /characters are not allowed/));
+    for (const error of errors) expect(error.message).not.toMatch(unsafe);
+  });
+
+  it('never echoes unsafe characters from a YAML library message', () => {
+    const result = parseRecipe('%FOO\u202e bar\n---\nversion: 1\n', FILE);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    for (const error of result.errors) expect(error.message).not.toMatch(unsafe);
   });
 });
 

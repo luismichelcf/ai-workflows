@@ -140,6 +140,13 @@ describe('paths and arguments', () => {
     expect(output.text).toContain(`${shown}:6:5: duplicate key "summary"`);
   });
 
+  it('never echoes control characters from the file name it was given', async () => {
+    const output = await recipeCommand(['validate', 'no\u001b[31mexist.yml'], { cwd });
+    expect(output.ok).toBe(false);
+    expect(output.text).not.toMatch(/[\u0000-\u001f\u007f-\u009f]/);
+    expect(output.text).toContain('exist.yml: not found');
+  });
+
   it('init takes no file: it only ever writes where the engine looks', async () => {
     const output = await recipeCommand(['init', 'other.yml'], { cwd });
     expect(output.ok).toBe(false);

@@ -1,6 +1,7 @@
 import { LineCounter, Parser, parseAllDocuments, type Node } from 'yaml';
 
 import { constructRecipe } from './construct.js';
+import { safeTerminalText } from './safe-text.js';
 import { validateSemantics } from './semantics.js';
 import type { Recipe, RecipeError } from './types.js';
 import {
@@ -57,15 +58,11 @@ function scanCst(item: unknown, issues: LocatedIssue[]): void {
   }
 }
 
-function safeLibraryMessage(message: string): string {
-  return message.split('\n')[0]?.replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ') ?? '';
-}
-
 function libraryIssues(
   text: string,
   lineCounter: LineCounter,
   issues: LocatedIssue[],
-): YamlNode {
+): YamlNode[] {
   const documents = parseAllDocuments(text, {
     version: '1.2',
     schema: 'core',
@@ -73,9 +70,9 @@ function libraryIssues(
     merge: false,
     lineCounter,
   });
-  const root = documents[0]?.contents ?? null;
+  const roots = documents.map((document) => document.contents);
 
-  if (documents.length === 0 || root === null) {
+  if (documents.length === 0 || roots[0] === null) {
     issues.push({ offset: 0, message: 'empty recipe' });
   }
   if (documents.length > 1) {
@@ -92,7 +89,7 @@ function libraryIssues(
       } else {
         issues.push({
           offset,
-          message: `invalid YAML: ${safeLibraryMessage(problem.message)}`,
+          message: `invalid YAML: ${problem.message.split('\n')[0] ?? ''}`,
         });
       }
     }
@@ -100,15 +97,15 @@ function libraryIssues(
 
   // A document's leading anchor or tag is outside contents.srcToken. Scan the entire CST.
   for (const token of new Parser().parse(text)) scanCst(token, issues);
-  return root;
+  return roots;
 }
 
 export function parseRecipe(text: string, file: string): RecipeParseResult {
   const lineCounter = new LineCounter();
   const issues: LocatedIssue[] = [];
-  let root: YamlNode;
+  let roots: YamlNode[];
   try {
-    root = libraryIssues(text, lineCounter, issues);
+    roots = libraryIssues(text, lineCounter, issues);
   } catch (error) {
     if (!(error instanceof RangeError)) throw error;
     return {
@@ -117,18 +114,12 @@ export function parseRecipe(text: string, file: string): RecipeParseResult {
     };
   }
 
-  const inspection = inspectYamlTree(root);
-  if (inspection.controls.length > 0) {
-    issues.length = 0;
-    issues.push(...inspection.controls);
-  } else if (inspection.depth.length > 0) {
-    issues.length = 0;
-    issues.push(...inspection.depth);
-  } else if (inspection.keys.length > 0) {
-    issues.length = 0;
-    issues.push(...inspection.keys);
+  for (const root of roots) {
+    const inspection = inspectYamlTree(root);
+    issues.push(...inspection.controls, ...inspection.depth, ...inspection.keys);
   }
 
+  const root = roots[0] ?? null;
   if (issues.length === 0) issues.push(...validateStructure(root));
   if (issues.length === 0) issues.push(...validateSemantics(root));
 
@@ -140,7 +131,7 @@ export function parseRecipe(text: string, file: string): RecipeParseResult {
         file,
         line: position.line,
         column: position.col,
-        message: issue.message,
+        message: safeTerminalText(issue.message),
       };
     });
     return { ok: false, errors };

@@ -1,6 +1,7 @@
 import { isMap, isScalar, isSeq, type Node, type YAMLMap, type YAMLSeq } from 'yaml';
 
 import { recipeSchema } from './schema.js';
+import { hasUnsafeText } from './safe-text.js';
 
 export type YamlNode = Node | null;
 
@@ -71,7 +72,6 @@ export function nodeStart(node: YamlNode): number {
   return node?.range?.[0] ?? 0;
 }
 
-const CONTROL = /[\u0000-\u001f\u007f-\u009f]/;
 const MAX_DEPTH = 64;
 
 interface TreeInspection {
@@ -98,7 +98,7 @@ export function inspectYamlTree(root: YamlNode): TreeInspection {
     }
 
     if (isScalar(current.node)) {
-      if (typeof current.node.value === 'string' && CONTROL.test(current.node.value)) {
+      if (typeof current.node.value === 'string' && hasUnsafeText(current.node.value)) {
         controls.push({
           offset: nodeStart(current.node),
           message: 'control characters are not allowed',

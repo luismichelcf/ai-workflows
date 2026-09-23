@@ -18,12 +18,13 @@ function matchSegment(pattern: string, path: string): boolean {
 
   while (pathIndex < path.length) {
     const token = pattern[patternIndex];
-    if (token === '?' || token === path[pathIndex]) {
-      patternIndex++;
-      pathIndex++;
-    } else if (token === '*') {
+    // A pattern star stays a wildcard even when the file name contains a literal star.
+    if (token === '*') {
       starIndex = patternIndex++;
       retryIndex = pathIndex;
+    } else if (token === '?' || token === path[pathIndex]) {
+      patternIndex++;
+      pathIndex++;
     } else if (starIndex !== -1) {
       patternIndex = starIndex + 1;
       pathIndex = ++retryIndex;
@@ -44,30 +45,36 @@ function collapseDoubleStars(segments: readonly string[]): string[] {
 }
 
 /** Dynamic programming bounds work even when many whole-segment ** markers overlap. */
-function matchPath(pattern: readonly string[], path: readonly string[]): boolean {
-  const segments = collapseDoubleStars(pattern);
-  const rows = Array.from(
-    { length: segments.length + 1 },
-    () => Array<boolean>(path.length + 1).fill(false),
-  );
-  const last = rows[segments.length];
-  if (last) last[path.length] = true;
+function matchPath(
+  segments: readonly string[],
+  path: readonly string[],
+  buffers: readonly [boolean[], boolean[]],
+): boolean {
+  const width = path.length + 1;
+  let next = buffers[0];
+  let row = buffers[1];
+  next.length = width;
+  row.length = width;
+  next.fill(false);
+  next[path.length] = true;
 
   for (let i = segments.length - 1; i >= 0; i--) {
     const segment = segments[i];
-    const row = rows[i];
-    const next = rows[i + 1];
-    if (!row || !next || segment === undefined) continue;
+    if (segment === undefined) continue;
+    row.fill(false);
 
     for (let j = path.length; j >= 0; j--) {
       if (segment === '**') {
         row[j] = next[j] === true || (j < path.length && row[j + 1] === true);
       } else if (j < path.length) {
-        row[j] = matchSegment(segment, path[j] ?? '') && next[j + 1] === true;
+        row[j] = next[j + 1] === true && matchSegment(segment, path[j] ?? '');
       }
     }
+    const previous = next;
+    next = row;
+    row = previous;
   }
-  return rows[0]?.[0] === true;
+  return next[0] === true;
 }
 
 export function classifyFiles(
@@ -75,8 +82,14 @@ export function classifyFiles(
   files: readonly string[],
 ): string[] {
   const paths = files.map((file) => file.replace(/\\/g, '/').split('/'));
-  return Object.entries(classify)
-    .filter(([, patterns]) => patterns.some((pattern) =>
-      paths.some((path) => matchPath(pattern.split('/'), path))))
-    .map(([name]) => name);
+  const buffers: [boolean[], boolean[]] = [[], []];
+  const touched: string[] = [];
+
+  for (const [name, patterns] of Object.entries(classify)) {
+    const compiled = patterns.map((pattern) => collapseDoubleStars(pattern.split('/')));
+    if (compiled.some((pattern) => paths.some((path) => matchPath(pattern, path, buffers)))) {
+      touched.push(name);
+    }
+  }
+  return touched;
 }
