@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { existsSync, lstatSync, rmSync, symlinkSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -11,6 +12,7 @@ import { gitEnvironment } from '../git-env.js';
 import type { BlockDefinition, EngineBlockDeps } from './definition.js';
 import type { BlockManifest } from './manifest.js';
 import {
+  existingFiles,
   filesMatching,
   hashFiles,
   matchesGlobs,
@@ -132,6 +134,73 @@ function runGit(
       resolve({ stdout: (stdout ?? '').trim(), ok: error === null });
     });
   });
+}
+
+/** Runs `git <args>` returning the raw bytes, so a file's content can be hashed as it is. */
+function runGitRaw(
+  root: string,
+  args: readonly string[],
+): Promise<{ readonly stdout: Buffer; readonly ok: boolean }> {
+  const options = {
+    cwd: root,
+    timeout: GIT_TIMEOUT_MS,
+    maxBuffer: GIT_MAX_BUFFER,
+    windowsHide: true,
+    encoding: 'buffer' as const,
+    env: gitEnvironment(),
+  };
+  return new Promise((resolve) => {
+    execFile('git', [...args], options, (error, stdout) => {
+      resolve({ stdout: stdout ?? Buffer.alloc(0), ok: error === null });
+    });
+  });
+}
+
+/**
+ * The commits after the red test that really touched a test file: one counts only when, in
+ * THAT commit, some test file holds a different content (sha256) from the one recorded red, or
+ * is a test that was never recorded. A commit that merely saves an unchanged test which was
+ * red while still unsaved is not a change to the tests (review round 1).
+ */
+async function changedTestCommits(
+  root: string,
+  since: string,
+  paths: readonly string[],
+  recorded: Readonly<Record<string, string>>,
+): Promise<string[]> {
+  if (paths.length === 0) return [];
+  const history = await runGit(root, [
+    'log',
+    '--format=%H',
+    '--name-only',
+    `${since}..HEAD`,
+    '--',
+    ...paths,
+  ]);
+  if (!history.ok) throw new Error('the history of the test files could not be read');
+
+  const commits: string[] = [];
+  let commit: string | undefined;
+  for (const raw of history.stdout.split('\n')) {
+    const line = raw.trim();
+    if (line.length === 0) continue;
+    if (/^[0-9a-f]{40}$/.test(line)) {
+      commit = line;
+      continue;
+    }
+    if (commit === undefined) continue;
+    const file = line;
+    const recordedHash = Object.hasOwn(recorded, file) ? recorded[file] : undefined;
+    let changed = typeof recordedHash !== 'string';
+    if (!changed && typeof recordedHash === 'string') {
+      const expected = recordedHash;
+      const shown = await runGitRaw(root, ['show', `${commit}:${file}`]);
+      const hash = shown.ok ? createHash('sha256').update(shown.stdout).digest('hex') : undefined;
+      changed = hash === undefined || hash.toLowerCase() !== expected.toLowerCase();
+    }
+    if (changed && !commits.includes(commit)) commits.push(commit);
+  }
+  return commits;
 }
 
 function noRedReason(redStage: string, spanish: boolean): string {
@@ -299,26 +368,22 @@ function createGate(
     const red = readRedEvidence(redEntry);
     if (red === undefined) return { ok: false, reason: noRedReason(redStage, spanish) };
 
-    const recorded = Object.keys(red.files);
-    const current = await hashFiles(deps.root, recorded);
+    const change = changeOf(context);
+    const changeFiles = asStringList(change['files']);
+    // The test files are the ones of the change that match `tests` and still exist: a test
+    // added after the red run is an appeared file, and requireSameFiles refuses it by name.
+    const testFiles = existingFiles(deps.root, filesMatching(tests, changeFiles));
+
+    const current = await hashFiles(deps.root, testFiles);
     const sameFiles = requireSameFiles(red.files, current);
     if (!sameFiles.ok) return { ok: false, reason: sameFiles.reason };
 
-    const history = await runGit(deps.root, [
-      'log',
-      '--format=%H',
-      `${red.judgedSha}..HEAD`,
-      '--',
-      ...recorded,
-    ]);
-    if (!history.ok) throw new Error('the history of the test files could not be read');
-    const commits = history.stdout.split('\n').filter((line) => line.length > 0);
+    const commits = await changedTestCommits(deps.root, red.judgedSha, [
+      ...new Set([...Object.keys(red.files), ...testFiles]),
+    ], red.files);
     if (commits.length > 0) return { ok: false, reason: changedTestsReason(commits, spanish) };
 
-    const change = changeOf(context);
-    const changeFiles = asStringList(change['files']);
-    const testFiles = filesMatching(tests, changeFiles);
-    const greenTests = testFiles.length > 0 ? testFiles : recorded;
+    const greenTests = testFiles.length > 0 ? testFiles : Object.keys(red.files);
 
     const green = await runTests({
       command,
@@ -356,7 +421,7 @@ function createGate(
       snapshot,
       mergeBase,
       implementation,
-      tests: recorded,
+      tests: Object.keys(red.files),
       command,
       timeoutMs,
       piece: context.piece,

@@ -210,16 +210,24 @@ function evaluate(
   }
 
   if (decisions !== undefined) {
-    const lines = sectionOf(analysis, decisions.section)?.lines ?? [];
-    const pending = decisions.pendingMarkers.map((marker) => canonicalText(marker));
-    for (const line of lines) {
-      const folded = canonicalText(line);
-      if (pending.some((marker) => marker.length > 0 && folded.includes(marker))) {
-        problems.push(
-          spanish
-            ? `Queda una decisión pendiente: ${quoted(withoutBullet(line), spanish)}.`
-            : `A decision is still pending: ${quoted(withoutBullet(line), spanish)}.`,
-        );
+    const section = sectionOf(analysis, decisions.section);
+    if (section === undefined) {
+      problems.push(
+        spanish
+          ? `Falta la sección ${quoted(decisions.section, spanish)}.`
+          : `Missing section ${quoted(decisions.section, spanish)}.`,
+      );
+    } else {
+      const pending = decisions.pendingMarkers.map((marker) => canonicalText(marker));
+      for (const line of section.lines) {
+        const folded = canonicalText(line);
+        if (pending.some((marker) => marker.length > 0 && folded.includes(marker))) {
+          problems.push(
+            spanish
+              ? `Queda una decisión pendiente: ${quoted(withoutBullet(line), spanish)}.`
+              : `A decision is still pending: ${quoted(withoutBullet(line), spanish)}.`,
+          );
+        }
       }
     }
   }

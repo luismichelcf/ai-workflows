@@ -1,12 +1,11 @@
+import { execFile } from 'node:child_process';
 import { realpathSync } from 'node:fs';
-import { readFile } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
+import { resolve } from 'node:path';
 
 import type {
   Gate,
   GateContext,
   GateResult,
-  GateNature,
   JsonValue,
   PipelineConfig,
   StageConfig,
@@ -19,19 +18,24 @@ import type {
   EngineBlockDeps,
   ProviderRunner,
 } from '../blocks/definition.js';
-import type { BlockManifest, InputSpec, ValidWhile } from '../blocks/manifest.js';
+import type { BlockManifest, InputSpec } from '../blocks/manifest.js';
 import { createModuleGate } from '../blocks/module-block.js';
 import { engineBlock } from '../blocks/registry.js';
+import { gitEnvironment } from '../git-env.js';
 import {
   DEFAULT_PROCESS_GROUPS,
-  DEFAULT_STDOUT_BYTES,
+  TEST_STDOUT_BYTES,
   type ProcessGroup,
   type ProcessGroupControl,
 } from '../process-group.js';
 import type { Invocation, RawRun } from '../providers.js';
 import { appliesIfFor } from './applies.js';
+import {
+  loadProjectBlockStrict,
+  natureComplaint,
+  validityComplaint,
+} from './blocks.js';
 import { describeChangeFromGit, type ChangeDeclared, type ChangeFacts } from './facts.js';
-import { readStrictYaml } from './parse.js';
 import type { Recipe, RecipeStage } from './types.js';
 import { readJudged, recordCleanUpdate, stillValidFor } from './validity.js';
 import {
@@ -116,7 +120,7 @@ export async function runProviderInGroup(
     cwd: invocation.cwd,
     stdin: invocation.stdin ?? '',
     ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
-    stdoutBytes: DEFAULT_STDOUT_BYTES,
+    stdoutBytes: TEST_STDOUT_BYTES,
   });
 
   // Cancellation must be honoured at once, not when the CLI decides to end: the wait races the
@@ -132,7 +136,6 @@ export async function runProviderInGroup(
     signal?.addEventListener('abort', onAbort, { once: true });
   });
 
-  let resolvedCleanly = false;
   try {
     const raced = await Promise.race([
       group.wait().then((exit) => ({ exit })),
@@ -144,11 +147,10 @@ export async function runProviderInGroup(
     }
     const exit = raced.exit;
     if (exit.kind === 'technical') throw new Error(exit.reason);
-    resolvedCleanly = exit.code === 0;
     return { output: exit.stdout, exitCode: exit.code };
   } finally {
     if (onAbort !== undefined) options.signal?.removeEventListener('abort', onAbort);
-    await confirmEmptyGroup(group, groups, invocation.command, resolvedCleanly);
+    await confirmEmptyGroup(group, groups, invocation.command);
   }
 }
 
@@ -263,118 +265,102 @@ interface ProjectBlock {
   readonly timeoutMinutes?: number;
 }
 
-/** Reads `.ai-workflows/blocks/<name>/block.yml` with the recipe's own strict YAML reader. */
+/**
+ * Reads a project block with the recipe's own strict reader and validation (the same ones
+ * `checkRecipe` uses), so an unknown `kind` or an escaping `main`/`run` is refused here too and
+ * never guessed.
+ */
 async function readProjectBlock(root: string, name: string): Promise<ProjectBlock> {
-  const blockDir = join(root, '.ai-workflows', 'blocks', name);
   const uses = `./.ai-workflows/blocks/${name}`;
-  let text: string;
-  try {
-    text = await readFile(join(blockDir, 'block.yml'), 'utf8');
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-      throw new Error(`project block "${uses}" has no block.yml`);
-    }
-    throw error;
-  }
-
-  const strict = readStrictYaml(text, 'empty block');
-  const firstIssue = strict.issues[0];
-  if (firstIssue !== undefined) {
-    throw new Error(`project block "${uses}" has an invalid block.yml: ${firstIssue.message}`);
-  }
-
+  const strict = await loadProjectBlockStrict(root, name, uses);
   const rootNode = strict.root;
-  const kindWord = yamlWord(yamlField(rootNode, 'kind'));
-  const kind: 'module' | 'command' = kindWord === 'command' ? 'command' : 'module';
-  const natures = (yamlSeq(yamlField(rootNode, 'natures'))?.items ?? []).map(
-    (item) => yamlWord(item) as GateNature,
-  );
-  const validWhiles = (yamlSeq(yamlField(rootNode, 'valid-while'))?.items ?? [])
-    .map((item) => yamlWord(item) as ValidWhile);
-  const inputs = parseInputSpecs(yamlField(rootNode, 'inputs'));
   const mainNode = yamlField(rootNode, 'main');
   const runNode = yamlField(rootNode, 'run');
   const timeout = yamlValue(yamlField(rootNode, 'timeout-minutes'));
 
-  const manifest: BlockManifest = {
-    name: uses,
-    kind,
-    natures,
-    ...(validWhiles.length === 0 ? {} : { validWhile: validWhiles }),
-    inputs,
-  };
-
   return {
-    manifest,
-    blockDir,
-    kind,
+    manifest: strict.manifest,
+    blockDir: strict.blockDir,
+    kind: strict.manifest.kind,
     ...(mainNode === null ? {} : { main: yamlWord(mainNode) }),
     ...(runNode === null ? {} : { run: yamlWord(runNode) }),
     ...(typeof timeout === 'number' && Number.isInteger(timeout) ? { timeoutMinutes: timeout } : {}),
   };
 }
 
-function parseInputSpecs(node: YamlNode): Record<string, InputSpec> {
-  const map = yamlMap(node);
-  if (map === undefined) return {};
-  const inputs: Record<string, InputSpec> = {};
-  for (const pair of map.items) inputs[yamlWord(pair.key)] = parseInputSpec(pair.value);
-  return inputs;
+/** The synthetic manifest of a stage written with `run:`: never a module, only recompute/structure. */
+function runManifest(name: string): BlockManifest {
+  return { name, kind: 'command', natures: ['recompute', 'structure'], inputs: {} };
 }
 
-function parseInputSpec(node: YamlNode): InputSpec {
-  const type = yamlWord(yamlField(node, 'type')) || 'string';
-  const requiredField = yamlValue(yamlField(node, 'required')) === true ? { required: true as const } : {};
-  const fallback = yamlValue(yamlField(node, 'default'));
-
-  switch (type) {
-    case 'integer': {
-      const min = numericField(node, 'min');
-      const max = numericField(node, 'max');
-      return {
-        type: 'integer',
-        ...requiredField,
-        ...(typeof fallback === 'number' ? { default: fallback } : {}),
-        ...(min === undefined ? {} : { min }),
-        ...(max === undefined ? {} : { max }),
-      };
+/**
+ * PLAN-13-R2 §1.3 rules 5–6 and §2 re-checked where it matters: before creating anything, the
+ * nature and the validity of every stage are checked against the manifest that will run it.
+ * `compileRecipe` is the last door before a block runs, so it cannot trust that `validate` ran.
+ */
+async function assertManifestsAllow(
+  recipe: Recipe,
+  deps: CompileRecipeDeps,
+  root: string,
+): Promise<void> {
+  for (const stage of recipe.stages) {
+    const { uses, run } = stage.gate;
+    let manifest: BlockManifest;
+    if (run !== undefined) {
+      manifest = runManifest(stage.id);
+    } else {
+      if (uses === undefined) throw new Error(`stage "${stage.id}" has neither uses nor run`);
+      if (deps.extraBlocks !== undefined && Object.hasOwn(deps.extraBlocks, uses)) {
+        manifest = (deps.extraBlocks[uses] as BlockDefinition).manifest;
+      } else if (uses.startsWith('ai-workflows/')) {
+        const found = engineBlock(uses)?.manifest;
+        if (found === undefined) throw new Error(`unknown engine block "${uses}"`);
+        manifest = found;
+      } else {
+        const project = PROJECT_USES.exec(uses);
+        if (!project) throw new Error(`unknown block "${uses}"`);
+        manifest = (await readProjectBlock(root, project[1] ?? '')).manifest;
+      }
     }
-    case 'boolean':
-      return {
-        type: 'boolean',
-        ...requiredField,
-        ...(typeof fallback === 'boolean' ? { default: fallback } : {}),
-      };
-    case 'string-list':
-      return { type: 'string-list', ...requiredField, ...(isStringArray(fallback) ? { default: fallback } : {}) };
-    case 'glob-list':
-      return { type: 'glob-list', ...requiredField, ...(isStringArray(fallback) ? { default: fallback } : {}) };
-    case 'command':
-      return {
-        type: 'command',
-        ...requiredField,
-        ...(typeof fallback === 'string' ? { default: fallback } : {}),
-      };
-    case 'object':
-      return { type: 'object', ...requiredField, fields: parseInputSpecs(yamlField(node, 'fields')) };
-    case 'object-list':
-      return { type: 'object-list', ...requiredField, items: parseInputSpecs(yamlField(node, 'items')) };
-    default:
-      return {
-        type: 'string',
-        ...requiredField,
-        ...(typeof fallback === 'string' ? { default: fallback } : {}),
-      };
+
+    const blockName = uses ?? stage.id;
+    const nature = natureComplaint(blockName, stage.nature, manifest);
+    if (nature !== undefined) throw new Error(nature);
+    const validity = validityComplaint(blockName, stage.validWhile, manifest);
+    if (validity !== undefined) throw new Error(validity);
   }
 }
 
-function numericField(node: YamlNode, key: string): number | undefined {
-  const value = yamlValue(yamlField(node, key));
-  return typeof value === 'number' && Number.isInteger(value) ? value : undefined;
+/** The folder git considers the top of the repository, or undefined outside a repository. */
+function gitTopLevel(root: string): Promise<string | undefined> {
+  return new Promise((resolveTop) => {
+    execFile(
+      'git',
+      ['rev-parse', '--show-toplevel'],
+      {
+        cwd: root,
+        timeout: 60_000,
+        windowsHide: true,
+        encoding: 'utf8',
+        env: gitEnvironment(),
+      },
+      (error, stdout) => {
+        resolveTop(error === null ? (stdout ?? '').trim() : undefined);
+      },
+    );
+  });
 }
 
-function isStringArray(value: unknown): value is readonly string[] {
-  return Array.isArray(value) && value.every((item) => typeof item === 'string');
+/** The `with:` a project command block receives: declared defaults applied, keys as written. */
+function writtenInputs(fields: Readonly<Record<string, InputSpec>>, raw: unknown): Record<string, unknown> {
+  const provided = (typeof raw === 'object' && raw !== null ? raw : {}) as Record<string, unknown>;
+  const result: Record<string, unknown> = {};
+  for (const [key, spec] of Object.entries(fields)) {
+    const value = Object.hasOwn(provided, key) ? provided[key] : defaultValueOf(spec);
+    if (value === undefined) continue;
+    result[key] = withDefaults(spec, value);
+  }
+  return result;
 }
 
 // ---------------------------------------------------------------------------------------
@@ -429,7 +415,7 @@ async function resolveStageBlock(
           root: engineDeps.root,
           groups,
           limits: deps.limits ?? {},
-          withValue,
+          withValue: writtenInputs(block.manifest.inputs, withValue),
           blockDir: block.blockDir,
           ...(block.timeoutMinutes === undefined ? {} : { timeoutMinutes: block.timeoutMinutes }),
         }),
@@ -451,9 +437,19 @@ export async function compileRecipe(
   // the module loader and the blocks all need one canonical path: the real one. It is resolved
   // once, here, and every path the engine builds from it is the long form.
   const root = realRoot(deps.root);
+  // The whole translation assumes `root` is the repository: any git command and every block
+  // that reads a path acts there. A subfolder would make the facts and the project blocks
+  // disagree about which repository they belong to, so it is refused rather than guessed.
+  const top = await gitTopLevel(root);
+  if (top === undefined || realRoot(top) !== root) {
+    throw new Error(`root "${deps.root}" is not the top of the repository`);
+  }
   const rootDeps: CompileRecipeDeps = { ...deps, root };
   const stages: StageConfig[] = [];
   const groups = deps.processGroups ?? DEFAULT_PROCESS_GROUPS;
+  // The same rules validate already applied, checked again here with the same functions: the
+  // recipe is not trusted to have passed `validate` before it reaches the engine.
+  await assertManifestsAllow(recipe, rootDeps, root);
   // The default runs a coding CLI the same way a command block runs: inside a group of its
   // own, without a console, with the prompt on stdin, under its time limit, cancellable, and
   // the group always confirmed empty (PLAN-13-R2 §11).

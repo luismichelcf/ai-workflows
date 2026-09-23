@@ -222,3 +222,12 @@ describe('CN-01 · advancing without the benchmark, through benchmark-sources@1'
     expect((await runBlock(root, BENCH_STAGE())).outcome).toMatchObject(refused(/docs\/research\/42-\*\.md/));
   });
 });
+
+
+describe('review round 1: a required decisions section that is missing is a problem, not a pass', () => {
+  it('names the missing section', async () => {
+    const root = projectWith({ 'docs/plans/PLAN-42.md': GOOD_SPEC.replace(/## Decisiones[\s\S]*$/, '') });
+    const stage = SPEC_STAGE.map((row) => (row.includes('sections:') ? '        sections: ["En tres líneas", "Casos de aceptación"]' : row));
+    expect((await runBlock(root, stage)).outcome).toMatchObject(refused(/«Decisiones»/));
+  });
+});

@@ -1,4 +1,5 @@
 import { existsSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
 
 import {
   type Gate,
@@ -9,7 +10,11 @@ import type { BlockDefinition, EngineBlockDeps } from './definition.js';
 import type { BlockManifest } from './manifest.js';
 import { isGreenRun, parseTestRun } from '../commands.js';
 import { resolveExecutable, type ExecutableEnvironment } from '../exec.js';
-import { DEFAULT_PROCESS_GROUPS, DEFAULT_STDOUT_BYTES } from '../process-group.js';
+import {
+  DEFAULT_PROCESS_GROUPS,
+  DEFAULT_STDOUT_BYTES,
+  TEST_STDOUT_BYTES,
+} from '../process-group.js';
 import { confirmEmptyGroup } from './confirm-empty.js';
 
 // PLAN-13-R2 §3.6 (CN-04, CN-09): the engine's `command@1` runs a command of the project with a
@@ -140,7 +145,7 @@ function createGate(
     const { program, args } = expandedArguments(
       command,
       context.piece,
-      testFiles(changeFiles(context)),
+      testFiles(changeFiles(context)).filter((file) => existsSync(join(deps.root, file))),
     );
     const resolved = resolveExecutable(program, executableEnvironment());
     if (!resolved.ok) throw new Error(`could not start ${program}: ${resolved.reason}`);
@@ -152,7 +157,9 @@ function createGate(
       stdin: '',
       ...(resolved.env === undefined ? {} : { env: resolved.env }),
       timeoutMs,
-      stdoutBytes: DEFAULT_STDOUT_BYTES,
+      // The JSON contract of a command block stays at 1 MiB; a suite report read with the
+      // Vitest reader can be much larger, so that reading is given the room it needs.
+      stdoutBytes: readVitest ? TEST_STDOUT_BYTES : DEFAULT_STDOUT_BYTES,
     });
 
     // Cancellation must be honoured at once: the wait races the signal, and on abort the group
@@ -167,9 +174,8 @@ function createGate(
       context.signal.addEventListener('abort', onAbort, { once: true });
     });
 
-    let resolvedCleanly = false;
     const confirmEmpty = (): Promise<void> =>
-      confirmEmptyGroup(group, DEFAULT_PROCESS_GROUPS, program, resolvedCleanly);
+      confirmEmptyGroup(group, DEFAULT_PROCESS_GROUPS, program);
 
     try {
       const raced = await Promise.race([
@@ -183,13 +189,11 @@ function createGate(
         await confirmEmpty();
         const exit = await group.wait();
         if (exit.kind === 'technical') throw new Error(exit.reason);
-        resolvedCleanly = exit.code === 0;
         code = exit.code;
         output = combinedOutput(exit.stdout, exit.stderr);
       } else {
         const exit = raced.exit;
         if (exit.kind === 'technical') throw new Error(exit.reason);
-        resolvedCleanly = exit.code === 0;
         code = exit.code;
         output = combinedOutput(exit.stdout, exit.stderr);
       }

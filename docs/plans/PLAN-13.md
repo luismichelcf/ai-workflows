@@ -56,7 +56,7 @@ que no pudo correr queda `blocked:technical`, nunca «atestiguado».
 
 **Identidad.** Publicador (cuenta de GitHub) ≠ ejecución (proveedor + modelo + esfuerzo + sesión)
 ≠ pieza (repo, pieza, base, SHA). La independencia de un revisor se juzga por la identidad de
-ejecución y la familia, nunca por la cuenta de GitHub.
+ejecución y la familia, nunca por la cuenta de GitHub. Dos ejecuciones de la misma sesión son la misma aunque cambie el modelo (R18).
 
 **Pipeline lineal.** Una etapa tiene como máximo un predecesor; dos etapas con el mismo `after`
 se rechazan. Si una pieza necesita paralelismo, se parte en dos piezas.
@@ -103,6 +103,7 @@ permanente (§8.2).
 | R15 | **La receta declara su vocabulario de tipos y carriles** (22-sep). `kinds.names` lista una vez los tipos válidos y `lanes:` reparte cada tipo en un carril; `validate` rechaza cualquier tipo o carril fuera de esa lista en `applies-if`, `default`, `from-paths` y `elevate`. El carril no se declara: sale del tipo efectivo, así que sube cuando sube el riesgo (detalle en [PLAN-13-R2](PLAN-13-R2.md) §1.1). Descartado: una lista fija dentro del motor (otro proyecto no podría usar sus propios tipos, contra R05). |
 | R16 | **Nombres en el idioma del dueño para clases y tipos** (22-sep). Cada clase de `classify` y cada tipo o carril puede llevar un nombre legible que `explain` usa en lugar de la palabra en inglés («toca permisos y datos» en vez de «toca security»). Opcional: sin nombre, `explain` muestra la palabra en inglés. |
 | R17 | **Constructor desde la rebanada 2: DeepSeek V4.1 Flash `high`** por OpenCode (22-sep, porque se agota la cuota de ChatGPT). Relevo: GPT-6 Sol `high`, por cuota, autenticación o dos intentos fallidos. La revisión del spec sigue con Sol y la del código con la parvada Claude (R12). |
+| R18 | **La misma conversación es el mismo revisor, aunque cambie de modelo** (23-sep, en la revisión del PR #17). Un modelo que construyó y luego, en la misma sesión, cambia de modelo para revisar, no cuenta como independiente: ya sabe lo que escribió. La identidad de ejecución para juzgar independencia es proveedor + sesión; el modelo y el esfuerzo se siguen registrando, pero no separan dos ejecuciones de la misma sesión. Precisa §1.1 («Identidad»). |
 
 Decisiones de construcción tomadas por el orquestador (el dueño decide qué, el orquestador cómo):
 YAML 1.2 con esquema publicado (§3.2), condiciones estructuradas sin lenguaje de expresiones en v1

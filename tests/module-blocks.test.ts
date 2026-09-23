@@ -20,7 +20,11 @@ import { commit, emptyFolder, git, removeRepositories, repository, write } from 
 // outside world instead of repeating it. The outside world here is a real git remote (a bare
 // repository on disk); the same path against GitHub is in tests/github/.
 
-afterEach(removeRepositories);
+afterEach(() => {
+  removeRepositories();
+  delete process.env.AIW_TEST_REMOTE;
+  delete process.env.AIW_TEST_CRASH;
+});
 
 const lines = (...rows: string[]): string => `${rows.join('\n')}\n`;
 

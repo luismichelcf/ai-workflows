@@ -259,3 +259,66 @@ describe('review round 1: the retirement never touches the project dependencies'
     expect(existsSync(join(root, 'node_modules/pkg/index.js'))).toBe(true);
   });
 });
+
+describe('review round 1: build-verify works from what was really judged', () => {
+  it('retires from the snapshot: a red test never committed is still in the retired tree', async () => {
+    const root = project();
+    write(root, 'tests/bonus.test.mjs', TEST);
+    const first = await runBlock(root, BUILD_STAGE, { before: RED_BEFORE });
+    expect(first.journal.find((entry) => entry.stage === 'red')?.outcome).toBe('passed');
+    write(root, 'src/bonus.mjs', BONUS(1000));
+    expect((await first.again()).outcome).toMatchObject(passed);
+  });
+
+  it('does not flag the commit that saves, unchanged, a test that was red while unsaved', async () => {
+    const root = project();
+    write(root, 'tests/bonus.test.mjs', TEST);
+    const first = await runBlock(root, BUILD_STAGE, { before: RED_BEFORE });
+    write(root, 'src/bonus.mjs', BONUS(1000));
+    commit(root, 'test and implementation, the test exactly as it was red');
+    expect((await first.again()).outcome).toMatchObject(passed);
+  });
+
+  it('refuses a test file added after the red run: it was never seen red', async () => {
+    const { second } = await redThenBuild((root) => {
+      write(root, 'src/bonus.mjs', BONUS(1000));
+      write(root, 'tests/extra.test.mjs', 'export const cases = { "extra": () => {} };\n');
+      commit(root, 'implementation and an unseen test');
+    });
+    expect(second.outcome).toMatchObject(refused(/tests\/extra\.test\.mjs/));
+  });
+});
+
+describe('review round 1: what counts as red', () => {
+  it('a test that crashes with a TypeError, not an assertion, is not red', async () => {
+    const root = project();
+    write(root, 'tests/bonus.test.mjs', [
+      'import { bonus } from "../src/bonus.mjs";',
+      'export const cases = { "paga el bono completo": () => { const t = TypeError; throw new t("bonus is not a function"); } };',
+      '',
+    ].join('\n'));
+    commit(root, 'crash, not assertion');
+    const RUNNER_TYPEERROR = RUNNER.replace('`AssertionError: ${error.message.split("\\n")[0]}`', '`${error.name}: ${error.message.split("\\n")[0]}`');
+    write(root, 'runner.mjs', RUNNER_TYPEERROR);
+    commit(root, 'runner prints the error type');
+    expect((await runBlock(root, RED_STAGE)).outcome).toMatchObject(refused(/importación o entorno|aserción/));
+  });
+
+  it('a red run that prints a lot is still read, not cut off as too much output', async () => {
+    const root = project();
+    write(root, 'tests/bonus.test.mjs', TEST);
+    write(root, 'runner.mjs', `process.stdout.write("x".repeat(2 * 1024 * 1024) + "\\n");\n${RUNNER}`);
+    commit(root, 'noisy runner');
+    expect((await runBlock(root, RED_STAGE)).outcome).toMatchObject(passed);
+  });
+
+  it('passes only the test files that still exist to {tests}', async () => {
+    const root = repository({ 'runner.mjs': RUNNER, 'src/bonus.mjs': BONUS(800), 'tests/old.test.mjs': 'export const cases = {};\n' });
+    git(root, 'rm', '-q', 'tests/old.test.mjs');
+    write(root, 'tests/bonus.test.mjs', TEST);
+    commit(root, 'replace the old test');
+    const result = await runBlock(root, RED_STAGE);
+    expect(result.outcome).toMatchObject(passed);
+    expect(Object.keys((result.entry?.evidence as { block: { files: Record<string, string> } }).block.files)).toEqual(['tests/bonus.test.mjs']);
+  });
+});

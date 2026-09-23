@@ -220,12 +220,11 @@ export function createCommandGate(options: CommandGateOptions): Gate {
       context.signal.addEventListener('abort', onAbort, { once: true });
     });
 
-    // Ends the group and confirms it is empty. An explicit "not empty" from a command that did
-    // not end in a clean success (killed, timed out, non-zero) is quarantined at once; only
-    // after a command that exited 0 is the system asked again (PLAN-13-R2 §11).
-    let endedCleanly = false;
+    // Ends the group and confirms it is empty. An explicit "not empty" is quarantined at once,
+    // whatever the command's exit code; only a lost answer is settled by asking the system
+    // again (PLAN-13-R2 §11).
     const confirmEmpty = (): Promise<void> =>
-      confirmEmptyGroup(group, options.groups, program, endedCleanly);
+      confirmEmptyGroup(group, options.groups, program);
 
     try {
       const raced = await Promise.race([
@@ -240,7 +239,6 @@ export function createCommandGate(options: CommandGateOptions): Gate {
       } else {
         exit = raced.exit;
       }
-      endedCleanly = exit.kind === 'exited' && exit.code === 0;
 
       if (exit.kind === 'technical') throw new Error(exit.reason);
       if (exit.code !== 0) throw new Error(`the command exited with code ${exit.code}`);

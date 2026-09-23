@@ -144,8 +144,9 @@ async function matchingFiles(root: string, globs: readonly string[]): Promise<st
   return [...matched].sort();
 }
 
-/** Whether a source answers to HEAD, or failing that to GET, with a status below 400. */
-async function responds(url: string): Promise<boolean> {
+/** The URL that answered, or undefined when none did. A redirect is not followed: a 3xx is an
+ * answer, and following it could reach an internal address the document never cited. */
+async function respondingUrl(url: string): Promise<string | undefined> {
   let origin: string;
   try {
     origin = new URL(url).origin;
@@ -161,28 +162,28 @@ async function responds(url: string): Promise<boolean> {
       try {
         const head = await fetch(candidate, {
           method: 'HEAD',
-          redirect: 'follow',
+          redirect: 'manual',
           headers: BROWSER_HEADERS,
           signal: controller.signal,
         });
-        if (head.status < 400) return true;
+        if (head.status < 400) return candidate;
       } catch {
         // A HEAD that does not answer falls through to a GET.
       }
       const get = await fetch(candidate, {
         method: 'GET',
-        redirect: 'follow',
+        redirect: 'manual',
         headers: BROWSER_HEADERS,
         signal: controller.signal,
       });
-      if (get.status < 400) return true;
+      if (get.status < 400) return candidate;
     } catch {
       // The candidate is unreachable; the next one, or the refusal, decides.
     } finally {
       clearTimeout(timer);
     }
   }
-  return false;
+  return undefined;
 }
 
 async function evaluateFile(
@@ -213,7 +214,7 @@ async function evaluateFile(
 
   const counts: Record<string, number> = {};
   const matchedTexts: string[] = [];
-  const domains = new Map<string, string>();
+  const citedUrls = new Set<string>();
 
   // A heading of level 1 or 2 belongs to the FIRST category, in the order written, whose
   // heading its title contains. One section goes to exactly one category.
@@ -242,9 +243,7 @@ async function evaluateFile(
     const count = countDistinctSources(joined);
     counts[category.heading] = count;
     matchedTexts.push(joined);
-    for (const source of collectSourceUrls(joined)) {
-      if (!domains.has(source.domain)) domains.set(source.domain, source.url);
-    }
+    for (const source of collectSourceUrls(joined)) citedUrls.add(source.url);
     if (count < category.min) {
       return {
         ok: false,
@@ -265,9 +264,12 @@ async function evaluateFile(
     };
   }
 
+  let reachable: Record<string, string> | undefined;
   if (checkReachable) {
-    for (const [, url] of domains) {
-      if (!(await responds(url))) {
+    reachable = {};
+    for (const url of citedUrls) {
+      const answered = await respondingUrl(url);
+      if (answered === undefined) {
         return {
           ok: false,
           reason: spanish
@@ -275,10 +277,14 @@ async function evaluateFile(
             : `The source ${quoted(url, spanish)} does not respond.`,
         };
       }
+      reachable[url] = answered;
     }
   }
 
-  return { ok: true, evidence: { file, counts } };
+  return {
+    ok: true,
+    evidence: { file, counts, ...(reachable === undefined ? {} : { reachable }) },
+  };
 }
 
 function createGate(

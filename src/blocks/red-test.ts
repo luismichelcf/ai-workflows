@@ -3,6 +3,7 @@ import { isGreenRun, isRedEvidence, parseTestRun } from '../commands.js';
 import type { BlockDefinition, EngineBlockDeps } from './definition.js';
 import type { BlockManifest } from './manifest.js';
 import {
+  existingFiles,
   filesMatching,
   hashFiles,
   refuseDryRun,
@@ -111,7 +112,7 @@ function createGate(
     await refuseDryRun(context, 'red-test');
     const spanish = isSpanish(context.locale);
 
-    const files = filesMatching(tests, changeFiles(context));
+    const files = existingFiles(deps.root, filesMatching(tests, changeFiles(context)));
     if (files.length === 0) return { ok: false, reason: noTestsReason(spanish) };
 
     const run = await runTests({

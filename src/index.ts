@@ -95,8 +95,9 @@ export { resolveExecutable, type ExecutableEnvironment, type ResolvedExecutable 
 export { recipeSchema } from './recipe/schema.js';
 export { parseRecipe } from './recipe/parse.js';
 export { checkRecipe } from './recipe/blocks.js';
+export type { CheckRecipeResult } from './recipe/blocks.js';
 export { engineBlockManifest } from './blocks/registry.js';
-export type { BlockDefinition, EngineBlockDeps } from './blocks/definition.js';
+export type { BlockDefinition, EngineBlockDeps, ProviderRunner } from './blocks/definition.js';
 export {
   compileRecipe,
   runProviderInGroup,
@@ -119,7 +120,7 @@ export { explainRecipe } from './recipe/explain.js';
 export { recipeCommand } from './recipe/command.js';
 export { DEFAULT_BANNED_TERMS, findBannedTerms } from './messages.js';
 export type { Recipe, RecipeStage, RecipeCondition, RecipeError } from './recipe/types.js';
-export type { BlockManifest, InputSpec } from './blocks/manifest.js';
+export type { BlockManifest, InputSpec, ValidWhile } from './blocks/manifest.js';
 export {
   parseHookInput,
   decideToolUse,

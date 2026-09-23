@@ -215,6 +215,12 @@ export async function stillValidFor(
   }
 
   if (rule === 'same-fingerprint') {
+    // The very same commit and working state is the same evidence, even when the featureless
+    // case (a piece with no changes of its own) leaves the fingerprint empty. Anything else
+    // needs two non-empty fingerprints that agree.
+    if (sha !== undefined && snapshot !== undefined && judged.sha === sha && judged.snapshot === snapshot) {
+      return true;
+    }
     const fingerprint = stringField(change, 'fingerprint');
     return (
       fingerprint !== undefined &&
@@ -229,13 +235,23 @@ export async function stillValidFor(
     return true;
   }
   if (fieldOf(change, 'clean') !== true) return false;
-  const judgedTree = await gitText(options.root, ['rev-parse', `${judged.sha}^{tree}`]);
+  let judgedTree: string;
+  try {
+    judgedTree = await gitText(options.root, ['rev-parse', `${judged.sha}^{tree}`]);
+  } catch {
+    // The judged commit no longer exists (a force push and a cleanup): the evidence has
+    // expired. Expiry is never a block, so the stage simply runs again.
+    return false;
+  }
   if (judged.snapshot !== judgedTree) return false;
   if (sha === undefined) return false;
   return chainHolds(options.root, options.baseRef, context.journal, judged.sha, sha);
 }
 
-/** A chain of recorded and re-verified clean update steps from `from` to `to`. */
+/**
+ * A chain of recorded and re-verified clean update steps from `from` to `to`. Every record for
+ * a step is tried: an invalid one never hides a valid one written for the same step.
+ */
 async function chainHolds(
   root: string,
   baseRef: string,
@@ -243,28 +259,31 @@ async function chainHolds(
   from: string,
   to: string,
 ): Promise<boolean> {
-  const next = new Map<string, string>();
+  const next = new Map<string, string[]>();
   for (const entry of journal) {
     if (entry.stage !== '@clean-update' || entry.outcome !== 'passed') continue;
     const stepFrom = stringField(entry.evidence, 'from');
     const stepTo = stringField(entry.evidence, 'to');
     if (stepFrom === undefined || stepTo === undefined) continue;
-    if (!next.has(stepFrom)) next.set(stepFrom, stepTo);
+    const candidates = next.get(stepFrom) ?? [];
+    candidates.push(stepTo);
+    next.set(stepFrom, candidates);
   }
 
   const seen = new Set<string>();
-  let cursor = from;
-  while (cursor !== to) {
+  const walk = async (cursor: string): Promise<boolean> => {
+    if (cursor === to) return true;
     if (seen.has(cursor)) return false;
     seen.add(cursor);
-    const target = next.get(cursor);
-    if (target === undefined) return false;
-    try {
-      await verifyCleanUpdate(root, baseRef, cursor, target);
-    } catch {
-      return false;
+    for (const target of next.get(cursor) ?? []) {
+      try {
+        await verifyCleanUpdate(root, baseRef, cursor, target);
+      } catch {
+        continue;
+      }
+      if (await walk(target)) return true;
     }
-    cursor = target;
-  }
-  return true;
+    return false;
+  };
+  return walk(from);
 }

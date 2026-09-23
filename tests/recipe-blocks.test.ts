@@ -95,8 +95,8 @@ describe('§2.1: engine blocks have manifests', () => {
     'build-verify': { natures: ['recompute', 'execution-record'], validWhile: ['same-sha'] },
     command: { natures: ['recompute'] },
     'scope-reconcile': { natures: ['recompute'] },
-    'independent-review': { natures: ['execution-record', 'attest'] },
-    'approval-comment': { natures: ['attest', 'recompute'] },
+    'independent-review': { natures: ['execution-record', 'attest'], validWhile: ['same-sha', 'same-fingerprint', 'same-fingerprint-or-clean-update'] },
+    'approval-comment': { natures: ['attest', 'recompute'], validWhile: ['same-sha', 'same-fingerprint', 'same-fingerprint-or-clean-update'] },
     'preview-deployment': { natures: ['recompute'] },
     'browser-qa': { natures: ['recompute'], validWhile: ['same-sha'] },
     'github-merge': { natures: ['recompute'] },
@@ -500,4 +500,39 @@ describe('§2.2: block.yml inputs are declared as strictly as the recipe', () =>
       at({ line: 3, column: 6 }, /"run" must name a script inside the block folder/, BLOCK),
     );
   });
+});
+
+describe('review round 1: rules that were silently ignored', () => {
+  it('benchmark-sources needs spec whenever it has a waiver', async () => {
+    const rows = recipe(uses(
+      'ai-workflows/benchmark-sources@1',
+      'structure',
+      '      with:',
+      '        files: ["docs/research/{piece}-*.md"]',
+      '        waiver: "Benchmark: no aplica"',
+    ));
+    expect(await errorsOf(rows)).toContainEqual(at(place(rows, 8, 'ai-workflows/'), /input "spec" is required with "waiver"/));
+  });
+
+  it('a command block names a program on the PATH and a script of its own folder, never a path as the program', async () => {
+    const BLOCK = '.ai-workflows/blocks/check/block.yml';
+    const root = project({
+      [BLOCK]: lines('kind: command', 'natures: [recompute]', 'run: ./check.mjs'),
+      '.ai-workflows/blocks/check/check.mjs': '',
+    });
+    expect(await errorsOf(recipe(uses('./.ai-workflows/blocks/check', 'recompute')), root)).toContainEqual(
+      at({ line: 3, column: 6 }, /"run" must start with a program on the PATH/, BLOCK),
+    );
+  });
+
+  for (const name of ['independent-review', 'approval-comment']) {
+    it(`${name}@1 cannot keep a verdict forever: a new commit or a force push must expire it`, () => {
+      expect(engineBlockManifest(`ai-workflows/${name}@1`)?.validWhile).toEqual(
+        expect.not.arrayContaining(['forever']),
+      );
+      expect(engineBlockManifest(`ai-workflows/${name}@1`)?.validWhile).toEqual(
+        expect.arrayContaining(['same-sha']),
+      );
+    });
+  }
 });

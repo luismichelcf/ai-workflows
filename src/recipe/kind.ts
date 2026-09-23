@@ -74,7 +74,9 @@ export function effectiveKind(
   let kind: string;
   if (forced !== undefined) {
     kind = forced;
-    raisedBy.push(`from-paths: ${forced}`);
+    // `from-paths` only counts as a raise when it really changed the kind: a folder that
+    // forces the kind the piece already declared raised nothing (review round 1).
+    if (declared === undefined || declared !== forced) raisedBy.push(`from-paths: ${forced}`);
   } else {
     kind = declared ?? kinds.default;
   }

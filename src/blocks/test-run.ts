@@ -10,7 +10,7 @@ import { resolveExecutable, type ExecutableEnvironment } from '../exec.js';
 import { classifyFiles } from '../recipe/glob.js';
 import {
   DEFAULT_PROCESS_GROUPS,
-  DEFAULT_STDOUT_BYTES,
+  TEST_STDOUT_BYTES,
 } from '../process-group.js';
 import { confirmEmptyGroup } from './confirm-empty.js';
 
@@ -94,6 +94,11 @@ export function matchesGlobs(globs: readonly string[], file: string): boolean {
   return classifyFiles({ match: globs }, [file]).includes('match');
 }
 
+/** The files of `files` that exist in the working tree, in order. */
+export function existingFiles(root: string, files: readonly string[]): string[] {
+  return files.filter((file) => existsSync(join(root, file)));
+}
+
 /** The files of `files`, in order, that match the `tests` globs. */
 export function filesMatching(globs: readonly string[], files: readonly string[]): string[] {
   return files.filter((file) => matchesGlobs(globs, file));
@@ -135,7 +140,10 @@ export async function refuseDryRun(context: GateContext, operationId: string): P
  * first. A group that cannot be confirmed empty raises `ProcessTreeSurvived`.
  */
 export async function runTests(options: RunTestsOptions): Promise<TestGroupResult> {
-  const { program, args } = expandedArguments(options.command, options.piece, options.tests);
+  // `{tests}` only ever names files that still exist: a test the piece deleted is no longer a
+  // test file, and passing its name to the runner would only make the runner fail to load it.
+  const tests = existingFiles(options.root, options.tests);
+  const { program, args } = expandedArguments(options.command, options.piece, tests);
   const resolved = resolveExecutable(program, executableEnvironment());
   if (!resolved.ok) return { kind: 'technical', reason: `could not start ${program}: ${resolved.reason}` };
 
@@ -146,7 +154,7 @@ export async function runTests(options: RunTestsOptions): Promise<TestGroupResul
     stdin: '',
     ...(resolved.env === undefined ? {} : { env: resolved.env }),
     timeoutMs: options.timeoutMs,
-    stdoutBytes: DEFAULT_STDOUT_BYTES,
+    stdoutBytes: TEST_STDOUT_BYTES,
   });
 
   // Cancellation must be honoured at once: the wait races the signal, and on abort the group
@@ -161,9 +169,8 @@ export async function runTests(options: RunTestsOptions): Promise<TestGroupResul
     options.signal.addEventListener('abort', onAbort, { once: true });
   });
 
-  let resolvedCleanly = false;
   const confirmEmpty = (): Promise<void> =>
-    confirmEmptyGroup(group, DEFAULT_PROCESS_GROUPS, program, resolvedCleanly);
+    confirmEmptyGroup(group, DEFAULT_PROCESS_GROUPS, program);
 
   try {
     const raced = await Promise.race([
@@ -174,7 +181,6 @@ export async function runTests(options: RunTestsOptions): Promise<TestGroupResul
     if (raced === 'aborted') await confirmEmpty();
     const exit = raced === 'aborted' ? await group.wait() : raced.exit;
     if (exit.kind === 'technical') return { kind: 'technical', reason: exit.reason };
-    resolvedCleanly = exit.code === 0;
     return {
       kind: 'exited',
       code: exit.code,

@@ -23,6 +23,7 @@ const MANIFESTS: Readonly<Record<string, BlockManifest>> = {
     name: 'independent-review',
     kind: 'module',
     natures: ['execution-record', 'attest'],
+    validWhile: ['same-sha', 'same-fingerprint', 'same-fingerprint-or-clean-update'],
     inputs: {
       'forbid-same-family': { type: 'boolean', default: true },
       angles: { type: 'string-list' },
@@ -33,6 +34,7 @@ const MANIFESTS: Readonly<Record<string, BlockManifest>> = {
     name: 'approval-comment',
     kind: 'module',
     natures: ['attest', 'recompute'],
+    validWhile: ['same-sha', 'same-fingerprint', 'same-fingerprint-or-clean-update'],
     inputs: {
       command: { type: 'string', default: '/approve' },
       'code-length': { type: 'integer', min: 4, max: 40, default: 7 },

@@ -584,3 +584,62 @@ Decididas por el orquestador al verificar cada parte; ninguna cambia lo que deci
 - **Pruebas:** las que manejan git y procesos reales tienen tope de 30 s y el borrado de
   carpetas temporales reintenta en Windows; RC-09 contra GitHub vive en `tests/github/` y corre
   con `pnpm test:github` (evidencia en el PR).
+
+## 12. Revisión de la parvada (PR #17, ronda 1)
+
+Cuatro revisores Claude en sesiones frescas (correctitud, seguridad, contrato del motor y
+pruebas) pidieron cambios. Bloqueantes, todos corregidos con su prueba:
+
+1. Un proceso muerto por señal contaba como salida 0 y `command@1` lo aprobaba (Linux); en
+   Windows, un resultado sin código de salida también valía 0 → bloqueo técnico.
+2. Windows levantaba la cuarentena con cualquier fallo al abrir el objeto de trabajo, y la nueva
+   pregunta de §11 podía contradecir un «no vacío» explícito del lanzador → solo «no existe» es
+   vacío; la cuarentena lleva los procesos sobrevivientes con su hora de creación y no se levanta
+   mientras vivan; un «no vacío» explícito es final y solo un resultado **perdido** se vuelve a
+   preguntar.
+3. El revisor de `sandboxed-review` corría sin tiempo límite, no se detenía al cancelar y
+   descartaba un grupo no vacío → mismo ejecutor que los demás, con tiempo límite, señal y
+   confirmación de vacío.
+4. En Windows, `build-verify` borraba las dependencias reales del proyecto al retirar su carpeta
+   temporal (git sigue el enlace de `node_modules`) → se quita el enlace antes.
+5. Faltaban pruebas de RC-10 (resultado perdido con y sin procesos vivos), de la regla «el segundo
+   padre viene de la base», de la retirada desde la instantánea y de la regla de sesión.
+6. `sameExecution` exigía que las etiquetas de modelo coincidieran: la misma sesión reanudada con
+   otro modelo no contaba como el constructor. **Cambio de regla:** mismo proveedor y misma sesión
+   son la misma ejecución, sea cual sea la etiqueta.
+
+También corregidos: variables de git heredadas de un gancho (`GIT_DIR`, `GIT_INDEX_FILE`…) ya no
+redirigen al motor; los hechos que ve cada etapa están congelados (un bloque módulo no puede
+cambiar lo que leen las siguientes); el identificador de pieza se valida
+(`^[A-Za-z0-9][A-Za-z0-9._-]*$`, sin `..`); la raíz se resuelve a su ruta real y debe ser la raíz
+del repositorio; `compileRecipe` vuelve a comprobar naturaleza, vigencia, `block.yml` y contención
+en vez de confiar en `validate`; el ejecutor de Windows tiene tope de 10 s, instala su ensamblado
+de forma atómica y verificada, y el bloque ya no ve sus variables internas; `run` de un
+`block.yml` empieza con un programa del PATH y un script del bloque; las corridas de pruebas y del
+revisor aceptan 32 MB de salida (el contrato JSON sigue en 1 MB); `{tests}` solo lleva archivos
+que existen; `build-verify` rechaza pruebas que aparecen después de la roja y no marca el commit
+que guarda sin cambios una prueba roja; una evidencia cuyo commit juzgado desapareció caduca en vez
+de bloquear; la cadena de actualizaciones lee todos los registros; `same-fingerprint` se conserva
+con el mismo SHA e instantánea y nunca con huellas vacías; un ensayo no escribe en el almacén;
+`resume` devuelve la cuarentena; la cuarentena se guarda aunque se pierda el arrendamiento;
+`independent-review` y `approval-comment` no admiten `forever`; `explain` dice que quién
+construyó lo declara la pieza; `spec-structure` exige la sección de decisiones que nombra;
+`benchmark-sources` exige `spec` con `waiver` y registra qué URL respondió, sin seguir
+redirecciones.
+
+**Otras desviaciones de la API respecto a §1.3 y §5** (aceptadas): `checkRecipe(text, file,
+{root})` en lugar de `validateRecipeBlocks`; `compileRecipe` recibe `{root, baseRef, declared,
+store, extraBlocks?, processGroups?, limits?, providers?}` y devuelve también
+`confirmQuarantine`; `extraBlocks` es una costura pública para bloques del motor ajenos al
+registro (reciben las dependencias privilegiadas: quien la usa es de confianza); `runGateCommand`
+no se reescribió sobre el ejecutor nuevo (conviven dos ejecutores); los archivos salen de un solo
+`git diff <mergeBase> <snapshot>`, equivalente a las tres órdenes de §4.1; `git merge-tree
+--merge-base` requiere git 2.40, no 2.38.
+
+**Límites declarados nuevos:** si el propio motor muere en Linux, el grupo de procesos separado
+sigue corriendo y no queda cuarentena; en Windows, un proceso que el sistema no logra terminar
+aunque ya no quede ningún manejador del trabajo no se detecta cuando el resultado del lanzador se
+pierde; `check-reachable` comprueba que el **dominio** responde (con respaldo en la raíz), no que
+la página exacta exista; `scope-reconcile` deja la subida en la evidencia, no en un texto para el
+dueño (una etapa aprobada no tiene motivo); la receta de ejemplo de `init` usa `retry`, que
+`compileRecipe` rechaza hasta la rebanada 4.

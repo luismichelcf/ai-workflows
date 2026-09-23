@@ -43,7 +43,8 @@ const ORPHANING_BLOCK = (answer: 'wait' | 'pass') => [
   '`], { stdio: "ignore" });',
   'grandchild.unref();',
   answer === 'pass'
-    ? 'process.stdout.write(JSON.stringify({ ok: true }));'
+    ? // Answer only once the grandchild is really writing, so a stopped heartbeat proves a kill.
+      'const wait = setInterval(async () => { const fs = await import("node:fs"); if (fs.existsSync("heartbeat.txt")) { clearInterval(wait); process.stdout.write(JSON.stringify({ ok: true })); } }, 20);'
     : 'setInterval(() => {}, 1000);',
   '',
 ].join('\n');

@@ -180,7 +180,73 @@ async function readProjectBlock(
   return constructBlockManifest(name, strict.root);
 }
 
+/** A project block read the strict way, with its runtime manifest and its YAML root node. */
+export interface StrictProjectBlock {
+  readonly manifest: BlockManifest;
+  readonly blockDir: string;
+  readonly relativePath: string;
+  readonly root: YamlNode;
+}
+
+/**
+ * Reads `.ai-workflows/blocks/<name>/block.yml` with the recipe's own strict reader and its own
+ * validation, throwing the first error when it is invalid. `compileRecipe` uses it so a block
+ * that `validate` would reject — an unknown `kind` included — is never guessed at run time.
+ */
+export async function loadProjectBlockStrict(
+  rootDir: string,
+  name: string,
+  uses: string,
+): Promise<StrictProjectBlock> {
+  const relativePath = `.ai-workflows/blocks/${name}/block.yml`;
+  const blockDir = join(rootDir, '.ai-workflows/blocks', name);
+  let content: string;
+  try {
+    content = await readFile(join(rootDir, relativePath), 'utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      throw new Error(`project block "${uses}" has no block.yml`);
+    }
+    throw error;
+  }
+
+  const strict = readStrictYaml(content, 'empty block');
+  const issues: LocatedIssue[] = [...strict.issues];
+  if (issues.length === 0) validateBlockManifest(strict.root, blockDir, issues);
+  if (issues.length > 0) {
+    const errors = locatedRecipeErrors(issues, strict.lineCounter, relativePath);
+    throw new Error(errors[0]?.message ?? `invalid block.yml of project block "${uses}"`);
+  }
+
+  return {
+    manifest: constructBlockManifest(name, strict.root),
+    blockDir,
+    relativePath,
+    root: strict.root,
+  };
+}
+
 /** §1.3 rule 5: the stage's nature must be one the manifest allows. */
+export function natureComplaint(
+  uses: string,
+  nature: string,
+  manifest: BlockManifest,
+): string | undefined {
+  if (manifest.natures.includes(nature as GateNature)) return undefined;
+  return `block "${uses}" cannot be ${nature}; it allows: ${manifest.natures.join(', ')}`;
+}
+
+/** §1.3 rule 6 and R14: the written validity, or the default `same-sha`, must be allowed. */
+export function validityComplaint(
+  uses: string,
+  validWhile: string,
+  manifest: BlockManifest,
+): string | undefined {
+  const allowed = manifest.validWhile ?? ALL_VALID_WHILE;
+  if (allowed.includes(validWhile as ValidWhile)) return undefined;
+  return `block "${uses}" cannot use valid-while: ${validWhile}; it allows: ${allowed.join(', ')}`;
+}
+
 function checkNature(
   stage: YamlNode,
   uses: string,
@@ -189,9 +255,8 @@ function checkNature(
 ): void {
   const natureNode = yamlField(stage, 'nature');
   const nature = yamlWord(natureNode);
-  if (!manifest.natures.includes(nature as GateNature)) {
-    add(issues, natureNode, `block "${uses}" cannot be ${nature}; it allows: ${manifest.natures.join(', ')}`);
-  }
+  const complaint = natureComplaint(uses, nature, manifest);
+  if (complaint !== undefined) add(issues, natureNode, complaint);
 }
 
 /** §1.3 rule 6 and R14: the written validity, or the default `same-sha`, must be allowed. */
@@ -206,9 +271,8 @@ function checkValidity(
   const validWhileNode = yamlField(stage, 'valid-while');
   if (validWhileNode !== null) {
     const value = yamlWord(validWhileNode);
-    if (!allowed.includes(value as ValidWhile)) {
-      add(issues, validWhileNode, `block "${uses}" cannot use valid-while: ${value}; it allows: ${allowed.join(', ')}`);
-    }
+    const complaint = validityComplaint(uses, value, manifest);
+    if (complaint !== undefined) add(issues, validWhileNode, complaint);
     return;
   }
   if (!allowed.includes('same-sha')) {
@@ -254,6 +318,11 @@ function checkInputs(
       continue;
     }
     validateInput(node, spec, key, `input "${key}"`, context, issues);
+  }
+
+  // A waiver is a written excuse: without the file that carries it, there is nothing to read.
+  if (Object.hasOwn(manifest.inputs, 'spec') && provided.has('waiver') && !provided.has('spec')) {
+    add(issues, usesNode, `input "spec" is required with "waiver"`);
   }
 }
 
@@ -566,8 +635,14 @@ function validateBlockManifest(root: YamlNode, blockDir: string, issues: Located
       add(issues, root, 'a command block needs "run"');
     } else {
       validateCommandLine(runNode, issues, 'run');
-      const script = scriptArgument(yamlWord(runNode));
-      if (script === undefined) {
+      const { program, script } = runParts(yamlWord(runNode));
+      if (program === undefined || !isPathProgram(program)) {
+        add(
+          issues,
+          runNode,
+          '"run" must start with a program on the PATH followed by a script of the block folder',
+        );
+      } else if (script === undefined) {
         add(issues, runNode, '"run" must name a script inside the block folder');
       } else if (!staysInside(blockDir, script)) {
         add(issues, runNode, '"run" must stay inside the block folder');
@@ -790,7 +865,7 @@ function isStringArray(value: unknown): value is readonly string[] {
 }
 
 /** `main` and the script of a `run:` must resolve inside the block folder, links included. */
-function staysInside(blockDir: string, candidate: string): boolean {
+export function staysInside(blockDir: string, candidate: string): boolean {
   if (candidate.length === 0 || isAbsolute(candidate)) return false;
   if (candidate.split(/[\\/]+/).includes('..')) return false;
   try {
@@ -803,17 +878,28 @@ function staysInside(blockDir: string, candidate: string): boolean {
   }
 }
 
-/** PLAN-13-R2 §2.2: the program, or the first non-flag non-marker argument after it. */
-function scriptArgument(run: string): string | undefined {
+/**
+ * PLAN-13-R2 §2.2: the program of a `run:` is a program that lives on the PATH — no slash, no
+ * backslash and no leading dot — so validation and execution agree on where it is looked up.
+ */
+export function isPathProgram(program: string): boolean {
+  return (
+    program.length > 0 &&
+    !program.includes('/') &&
+    !program.includes('\\') &&
+    !program.startsWith('.')
+  );
+}
+
+/** PLAN-13-R2 §2.2: the program, and the first non-flag non-marker argument after it. */
+export function runParts(run: string): { program?: string; script?: string } {
   const args = run.split(' ').filter((argument) => argument.length > 0);
-  const first = args[0];
-  if (first === undefined) return undefined;
-  if (first.includes('/') || first.includes('\\') || first.startsWith('.')) return first;
+  const program = args[0];
   for (let index = 1; index < args.length; index += 1) {
     const argument = args[index];
     if (argument === undefined) continue;
     if (argument.startsWith('-') || PLACEHOLDER.test(argument)) continue;
-    return argument;
+    return program === undefined ? {} : { program, script: argument };
   }
-  return undefined;
+  return program === undefined ? {} : { program };
 }

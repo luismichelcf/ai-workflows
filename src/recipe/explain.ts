@@ -14,6 +14,7 @@ interface ExplainWords {
   readonly and: string;
   readonly condition: Readonly<Record<Clause, (items: readonly string[]) => string>>;
   readonly validity: Readonly<Record<Validity, string>>;
+  readonly declaredBuilder: string;
   readonly requiredFailure: string;
   readonly optionalFailure: string;
   readonly humanWait: string;
@@ -52,6 +53,7 @@ const EXPLAIN_WORDS: Record<Language, ExplainWords> = {
         'Vale mientras el código no cambie, salvo por actualizaciones sin conflictos con la versión principal.',
       forever: 'Vale siempre, una vez cumplido.',
     },
+    declaredBuilder: 'Quién construyó lo declara la pieza; el motor no puede comprobarlo.',
     requiredFailure: 'Si no se cumple: la pieza se detiene hasta corregirlo.',
     optionalFailure: 'Si no se cumple: se avisa y la pieza sigue.',
     humanWait: 'Si falta: la pieza espera tu decisión; las demás siguen.',
@@ -89,6 +91,7 @@ const EXPLAIN_WORDS: Record<Language, ExplainWords> = {
         'Valid while the code does not change, except for conflict-free updates from the main line.',
       forever: 'Valid for good once met.',
     },
+    declaredBuilder: 'Who built it is declared by the piece; the engine cannot check it.',
     requiredFailure: 'If it fails: the piece stops until it is fixed.',
     optionalFailure: 'If it fails: you are told and the piece carries on.',
     humanWait: 'If it is missing: the piece waits for your decision; the others carry on.',
@@ -161,6 +164,11 @@ export function explainRecipe(recipe: Recipe): string {
     lines.push(`${index + 1}. ${summary}`);
     lines.push(`   ${words.whenLabel}: ${when(stage.appliesIf, recipe.labels, words)}.`);
     lines.push(`   ${words.validity[stage.validWhile]}`);
+    // Who built the piece is only declared by the piece (PLAN-13-R2 §3.3): say so, so nobody
+    // reads the engine's approval as proof of who wrote the code.
+    if (stage.gate.uses === 'ai-workflows/sandboxed-review@1') {
+      lines.push(`   ${words.declaredBuilder}`);
+    }
     lines.push(`   ${failureLine(stage, words)}`);
 
     const retry = retryLine(stage, words);

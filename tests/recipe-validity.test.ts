@@ -561,3 +561,92 @@ describe('review round 1: a piece is named by a plain identifier', () => {
     });
   }
 });
+
+describe('review round 1: a clean update keeps a review only from the base', () => {
+  it('refuses to record a clean merge of a branch that is not the base', async () => {
+    const root = repository({ 'app/list.txt': 'one\ntwo\n' });
+    write(root, 'app/list.txt', 'one changed\ntwo\n');
+    const from = commit(root, 'piece');
+    git(root, 'switch', '-q', '-c', 'foreign', 'main');
+    write(root, 'docs/foreign.md', 'not from the base\n');
+    commit(root, 'foreign work');
+    git(root, 'switch', '-q', 'piece');
+    git(root, 'merge', '-q', '--no-ff', '--no-edit', 'foreign');
+    const to = git(root, 'rev-parse', 'HEAD');
+    await expect(recordCleanUpdate({ store: createMemoryStore(), root, baseRef: 'main', piece: '42', from, to }))
+      .rejects.toThrow(/not a clean update/);
+  });
+});
+
+describe('review round 1: evidence expires, it never blocks, when the judged commit is gone', () => {
+  it('a force push that erased the judged commit expires the review instead of blocking the piece', async () => {
+    const root = repository({ 'app/list.txt': 'one\n' });
+    write(root, 'app/list.txt', 'one changed\n');
+    commit(root, 'piece');
+    const { block, calls } = probe();
+    const piece = await pieceOver(root, validityRecipe('same-fingerprint-or-clean-update'), block);
+    await piece.run();
+    git(root, 'commit', '-q', '--amend', '-m', 'rewritten');
+    git(root, 'reflog', 'expire', '--expire=now', '--all');
+    git(root, 'gc', '-q', '--prune=now');
+    const outcome = await piece.run();
+    expect(outcome).not.toMatchObject({ status: { state: 'blocked:technical' } });
+    expect(calls).toHaveLength(2);
+  });
+});
+
+describe('review round 1: a chain of clean updates reads every record', () => {
+  it('a bad record for the same step does not hide a good one written after it', async () => {
+    const root = repository({ 'app/list.txt': 'one\ntwo\n' });
+    write(root, 'app/list.txt', 'one changed\ntwo\n');
+    const from = commit(root, 'piece');
+    const { block, calls } = probe();
+    const store = createMemoryStore();
+    const piece = await pieceOver(root, validityRecipe('same-fingerprint-or-clean-update'), block, store);
+    await piece.run();
+    advanceMain(root, { 'docs/news.md': 'n\n' });
+    const to = mergeMain(root);
+    await store.append('42', { stage: '@clean-update', outcome: 'passed', evidence: { from, to: 'f'.repeat(40), base: 'x' }, at: 1, runId: 'noise', pipeline: '' });
+    await recordCleanUpdate({ store, root, baseRef: 'main', piece: '42', from, to });
+    await piece.run();
+    expect(calls).toHaveLength(1);
+  });
+});
+
+describe('review round 1: an empty fingerprint proves nothing', () => {
+  it('a piece with no changes of its own keeps same-fingerprint evidence only while the commit is the same', async () => {
+    const root = repository();
+    const { block, calls } = probe();
+    const piece = await pieceOver(root, validityRecipe('same-fingerprint'), block);
+    await piece.run();
+    await piece.run();
+    expect(calls).toHaveLength(1);
+    git(root, 'commit', '-q', '--allow-empty', '-m', 'another commit, still no changes');
+    await piece.run();
+    expect(calls).toHaveLength(2);
+  });
+});
+
+describe('review round 1: quarantine and the other engine paths', () => {
+  const quarantined = async () => {
+    const store = createMemoryStore();
+    const quarantine = { host: 'here', platform: 'posix', pgid: 1, confirmed: false };
+    await store.saveStatus({ piece: '42', state: 'blocked:technical', reason: 'processes', quarantine }, undefined);
+    return { store, quarantine };
+  };
+  const config = { locale: 'es', stages: [{ name: 'only', nature: 'recompute' as const, gate: () => ({ ok: true as const }) }] };
+
+  it('a dry run never clears a quarantine, even when the system says it is empty', async () => {
+    const { store, quarantine } = await quarantined();
+    const engine = createEngine({ config, store, confirmQuarantine: async () => undefined });
+    await engine.run('42', { mode: 'dry-run' });
+    expect((await store.loadStatus('42'))?.status.quarantine).toEqual(quarantine);
+  });
+
+  it('resume answers with the quarantine it keeps', async () => {
+    const { store, quarantine } = await quarantined();
+    const engine = createEngine({ config, store });
+    await engine.stop('42', 'stop');
+    expect((await engine.resume('42')).quarantine).toEqual(quarantine);
+  });
+});

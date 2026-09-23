@@ -43,26 +43,6 @@ function isFullSha(value: string): boolean {
   return FULL_SHA.test(value);
 }
 
-/**
- * An alias can only be recognised, not listed in advance. A snapshot label is the requested
- * label with a version/date suffix ("claude-opus-5" -> "claude-opus-5-20260901"), so the
- * shorter label is a prefix of the longer one up to a separator. The separator matters:
- * "deepseek-flash" and "deepseek-pro" share a prefix character-wise but are different
- * models, and no amount of string cleverness should merge them.
- */
-function modelLabelsMatch(a: string, b: string): boolean {
-  if (a === b) {
-    return true;
-  }
-  // A missing label cannot be shown to be the same model, only refused for being unprovable.
-  if (!a || !b) {
-    return false;
-  }
-  const longer = a.length >= b.length ? a : b;
-  const shorter = a.length >= b.length ? b : a;
-  return longer.startsWith(`${shorter}-`) || longer.startsWith(`${shorter}:`);
-}
-
 export function sameExecution(a: ExecutionIdentity, b: ExecutionIdentity): boolean {
   // An empty provider or session is not an identity. Two unknown sessions cannot be shown
   // to be the same run, so the only safe reading is "not the same execution".
@@ -70,11 +50,11 @@ export function sameExecution(a: ExecutionIdentity, b: ExecutionIdentity): boole
     return false;
   }
 
-  // Same provider and same non-empty session is one execution even when the model label
-  // differs. Reachable in practice: when a CLI does not report the model, the system fills
-  // in the model that was REQUESTED, so resuming the builder's session under an alias only
-  // rewrites the label and must not launder a self-approval.
-  return a.provider === b.provider && a.session === b.session && modelLabelsMatch(a.model, b.model);
+  // Same provider and same non-empty session is one execution, whatever the model label
+  // says. A session can change models or be resumed under another name, and a CLI that does
+  // not report the model is filled with the one that was REQUESTED: comparing labels would
+  // let a resumed builder session launder a self-approval.
+  return a.provider === b.provider && a.session === b.session;
 }
 
 /** A human-readable name for the execution, so a rejection can name the offender. */

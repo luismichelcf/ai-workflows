@@ -68,7 +68,7 @@ declares the natures it may claim, the validity rules it accepts and its typed i
 | Block | Checks | Nature |
 |---|---|---|
 | `spec-structure` | Required sections, a labelled summary, identified criteria, no pending decisions | structure |
-| `benchmark-sources` | Distinct sources per category, optional reachability; a written waiver skips it | structure |
+| `benchmark-sources` | Distinct sources per category, optionally that each source's domain answers; a written waiver skips it | structure |
 | `sandboxed-review` | Runs a reviewer read-only, observes its identity, the tree before and after, and its verdict | recompute + attest |
 | `red-test` | The new tests fail by their assertion, not by an import or the environment | recompute + execution record |
 | `build-verify` | Tests green, untouched since the red run (also in history), and red again with only the implementation retired | recompute + execution record |
@@ -112,8 +112,14 @@ with the lane following the kind (`lanes:`). The recipe declares its kinds and l
 (`kinds.names`, `lanes`), and any other word is rejected. `labels` gives classes, kinds and lanes
 the owner's words for `explain`.
 
-`compileRecipe(recipe, deps)` turns a recipe into the engine's configuration. Wiring `run`,
-`status` and `stop` of the command line to the recipe arrives in slice 4.
+`compileRecipe(recipe, deps)` turns a recipe into the engine's configuration and re-checks it against
+the manifests on its own; `deps.root` must be the top of the repository. Pass everything it
+returns to `createEngine` — `config`, `describeChange`, `confirmFacts` (the final check before a
+piece is done) and `confirmQuarantine` (without it a quarantined piece cannot be released).
+Wiring `run`, `status` and `stop` of the command line to the recipe arrives in slice 4.
+
+The independence of a review is judged by provider and session: the same session under another
+model is still the builder (PLAN-13 R18).
 
 ## Where progress lives on GitHub
 

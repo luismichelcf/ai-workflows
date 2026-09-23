@@ -86,6 +86,8 @@ export const DEFAULT_PROCESS_GROUPS: ProcessGroupControl = {
 
 /** The command block's default output limit, one mebibyte. */
 export const DEFAULT_STDOUT_BYTES = 1_048_576;
+/** The output limit for a test suite or a coding CLI, whose report can be large (32 MiB). */
+export const TEST_STDOUT_BYTES = 33_554_432;
 /** How long `terminate` waits for the group to actually empty before reporting failure. */
 export const TERMINATE_TIMEOUT_MS = 10_000;
 

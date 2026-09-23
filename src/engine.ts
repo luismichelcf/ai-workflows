@@ -533,44 +533,52 @@ export function createEngine(options: EngineOptions): Engine {
       // Persists the run's verdict, but first re-reads: a stop that landed while the gates
       // ran must win over this write, so the parked status is returned untouched instead.
       // The lease is re-checked too: work done after losing the piece is worthless, and
-      // writing over whoever holds it now would be worse.
+      // writing over whoever holds it now would be worse. A quarantine (`overParked`) is the
+      // exception: a process nobody can account for must be written even when the piece was
+      // parked AND even when the lease was lost — what prevents another run is the stored
+      // quarantine, not the lease.
       const finish = async (status: PieceStatus, overParked = false): Promise<RunOutcome> => {
         if (dryRun) return { outcome: 'ran', status };
 
-        const held = await renewLease();
-        if (!held.ok) {
-          return lostByHolder(held.heldBy);
+        if (!overParked) {
+          const held = await renewLease();
+          if (!held.ok) {
+            return lostByHolder(held.heldBy);
+          }
         }
 
         const latest = await readStatus();
-        // A stop that landed while the gates ran wins over this write. The one exception is a
-        // quarantine (`overParked`): a process nobody can account for must not be forgotten
-        // because the piece was also being stopped, so its blocked status is written anyway.
+        // A stop that landed while the gates ran wins over this write, unless it is a quarantine.
         if (!overParked && latest !== undefined && latest.status.state === 'parked') {
           return { outcome: 'parked', status: latest.status };
         }
 
-        try {
-          await store.saveStatus(status, latest?.version);
-        } catch (error) {
-          // Someone wrote between our read and our write. If it was a stop, honour it; any
-          // other lost race is reported rather than thrown out of run.
-          if (error instanceof StaleVersion) {
-            const current = await readStatus();
-            if (!overParked && current !== undefined && current.status.state === 'parked') {
-              return { outcome: 'parked', status: current.status };
+        const attempts = overParked ? 3 : 1;
+        for (let attempt = 1; ; attempt += 1) {
+          try {
+            const current = attempt === 1 ? latest : await readStatus();
+            await store.saveStatus(status, current?.version);
+            return { outcome: 'ran', status };
+          } catch (error) {
+            // Someone wrote between our read and our write. A quarantine is retried by
+            // re-reading (its version changed); if it was a stop, honour it for anything else.
+            if (error instanceof StaleVersion && attempt < attempts) continue;
+            if (error instanceof StaleVersion) {
+              const current = await readStatus().catch(() => undefined);
+              if (!overParked && current !== undefined && current.status.state === 'parked') {
+                return { outcome: 'parked', status: current.status };
+              }
             }
+            // Saving the failure must not recurse into saving another failure.
+            return {
+              outcome: 'ran',
+              status: blockedStatus(
+                undefined,
+                `store failed to save the piece status: ${describeUnknown(error)}`,
+              ),
+            };
           }
-          // Saving the failure must not recurse into saving another failure.
-          return {
-            outcome: 'ran',
-            status: blockedStatus(
-              undefined,
-              `store failed to save the piece status: ${describeUnknown(error)}`,
-            ),
-          };
         }
-        return { outcome: 'ran', status };
       };
 
       // Writes one append-only observation. A dry run leaves no trace at all.
@@ -610,8 +618,9 @@ export function createEngine(options: EngineOptions): Engine {
       // PLAN-13-R2 §2.2: a stored quarantine is re-asked of the system before any stage runs,
       // after the lease expired or not. Another machine cannot be asked, a group still alive
       // and an unreadable quarantine all block; only an affirmative empty answer lifts it, and
-      // it is then cleared from the stored state. Nothing is journalled either way.
-      if (before !== undefined && before.status.quarantine !== undefined) {
+      // it is then cleared from the stored state. Nothing is journalled either way. A dry run
+      // is a rehearsal: it writes nothing at all, not even this cleanup.
+      if (!dryRun && before !== undefined && before.status.quarantine !== undefined) {
         const quarantine = before.status.quarantine;
         const motive = await quarantineMotive(quarantine);
         if (motive !== undefined) {
@@ -1298,7 +1307,7 @@ export function createEngine(options: EngineOptions): Engine {
           ? restored
           : { ...restored, quarantine: current.status.quarantine };
       await store.saveStatus(withQuarantine, current.version);
-      return restored;
+      return withQuarantine;
     },
   };
 }

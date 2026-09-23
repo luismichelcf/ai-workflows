@@ -287,3 +287,11 @@ describe('review round 1: git variables inherited from a hook never redirect the
     expect(git(other, 'status', '--porcelain')).toBe('');
   });
 });
+
+
+describe('review round 1: a raise is reported only when the kind really changed', () => {
+  it('paths that force the kind already declared raise nothing', () => {
+    expect(effectiveKind(RECIPE, 'docs', ['docs/a.md'])).toEqual({ kind: 'docs', lane: 'light', raisedBy: [] });
+  });
+});
+
