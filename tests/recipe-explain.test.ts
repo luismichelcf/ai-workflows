@@ -161,6 +161,40 @@ describe('explain, piece by piece', () => {
     expect(explainRecipe(one('es', '    retry: { attempts: 1 }'))).not.toContain('Se intenta');
   });
 
+  it('follows the order of after, not the order the stages are written in', () => {
+    const text = explainRecipe(
+      recipeOf(
+        lines(
+          'version: 1',
+          'locale: es',
+          'stages:',
+          '  - id: c',
+          '    summary: "Tercero"',
+          '    after: b',
+          '    nature: recompute',
+          '    gate:',
+          '      run: node c.mjs',
+          '  - id: a',
+          '    summary: "Primero"',
+          '    nature: recompute',
+          '    gate:',
+          '      run: node a.mjs',
+          '  - id: b',
+          '    summary: "Segundo"',
+          '    after: a',
+          '    nature: recompute',
+          '    gate:',
+          '      run: node b.mjs',
+        ),
+      ),
+    );
+    expect(text.split('\n').filter((line) => /^\d\. /.test(line))).toEqual([
+      '1. Primero.',
+      '2. Segundo.',
+      '3. Tercero.',
+    ]);
+  });
+
   it('marks each phase only when it changes', () => {
     const text = explainRecipe(one('es'));
     expect(text.split('\n').filter((line) => line === 'Antes de fusionar')).toHaveLength(1);

@@ -5,12 +5,13 @@ import { validateSemantics } from './semantics.js';
 import type { Recipe, RecipeError } from './types.js';
 import {
   nodeStart,
+  inspectYamlTree,
   type LocatedIssue,
+  scalarKey,
   validateStructure,
   type YamlNode,
   yamlMap,
   yamlSeq,
-  yamlWord,
 } from './validation.js';
 
 export type RecipeParseResult =
@@ -18,42 +19,46 @@ export type RecipeParseResult =
   | { ok: false; errors: readonly RecipeError[] };
 
 function duplicateKeyAt(node: YamlNode, offset: number): string | undefined {
-  const object = yamlMap(node);
-  if (object) {
-    for (const pair of object.items) {
-      if (nodeStart(pair.key) === offset) return yamlWord(pair.key);
-      const nested = duplicateKeyAt(pair.value, offset);
-      if (nested !== undefined) return nested;
+  const pending: YamlNode[] = [node];
+  while (pending.length > 0) {
+    const current = pending.pop() ?? null;
+    for (const pair of yamlMap(current)?.items ?? []) {
+      if (nodeStart(pair.key) === offset) return scalarKey(pair.key);
+      pending.push(pair.value);
     }
-  }
-
-  for (const item of yamlSeq(node)?.items ?? []) {
-    const nested = duplicateKeyAt(item, offset);
-    if (nested !== undefined) return nested;
+    for (const item of yamlSeq(current)?.items ?? []) pending.push(item);
   }
   return undefined;
 }
 
 function scanCst(item: unknown, issues: LocatedIssue[]): void {
-  if (Array.isArray(item)) {
-    for (const child of item) scanCst(child, issues);
-    return;
-  }
-  if (typeof item !== 'object' || item === null) return;
+  const pending: unknown[] = [item];
+  while (pending.length > 0) {
+    const current = pending.pop();
+    if (Array.isArray(current)) {
+      for (const child of current) pending.push(child);
+      continue;
+    }
+    if (typeof current !== 'object' || current === null) continue;
 
-  const token = item as Record<string, unknown>;
-  if (typeof token.offset === 'number') {
-    if (token.type === 'anchor') {
-      issues.push({ offset: token.offset, message: 'anchors are not allowed' });
-    } else if (token.type === 'alias') {
-      issues.push({ offset: token.offset, message: 'aliases are not allowed' });
-    } else if (token.type === 'tag') {
-      issues.push({ offset: token.offset, message: 'tags are not allowed' });
+    const token = current as Record<string, unknown>;
+    if (typeof token.offset === 'number') {
+      if (token.type === 'anchor') {
+        issues.push({ offset: token.offset, message: 'anchors are not allowed' });
+      } else if (token.type === 'alias') {
+        issues.push({ offset: token.offset, message: 'aliases are not allowed' });
+      } else if (token.type === 'tag') {
+        issues.push({ offset: token.offset, message: 'tags are not allowed' });
+      }
+    }
+    for (const child of Object.values(token)) {
+      if (typeof child === 'object') pending.push(child);
     }
   }
-  for (const child of Object.values(token)) {
-    if (typeof child === 'object') scanCst(child, issues);
-  }
+}
+
+function safeLibraryMessage(message: string): string {
+  return message.split('\n')[0]?.replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ') ?? '';
 }
 
 function libraryIssues(
@@ -87,7 +92,7 @@ function libraryIssues(
       } else {
         issues.push({
           offset,
-          message: `invalid YAML: ${problem.message.split('\n')[0]}`,
+          message: `invalid YAML: ${safeLibraryMessage(problem.message)}`,
         });
       }
     }
@@ -101,7 +106,28 @@ function libraryIssues(
 export function parseRecipe(text: string, file: string): RecipeParseResult {
   const lineCounter = new LineCounter();
   const issues: LocatedIssue[] = [];
-  const root = libraryIssues(text, lineCounter, issues);
+  let root: YamlNode;
+  try {
+    root = libraryIssues(text, lineCounter, issues);
+  } catch (error) {
+    if (!(error instanceof RangeError)) throw error;
+    return {
+      ok: false,
+      errors: [{ file, line: 1, column: 1, message: 'recipe nesting is too deep' }],
+    };
+  }
+
+  const inspection = inspectYamlTree(root);
+  if (inspection.controls.length > 0) {
+    issues.length = 0;
+    issues.push(...inspection.controls);
+  } else if (inspection.depth.length > 0) {
+    issues.length = 0;
+    issues.push(...inspection.depth);
+  } else if (inspection.keys.length > 0) {
+    issues.length = 0;
+    issues.push(...inspection.keys);
+  }
 
   if (issues.length === 0) issues.push(...validateStructure(root));
   if (issues.length === 0) issues.push(...validateSemantics(root));

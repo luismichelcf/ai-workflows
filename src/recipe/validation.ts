@@ -1,4 +1,4 @@
-import { isMap, isSeq, type Node, type YAMLMap, type YAMLSeq } from 'yaml';
+import { isMap, isScalar, isSeq, type Node, type YAMLMap, type YAMLSeq } from 'yaml';
 
 import { recipeSchema } from './schema.js';
 
@@ -38,7 +38,21 @@ export function yamlSeq(node: YamlNode): YAMLSeq<Node> | undefined {
 }
 
 export function yamlValue(node: YamlNode): unknown {
-  return node === null ? null : node.toJSON();
+  if (node === null) return null;
+  if (isScalar(node)) return node.value;
+  const list = yamlSeq(node);
+  if (list) return list.items.map((item) => yamlValue(item));
+  const object = yamlMap(node);
+  if (object) {
+    // A null prototype keeps a YAML __proto__ key as data, never as object behavior.
+    const result: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
+    for (const pair of object.items) {
+      const key = scalarKey(pair.key);
+      if (key !== undefined) result[key] = yamlValue(pair.value);
+    }
+    return result;
+  }
+  return null;
 }
 
 export function yamlField(node: YamlNode, key: string): YamlNode {
@@ -46,11 +60,70 @@ export function yamlField(node: YamlNode, key: string): YamlNode {
 }
 
 export function yamlWord(node: YamlNode): string {
-  return String(yamlValue(node));
+  return scalarKey(node) ?? '';
+}
+
+export function scalarKey(node: YamlNode): string | undefined {
+  return isScalar(node) && typeof node.value === 'string' ? node.value : undefined;
 }
 
 export function nodeStart(node: YamlNode): number {
   return node?.range?.[0] ?? 0;
+}
+
+const CONTROL = /[\u0000-\u001f\u007f-\u009f]/;
+const MAX_DEPTH = 64;
+
+interface TreeInspection {
+  readonly controls: readonly LocatedIssue[];
+  readonly keys: readonly LocatedIssue[];
+  readonly depth: readonly LocatedIssue[];
+}
+
+/** Inspect iteratively before validation or conversion can echo an unsafe key or recurse. */
+export function inspectYamlTree(root: YamlNode): TreeInspection {
+  const controls: LocatedIssue[] = [];
+  const keys: LocatedIssue[] = [];
+  const depth: LocatedIssue[] = [];
+  const pending: { node: YamlNode; level: number; key: boolean }[] = [
+    { node: root, level: 0, key: false },
+  ];
+
+  while (pending.length > 0) {
+    const current = pending.pop();
+    if (!current || current.node === null) continue;
+    if (current.level > MAX_DEPTH) {
+      depth.push({ offset: nodeStart(current.node), message: 'recipe nesting is too deep' });
+      continue;
+    }
+
+    if (isScalar(current.node)) {
+      if (typeof current.node.value === 'string' && CONTROL.test(current.node.value)) {
+        controls.push({
+          offset: nodeStart(current.node),
+          message: 'control characters are not allowed',
+        });
+      }
+    }
+    if (current.key && scalarKey(current.node) === undefined) {
+      keys.push({ offset: nodeStart(current.node), message: 'keys must be text' });
+    }
+
+    const list = yamlSeq(current.node);
+    if (list) {
+      for (const item of list.items) {
+        pending.push({ node: item, level: current.level + 1, key: false });
+      }
+    }
+    const object = yamlMap(current.node);
+    if (object) {
+      for (const pair of object.items) {
+        pending.push({ node: pair.value, level: current.level + 1, key: false });
+        pending.push({ node: pair.key, level: current.level + 1, key: true });
+      }
+    }
+  }
+  return { controls, keys, depth };
 }
 
 function issue(issues: LocatedIssue[], node: YamlNode, message: string): void {
@@ -62,7 +135,7 @@ function resolveReference(reference: string): Shape {
   if (!reference.startsWith(prefix)) throw new Error(`Unsupported schema reference: ${reference}`);
   const name = reference.slice(prefix.length);
   const definitions: Readonly<Record<string, Shape>> = recipeSchema.definitions;
-  const definition = definitions[name];
+  const definition = Object.hasOwn(definitions, name) ? definitions[name] : undefined;
   if (!definition) throw new Error(`Unknown schema definition: ${name}`);
   return definition;
 }
@@ -181,7 +254,9 @@ function validateObject(
     const key = yamlWord(pair.key);
     if (shape.propertyNames) validateNode(pair.key, shape.propertyNames, key, issues);
 
-    const property = shape.properties?.[key];
+    const property = shape.properties && Object.hasOwn(shape.properties, key)
+      ? shape.properties[key]
+      : undefined;
     if (property) {
       validateNode(pair.value, property, key, issues);
     } else if (shape.additionalProperties === false) {

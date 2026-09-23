@@ -127,3 +127,22 @@ describe('anything else', () => {
     }
   });
 });
+
+describe('paths and arguments', () => {
+  it('reads an absolute path and names it with forward slashes', async () => {
+    const absolute = join(cwd, 'bad.yml');
+    await writeFile(absolute, DUPLICATE_KEY);
+
+    const output = await recipeCommand(['validate', absolute], { cwd });
+
+    expect(output.ok).toBe(false);
+    const shown = absolute.split('\\').join('/');
+    expect(output.text).toContain(`${shown}:6:5: duplicate key "summary"`);
+  });
+
+  it('init takes no file: it only ever writes where the engine looks', async () => {
+    const output = await recipeCommand(['init', 'other.yml'], { cwd });
+    expect(output.ok).toBe(false);
+    expect(output.text).toContain('Usage: ai-workflows <validate|explain|init> [file]');
+  });
+});

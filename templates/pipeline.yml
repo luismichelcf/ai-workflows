@@ -77,7 +77,7 @@ stages:
     valid-while: same-fingerprint
     gate:
       uses: ai-workflows/approval-comment@1
-      with: { command: /visto-bueno, code-length: 7 }
+      with: { command: /approve }
     server: attestation
 
   - id: merge

@@ -374,7 +374,7 @@ describe('what a valid recipe reads as', () => {
     expect(byId.get('owner-approval')?.validWhile).toBe('same-fingerprint');
     expect(byId.get('owner-approval')?.gate).toEqual({
       uses: 'ai-workflows/approval-comment@1',
-      with: { command: '/visto-bueno', 'code-length': 7 },
+      with: { command: '/approve' },
     });
     expect(byId.get('merge')?.phase).toBe('merge');
     expect(byId.get('cleanup')?.phase).toBe('post-merge');
@@ -529,7 +529,7 @@ describe('shape of each field', () => {
         '      run: node a.mjs',
       ),
     );
-    expect(errors.some((e) => e.line === 9 && /touches-any/.test(e.message))).toBe(true);
+    expect(errors).toContainEqual(at(9, 40, /"touches-any" must not repeat values/));
   });
 
   it('refuses glob syntax the engine does not support', () => {

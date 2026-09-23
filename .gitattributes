@@ -1,1 +1,4 @@
 tests/fixtures/** -text
+# The example recipe and the schema are published byte for byte: init must write LF everywhere.
+templates/** text eol=lf
+schema/** text eol=lf

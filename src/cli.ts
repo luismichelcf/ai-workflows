@@ -606,9 +606,12 @@ export async function runCommand(argv: readonly string[], options: CommandOption
       );
       if (isOutput(engine)) return engine;
 
-      const piece = args[0];
+      const piece = args.find((arg) => !arg.startsWith('--'));
       if (piece === undefined) {
-        return { ok: true, text: renderStatus(await engine.list(), { locale }) };
+        return {
+          ok: true,
+          text: renderStatus(await engine.list(), { locale, verbose: args.includes('--verbose') }),
+        };
       }
       const status = await engine.status(piece);
       if (status === undefined) {
