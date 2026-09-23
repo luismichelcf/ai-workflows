@@ -21,7 +21,7 @@ function constructStage(node: Node): RecipeStage {
     yamlWord(pair.key),
     yamlValue(pair.value),
   ]);
-  const base: RecipeStage = {
+  const base: Omit<RecipeStage, 'validWhile'> = {
     id: yamlWord(yamlField(node, 'id')),
     summary: yamlWord(yamlField(node, 'summary')),
     phase: (yamlValue(yamlField(node, 'phase')) ?? 'pre-merge') as RecipeStage['phase'],
@@ -40,9 +40,9 @@ function constructStage(node: Node): RecipeStage {
     ...base,
     ...(after === null ? {} : { after: yamlWord(after) }),
     ...(appliesIf === null ? {} : { appliesIf: condition(appliesIf) }),
-    ...(validWhile === null ? {} : {
-      validWhile: yamlWord(validWhile) as NonNullable<RecipeStage['validWhile']>,
-    }),
+    validWhile: (validWhile === null
+      ? 'same-sha'
+      : yamlWord(validWhile)) as RecipeStage['validWhile'],
     ...(server === null ? {} : {
       server: isMap(server)
         ? { requireCheck: yamlWord(yamlField(server, 'require-check')) }
@@ -60,6 +60,8 @@ function constructStage(node: Node): RecipeStage {
 export function constructRecipe(root: Node): Recipe {
   const classify = yamlField(root, 'classify');
   const kinds = yamlField(root, 'kinds');
+  const lanes = yamlField(root, 'lanes');
+  const labels = yamlField(root, 'labels');
   const stageNodes = yamlSeq(yamlField(root, 'stages'))?.items ?? [];
   const owner = yamlField(root, 'owner');
   const elevations = yamlSeq(yamlField(kinds, 'elevate'))?.items ?? [];
@@ -71,6 +73,7 @@ export function constructRecipe(root: Node): Recipe {
     ...(owner === null ? {} : { owner: yamlWord(owner) }),
     ...(kinds === null ? {} : {
       kinds: {
+        names: (yamlValue(yamlField(kinds, 'names')) ?? []) as string[],
         default: yamlWord(yamlField(kinds, 'default')),
         fromPaths: (yamlValue(yamlField(kinds, 'from-paths')) ?? {}) as Record<string, string[]>,
         elevate: elevations.map((entry) => ({
@@ -78,6 +81,12 @@ export function constructRecipe(root: Node): Recipe {
           to: yamlWord(yamlField(entry, 'to')),
         })),
       },
+    }),
+    ...(lanes === null ? {} : {
+      lanes: yamlValue(lanes) as Record<string, string[]>,
+    }),
+    ...(labels === null ? {} : {
+      labels: yamlValue(labels) as Record<string, string>,
     }),
   };
 }

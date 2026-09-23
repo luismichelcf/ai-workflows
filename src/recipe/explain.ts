@@ -3,6 +3,7 @@ import type { Recipe, RecipeCondition, RecipeStage } from './types.js';
 
 type Clause = keyof RecipeCondition;
 type Phase = RecipeStage['phase'];
+type Validity = RecipeStage['validWhile'];
 
 interface ExplainWords {
   readonly heading: (count: number) => string;
@@ -12,6 +13,7 @@ interface ExplainWords {
   readonly onlyIf: string;
   readonly and: string;
   readonly condition: Readonly<Record<Clause, (items: readonly string[]) => string>>;
+  readonly validity: Readonly<Record<Validity, string>>;
   readonly requiredFailure: string;
   readonly optionalFailure: string;
   readonly humanWait: string;
@@ -43,6 +45,13 @@ const EXPLAIN_WORDS: Record<Language, ExplainWords> = {
       kindNone: (items) => `el tipo de cambio no es ${joined(items, true, true)}`,
       laneAny: (items) => `el carril es ${joined(items, true)}`,
     },
+    validity: {
+      'same-sha': 'Vale mientras el código no cambie.',
+      'same-fingerprint': 'Vale mientras los cambios propios de la pieza sigan iguales.',
+      'same-fingerprint-or-clean-update':
+        'Vale mientras el código no cambie, salvo por actualizaciones sin conflictos con la versión principal.',
+      forever: 'Vale siempre, una vez cumplido.',
+    },
     requiredFailure: 'Si no se cumple: la pieza se detiene hasta corregirlo.',
     optionalFailure: 'Si no se cumple: se avisa y la pieza sigue.',
     humanWait: 'Si falta: la pieza espera tu decisión; las demás siguen.',
@@ -73,6 +82,13 @@ const EXPLAIN_WORDS: Record<Language, ExplainWords> = {
         : `the kind of change is ${noneOf(items)}`,
       laneAny: (items) => `the lane is ${joined(items, false)}`,
     },
+    validity: {
+      'same-sha': 'Valid while the code does not change.',
+      'same-fingerprint': "Valid while the piece's own changes stay the same.",
+      'same-fingerprint-or-clean-update':
+        'Valid while the code does not change, except for conflict-free updates from the main line.',
+      forever: 'Valid for good once met.',
+    },
     requiredFailure: 'If it fails: the piece stops until it is fixed.',
     optionalFailure: 'If it fails: you are told and the piece carries on.',
     humanWait: 'If it is missing: the piece waits for your decision; the others carry on.',
@@ -82,12 +98,23 @@ const EXPLAIN_WORDS: Record<Language, ExplainWords> = {
   },
 };
 
-function when(condition: RecipeCondition | undefined, words: ExplainWords): string {
+function labeled(
+  labels: Readonly<Record<string, string>> | undefined,
+  items: readonly string[],
+): readonly string[] {
+  return items.map((item) => labels?.[item] ?? item);
+}
+
+function when(
+  condition: RecipeCondition | undefined,
+  labels: Readonly<Record<string, string>> | undefined,
+  words: ExplainWords,
+): string {
   if (!condition) return words.always;
   const clauses: string[] = [];
   for (const key of CONDITION_ORDER) {
     const list = condition[key];
-    if (list) clauses.push(words.condition[key](list));
+    if (list) clauses.push(words.condition[key](labeled(labels, list)));
   }
   return `${words.onlyIf} ${clauses.join(words.and)}`;
 }
@@ -132,7 +159,8 @@ export function explainRecipe(recipe: Recipe): string {
       ? stage.summary
       : `${stage.summary}.`;
     lines.push(`${index + 1}. ${summary}`);
-    lines.push(`   ${words.whenLabel}: ${when(stage.appliesIf, words)}.`);
+    lines.push(`   ${words.whenLabel}: ${when(stage.appliesIf, recipe.labels, words)}.`);
+    lines.push(`   ${words.validity[stage.validWhile]}`);
     lines.push(`   ${failureLine(stage, words)}`);
 
     const retry = retryLine(stage, words);

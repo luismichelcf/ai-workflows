@@ -14,6 +14,7 @@ classify:                             # qué rutas son de cada clase: datos, no 
   production: [".github/workflows/**"]
 
 kinds:                                # tipos de cambio que declara cada pieza
+  names: [behavior, docs]
   default: behavior
   from-paths:                         # si TODOS los archivos caen aquí, ese es el tipo
     docs: ["docs/**", "**/*.md"]
@@ -21,12 +22,22 @@ kinds:                                # tipos de cambio que declara cada pieza
     - when: { touches-any: [security], kind-none: [behavior] }
       to: behavior
 
+labels:                               # cómo se llaman al explicar la receta
+  security: "seguridad y permisos"
+  visible: "lo que se ve"
+  production: "producción"
+  behavior: "comportamiento"
+  docs: "documentación"
+
 stages:
   - id: spec
     summary: "Un plan escrito con el resumen de tres líneas y criterios con identificador"
     nature: structure
     gate:
       uses: ai-workflows/spec-structure@1
+      with:
+        file: "docs/plans/PLAN-{piece}.md"
+        sections: ["En tres líneas", "Casos de aceptación"]
     server: recompute
 
   - id: red-test
@@ -34,6 +45,7 @@ stages:
     after: spec
     nature: execution-record
     applies-if: { kind-any: [behavior] }
+    valid-while: forever                # lo que se registró no cambia con el código nuevo
     gate:
       uses: ai-workflows/red-test@1
       with: { command: "pnpm vitest run {tests}" }
@@ -46,6 +58,7 @@ stages:
     applies-if: { kind-any: [behavior] }
     gate:
       uses: ai-workflows/build-verify@1
+      with: { command: "pnpm vitest run {tests}", red-stage: red-test }
     server: { require-check: ai-workflows/red-test }
 
   - id: checks

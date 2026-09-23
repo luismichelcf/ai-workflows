@@ -51,9 +51,13 @@ export const recipeSchema = {
     kinds: {
       type: 'object',
       additionalProperties: false,
-      required: ['default'],
+      required: ['default', 'names'],
       description: 'Change kind rules.',
       properties: {
+        names: {
+          ...identifierList,
+          description: 'The closed vocabulary of change kinds.',
+        },
         default: { type: 'string', pattern: identifier },
         'from-paths': pathClasses,
         elevate: {
@@ -69,6 +73,18 @@ export const recipeSchema = {
           },
         },
       },
+    },
+    lanes: {
+      type: 'object',
+      propertyNames: { pattern: identifier },
+      additionalProperties: identifierList,
+      description: 'Every declared kind grouped into exactly one lane.',
+    },
+    labels: {
+      type: 'object',
+      propertyNames: { pattern: identifier },
+      additionalProperties: { type: 'string', minLength: 1 },
+      description: 'Owner-facing names for classes, kinds and lanes.',
     },
     stages: {
       type: 'array',

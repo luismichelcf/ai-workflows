@@ -117,6 +117,8 @@ export function appliesIfFor(
   if (!condition) return undefined;
 
   const words = MOTIVE_WORDS[languageOf(recipe.locale)];
+  const label = (name: string): string => recipe.labels?.[name] ?? name;
+  const labelAll = (names: readonly string[]): string[] => names.map(label);
   const skip = (message: string): Applicability => ({
     skip: `${words.prefix}: ${message}.`,
   });
@@ -132,31 +134,31 @@ export function appliesIfFor(
     // Clause order is contractual: the first failed fact supplies the skip motive.
     const touchesAny = condition.touchesAny;
     if (touchesAny && !touchesAny.some((name) => classes().includes(name))) {
-      return skip(words.noTouch(touchesAny));
+      return skip(words.noTouch(labelAll(touchesAny)));
     }
 
     const touchesNone = condition.touchesNone;
     if (touchesNone) {
       const matching = touchesNone.filter((name) => classes().includes(name));
-      if (matching.length > 0) return skip(words.touched(matching));
+      if (matching.length > 0) return skip(words.touched(labelAll(matching)));
     }
 
     const kindAny = condition.kindAny;
     if (kindAny) {
       const actual = requireTextFact(context, stageId, 'kind');
-      if (!kindAny.includes(actual)) return skip(words.wrongKind(actual, kindAny));
+      if (!kindAny.includes(actual)) return skip(words.wrongKind(label(actual), labelAll(kindAny)));
     }
 
     const kindNone = condition.kindNone;
     if (kindNone) {
       const actual = requireTextFact(context, stageId, 'kind');
-      if (kindNone.includes(actual)) return skip(words.excludedKind(actual));
+      if (kindNone.includes(actual)) return skip(words.excludedKind(label(actual)));
     }
 
     const laneAny = condition.laneAny;
     if (laneAny) {
       const actual = requireTextFact(context, stageId, 'lane');
-      if (!laneAny.includes(actual)) return skip(words.wrongLane(actual, laneAny));
+      if (!laneAny.includes(actual)) return skip(words.wrongLane(label(actual), labelAll(laneAny)));
     }
     return true;
   };

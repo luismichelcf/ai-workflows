@@ -22,10 +22,14 @@ describe('the published recipe schema', () => {
     expect([...recipeSchema.required].sort()).toEqual(['locale', 'stages', 'version']);
   });
 
-  it('allows at the top only the keys of §3.3', () => {
+  it('allows at the top only the keys of §3.3, plus lanes and labels (R15, R16)', () => {
     expect(Object.keys(recipeSchema.properties).sort()).toEqual(
-      ['classify', 'kinds', 'locale', 'owner', 'stages', 'version'].sort(),
+      ['classify', 'kinds', 'labels', 'lanes', 'locale', 'owner', 'stages', 'version'].sort(),
     );
+  });
+
+  it('requires the kind vocabulary whenever kinds are declared (R15)', () => {
+    expect([...recipeSchema.properties.kinds.required].sort()).toEqual(['default', 'names']);
   });
 
   it('allows in a stage exactly the fields §3.3 lists, and nothing else', () => {
