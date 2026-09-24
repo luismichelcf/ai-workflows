@@ -4,6 +4,7 @@ import { resolve } from 'node:path';
 
 import {
   EffectNeedsReconciliation,
+  EffectStillInDoubt,
   type Gate,
   type GateContext,
   type GateResult,
@@ -221,18 +222,6 @@ function sealedGate(gate: Gate, root: string): Gate {
     }
     return result;
   };
-}
-
-/**
- * PLAN-13-R4 §3.0.1 and §5: an effect that stays in doubt keeps blocking, optional stage or
- * not. It is the same class the engine already refuses to retry and to wave through, carrying
- * both the operation and the motive that could not settle it.
- */
-class EffectStillInDoubt extends EffectNeedsReconciliation {
-  constructor(piece: string, operationId: string, motive: string) {
-    super(piece, operationId, 'uncertain');
-    this.message = motive;
-  }
 }
 
 /**

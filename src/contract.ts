@@ -265,6 +265,20 @@ export class EffectNeedsReconciliation extends Error {
 }
 
 /**
+ * Thrown when an effect was left in doubt and nothing could settle it: the block has no
+ * reconciler, its reconciler failed or answered uselessly, or the store failed while writing
+ * the settlement. It extends `EffectNeedsReconciliation`, so the engine keeps the piece
+ * `blocked:technical` even in an optional stage — an effect in doubt is never waved through —
+ * and its message names the operation and the motive that could not settle it.
+ */
+export class EffectStillInDoubt extends EffectNeedsReconciliation {
+  constructor(piece: PieceId, operationId: string, motive: string) {
+    super(piece, operationId, 'uncertain');
+    this.message = motive;
+  }
+}
+
+/**
  * Thrown when `runEffect` is asked to start an effect for a parked piece. The effect was never
  * claimed, so nothing reached the outside world and nothing needs reconciling: the caller is
  * meant to read the parked status as the outcome instead. This is the effect's half of «stop

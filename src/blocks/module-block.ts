@@ -2,6 +2,7 @@ import { pathToFileURL } from 'node:url';
 
 import {
   EffectNeedsReconciliation,
+  EffectStillInDoubt,
   type Gate,
   type GateContext,
   type GateResult,
@@ -43,8 +44,17 @@ type Reconciler = (
   project: ModuleProject,
 ) => Promise<unknown> | unknown;
 
-function cannotReconcile(operationId: string): Error {
-  return new Error(`effect "${operationId}" is in doubt and the block cannot reconcile it`);
+// PLAN-13-R4 §3.0.1 and §5: an effect that stays in doubt keeps blocking, optional stage or
+// not. Every dead end — no reconciler, a reconciler that fails or answers uselessly, and a
+// store that fails while settling the answer — is an `EffectStillInDoubt`, the same class the
+// engine refuses to retry and to wave through, so the piece stays `blocked:technical` with the
+// operation and the motive.
+function cannotReconcile(piece: string, operationId: string): EffectStillInDoubt {
+  return new EffectStillInDoubt(
+    piece,
+    operationId,
+    `effect "${operationId}" is in doubt and the block cannot reconcile it`,
+  );
 }
 
 export function createModuleGate(options: ModuleGateOptions): Gate {
@@ -70,28 +80,43 @@ export function createModuleGate(options: ModuleGateOptions): Gate {
 
       const block = await load();
       const reconcile = block.reconcile;
-      if (typeof reconcile !== 'function') throw cannotReconcile(error.operationId);
+      if (typeof reconcile !== 'function') throw cannotReconcile(context.piece, error.operationId);
 
       let answer: unknown;
       try {
         answer = await (reconcile as Reconciler)(error.operationId, context, project);
       } catch (failure) {
         const message = failure instanceof Error ? failure.message : String(failure);
-        throw new Error(`effect "${error.operationId}" is in doubt and reconciling it failed: ${message}`);
+        throw new EffectStillInDoubt(
+          context.piece,
+          error.operationId,
+          `effect "${error.operationId}" is in doubt and reconciling it failed: ${message}`,
+        );
       }
       if (typeof answer !== 'object' || answer === null || Array.isArray(answer)) {
-        throw cannotReconcile(error.operationId);
+        throw cannotReconcile(context.piece, error.operationId);
       }
 
       const record = answer as Record<string, unknown>;
+      let outcome: { readonly confirmed: JsonValue } | { readonly didNotHappen: true };
       if (record['didNotHappen'] === true) {
-        await options.store.reconcileEffect(context.piece, error.operationId, { didNotHappen: true });
+        outcome = { didNotHappen: true };
       } else if (Object.hasOwn(record, 'confirmed')) {
-        await options.store.reconcileEffect(context.piece, error.operationId, {
-          confirmed: record['confirmed'] as JsonValue,
-        });
+        outcome = { confirmed: record['confirmed'] as JsonValue };
       } else {
-        throw cannotReconcile(error.operationId);
+        throw cannotReconcile(context.piece, error.operationId);
+      }
+      // Settling the effect is a store write. If it fails, the effect is STILL in doubt: the
+      // piece keeps blocking — even an optional stage — naming the operation and the motive.
+      try {
+        await options.store.reconcileEffect(context.piece, error.operationId, outcome);
+      } catch (failure) {
+        const message = failure instanceof Error ? failure.message : String(failure);
+        throw new EffectStillInDoubt(
+          context.piece,
+          error.operationId,
+          `effect "${error.operationId}" is in doubt and settling it failed: ${message}`,
+        );
       }
 
       // The effect is settled now: run the block one more time, and only once.
