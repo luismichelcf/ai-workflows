@@ -1,6 +1,7 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { hostname } from 'node:os';
 
+import { childEnvironment } from './git-env.js';
 import {
   launchWindowsGroup,
   checkWindowsQuarantine,
@@ -254,7 +255,8 @@ function launchPosix(options: LaunchInGroupOptions): ProcessGroup {
     detached: true,
     shell: false,
     stdio: ['pipe', 'pipe', 'pipe'],
-    env: { ...(options.environment ?? process.env), ...(options.env ?? {}) },
+    // The agents' credentials never reach a child the piece runs (PLAN-13-R4 §8).
+    env: { ...(options.environment ?? childEnvironment()), ...(options.env ?? {}) },
   });
   // A stream error on a child that never started must not crash the engine.
   child.stdin?.on('error', () => {});

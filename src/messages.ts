@@ -92,15 +92,24 @@ export interface OwnerMessageOptions {
   readonly detail?: string;
   /** Where the owner has to act, for the messages that carry one. */
   readonly link?: string;
+  /**
+   * PLAN-13-R4 §6: the exact order to write, for the approval that goes through a comment.
+   * When it is present the approval message says what to write and never mentions a button.
+   */
+  readonly order?: string;
   readonly maxLength: number;
   readonly banned: readonly string[];
 }
 
-type Templates = Readonly<Record<OwnerMessageKind, (o: { detail?: string; link?: string }) => string>>;
+type TemplateSubject = { detail?: string; link?: string; order?: string };
+type Templates = Readonly<Record<OwnerMessageKind, (o: TemplateSubject) => string>>;
 
 const SPANISH_TEMPLATES: Templates = {
   start: () => 'Empieza el trabajo de esta pieza.',
-  approval: (o) => `Para continuar, aprueba el cambio en GitHub con el botón "Approve": ${o.link ?? ''}`,
+  approval: (o) =>
+    o.order !== undefined
+      ? `Para continuar, escribe este comentario en GitHub: ${o.order}`
+      : `Para continuar, aprueba el cambio en GitHub con el botón "Approve": ${o.link ?? ''}`,
   question: (o) => `Hace falta una decisión tuya${o.detail === undefined ? '' : `: ${o.detail}`}.`,
   blocked: (o) => `No se pudo continuar${o.detail === undefined ? '' : `: ${o.detail}`}.`,
   close: () => 'El cambio se fusionó.',
@@ -108,7 +117,10 @@ const SPANISH_TEMPLATES: Templates = {
 
 const ENGLISH_TEMPLATES: Templates = {
   start: () => 'The work on this piece begins.',
-  approval: (o) => `To continue, approve the change in GitHub with the "Approve" button: ${o.link ?? ''}`,
+  approval: (o) =>
+    o.order !== undefined
+      ? `To continue, write this comment in GitHub: ${o.order}`
+      : `To continue, approve the change in GitHub with the "Approve" button: ${o.link ?? ''}`,
   question: (o) => `A decision from you is needed${o.detail === undefined ? '' : `: ${o.detail}`}.`,
   blocked: (o) => `It could not continue${o.detail === undefined ? '' : `: ${o.detail}`}.`,
   close: () => 'The change is in.',
@@ -158,11 +170,26 @@ export function renderOwnerMessage(
   const summary = options.summary?.map(neutralizeHtmlComments);
   const link = options.link === undefined ? undefined : neutralizeHtmlComments(options.link);
 
-  const full = compose(summary, templates[kind]({ ...(detail === undefined ? {} : { detail }), ...(link === undefined ? {} : { link }) }), spanish);
+  const full = compose(
+    summary,
+    templates[kind]({
+      ...(detail === undefined ? {} : { detail }),
+      ...(link === undefined ? {} : { link }),
+      ...(options.order === undefined ? {} : { order: options.order }),
+    }),
+    spanish,
+  );
   const fullBanned = findBannedTerms(full, options.banned);
   if (fullBanned.length === 0 && full.length <= options.maxLength) return { text: full };
 
-  const minimal = compose(summary, templates[kind](link === undefined ? {} : { link }), spanish);
+  const minimal = compose(
+    summary,
+    templates[kind]({
+      ...(link === undefined ? {} : { link }),
+      ...(options.order === undefined ? {} : { order: options.order }),
+    }),
+    spanish,
+  );
   const minimalBanned = findBannedTerms(minimal, options.banned);
   if (minimalBanned.length > 0) {
     return {

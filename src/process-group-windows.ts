@@ -4,6 +4,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+import { childEnvironment } from './git-env.js';
 import {
   collectExit,
   DEFAULT_STDOUT_BYTES,
@@ -694,7 +695,8 @@ export function launchWindowsGroup(options: LaunchInGroupOptions): ProcessGroup 
   const application = options.command;
   const commandLine = [application, ...options.args].map(quoteWindowsArgument).join(' ');
   const environment: NodeJS.ProcessEnv = {
-    ...(options.environment ?? process.env),
+    // The agents' credentials never reach a child the piece runs (PLAN-13-R4 §8).
+    ...(options.environment ?? childEnvironment()),
     ...(options.env ?? {}),
     AIW_MODE: 'launch',
     AIW_JOB: job,

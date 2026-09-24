@@ -3,7 +3,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 
 import {
-  EffectNeedsReconciliation,
+  EffectRefusedBecauseParked,
   type JournalEntry,
   type JsonValue,
   type PipelineConfig,
@@ -18,10 +18,10 @@ import { safeTerminalText } from '../safe-text.js';
 import { DEFAULT_BANNED_TERMS, readOwnerSummary, renderOwnerMessage, type OwnerMessageKind } from '../messages.js';
 import { agentCredentialsFromEnv, createAppTokenSource, APP_ID_ENV, APP_KEY_FILE_ENV } from './identity.js';
 import { createAgentGitHub, type AgentGitHub, type RemoteGit } from './github.js';
-import { renderEventComment, type PieceEvent } from './events.js';
+import { readPieceEvents, renderEventComment, slugOf, type IssueComment, type PieceEvent } from './events.js';
 import { createRemoteGit, gitCurrentBranch, gitHead, gitIsClean, gitMainRoot, gitOk, gitText, gitTopLevel, snapshotTree, runGit } from './git.js';
 import { finishPiece } from './finish.js';
-import { createGhRunner } from '../gh-runner.js';
+import { createGhRunner, type GhRunnerWithEnv } from '../gh-runner.js';
 import { createGitHubStatePort } from '../store-github.js';
 import { createGitStore, type StatePort } from '../store-git.js';
 import { checkRecipe } from '../recipe/blocks.js';
@@ -49,6 +49,53 @@ import {
 const RECIPE_FILE = '.ai-workflows/pipeline.yml';
 const LEASE_MS = 15 * 60_000;
 
+/** The agents' installation token, asked for again on every call (PLAN-13-R4 §1.2, §6). */
+export interface AgentTokenSource {
+  token(): Promise<string>;
+  /** The account GitHub reports for the app, as `<slug>[bot]`. */
+  account(): Promise<string>;
+}
+
+export interface CreateAgentEdgesOptions {
+  /** `owner/name`, as GitHub reports it. */
+  readonly repository: string;
+  /** The runner of `gh` the edges talk through; a test hands its own. */
+  readonly runner: GhRunnerWithEnv;
+  /** The app token source; without it the calls run as the account `gh` is logged in as. */
+  readonly tokenSource?: AgentTokenSource;
+  /** The repository the git side pushes in; defaults to the current folder. */
+  readonly root?: string;
+}
+
+export interface AgentEdges {
+  readonly github: AgentGitHub;
+  readonly remote: RemoteGit;
+}
+
+/**
+ * The two halves of the GitHub edge next to the agent, over one `gh` runner. A token source is
+ * asked for a live token on EVERY call: an installation token lives an hour, and a merge can be
+ * observed for hours, so caching one would send a dead token. Without a source the calls go out
+ * as the account `gh` is logged in as, with no token in the environment.
+ */
+export function createAgentEdges(options: CreateAgentEdgesOptions): AgentEdges {
+  const token =
+    options.tokenSource === undefined
+      ? undefined
+      : (): Promise<string> => options.tokenSource!.token();
+  const github = createAgentGitHub({
+    repository: options.repository,
+    runner: options.runner,
+    ...(token === undefined ? {} : { token }),
+  });
+  const remote = createRemoteGit({
+    root: options.root ?? process.cwd(),
+    repository: options.repository,
+    ...(token === undefined ? {} : { token }),
+  });
+  return { github, remote };
+}
+
 export interface AgentCliDeps {
   readonly cwd: string;
   readonly env: Readonly<Record<string, string | undefined>>;
@@ -57,9 +104,15 @@ export interface AgentCliDeps {
   readonly statePort?: StatePort;
   readonly repository?: string;
   readonly providers?: ProviderRunner;
+  /** The `gh` runner the edges use when the recipe has no agent identity; a test hands its own. */
+  readonly ghRunner?: GhRunnerWithEnv;
+  /** The app token source, so a test can hand one instead of the environment variables. */
+  readonly tokenSource?: AgentTokenSource;
   ghAccounts?(): Promise<string[]>;
   now?(): number;
   sleep?(ms: number, signal: AbortSignal): Promise<void>;
+  /** Only for tests: runs right after the engine returns and before any read. */
+  afterRun?(): Promise<void>;
   /** Only for tests: runs between the engine's verdict and the owner messages. */
   beforeMessages?(): Promise<void>;
   /** Only for tests: runs just before `sync` moves the head. */
@@ -152,40 +205,64 @@ async function resolveEdges(deps: AgentCliDeps, root: string, recipe: Recipe): P
         : 'The GitHub repository could not be told from "origin".',
     };
   }
+  // Two fakes handed in are the whole edge: no identity is checked, no `gh` is built.
   if (deps.github !== undefined && deps.remote !== undefined) {
     return { ok: true, github: deps.github, remote: deps.remote, repository };
   }
 
+  const runner = deps.ghRunner ?? createGhRunner();
+
   if (recipe.agentAccount !== undefined) {
-    const credentials = agentCredentialsFromEnv(deps.env, root);
-    if ('missing' in credentials) {
+    let tokenSource = deps.tokenSource;
+    if (tokenSource === undefined) {
+      const credentials = agentCredentialsFromEnv(deps.env, root);
+      if ('missing' in credentials) {
+        return {
+          ok: false,
+          text: spanish(recipe.locale)
+            ? `La receta declara una identidad de agente y falta ${credentials.missing} (${APP_ID_ENV} y ${APP_KEY_FILE_ENV}).`
+            : `The recipe declares an agent identity and ${credentials.missing} is missing (${APP_ID_ENV} and ${APP_KEY_FILE_ENV}).`,
+        };
+      }
+      if ('refused' in credentials) {
+        return {
+          ok: false,
+          text: spanish(recipe.locale)
+            ? `Las credenciales del agente no sirven: ${credentials.refused}`
+            : `The agent credentials are unusable: ${credentials.refused}`,
+        };
+      }
+      tokenSource = createAppTokenSource({ credentials, repository });
+    }
+    // Before touching anything: the key must belong to the declared identity. A key of another
+    // app would publish under an account the recipe never named.
+    const account = await tokenSource.account();
+    if (account !== recipe.agentAccount) {
       return {
         ok: false,
         text: spanish(recipe.locale)
-          ? `La receta declara una identidad de agente y falta ${credentials.missing} (${APP_ID_ENV} y ${APP_KEY_FILE_ENV}).`
-          : `The recipe declares an agent identity and ${credentials.missing} is missing (${APP_ID_ENV} and ${APP_KEY_FILE_ENV}).`,
+          ? `La llave no es de la identidad declarada: GitHub la reporta como "${account}", no como "${recipe.agentAccount}".`
+          : `The key is not of the declared identity: GitHub reports it as "${account}", not "${recipe.agentAccount}".`,
       };
     }
-    if ('refused' in credentials) {
-      return {
-        ok: false,
-        text: spanish(recipe.locale)
-          ? `Las credenciales del agente no sirven: ${credentials.refused}`
-          : `The agent credentials are unusable: ${credentials.refused}`,
-      };
-    }
-    const source = createAppTokenSource({ credentials, repository });
-    let token: string | undefined;
-    const tokenOf = async (): Promise<string> => {
-      token ??= await source.token();
-      return token;
+    const edges = createAgentEdges({ repository, runner, tokenSource, root });
+    return {
+      ok: true,
+      github: deps.github ?? edges.github,
+      remote: deps.remote ?? edges.remote,
+      repository,
     };
-    const github = deps.github ?? createAgentGitHub({ repository, runner: createGhRunner(), token: tokenOf });
-    const remote = deps.remote ?? createRemoteGit({ root, token: tokenOf });
-    return { ok: true, github, remote, repository };
   }
 
-  return { ok: true, ...(deps.github === undefined ? {} : { github: deps.github }), ...(deps.remote === undefined ? {} : { remote: deps.remote }), repository };
+  // A recipe without an agent identity still reaches GitHub, as the account `gh` is logged in
+  // as (the path of `approval-comment` and of every project without its own app).
+  const edges = createAgentEdges({ repository, runner, root });
+  return {
+    ok: true,
+    github: deps.github ?? edges.github,
+    remote: deps.remote ?? edges.remote,
+    repository,
+  };
 }
 
 async function resolveStore(deps: AgentCliDeps, root: string): Promise<Store> {
@@ -220,6 +297,18 @@ async function resolveBaseRef(root: string, principal: string): Promise<string> 
   return (await gitOk(root, ['rev-parse', '--verify', `${remote}^{commit}`])) ? remote : principal;
 }
 
+/** The principal branch of the repository; `main` when GitHub is not there to say. */
+async function principalOf(
+  github: AgentGitHub | undefined,
+): Promise<{ readonly ok: true; readonly branch: string } | { readonly ok: false; readonly text: string }> {
+  if (github === undefined) return { ok: true, branch: 'main' };
+  try {
+    return { ok: true, branch: await github.defaultBranch() };
+  } catch (error) {
+    return { ok: false, text: safeTerminalText(reasonOf(error)) };
+  }
+}
+
 // ---------------------------------------------------------------------------------------------
 // run
 
@@ -231,7 +320,9 @@ function busyText(locale: string): string {
 
 function renderOutcome(outcome: RunOutcome, locale: string): CommandOutput {
   if (outcome.outcome === 'busy') return { ok: false, text: busyText(locale) };
-  const text = renderStatus([outcome.status], { locale });
+  // The terminal keeps the whole motive (PLAN-13-R4 §6): the owner runs this by hand and needs
+  // to read what stopped the piece, not a reason trimmed to fit a line.
+  const text = renderStatus([outcome.status], { locale, verbose: true });
   if (outcome.outcome === 'parked') return { ok: false, text };
   return { ok: outcome.status.state === 'done', text };
 }
@@ -306,9 +397,51 @@ function markerOf(op: string): string {
   return `<!-- ai-workflows:message {"op":"${op}"} -->`;
 }
 
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
 /**
- * Runs one owner-message effect. A message left in doubt is settled by reading the issue: a
- * comment carrying this operation's mark means it already went out; none means it never did.
+ * PLAN-13-R4 §6: the exact order the owner has to write, for an approval by comment. It is built
+ * from the stage's own `command` and `code-length` and the head, so the message and the stage's
+ * refusal name the very same order. `undefined` when the stage approves with the GitHub button.
+ */
+function approvalOrder(status: PieceStatus, recipe: Recipe, facts: Facts): string | undefined {
+  const stage = recipe.stages.find((item) => item.id === status.stage);
+  const uses = stage?.gate.uses ?? '';
+  if (!uses.includes('approval-comment')) return undefined;
+  const withValue = asRecord(stage?.gate.with);
+  const command =
+    typeof withValue?.['command'] === 'string' && withValue['command'].length > 0
+      ? withValue['command']
+      : '/approve';
+  const rawLength = withValue?.['code-length'];
+  const codeLength = typeof rawLength === 'number' && Number.isInteger(rawLength) ? rawLength : 7;
+  return `${command} ${facts.sha.slice(0, codeLength)}`;
+}
+
+/** PLAN-13-R4 §6: the stage's own summary for a stop, never the raw technical reason. */
+function blockedDetail(status: PieceStatus, recipe: Recipe, es: boolean): string | undefined {
+  const stage = recipe.stages.find((item) => item.id === status.stage);
+  if (stage === undefined) return undefined;
+  const how =
+    status.state === 'blocked:technical'
+      ? es
+        ? 'fallo técnico'
+        : 'technical failure'
+      : es
+        ? 'rechazo'
+        : 'refusal';
+  return `${stage.summary} (${how})`;
+}
+
+/**
+ * Runs one owner-message effect. A message left in doubt — a crash before or after the comment,
+ * or a store that failed while recording it — is settled by reading the issue: a comment carrying
+ * this operation's mark AND written by the agents through their app means it already went out;
+ * anything else means it never did. A comment of another account quoting the mark never counts.
  */
 async function messageEffect(
   store: Store,
@@ -316,17 +449,26 @@ async function messageEffect(
   op: string,
   github: AgentGitHub,
   body: string,
+  agentAccount: string | undefined,
 ): Promise<void> {
   const send = async (): Promise<JsonValue> => {
     const id = await github.commentOnIssue(Number(piece), body);
     return { id };
   };
+  const isOurs = (comment: IssueComment): boolean => {
+    if (!comment.body.includes(`"op":"${op}"`)) return false;
+    if (comment.authorType !== 'Bot') return false;
+    if (agentAccount === undefined) return true;
+    return comment.author === agentAccount && comment.viaApp === slugOf(agentAccount);
+  };
   try {
     await store.runEffect(piece, op, send);
   } catch (error) {
-    if (!(error instanceof EffectNeedsReconciliation)) throw error;
+    if (error instanceof EffectRefusedBecauseParked) throw error;
+    // The effect may have landed before the failure: read the issue and settle it, then either
+    // return its recorded result or run it once more. A read that also fails propagates.
     const comments = await github.issueComments(Number(piece));
-    const sent = comments.some((comment) => comment.body.includes(`"op":"${op}"`));
+    const sent = comments.some(isOurs);
     await store.reconcileEffect(piece, op, sent ? { confirmed: null } : { didNotHappen: true });
     await store.runEffect(piece, op, send);
   }
@@ -337,7 +479,6 @@ async function deliverMessage(
   piece: string,
   status: PieceStatus,
   recipe: Recipe,
-  deps: AgentCliDeps,
   store: Store,
   github: AgentGitHub,
   root: string,
@@ -350,40 +491,89 @@ async function deliverMessage(
   const summary = summaryLines(recipe, root, piece);
   const link = status.reason === undefined ? undefined : /https?:\/\/\S+/.exec(status.reason)?.[0];
   const detail =
-    kind === 'question' || kind === 'blocked' ? status.reason : undefined;
+    kind === 'question'
+      ? status.reason
+      : kind === 'blocked'
+        ? blockedDetail(status, recipe, spanish(recipe.locale))
+        : undefined;
+  const order = kind === 'approval' ? approvalOrder(status, recipe, facts) : undefined;
   const rendered = renderOwnerMessage(kind, {
     locale: recipe.locale,
     ...(summary === undefined ? {} : { summary }),
     ...(detail === undefined ? {} : { detail }),
     ...(link === undefined ? {} : { link }),
+    ...(order === undefined ? {} : { order }),
     maxLength: messages.maxLength,
     banned: [...DEFAULT_BANNED_TERMS, ...messages.bannedWords],
   });
   if ('refused' in rendered) return rendered.refused;
   const body = `${rendered.text}\n\n${markerOf(op)}`;
-  await messageEffect(store, piece, op, github, body);
+  await messageEffect(store, piece, op, github, body, recipe.agentAccount);
   return '';
+}
+
+/** Whether the store still shows exactly what made the engine return this outcome. */
+function matchesOutcome(status: PieceStatus, facts: Facts, runId: string): boolean {
+  if (facts.state !== status.state) return false;
+  if ((facts.stage ?? null) !== (status.stage ?? null)) return false;
+  if ((facts.reason ?? null) !== (status.reason ?? null)) return false;
+  // The last entry of the stage must be from THIS run; a waiting stage records none.
+  if (facts.at !== null && facts.runId !== runId) return false;
+  return true;
+}
+
+/**
+ * PLAN-13-R4 §6: the `start` message, sent once per piece, inside the run and before its first
+ * stage, only when the store has never seen the piece. It is keyed by the piece, so a crash on
+ * either side of the comment never sends it twice.
+ */
+async function deliverStart(
+  piece: string,
+  recipe: Recipe,
+  store: Store,
+  github: AgentGitHub,
+  root: string,
+): Promise<string> {
+  const messages = recipe.messages;
+  if (messages === undefined) return '';
+  const runId = `start-${randomUUID()}`;
+  const held = await store.reserve(piece, runId, LEASE_MS);
+  if (!held.ok) return '';
+  try {
+    if ((await store.loadStatus(piece)) !== undefined) return '';
+    const op = `owner-message:start:${piece}`;
+    const summary = summaryLines(recipe, root, piece);
+    const rendered = renderOwnerMessage('start', {
+      locale: recipe.locale,
+      ...(summary === undefined ? {} : { summary }),
+      maxLength: messages.maxLength,
+      banned: [...DEFAULT_BANNED_TERMS, ...messages.bannedWords],
+    });
+    if ('refused' in rendered) return rendered.refused;
+    await messageEffect(store, piece, op, github, `${rendered.text}
+
+${markerOf(op)}`, recipe.agentAccount);
+    return '';
+  } finally {
+    await store.release(piece, runId).catch(() => undefined);
+  }
 }
 
 async function deliverOutcomeMessages(
   piece: string,
   outcome: RunOutcome,
   recipe: Recipe,
-  deps: AgentCliDeps,
   store: Store,
   github: AgentGitHub | undefined,
   root: string,
+  runId: string,
 ): Promise<string> {
   if (outcome.outcome !== 'ran' || recipe.messages === undefined) return '';
   const kind = messageKind(outcome.status, recipe);
   if (kind === undefined || github === undefined) return '';
 
-  // The window between the engine's verdict and this message is the one another session can use.
-  // `beforeMessages` records the facts as they were; the re-read below decides whether they still
-  // hold. The reservation is taken only after it, so a session that moved the piece can finish.
-  const facts = await captureFacts(piece, store, root);
-  if (deps.beforeMessages !== undefined) await deps.beforeMessages();
-  const runId = `messages-${randomUUID()}`;
+  // The reservation is the same one the run held: with it in hand the state cannot move under
+  // this message, and another session that took the piece meanwhile wins.
   const held = await store.reserve(piece, runId, LEASE_MS);
   if (!held.ok) {
     return spanish(recipe.locale)
@@ -392,45 +582,12 @@ async function deliverOutcomeMessages(
   }
   try {
     const now = await captureFacts(piece, store, root);
-    if (JSON.stringify(now) !== JSON.stringify(facts)) {
+    if (!matchesOutcome(outcome.status, now, runId)) {
       return spanish(recipe.locale)
         ? 'El aviso al dueño ya no corresponde: la pieza avanzó mientras tanto.'
         : 'The owner message no longer applies: the piece moved on meanwhile.';
     }
-    return await deliverMessage(kind, piece, outcome.status, recipe, deps, store, github, root, facts);
-  } finally {
-    await store.release(piece, runId).catch(() => undefined);
-  }
-}
-
-async function deliverStart(
-  piece: string,
-  recipe: Recipe,
-  deps: AgentCliDeps,
-  store: Store,
-  github: AgentGitHub,
-  root: string,
-): Promise<string> {
-  if (recipe.messages === undefined) return '';
-  const runId = `start-${randomUUID()}`;
-  const held = await store.reserve(piece, runId, LEASE_MS);
-  if (!held.ok) return '';
-  try {
-    const current = await store.loadStatus(piece);
-    if (current !== undefined) return '';
-    const kind: OwnerMessageKind = 'start';
-    const key = messageKey(kind, piece, { piece, state: 'running' }, await captureFacts(piece, store, root));
-    const op = `owner-message:${kind}:${key}`;
-    const summary = summaryLines(recipe, root, piece);
-    const rendered = renderOwnerMessage(kind, {
-      locale: recipe.locale,
-      ...(summary === undefined ? {} : { summary }),
-      maxLength: recipe.messages.maxLength,
-      banned: [...DEFAULT_BANNED_TERMS, ...recipe.messages.bannedWords],
-    });
-    if ('refused' in rendered) return rendered.refused;
-    await messageEffect(store, piece, op, github, `${rendered.text}\n\n${markerOf(op)}`);
-    return '';
+    return await deliverMessage(kind, piece, outcome.status, recipe, store, github, root, now);
   } finally {
     await store.release(piece, runId).catch(() => undefined);
   }
@@ -511,8 +668,36 @@ async function commandRun(args: readonly string[], deps: AgentCliDeps): Promise<
     declared = read.kind === undefined ? {} : { kind: read.kind };
   }
 
-  const principal = edges.github !== undefined ? await edges.github.defaultBranch() : 'main';
-  const baseRef = await resolveBaseRef(root, principal);
+  // PLAN-13-R4 §2.2: the builders of the piece are every builder event on its issue. Without the
+  // list the sandboxed review cannot judge independence, so an issue that cannot be read stops
+  // the run as a technical failure — never a run with no builder in silence.
+  if (recipe.agentAccount !== undefined && edges.github !== undefined) {
+    try {
+      const events = await readPieceEvents(edges.github, Number(piece), {
+        agentAccount: recipe.agentAccount,
+      });
+      const builders = events
+        .filter((event) => event.type === 'builder')
+        .map((event) => ({
+          provider: event.identity.provider,
+          model: event.identity.model,
+          session: event.identity.session,
+        }));
+      declared = { ...declared, builders };
+    } catch (error) {
+      const text = spanish(recipe.locale)
+        ? `La corrida se detuvo por un fallo técnico al leer el issue de la pieza: ${safeTerminalText(reasonOf(error))}`
+        : `The run stopped on a technical failure while reading the piece's issue: ${safeTerminalText(reasonOf(error))}`;
+      await store
+        .saveStatus({ piece, state: 'blocked:technical', reason: text }, existing?.version)
+        .catch(() => undefined);
+      return { ok: false, text };
+    }
+  }
+
+  const principal = await principalOf(edges.github);
+  if (!principal.ok) return { ok: false, text: principal.text };
+  const baseRef = await resolveBaseRef(root, principal.branch);
   const runId = randomUUID();
 
   let compiled;
@@ -554,7 +739,7 @@ async function commandRun(args: readonly string[], deps: AgentCliDeps): Promise<
   const dryRun = parsed.bools.has('--dry-run');
   const notes: string[] = [];
   if (!dryRun && recipe.messages !== undefined && edges.github !== undefined && existing === undefined) {
-    const note = await deliverStart(piece, recipe, deps, store, edges.github, root);
+    const note = await deliverStart(piece, recipe, store, edges.github, root);
     if (note.length > 0) notes.push(note);
   }
 
@@ -565,8 +750,14 @@ async function commandRun(args: readonly string[], deps: AgentCliDeps): Promise<
     return { ok: false, text: safeTerminalText(reasonOf(error)) };
   }
 
+  // PLAN-13-R4 §6: the window between the engine's verdict and the owner message is the one
+  // another session can use. The test hook and any `beforeMessages` run here, before any read,
+  // so the message is judged against the outcome that motivated it and against this run.
+  if (deps.afterRun !== undefined) await deps.afterRun();
+  if (deps.beforeMessages !== undefined) await deps.beforeMessages();
+
   if (!dryRun && edges.github !== undefined) {
-    const note = await deliverOutcomeMessages(piece, outcome, recipe, deps, store, edges.github, root);
+    const note = await deliverOutcomeMessages(piece, outcome, recipe, store, edges.github, root, runId);
     if (note.length > 0) notes.push(note);
   }
 
@@ -699,14 +890,15 @@ async function commandSync(args: readonly string[], deps: AgentCliDeps): Promise
     return { ok: false, text: busyText(recipe.locale) };
   }
   try {
-    const principal = edges.github !== undefined ? await edges.github.defaultBranch() : 'main';
+    const principal = await principalOf(edges.github);
+    if (!principal.ok) return { ok: false, text: principal.text };
     try {
       await gitText(root, ['fetch', 'origin', branch]);
-      await gitText(root, ['fetch', 'origin', principal]);
+      await gitText(root, ['fetch', 'origin', principal.branch]);
     } catch (error) {
       return { ok: false, text: safeTerminalText(reasonOf(error)) };
     }
-    const baseRef = `origin/${principal}`;
+    const baseRef = `origin/${principal.branch}`;
     const remoteTip = await gitText(root, ['rev-parse', `origin/${branch}`]);
     const localHead = await gitText(root, ['rev-parse', 'HEAD']);
     if (remoteTip === localHead) {
@@ -953,23 +1145,31 @@ async function commandDoctor(deps: AgentCliDeps): Promise<CommandOutput> {
       }
     }
     if (loaded.recipe.owner !== undefined && deps.ghAccounts !== undefined) {
-      let accounts: readonly string[] = [];
+      const owner = loaded.recipe.owner;
       try {
-        accounts = await deps.ghAccounts();
-      } catch {
-        accounts = [];
-      }
-      if (accounts.includes(loaded.recipe.owner)) {
+        const accounts = await deps.ghAccounts();
+        const loggedIn = accounts.some((account) => account.toLowerCase() === owner.toLowerCase());
+        if (loggedIn) {
+          lines.push(
+            es
+              ? `Aviso: la cuenta que aprueba (${owner}) está abierta en esta máquina; un agente podría aprobar por ti.`
+              : `Warning: the account that approves (${owner}) is signed in on this machine; an agent could approve for you.`,
+          );
+        }
+      } catch (error) {
+        // A list that could not be read is said: silence could hide that the owner is signed in.
         lines.push(
           es
-            ? `Aviso: la cuenta que aprueba (${loaded.recipe.owner}) está abierta en esta máquina; un agente podría aprobar por ti.`
-            : `Warning: the account that approves (${loaded.recipe.owner}) is signed in on this machine; an agent could approve for you.`,
+            ? `No se pudieron leer las cuentas abiertas de GitHub: ${safeTerminalText(reasonOf(error))}.`
+            : `The GitHub accounts signed in could not be read: ${safeTerminalText(reasonOf(error))}.`,
         );
       }
     }
   }
 
-  return { ok: true, text: lines.join('\n') };
+  // `doctor` answers `ok: false` for what it checks and can fail: an unreadable recipe or a git
+  // too old. A warning (the owner signed in here) never blocks.
+  return { ok: loaded.ok && gitOkVersion, text: lines.join('\n') };
 }
 
 // ---------------------------------------------------------------------------------------------

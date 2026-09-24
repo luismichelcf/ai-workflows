@@ -322,7 +322,7 @@ function synced() {
   const p = project();
   const origin = mkdtempSync(join(tmpdir(), 'aiw-origin-'));
   folders.push(origin);
-  execFileSync('git', ['init', '-q', '--bare', origin]);
+  execFileSync('git', ['init', '-q', '--bare', '--initial-branch=main', origin]);
   git(p.root, 'remote', 'add', 'origin', origin);
   git(p.root, 'push', '-q', 'origin', 'main', BRANCH);
   const other = mkdtempSync(join(tmpdir(), 'aiw-other-'));
