@@ -831,3 +831,26 @@ que fallaba era el de inicio) y `sync` sin prueba de reserva perdida. Menores ap
 aprobación por comentario validada (nunca `/approve-judge-change`), un evento cuyo commit no se puede
 traer se ignora en vez de bloquear para siempre, `pass-env` no puede pasar credenciales, y un efecto
 que falla se nombra por su propio error y no como falla del almacén.
+
+**Ronda 3** (un revisor de correctitud y seguridad y otro de pruebas con 21 mutantes, sobre el cambio
+de la ronda 2; la CI de Windows fallaba en `browser-qa` y en `finish`). Nuevos bloqueantes, con su
+prueba: (1) nombrar bien el error de un efecto había hecho que un efecto fallido en una etapa
+opcional dejara llegar la pieza a `done` → cuenta como «en duda»; (2) en el servidor, un constructor
+cuyo commit no se podía traer salía de la exclusión, y cualquier falla al traer se tragaba → todas
+las identidades de constructor excluyen, solo «el objeto no existe» permite ignorar un evento y lo
+demás es técnico; (3) los nombres de las credenciales se comparaban distinguiendo mayúsculas
+(`pass-env: [gh_token]` pasaba el token en Windows) → sin distinguir en todas partes; (4) pruebas que
+faltaban: `sync` perdiendo la pieza entre dos registros, los comandos sin credenciales,
+`sandboxed-review` con un evento ilegible y `finish` con rutas escritas de otra forma. CI de Windows:
+el lanzador de PowerShell recibía el entorno mínimo del comando y se colgaba → el lanzador usa el
+entorno normal del motor (sin credenciales) y solo el hijo recibe el mínimo, como bloque explícito;
+`finish` compara rutas reales (nombres cortos 8.3 y mayúsculas). Tras esto la CI quedó en verde en
+Linux y Windows.
+
+**Ronda 4** (un revisor sobre el cambio de la ronda 3): confirmó cerrados los cuatro puntos y
+encontró uno más: el mismo «efecto en duda en etapa opcional» en los **bloques módulo del proyecto**
+(sin `reconcile`, con un `reconcile` que falla o al asentar la respuesta) → lanzan `EffectStillInDoubt`
+como los del motor; y pidió fijar con prueba que un veredicto ilegible más reciente que el que decide
+su ángulo deja la revisión técnica. Declarado: el lanzador de Windows informa «no se pudo iniciar» sin
+el detalle de la excepción (puede llevar rutas); si todos los eventos de constructor son ilegibles, la
+revisión se rechaza por «no se sabe quién construyó».
