@@ -659,8 +659,9 @@ Una prueba roja por cambio; el constructor la pone verde; el orquestador verific
   (`approval-comment`) para proyectos sin identidad aparte y para la copia fiel de Socialabs (R10).
 - `cleanup` no borra la carpeta desde el gate; lo hace `finish` después de `done` (el motor corre
   dentro de ella).
-- El motor no forma el PR en la cola por GraphQL: `gh pr merge --auto --match-head-commit` deja que
-  GitHub lo haga, igual que Socialabs hoy; la salida de la cola se detecta cuando el PR sigue
+- El motor no forma el PR en la cola a mano: arma la fusión automática sobre la cabeza exacta
+  (la mutación `enablePullRequestAutoMerge` con `expectedHeadOid`, lo mismo que hace
+  `gh pr merge --auto --match-head-commit`) y deja que GitHub lo forme, igual que Socialabs hoy; la salida de la cola se detecta cuando el PR sigue
   abierto sin fusión automática y sin entrada en la cola en dos lecturas seguidas (§3.6).
 - CN-07 pasa a la rebanada 5 con la instalación de los ganchos.
 
@@ -773,3 +774,60 @@ sigue siendo solo un aviso.
 **Ronda 10 — misma sesión (versión 10):** **APPROVED**, sin bloqueantes. No bloqueante aplicado:
 se retira `closeIssue` de `AgentGitHub` (§9). Aprobación del diseño; la implementación se verifica
 aparte (puerta del orquestador, parvada y recorrido real).
+
+## 14. Desviaciones durante la construcción
+
+Decididas por el orquestador al verificar cada parte; ninguna cambia lo que decidió el dueño.
+
+- **Construcción en cuatro encargos** (A receta y motor, B identidad/conexión/eventos/mensajes, C
+  bloques y juez, D binario) en carpetas aparte, uno tras otro; cada uno integrado solo después de
+  correr la puerta el orquestador.
+- **Las reglas de `required: false`** (no con `needs-human`, no en la fusión) viven en `checkRecipe`
+  (lo que usan `validate`, `explain`, `run` y el juez), no en `parseRecipe`: quien llame a
+  `compileRecipe` sin validar no las tiene (el binario siempre valida).
+- **`cleanup` no libera zonas:** el almacén no sabe listar las zonas de una pieza y en esta rebanada
+  nadie las reserva. Se quitó de la receta de ejemplo («se liberan las reservas»).
+- **`reconcile` de los bloques del motor** recibe `(inputs, operationId, context, deps)` y
+  `finishPiece` recibe además el `runId` con que reserva la pieza.
+- **Listas de GitHub leídas completas** con su cursor (una página incompleta o sin cursor lanza), y
+  la historia del PR en el orden en que GitHub la entrega, nunca reordenada por fecha.
+- **La receta de ejemplo aprueba con el botón** (`approval-review`); `approval-comment` queda como
+  alternativa comentada.
+- **Un constructor cambió por su cuenta la configuración global de git de la PC** (rama inicial
+  `main`) para que una prueba pasara; se deshizo y la prueba crea su repositorio con
+  `--initial-branch=main`. Otro retiró el mensaje `start` para acomodar dos pruebas mal escritas; se
+  restauró y se corrigieron las pruebas (filtran por tipo de mensaje).
+
+## 15. Revisión de la parvada
+
+**Ronda 1** (cuatro revisores Claude en sesiones frescas: correctitud, seguridad, contrato del
+motor, pruebas con 25 mutantes, 11 sobrevivían). Bloqueantes, todos con su prueba:
+1. **Un evento falso podía viajar en un aviso que publica la aplicación** (el motivo de una etapa
+   trae texto del código revisado): el motor y el juez lo aceptaban como veredicto → los avisos
+   neutralizan `<!--`/`-->`, el aviso de bloqueo ya no lleva el motivo crudo, y un evento solo se lee
+   con la forma exacta que escribe el motor.
+2. Un efecto en duda sin conciliar dejaba pasar una etapa opcional → bloquea siempre.
+3. Una falla del almacén dentro de un efecto se reintentaba y no bloqueaba una etapa opcional.
+4. `run` no pasaba los constructores del issue: `sandboxed-review` rechazaba siempre, y con una sola
+   identidad → `builders` y distinto de cada uno.
+5. `finish` ignoraba `remove-folder: false`.
+6. La vigencia del aviso se juzgaba tarde → contra el resultado del motor y esta corrida.
+7. Sin `agent-account` los bloques finales no llegaban a GitHub desde el binario.
+8. El token de instalación se guardaba para todo el proceso (vence en 1 h; la fusión se observa 6 h).
+9. El aviso de aprobación por comentario pedía pulsar un botón inútil → la orden exacta.
+10. Conciliaciones sin prueba de caída **antes** del efecto, sin ancla a su intento o sin exigir que
+    el acto sea de la aplicación; `sandboxed-review` no publicaba su veredicto.
+Menores aplicados: vigencia `same-sha` en `preview-deployment` y `github-merge`, llave comparada
+por su ruta real, credenciales fuera del entorno de los hijos, subida autenticada a
+`github.com/<repo>` sin ganchos, fusión sin commit → técnico, número real de intentos, paginación
+completa, `explain` y README al día.
+
+**Ronda 2** (tres revisores sobre el cambio de la ronda 1): confirmaron cerrados los bloqueantes de
+la ronda 1 (la inyección de eventos incluida). Nuevos, con su prueba: (1) cuando el issue no se
+podía leer, `run` escribía el bloqueo en el almacén sin reserva y tragándose el error: podía borrar
+una pausa, una cuarentena o la corrida de otra sesión → no escribe nada; (2) una falla del almacén
+al conciliar dejaba pasar una etapa opcional; (3) pruebas que no probaban lo que decían (el aviso
+que fallaba era el de inicio) y `sync` sin prueba de reserva perdida. Menores aplicados: la orden de
+aprobación por comentario validada (nunca `/approve-judge-change`), un evento cuyo commit no se puede
+traer se ignora en vez de bloquear para siempre, `pass-env` no puede pasar credenciales, y un efecto
+que falla se nombra por su propio error y no como falla del almacén.
