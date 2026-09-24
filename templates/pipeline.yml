@@ -90,15 +90,14 @@ stages:
     server: attestation
 
   - id: owner-approval
-    summary: "El dueño aprueba lo que se ve"
+    summary: "El dueño aprueba lo que se ve con el botón «Approve» de GitHub"
     after: review
     nature: attest
     needs-human: true
     applies-if: { touches-any: [visible] }
     valid-while: same-fingerprint
     gate:
-      uses: ai-workflows/approval-comment@1
-      with: { command: /approve }
+      uses: ai-workflows/approval-review@1   # o approval-comment@1 si los agentes publican con tu cuenta
     server: attestation
 
   - id: merge
@@ -121,7 +120,7 @@ stages:
     server: local-only
 
   - id: cleanup
-    summary: "Se limpia la carpeta de trabajo y se liberan las reservas de la pieza"
+    summary: "Se borra la rama y se retira la carpeta de trabajo de la pieza"
     after: after-merge
     phase: post-merge
     nature: recompute

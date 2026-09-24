@@ -75,9 +75,30 @@ declares the natures it may claim, the validity rules it accepts and its typed i
 | `command` | A project command within a time limit; optionally reads a Vitest run | recompute |
 | `scope-reconcile` | Records when the real files raise the kind (and so the lane) above what was declared | recompute |
 
-`independent-review`, `approval-comment`, `preview-deployment`, `browser-qa`, `github-merge`,
-`post-merge` and `cleanup` have manifests already and are built in slice 4; a recipe that uses
-them validates, and running them blocks with that reason.
+The final stages (slice 4, [PLAN-13-R4](docs/plans/PLAN-13-R4.md)):
+
+| Block | Checks | Nature |
+|---|---|---|
+| `independent-review` | The flock's verdicts published on the piece's issue: one fresh approving verdict per angle, each from another session (and, by default, another model family) than every builder | execution record + attest |
+| `approval-review` | The owner's last decisive review of the pull request (GitHub's "Approve" button) names a version the stage accepts | attest |
+| `approval-comment` | The same with a comment `/<command> <code>`, for projects whose agents publish with the owner's own account | attest + recompute |
+| `preview-deployment` | The newest deployment of this exact commit in an environment is successful, with an `https` address matching a pattern | recompute |
+| `browser-qa` | The project's browser suite, run against that preview with a fresh environment, writes one passing report per criterion of the plan | recompute |
+| `github-merge` | Pushes the judged commit, opens the pull request once, arms auto-merge on that exact head (or joins the merge queue) and watches it to the end | recompute |
+| `post-merge` | Named checks and a deployment of the merge commit are green | recompute |
+| `cleanup` | Deletes the remote branch at the merged head; the folder and local branch are retired by `finish` after `done` | recompute |
+
+Every external effect goes through `runEffect` with an operation id and a mark GitHub keeps (the
+pull request body, the comment, the branch activity, the pull request timeline). After a crash the
+engine reads that history: an act of the agents' own identity after the anchor of this attempt
+confirms the effect — even if a person undid it since, which is then respected, never repeated —
+and only the absence of that act together with a state compatible with "never happened" lets it
+run again. Anything else leaves the stage technical, naming the effect.
+
+A stage may say `required: false` (it is recorded and the piece goes on; tried again on every run
+until `finish`; a surviving process group, an effect in doubt or a store failure still block) and
+`retry: { attempts, wait-seconds }` (a rejection or an ordinary error is tried again; a skip, a
+person's pending answer or an effect in doubt never is).
 
 **Project blocks.** A *module* block (`kind: module`, `main: index.mjs`) is imported and called
 with the same context as any gate — journal, locale, mode, cancellation signal and `runEffect` —
@@ -116,7 +137,7 @@ the owner's words for `explain`.
 the manifests on its own; `deps.root` must be the top of the repository. Pass everything it
 returns to `createEngine` — `config`, `describeChange`, `confirmFacts` (the final check before a
 piece is done) and `confirmQuarantine` (without it a quarantined piece cannot be released).
-Wiring `run`, `status` and `stop` of the command line to the recipe arrives in slice 4.
+The command line runs the recipe next to the agent (below).
 
 The independence of a review is judged by provider and session: the same session under another
 model is still the builder (PLAN-13 R18).
@@ -142,7 +163,7 @@ allows, and `validate` enforces it:
 |---|---|
 | `recompute` | Runs the block's server check again on the pull request's files, read from git objects (spec structure, benchmark sources without reachability, scope) |
 | `require-check: <name>` | Requires that check — a check run or a commit status — green on the judged SHA (the pull request head, or the merge group SHA in the queue) |
-| `attestation` | Looks for the authenticated event: today the owner's approval comment (`approval-comment`); independent reviews arrive in slice 4 |
+| `attestation` | Looks for the authenticated event: the owner's review or comment on the pull request (`approval-review`, `approval-comment`), or the verdicts published on the piece's issue (`independent-review`, `sandboxed-review`) |
 | `local-only` | Only for post-merge stages or `required: false`: checked next to the agent only |
 
 **Pieces.** `pieces:` tells the judge which branch is which piece (`branch: ["*/{piece}-*"]`,
@@ -181,6 +202,52 @@ one that copies the link of a real judge run is not detected. A required check p
 outside Actions does not trigger the judge again; the next event or `workflow_dispatch` does. If
 GitHub's status API or Actions are down, nothing can be published, not even the green of `off`.
 An approval whose commit GitHub no longer delivers after a force push has to be given again.
+
+## Next to the agent: the command line
+
+```sh
+ai-workflows run <piece>        # runs the recipe for the piece of the current branch
+ai-workflows status [piece]     # plain-language state
+ai-workflows stop <piece> [why] # also: pause, resume — they work even with a broken recipe
+ai-workflows build <piece> --provider P --model M [--effort E] --prompt <file>
+ai-workflows review <piece> --angle A --provider P --model M [--effort E] --prompt <file>
+ai-workflows sync <piece>       # takes GitHub's "Update branch" merge, only if it is a clean update
+ai-workflows finish <piece>     # after done: retires the piece's worktree and local branch
+ai-workflows doctor
+```
+
+`run`, `build`, `review` and `sync` refuse an invalid recipe or a piece that is not the one of the
+current branch before touching anything. `build` and `review` run the coding CLI, observe its real
+identity and publish a builder or verdict event on the piece's issue; `independent-review` reads
+them. Progress lives in `refs/ai-workflows/*` of `origin` with a 15-minute lease.
+
+**The agents' own GitHub identity (R21).** Declare `agent-account: "<app-slug>[bot]"` in the recipe
+and everything the engine does on GitHub is done as a GitHub App, so the pull request is not the
+owner's and the owner can press "Approve" (GitHub never lets an author approve their own pull
+request). Setup, once:
+
+1. In the organization (or account) settings: Developer settings → GitHub Apps → New GitHub App.
+   No webhook. Repository permissions: Contents, Pull requests and Issues **read and write**;
+   Checks, Commit statuses, Deployments and Actions **read-only**. Installable only on this account.
+2. Note the App ID; generate a private key and keep the `.pem` **outside every repository**.
+3. Install the app on the repositories it will work on.
+4. On the machine that runs the engine: `AI_WORKFLOWS_APP_ID=<id>` and
+   `AI_WORKFLOWS_APP_KEY_FILE=<absolute path to the .pem>`.
+
+The engine signs a short JWT, mints an installation token for each call as needed and checks that
+the key belongs to `agent-account`; the token travels only in the environment of one call. The
+approval only means something if the owner's own GitHub session is **not** available on the
+machine where the agents run — `doctor` warns when it is. Without `agent-account` the engine
+acts as the account `gh` is logged in to, and `approval-comment` is the way to approve.
+
+**Messages to the owner.** With `messages:` in the recipe (`summary: { file, section }`,
+`max-length`, extra `banned-words`), the engine comments on the piece's issue when a piece starts,
+waits for the owner's approval or decision, stops, or is merged: the three summary lines first,
+never a banned word, never over the length, and never a raw technical reason. Each message is sent
+once, and only if it is still true when it would go out.
+
+If a pull request of the agents in the piece's branch lost its mark, the engine stops rather than
+open a second one: continue the piece in a new branch that still names it (`feat/13-algo-2`).
 
 ## Where progress lives on GitHub
 
