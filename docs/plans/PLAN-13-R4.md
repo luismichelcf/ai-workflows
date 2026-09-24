@@ -2,7 +2,7 @@
 
 Diseño de construcción de la rebanada 4 de [PLAN-13](PLAN-13.md) (issue #13). El plan decide
 *qué*; este documento fija *cómo*. Autor: Claude Opus 5.5 (orquestador). Revisor: GPT-6 Sol `high`
-(R12). Versión 3 · 24-sep-2026 · en revisión (corrige las rondas 1 y 2, §13). Constructor: DeepSeek V4.1 Flash `high` (R17).
+(R12). Versión 10 · 24-sep-2026 · **Aprobado** por GPT-6 Sol `high` en 10 rondas (§13). Constructor: DeepSeek V4.1 Flash `high` (R17).
 
 ## En tres líneas
 
@@ -173,16 +173,22 @@ identidad de §1 y tope de 120 s; en `dry-run` no publican ni cambian nada (lo d
 Función compartida `pullRequestOf(piece, sha, { create })`:
 1. Rama = la rama actual del árbol de la pieza (`git symbolic-ref --short HEAD`; cabeza suelta →
    técnico). Debe dar esta pieza por R19; si no, técnico.
-2. Busca los PRs de esa rama en **todos** los estados. Los que no pasan la **procedencia** (autor
-   `agent-account` cuando está declarado, cabeza del mismo repositorio, base = la principal) no se
-   usan para nada. Si queda exactamente uno `MERGED` con `headRefOid == sha`, lo devuelve sin subir
-   nada (reanudar tras una fusión que ocurrió con el motor caído); más de uno → técnico.
+2. Lee la lista **completa** de PRs de esa rama en todos los estados (se conserva entera). La
+   **procedencia** (autor `agent-account` cuando está declarado, cabeza del mismo repositorio, base =
+   la principal) se usa solo para **elegir** un PR fusionado o reutilizable, nunca para ocultar uno.
+   Si de los `MERGED` con `headRefOid == sha` exactamente uno tiene procedencia, lo devuelve sin
+   subir nada (reanudar tras una fusión que ocurrió con el motor caído); más de uno → técnico.
 3. Sube el `sha` juzgado a esa rama sin forzar (`git push origin <sha>:refs/heads/<rama>`) en
    `runEffect('push:<rama>:<sha>')`. Si la rama remota tiene commits que no están en `sha` → rechazo
    «la rama en GitHub tiene cambios que no están aquí» (se resuelve con `sync`, §8).
-4. De los PRs **abiertos** de esa rama: más de uno → técnico. Uno que no pasa la procedencia →
-   rechazo «este PR lo abrió <cuenta> (o apunta a otra base u otro repositorio); ciérralo para que
-   el motor abra uno propio (el dueño no puede aprobar lo suyo)». Uno que pasa → se usa. Ninguno y
+4. De los PRs **abiertos** de la lista completa: más de uno → técnico. Uno que no pasa la
+   procedencia → rechazo «este PR lo abrió <cuenta> (o apunta a otra base u otro repositorio);
+   ciérralo para que el motor abra uno propio (el dueño no puede aprobar lo suyo)», **sin** intentar
+   crear otro. Uno que pasa → se usa. Un PR de `agent-account` en esa rama, **abierto o cerrado**,
+   sin la marca de ninguna operación (alguien la borró del cuerpo) → técnico «no se sabe si este PR
+   es del motor (PR #N)», nunca se abre otro. Salida documentada (README): continuar la pieza en una
+   rama nueva que siga dando la misma pieza por R19 (p. ej. `feat/13-algo-2`), sin tocar el PR
+   viejo; el motor nunca trata la falta de marca como prueba de que no lo creó. Ninguno y
    `create` → `runEffect('open-pr:<rama>:<sha>')` lo crea en borrador (título = el del issue de la
    pieza; cuerpo = `Refs #<pieza>` más la marca `<!-- ai-workflows:op open-pr:<rama>:<sha> -->`).
 5. Exige `head == sha` y estado `OPEN`; si no, técnico «el PR no apunta a esta versión».
@@ -200,17 +206,22 @@ conciliador desde `run`.
 
 | Efecto (`operationId`) | Marca externa | Confirmado si… | No ocurrió si… |
 |---|---|---|---|
-| `push:<rama>:<sha>` | la punta de la rama remota | la punta es `sha` o lo contiene | la rama no existe o su punta es ancestro de `sha` |
-| `open-pr:<rama>:<sha>` | PR de esa rama, de `agent-account`, con la marca de **esa** operación en el cuerpo | hay exactamente uno (cualquier estado; si está cerrado, el paso 5 de §3.0 lo dice) | no hay ninguno con esa marca (un PR viejo de la rama sin la marca no cuenta) |
-| `ready:<pr>:<sha>` | `isDraft` | `false` | `true` |
+| `push:<rama>:<sha>` | actividad del repositorio (`GET repos/<repo>/activity?ref=refs/heads/<rama>`: tipo, actor, `before`, `after`) | hay una actividad de `agent-account` en esa rama con `after == sha` (aunque después alguien la haya borrado o movido: no se vuelve a subir, y el bloque rechaza «la rama cambió en GitHub») | no hay ninguna actividad de `agent-account` con `after == sha` **y** la punta actual es ancestro de `sha` o la rama no existe |
+| `open-pr:<rama>:<sha>` | PR de esa rama, de `agent-account`, con la marca de **esa** operación en el cuerpo | hay exactamente uno (cualquier estado; si está cerrado, el paso 5 de §3.0 lo dice) | no hay ninguno con esa marca **y** ningún PR de `agent-account` en esa rama carece de marca (uno sin marca, abierto o cerrado, → técnico) |
+| `ready:<pr>:<sha>` | historia del PR (`ReadyForReviewEvent`) | hay uno hecho por `agent-account` después del último cambio de cabeza (aunque ahora vuelva a estar en borrador: alguien lo devolvió, y el bloque lo rechaza «el PR volvió a borrador» en vez de marcarlo otra vez) | no hay ninguno y está en borrador |
 | `merge:<pr>:<sha>` | historia del PR (`timelineItems`: `AutoMergeEnabledEvent`, `AddedToMergeQueueEvent`, `MergedEvent`) | hay un evento de armado o de entrada a la cola hecho por `agent-account` **después** del último cambio de cabeza, o está `MERGED` (aunque ahora esté desarmado: alguien lo desarmó, y la observación lo rechaza en vez de volver a armar) | no hay ninguno de esos eventos y está abierto |
 | `verdict:<stage>:<sha>` | comentario con ese `op` | hay uno o más | no hay |
 | `owner-message:<tipo>:<clave>` | comentario con ese `op` | hay uno o más | no hay |
-| `close-issue:<n>` | estado del issue | cerrado | abierto |
-| `delete-branch:<rama>:<sha>` | la rama remota | no existe | su punta es `sha` |
+| `delete-branch:<rama>:<sha>` | actividad del repositorio (`branch_deletion` en esa rama) | hay un borrado de `agent-account` con `before == sha` (aunque alguien la haya recreado: no se vuelve a borrar, y la evidencia lo dice) | no hay ese borrado **y** la punta actual es `sha` |
 
-Cualquier otra lectura (varios PRs, una punta distinta, historia no confirmable, lectura fallida)
-→ la etapa queda técnica nombrando el efecto, nunca se repite a ciegas. **Se concilia solo con la
+Regla general: cada acto se busca en la historia **anclado a este intento** (el `sha` exacto en
+`push` y `delete-branch`; después del último cambio de cabeza en `ready` y `merge`, que solo esas
+operaciones hacen), así un acto viejo nunca confirma uno nuevo. Historia incompleta → técnico. «No ocurrió» exige **dos**
+cosas, la ausencia en la historia anclada de un acto de `agent-account` y un estado actual
+compatible con que nunca pasó; si la historia muestra el acto,
+es «confirmado» aunque el estado actual lo contradiga (alguien lo deshizo a mano, y se respeta).
+Cualquier otra lectura (varios PRs, una punta distinta sin historia, historia no confirmable,
+lectura fallida) → la etapa queda técnica nombrando el efecto, nunca se repite a ciegas. **Se concilia solo con la
 reserva de la pieza en la mano** (dentro de un gate ya la tiene; fuera, §6): un efecto `pending`
 de una sesión que sigue viva nunca se concilia, porque su reserva lo impide. Cada fila tiene su prueba de caída **antes** y
 **después** de la llamada externa (§10).
@@ -329,13 +340,15 @@ aquí sobre `mergeSha`. Condiciones por rutas (p. ej. migraciones) se expresan c
 
 ### 3.8 `cleanup@1` — recompute, fase `post-merge`
 
-Entradas: `merge-stage` (obligatoria), `delete-branch` (por omisión `true`), `close-issue` (por
-omisión `false`), `remove-folder` (por omisión `true`).
+Entradas: `merge-stage` (obligatoria), `delete-branch` (por omisión `true`), `remove-folder` (por
+omisión `true`). Cerrar el issue de la pieza **no** es parte del bloque (§4.1 del plan pide carpeta,
+rama, procesos hijos y reservas): el proyecto que lo quiera lo hace con un bloque propio (Socialabs,
+en la rebanada 6).
 En el gate: exige la fusión registrada; borra la rama remota solo si su punta es la cabeza fusionada
-(`git push origin --delete` con `--force-with-lease=<rama>:<headSha>`, en `runEffect`); cierra el
-issue si se pide (con el mensaje `close`, §6); libera las zonas que la pieza tenga reservadas.
+(`git push origin --delete` con `--force-with-lease=<rama>:<headSha>`, en `runEffect`); libera las
+zonas que la pieza tenga reservadas.
 Recurso ya ausente → se salta (se puede repetir). Evidencia (el único esquema que lee `finish`):
-`{ branch, headSha, mergeSha, issue, folder, removeFolder }`.
+`{ branch, headSha, mergeSha, folder, removeFolder }`.
 **La carpeta y la rama local no las borra el gate** (el motor corre dentro de la carpeta y la
 vuelve a leer para sellar). Lo hace `ai-workflows finish <pieza>`, que `run` llama solo al terminar
 en `done` y que también se puede correr a mano **desde la copia principal** (así una caída a mitad
@@ -348,10 +361,17 @@ se retoma aunque la carpeta ya no exista):
    carpeta ya se retiró se niega y lo dice.
 2. Carpeta: si existe, debe ser un *worktree* enlazado de este repositorio (nunca la copia
    principal), sin cambios sin guardar y con `HEAD == headSha`; entonces `git worktree remove` sin
-   forzar, ejecutado con `cwd` en la copia principal. Si ya no existe, `git worktree prune`.
+   forzar, ejecutado con `cwd` en la copia principal. Si ya no existe, se repara **solo** su registro: se busca en `git worktree list
+   --porcelain` la entrada con esa ruta; si su archivo `gitdir` en `.git/worktrees/<nombre>/` apunta
+   exactamente a `<carpeta>/.git`, se borra esa carpeta de administración y nada más. Nunca `git
+   worktree prune` (limpiaría los registros de otras piezas cuya carpeta esté en una unidad
+   desconectada).
 3. Rama local: si existe y su punta es `headSha` (la cabeza que GitHub fusionó, sea cual sea el
    método), `git branch -D`; si su punta es otra, no se toca y se dice. Si ya no existe, nada.
-4. Cada paso ya hecho se salta, así que repetir `finish` termina lo que faltaba. Un fallo no cambia
+4. Cada paso ya hecho se salta, así que repetir `finish` termina lo que faltaba. Cuando `run` lo
+   llama desde la carpeta que va a retirar, el proceso primero se muda a la copia principal
+   (`process.chdir`) y no deja nada abierto dentro de ella: en Windows una carpeta con algo abierto
+   no se borra. Un fallo no cambia
    `done`, pero la orden sale con error y dice qué quedó y cómo terminarlo.
 
 ## 4. El binario conectado a la receta
@@ -391,8 +411,9 @@ se retoma aunque la carpeta ya no exista):
 - **`required: false`:** si la etapa termina rechazada (`ok: false`) o su gate lanza un error
   ordinario, se registra así (`rejected`/`failed` con su motivo) y la pieza **sigue** con la
   siguiente etapa; `status` la muestra como «falló, no bloquea». Una etapa opcional fallida **no**
-  queda resuelta: se vuelve a intentar en cada corrida (el motor sigue reutilizando solo `passed` y
-  `skipped` vigentes), y nunca bloquea. **Siguen bloqueando aunque la etapa sea opcional:**
+  queda resuelta: se vuelve a intentar en cada corrida **hasta `finish`** (el motor sigue
+  reutilizando solo `passed` y `skipped` vigentes; después de `finish` la pieza está cerrada, §3.8),
+  y nunca bloquea. **Siguen bloqueando aunque la etapa sea opcional:**
   `ProcessTreeSurvived` (cuarentena), `EffectNeedsReconciliation` (efecto en duda), un fallo del
   almacén y la pérdida del arrendamiento. `validate` rechaza `required: false` con `needs-human:
   true` (esperar a una persona y no bloquear se contradicen) y en la etapa `phase: merge`.
@@ -426,8 +447,12 @@ messages:
 - **Con la reserva en la mano:** los mensajes que dependen del resultado (`approval`, `question`,
   `blocked`, `close`) se envían después de que el motor devuelve, así que `run` vuelve a reservar la
   pieza con su mismo `runId` antes de enviar (y concilia un mensaje `pending` solo entonces). Si otra
-  sesión la tomó en ese instante, no envía nada y lo dice: la otra sesión enviará los suyos. `start`
-  se envía dentro de la corrida, antes de la primera etapa.
+  sesión la tomó en ese instante, no envía nada y lo dice: la otra sesión enviará los suyos. Con la
+  reserva en la mano **vuelve a leer** estado, etapa y última entrada del diario de esa etapa, y los
+  hechos (`sha`); envía solo si siguen siendo exactamente los que motivaron el mensaje (misma etapa,
+  mismo estado, misma entrada por `at` y `runId`, mismo `sha`). Si otra corrida avanzó mientras
+  tanto, no envía nada: el aviso ya no corresponde. `start` se envía dentro de la corrida, antes de la
+  primera etapa.
 - Sin `messages:` no se envía nada (compatibilidad); `run` imprime lo mismo en la terminal siempre.
 
 ## 7. Cambios en el juez
@@ -481,8 +506,18 @@ renderEventComment(e: PieceEvent, locale: string): string;
 readPieceEvents(github: Pick<AgentGitHub, 'issueComments'>, piece: number, rules): Promise<PieceEvent[]>;
 
 // src/agent/github.ts — el borde con GitHub junto al agente, sobre createGhRunner
-interface AgentGitHub extends Pick<JudgeGitHub, 'defaultBranch' | 'pullRequest' | 'reviews' | 'issueComments' | 'comments' | 'checkRuns' | 'statuses' | 'forcePushedHeads'> {
-  pullRequestsOfBranch(branch: string, state: 'open' | 'all'): Promise<AgentPullRequest[]>;
+interface AgentPullRequest {
+  number: number; url: string; state: 'OPEN' | 'CLOSED' | 'MERGED'; isDraft: boolean;
+  headSha: string; headRef: string; headRepo: string; baseRef: string; author: string; body: string;
+  mergeCommit: string | null; autoMerge: boolean; inMergeQueue: boolean;
+}
+type PullRequestHistoryItem =
+  | { type: 'ready' | 'auto-merge-enabled' | 'added-to-queue' | 'merged' | 'head-changed'; actor: string | null; at: string };
+interface AgentGitHub extends Pick<JudgeGitHub, 'defaultBranch' | 'reviews' | 'issueComments' | 'comments' | 'checkRuns' | 'statuses' | 'forcePushedHeads'> {
+  pullRequestsOfBranch(branch: string): Promise<AgentPullRequest[]>;        // todos los estados, paginado; lanza si no es confirmable
+  pullRequestDetail(n: number): Promise<AgentPullRequest>;
+  pullRequestHistory(n: number): Promise<PullRequestHistoryItem[]>;          // timelineItems paginado completo; lanza si no es confirmable
+  branchActivity(branch: string): Promise<{ type: string; actor: string | null; before: string; after: string; at: string }[]>; // GET activity, paginado; lanza si no es confirmable
   createDraftPullRequest(o: { branch; base; title; body }): Promise<number>;
   issueTitle(n: number): Promise<string>;
   markReady(pr: number): Promise<void>;
@@ -490,7 +525,6 @@ interface AgentGitHub extends Pick<JudgeGitHub, 'defaultBranch' | 'pullRequest' 
   deployments(sha: string, environment: string): Promise<{ id: number; sha: string; creator: string }[]>;
   deploymentState(id: number): Promise<{ state: string; url: string | null } | undefined>;
   commentOnIssue(n: number, body: string): Promise<number>;
-  closeIssue(n: number): Promise<void>;
 }
 
 // src/approval/review.ts (§3.2), usada por el bloque y por el juez
@@ -521,8 +555,10 @@ selectVerdicts(o: { events: PieceEvent[]; head: string; validWhile: ValidWhile; 
 ```
 
 `FinalBlockDeps` = `EngineBlockDeps` + `github: AgentGitHub` + `git` (push con cabecera) + `sleep`
-inyectable. Las pruebas usan un `AgentGitHub` falso (borde externo), git real y el almacén en
-memoria; el puerto real se prueba contra `ai-workflows-pruebas`. Los nombres de módulos pueden
+inyectable. Las pruebas de los bloques usan un `AgentGitHub` falso (borde externo), git real y el
+almacén en memoria. El puerto real (`createAgentGitHub` sobre `createGhRunner`) se prueba **con la
+misma implementación** de dos formas: sobre un `gh` falso que devuelve respuestas grabadas de GitHub
+(paginación incompleta, página extra, campos ausentes → lanza) y contra `ai-workflows-pruebas`. Los nombres de módulos pueden
 cambiar si el constructor lo necesita; las firmas son las que usan las pruebas.
 
 ## 10. Casos y pruebas
@@ -535,9 +571,10 @@ Cada caso: motivo, estado resultante y ausencia de efectos, con su control posit
 | CN-12 | Dos `ai-workflows run` de la misma pieza a la vez sobre el almacén de GitHub en memoria (`StatePort` falso compartido): uno trabaja, el otro sale con «otra sesión la tiene» y no escribe diario ni efectos. Positivo: uno solo | sí: dos procesos reales contra el almacén del repositorio de pruebas |
 | CN-06 | Corte al escribir el diario durante la observación de `github-merge` (el almacén falla una vez): la segunda corrida retoma, no vuelve a armar la fusión (efecto confirmado) y termina. El PR se fusiona mientras el motor está caído: la corrida siguiente lo reconoce `MERGED` antes de subir nada y pasa. Positivo sin corte | — |
 | §3.0.1 | Por **cada** fila de la tabla: caída antes de la llamada externa (el conciliador responde «no ocurrió» y se hace una vez) y después (responde «confirmado» y no se repite); lectura ambigua → técnico que nombra el efecto | — |
-| §3.0 | PR abierto por el dueño en la rama → rechazo con el motivo; PR desde un fork o hacia otra base → no se usa; dos PRs abiertos → técnico; rama remota con commits ajenos → rechazo que manda a `sync`; PR `MERGED` de la rama hacia otra base, o abierto por otra cuenta → no hace pasar `github-merge` ni alimenta `post-merge`; dos `MERGED` válidos → técnico | — |
-| §3.0.1 historia | PR viejo cerrado de la misma rama sin la marca y caída antes de crear el nuevo → «no ocurrió», se crea uno; el dueño desarma la fusión entre el efecto y la conciliación → «confirmado» (por la historia) y la observación rechaza «alguien desarmó la fusión», sin volver a armar; historia ilegible → técnico | — |
-| Reserva fuera del gate | Dos procesos en la ventana entre el fin de `run` y el envío del mensaje: solo el que tiene la reserva envía o concilia; el otro no envía y lo dice; nunca dos comentarios | — |
+| §3.0 | PR abierto por el dueño en la rama → rechazo con el motivo y ningún intento de crear otro (el puerto falso lo cuenta); PR desde un fork o hacia otra base → no se usa; dos PRs abiertos → técnico; rama remota con commits ajenos → rechazo que manda a `sync`; PR `MERGED` de la rama hacia otra base, o abierto por otra cuenta → no hace pasar `github-merge` ni alimenta `post-merge`; dos `MERGED` válidos → técnico | — |
+| §3.0.1 historia | PR viejo cerrado de la misma rama con la marca de otra operación y caída antes de crear el nuevo → «no ocurrió», se crea uno; PR abierto de la aplicación sin marca → técnico, no se abre otro; el dueño devuelve el PR a borrador entre `ready` y su conciliación → confirmado, rechazo «volvió a borrador», no se marca otra vez; alguien borra o mueve la rama entre `push` y su conciliación → confirmado por la actividad, no se vuelve a subir y el bloque rechaza; alguien recrea la rama en el mismo SHA entre `delete-branch` y su conciliación → confirmado, no se vuelve a borrar; caída tras crear el PR y alguien le quita la marca y lo cierra → técnico, nunca un segundo PR (CN-13); el dueño desarma la fusión entre el efecto y la conciliación → «confirmado» (por la historia) y la observación rechaza «alguien desarmó la fusión», sin volver a armar; historia ilegible → técnico | — |
+| Reserva fuera del gate | Dos procesos en la ventana entre el fin de `run` y el envío del mensaje: solo el que tiene la reserva envía o concilia; el otro no envía y lo dice; nunca dos comentarios. Carrera en secuencia: la corrida A termina esperando aprobación, la B toma la pieza, recibe la aprobación y avanza; A vuelve a reservar → no envía «aprueba» | — |
+| Puerto real | `createAgentGitHub` sobre un `gh` falso con respuestas grabadas: historia en varias páginas se lee entera; página que falta o `hasNextPage` incoherente → lanza; campos ausentes → lanza | las mismas lecturas contra el repositorio de pruebas |
 | §2.2 | Constructor en dos tandas (dos eventos): el revisor de cualquiera de las dos sesiones se rechaza; `build` → commit del orquestador → `review` → pasa (el evento del constructor apunta al commit de partida); `build` que no cambió nada como único evento → «no se sabe quién construyó»; constructor seguido de un `sync` que mueve la base de fusión → sigue excluido; la pieza cambia `foo`, la principal añade `bar` y la pieza lo incorpora limpio: con `same-fingerprint` el veredicto anterior sigue contando en motor y juez (cada huella contra su propia base); veredicto de `S` con la misma huella que `H` cuenta con `same-fingerprint` y no con `same-sha`; con `…-or-clean-update` cuenta junto al agente tras un `sync` registrado y no en el juez; `REVISE` posterior a un `APPROVED` del mismo ángulo rechaza; motor y juez dan lo mismo sobre la misma tabla | — |
 | R21 | JWT firmado con una llave de prueba y verificado con su pública; token reutilizado hasta 5 min antes de vencer; llave dentro del repo → rechazo; cuenta distinta de `agent-account` → técnico; el token nunca aparece en un error; `validate` exige `agent-account` y lo distingue de `owner` | la aplicación real sube la rama, abre el PR y comenta; el autor que muestra GitHub es `<slug>[bot]` |
 | §2 | Evento válido; editado, de otra cuenta, de la app equivocada, con campo extra, de otra pieza → no vale; veredicto de un SHA que no cumple la vigencia (§2.2) → no cuenta; `build` y `review` publican solo con identidad observada; revisor que escribe el árbol → veredicto `approved: false` publicado y el bloque no pasa | `review` real publica en el issue de prueba |
@@ -548,7 +585,7 @@ Cada caso: motivo, estado resultante y ausencia de efectos, con su control posit
 | `browser-qa` | Comando falso (script de Node) que escribe reportes: falta uno, sobra uno, `failed`, `assertions: 0`, JSON inválido, salida ≠ 0, PR que cambió de cabeza durante la corrida → rechazo; vista previa de otro SHA → rechazo; el entorno del comando no tiene nada fuera de lo mínimo y `pass-env` (el script lo comprueba); comando que escribe dentro del árbol → técnico por el sellado; positivo: pasa, la instantánea y los archivos del árbol quedan idénticos antes y después, y la carpeta de reportes ya no existe | — |
 | `github-merge` | Puerto falso que avanza estados: fusiona → pasa con `mergeSha`; se cierra, cambia de cabeza, sale de la cola → rechazo; tope → rechazo y la siguiente corrida observa sin armar de nuevo; borrador → `ready`; tres errores de lectura seguidos se toleran, el cuarto es técnico | sí: fusión real (con y sin cola nativa, según la protección del repositorio de pruebas) |
 | `post-merge` | Check en curso, fallido, ausente; despliegue de producción de otro SHA; positivo | sí: un workflow de `main` de prueba sobre el commit de la fusión |
-| `cleanup` y `finish` | `finish` mientras otra sesión tiene la pieza → no toca nada; etapa opcional fallida seguida de `done` → `finish` retira la carpeta y `run` posterior se niega diciéndolo; Rama remota con otra punta → no se borra y lo dice; ya borrada → se salta; carpeta principal, con cambios sin guardar o con `HEAD` en otra punta → no se borra; rama local en otra punta → no se borra; caída después de borrar la carpeta y antes de la rama → `finish` desde la copia principal termina; fusiones `merge`, `squash` y `rebase` → la rama local se borra en las tres; positivo: rama y carpeta borradas tras `done` | sí: la rama desaparece y la carpeta temporal se retira |
+| `cleanup` y `finish` | `finish` mientras otra sesión tiene la pieza → no toca nada; carpeta ya ausente con otro *worktree* ausente de otra pieza → solo se retira el registro de esta; `run` que termina `done` y llama a `finish` desde la carpeta que retira (Windows y Linux) → la carpeta desaparece; etapa opcional fallida seguida de `done` → `finish` retira la carpeta y `run` posterior se niega diciéndolo; Rama remota con otra punta → no se borra y lo dice; ya borrada → se salta; carpeta principal, con cambios sin guardar o con `HEAD` en otra punta → no se borra; rama local en otra punta → no se borra; caída después de borrar la carpeta y antes de la rama → `finish` desde la copia principal termina; fusiones `merge`, `squash` y `rebase` → la rama local se borra en las tres; positivo: rama y carpeta borradas tras `done` | sí: la rama desaparece y la carpeta temporal se retira |
 | §5 | `retry` 3: rechaza dos veces y pasa → `passed`, una sola entrada; rechaza siempre → rechazo «tras 3 intentos»; parar durante la espera → `parked` sin `failed`; no reintenta `skipped`, `needs-human`, `ProcessTreeSurvived` ni `EffectNeedsReconciliation`. `required: false` rechazada y con fallo técnico → la pieza sigue y termina `done` con la entrada; la corrida siguiente la vuelve a intentar; opcional con `ProcessTreeSurvived` o con un efecto en duda → la pieza se bloquea igual; `validate` de las dos combinaciones prohibidas | — |
 | §6 | Resumen de tres líneas presente y ausente; palabra prohibida → versión mínima; largo excedido → mínima; mínima que aún falla → no se envía y se dice; no se repite al reanudar; sin `messages:` nada | un mensaje `approval` real en el issue de prueba |
 | §7 | `/approve-judge-change` con 15 caracteres → no vale; con 16 → vale; notas como `::warning::` | — |
@@ -644,3 +681,62 @@ No bloqueantes aplicados: `push` con la rama en su clave; aviso `blocked` por mo
 
 No bloqueantes aplicados: credencial de `git` por el entorno del subproceso (§1.2), §12 al día,
 redacción de §10.
+
+**Ronda 3 — misma sesión (versión 3):** REVISE; confirmó cerrados 1, 2, 3, 6 y 7 y dejó 5
+bloqueantes, aceptados:
+1. `ready` y `close-issue` se conciliaban por el estado actual → por la historia del PR y del issue;
+   un deshacer humano no se repite (§3.0.1).
+2. Un aviso atrasado podía salir tras el avance de otra corrida → con la reserva, se relee y solo se
+   envía si sigue vigente (§6).
+3. La procedencia del PR abierto tenía dos lecturas → lista completa conservada, procedencia solo
+   para elegir (§3.0).
+4. El puerto fijado no permitía observar lo que exige la conciliación → `AgentPullRequest` e
+   historia paginada explícitos, la misma implementación probada con `gh` falso y real (§9).
+5. `git worktree prune` limpiaba registros ajenos → reparación dirigida solo del registro de la
+   pieza (§3.8).
+
+No bloqueantes aplicados: PR de la aplicación sin marca → técnico; `finish` se muda de carpeta
+antes de retirar; el reintento de una opcional solo hasta `finish`.
+
+**Ronda 4 — misma sesión (versión 4):** REVISE, 3 bloqueantes, aceptados:
+1. `push` y `delete-branch` se conciliaban por el estado actual → por la actividad del repositorio
+   (actor, antes y después); regla general: «no ocurrió» exige ausencia en la historia **y** estado
+   compatible (§3.0.1).
+2. Un PR cerrado y sin marca permitía abrir un segundo → todo PR de la aplicación sin marca, abierto
+   o cerrado, es técnico (§3.0, §3.0.1).
+3. `close-issue` no tenía lectura del estado → `issueState` en el puerto; si el dueño reabre,
+   `cleanup` pasa sin volver a cerrar y lo registra (§3.0.1, §3.8, §9).
+
+**Ronda 5 — misma sesión (versión 5):** REVISE, 1 bloqueante, aceptado: la reapertura del issue se
+atribuía al dueño sin comprobarlo → `issueState` trae los eventos `closed`/`reopened` con su autor;
+solo una reapertura del `owner` deja pasar `cleanup`, cualquier otra la rechaza (§3.8, §9, §10). No
+bloqueante aplicado: el motivo del PR sin marca muestra su número y el README documenta la salida
+(una rama nueva de la misma pieza).
+
+**Ronda 6 — misma sesión (versión 6):** REVISE, 1 bloqueante, aceptado: un cierre del issue
+anterior al intento podía confirmarlo → cada conciliación busca el acto anclado a su intento (para
+`close-issue`, después de `mergedAt`), y la reapertura que cuenta es la posterior a ese cierre
+(§3.0.1, §3.8, §10).
+
+**Ronda 7 — misma sesión (versión 7):** REVISE, 1 bloqueante, aceptado: `mergedAt` no separaba un
+cierre de la aplicación ocurrido tras la fusión y antes de `cleanup` → el ancla es el último evento
+del issue leído justo antes de reclamar el cierre y **guardada como efecto**, así toda reanudación
+usa la misma (§3.0.1, §10).
+
+**Ronda 8 — misma sesión (versión 8):** REVISE, 2 bloqueantes, aceptados: el ancla guardada se
+reutilizaba entre intentos, y el puerto no daba un identificador del evento → el ancla pasa a ser
+el propio comentario marcado del cierre, que vive en GitHub con el `op` de la operación; la línea
+de tiempo del issue se lee completa y en su orden, cada evento con su `id`, y un issue sin cierres no es error (§3.0.1, §9,
+§10).
+
+**Ronda 9 — misma sesión (versión 9):** REVISE, 2 bloqueantes sobre el comentario-ancla del cierre
+del issue (contrato doble con el mensaje `close` y un comentario borrado que parecía «nada empezó»).
+**Decisión del orquestador:** cerrar el issue sale del bloque `cleanup`. §4.1 del plan no lo pide
+(carpeta, rama, procesos y reservas), fue la fuente de los bloqueantes de las rondas 3 a 9 y es
+propio de un proyecto: Socialabs lo hará con un bloque suyo en la rebanada 6. Se retiran la
+entrada `close-issue`, su efecto, `issueState` del puerto y sus pruebas; el mensaje `close` de §6
+sigue siendo solo un aviso.
+
+**Ronda 10 — misma sesión (versión 10):** **APPROVED**, sin bloqueantes. No bloqueante aplicado:
+se retira `closeIssue` de `AgentGitHub` (§9). Aprobación del diseño; la implementación se verifica
+aparte (puerta del orquestador, parvada y recorrido real).
