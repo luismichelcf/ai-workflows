@@ -478,7 +478,7 @@ describe('§5 from the recipe to the engine', () => {
     expect(received).toEqual([{ timeoutMinutes: 30, redStage: 'first' }, 'function']);
   });
 
-  it('refuses retry and required: false until slice 4, instead of ignoring them', async () => {
+  it('passes retry and required: false to the engine (PLAN-13-R4 §5)', async () => {
     const base = (extra: string) => recipeOf(lines(
       'version: 1',
       'locale: es',
@@ -498,8 +498,37 @@ describe('§5 from the recipe to the engine', () => {
       store: createMemoryStore(),
       extraBlocks: { 'ai-workflows/probe@1': probe().block },
     };
-    await expect(compileRecipe(base('    retry: { attempts: 2 }'), deps)).rejects.toThrow(/retry.*slice 4/);
-    await expect(compileRecipe(base('    required: false'), deps)).rejects.toThrow(/required: false.*slice 4/);
+    const retried = await compileRecipe(base('    retry: { attempts: 2, wait-seconds: 30 }'), deps);
+    expect(retried.config.stages[0]).toMatchObject({ retry: { attempts: 2, waitMs: 30_000 } });
+    const noWait = await compileRecipe(base('    retry: { attempts: 3 }'), deps);
+    expect(noWait.config.stages[0]).toMatchObject({ retry: { attempts: 3, waitMs: 0 } });
+    const plain = await compileRecipe(base(''), deps);
+    expect(plain.config.stages[0]?.retry).toBeUndefined();
+    expect(plain.config.stages[0]?.required).not.toBe(false);
+
+    const optional = await compileRecipe(recipeOf(lines(
+      'version: 1',
+      'locale: es',
+      'stages:',
+      '  - id: sweep',
+      '    summary: "Barrido"',
+      '    required: false',
+      '    nature: recompute',
+      '    gate:',
+      '      uses: ai-workflows/probe@1',
+      '    server: local-only',
+      '  - id: only',
+      '    summary: "Uno"',
+      '    after: sweep',
+      '    phase: merge',
+      '    nature: recompute',
+      '    gate:',
+      '      uses: ai-workflows/probe@1',
+    )), deps);
+    expect(optional.config.stages.map((stage) => [stage.name, stage.required])).toEqual([
+      ['sweep', false],
+      ['only', true],
+    ]);
   });
 
   it('refuses a block it does not know', async () => {

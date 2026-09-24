@@ -52,7 +52,8 @@ agent-account: "mi-motor[bot]"         # la identidad con que publican los agent
   etapa usa `approval-review` o `independent-review`, o `sandboxed-review` con `server:
   attestation` (§2). Sin él, esas etapas no validan; `approval-comment` sigue funcionando con la
   cuenta de `gh` (el camino de hoy en Socialabs).
-- `agent-account` distinto de `owner` (rechazo si son iguales ignorando mayúsculas).
+- `agent-account` nunca coincide con `owner`: el patrón exige el sufijo `[bot]`, que una cuenta de
+  persona no puede tener.
 
 ### 1.2 Cómo obtiene el motor el permiso
 

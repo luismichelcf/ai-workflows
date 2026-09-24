@@ -22,9 +22,9 @@ describe('the published recipe schema', () => {
     expect([...recipeSchema.required].sort()).toEqual(['locale', 'stages', 'version']);
   });
 
-  it('allows at the top only the keys of §3.3, plus lanes and labels (R15, R16) and pieces (R19)', () => {
+  it('allows at the top only the keys of §3.3, plus lanes and labels (R15, R16), pieces (R19), agent-account (R21) and messages (PLAN-13-R4 §6)', () => {
     expect(Object.keys(recipeSchema.properties).sort()).toEqual(
-      ['classify', 'kinds', 'labels', 'lanes', 'locale', 'owner', 'pieces', 'stages', 'version'].sort(),
+      ['agent-account', 'classify', 'kinds', 'labels', 'lanes', 'locale', 'messages', 'owner', 'pieces', 'stages', 'version'].sort(),
     );
   });
 
