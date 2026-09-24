@@ -2,21 +2,24 @@ import { execFile } from 'node:child_process';
 import { realpathSync } from 'node:fs';
 import { resolve } from 'node:path';
 
-import type {
-  Gate,
-  GateContext,
-  GateResult,
-  JsonValue,
-  PipelineConfig,
-  StageConfig,
-  Store,
+import {
+  EffectNeedsReconciliation,
+  type Gate,
+  type GateContext,
+  type GateResult,
+  type JsonValue,
+  type PipelineConfig,
+  type StageConfig,
+  type Store,
 } from '../contract.js';
 import { createCommandGate } from '../blocks/command-block.js';
 import { confirmEmptyGroup } from '../blocks/confirm-empty.js';
 import type {
+  AgentDeps,
   BlockDefinition,
   EngineBlockDeps,
   ProviderRunner,
+  ReconcileAnswer,
 } from '../blocks/definition.js';
 import type { BlockManifest } from '../blocks/manifest.js';
 import { createModuleGate } from '../blocks/module-block.js';
@@ -72,6 +75,8 @@ export interface CompileRecipeDeps {
   readonly processGroups?: ProcessGroupControl;
   /** How a block runs a coding CLI. Defaults to the real process group. */
   readonly providers?: ProviderRunner;
+  /** PLAN-13-R4 §3.0: the GitHub edge the final blocks receive. */
+  readonly agent?: AgentDeps;
   readonly limits?: CompileLimits;
 }
 
@@ -215,6 +220,55 @@ function sealedGate(gate: Gate, root: string): Gate {
       };
     }
     return result;
+  };
+}
+
+/**
+ * PLAN-13-R4 §3.0.1: an engine block with effects exports `reconcile`. When its gate leaves an
+ * effect in doubt (`EffectNeedsReconciliation`), the reconciler reads the outside world, settles
+ * the effect in the store, and the block is run one more time — never retried blindly. A
+ * reconciler that cannot answer leaves the piece technical, naming the effect.
+ */
+function reconcilableGate(
+  gate: Gate,
+  definition: BlockDefinition,
+  inputs: Record<string, unknown>,
+  engineDeps: EngineBlockDeps,
+  store: Store,
+): Gate {
+  const reconcile = definition.reconcile;
+  if (reconcile === undefined) return gate;
+
+  const cannot = (operationId: string): Error =>
+    new Error(`effect "${operationId}" is in doubt and the block cannot reconcile it`);
+
+  return async (context: GateContext): Promise<GateResult> => {
+    try {
+      return await gate(context);
+    } catch (error) {
+      if (!(error instanceof EffectNeedsReconciliation)) throw error;
+
+      const operationId = error.operationId;
+      let answer: ReconcileAnswer;
+      try {
+        answer = await reconcile(inputs, operationId, context, engineDeps);
+      } catch (failure) {
+        const message = failure instanceof Error ? failure.message : String(failure);
+        throw new Error(
+          `effect "${operationId}" is in doubt and reconciling it failed: ${message}`,
+        );
+      }
+      if (typeof answer !== 'object' || answer === null) throw cannot(operationId);
+      if ('didNotHappen' in answer) {
+        await store.reconcileEffect(context.piece, operationId, { didNotHappen: true });
+      } else if ('confirmed' in answer) {
+        await store.reconcileEffect(context.piece, operationId, { confirmed: answer.confirmed });
+      } else {
+        throw cannot(operationId);
+      }
+      // The effect is settled now: run the block one more time, and only once.
+      return await gate(context);
+    }
   };
 }
 
@@ -438,6 +492,7 @@ export async function compileRecipe(
       store: deps.store,
       providers,
       recipe,
+      ...(deps.agent === undefined ? {} : { agent: deps.agent }),
       recordCleanUpdate: (update) =>
         recordCleanUpdate({
           store: deps.store,
@@ -448,7 +503,13 @@ export async function compileRecipe(
           to: update.to,
         }),
     };
-    const gate = definition.create(inputs, engineDeps);
+    const gate = reconcilableGate(
+      definition.create(inputs, engineDeps),
+      definition,
+      inputs,
+      engineDeps,
+      deps.store,
+    );
     const appliesWhen = appliesIfFor(recipe, stage.id);
 
     stages.push({

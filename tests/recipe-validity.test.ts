@@ -551,7 +551,7 @@ describe('§5 from the recipe to the engine', () => {
     })).rejects.toThrow(/unknown engine block "ai-workflows\/ghost@1"/);
   });
 
-  it('a block of slice 4 blocks the piece technically, saying so', async () => {
+  it('a final block without the GitHub identity blocks the piece technically, saying so (PLAN-13-R4 §3)', async () => {
     const recipe = recipeOf(lines(
       'version: 1',
       'locale: es',
@@ -571,7 +571,7 @@ describe('§5 from the recipe to the engine', () => {
     const engine = createEngine({ config: compiled.config, store, describeChange: compiled.describeChange });
     expect(await engine.run('42')).toMatchObject({
       outcome: 'ran',
-      status: { state: 'blocked:technical', stage: 'only', reason: expect.stringMatching(/not built yet \(slice 4\)/) },
+      status: { state: 'blocked:technical', stage: 'only', reason: expect.stringMatching(/identidad de GitHub|GitHub identity/) },
     });
   });
 });

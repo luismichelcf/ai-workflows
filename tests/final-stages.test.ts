@@ -380,7 +380,7 @@ describe('independent-review next to the agent', () => {
   it('refuses a reviewer that is the same session as any builder, even under another model (R18)', async () => {
     const setup = reviewed([]);
     const events = setup.github.issueCommentsOf.get(Number(PIECE)) ?? [];
-    events.push(event(builder(setup.base, 'x'.repeat(40), 'ses_seguridad'), '2026-09-24T09:05:00Z'));
+    events.push(event(builder(setup.base, '7'.repeat(40), 'ses_seguridad'), '2026-09-24T09:05:00Z'));
     events.push(event(verdict(setup.head, 'seguridad', { identity: { provider: 'opencode', model: 'otro-modelo', effort: 'high', session: 'ses_seguridad' } }), '2026-09-24T10:00:00Z'));
     events.push(event(verdict(setup.head, 'arquitectura'), '2026-09-24T10:01:00Z'));
     const run = await runFinal(setup.root, setup.github, preMerge(REVIEW));

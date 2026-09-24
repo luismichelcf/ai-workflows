@@ -392,6 +392,7 @@ function serverAttestContext(stage: RecipeStage, work: StageWork): ServerAttestC
     validWhile: stage.validWhile,
     ...(work.recipe.owner === undefined ? {} : { owner: work.recipe.owner }),
     pullRequest: work.target.pr,
+    stage: stage.id,
     github: work.github,
     fetchObjects: work.fetchObjects,
   };

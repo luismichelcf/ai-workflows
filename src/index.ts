@@ -87,6 +87,7 @@ export {
 } from './commands.js';
 export {
   sameExecution,
+  familyOf,
   requireDifferentBuilder,
   requireFreshVerdicts,
   type ExecutionIdentity,
@@ -120,10 +121,12 @@ export { checkRecipe } from './recipe/blocks.js';
 export type { CheckRecipeResult } from './recipe/blocks.js';
 export { engineBlockManifest, engineBlock } from './blocks/registry.js';
 export type {
+  AgentDeps,
   BlockDefinition,
   EngineBlockDeps,
   ProviderRunner,
   ProviderRunOptions,
+  ReconcileAnswer,
   ServerCapability,
   ServerContext,
   ServerAttestContext,

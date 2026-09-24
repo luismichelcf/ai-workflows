@@ -43,6 +43,33 @@ function isFullSha(value: string): boolean {
   return FULL_SHA.test(value);
 }
 
+/** The families behind the provider names and the model prefixes of this house. */
+const FAMILIES: Readonly<Record<string, string>> = {
+  claude: 'anthropic',
+  anthropic: 'anthropic',
+  codex: 'openai',
+  openai: 'openai',
+  gemini: 'google',
+  google: 'google',
+  antigravity: 'google',
+  deepseek: 'deepseek',
+};
+
+/**
+ * PLAN-13-R4 §3.1, §3.3 of the slice's review: the family a reviewer or builder belongs to,
+ * from its provider or — when the provider is not one of the known names — its model prefix.
+ */
+export function familyOf(identity: Pick<ExecutionIdentity, 'provider' | 'model'>): string {
+  const provider = identity.provider.toLowerCase();
+  const byProvider = FAMILIES[provider];
+  if (byProvider !== undefined) return byProvider;
+
+  const model = identity.model.toLowerCase();
+  const slash = model.indexOf('/');
+  const token = slash >= 0 ? model.slice(0, slash) : (model.split('-')[0] ?? model);
+  return FAMILIES[token] ?? token;
+}
+
 export function sameExecution(a: ExecutionIdentity, b: ExecutionIdentity): boolean {
   // An empty provider or session is not an identity. Two unknown sessions cannot be shown
   // to be the same run, so the only safe reading is "not the same execution".

@@ -1,164 +1,25 @@
 import type { BlockDefinition } from './definition.js';
 import type { BlockManifest } from './manifest.js';
-import { approvalCommentAttestation } from '../judge/attest.js';
+import { approvalCommentBlock } from './approval-comment.js';
+import { approvalReviewBlock } from './approval-review.js';
 import { benchmarkSourcesBlock } from './benchmark-sources.js';
+import { browserQaBlock } from './browser-qa.js';
 import { buildVerifyBlock } from './build-verify.js';
+import { cleanupBlock } from './cleanup.js';
 import { commandBlock } from './command.js';
+import { githubMergeBlock } from './github-merge.js';
+import { independentReviewBlock } from './independent-review.js';
+import { postMergeBlock } from './post-merge.js';
+import { previewDeploymentBlock } from './preview-deployment.js';
 import { redTestBlock } from './red-test.js';
 import { sandboxedReviewBlock } from './sandboxed-review.js';
 import { scopeReconcileBlock } from './scope-reconcile.js';
 import { specStructureBlock } from './spec-structure.js';
 
-// PLAN-13-R2 §2.1, §3 and §3.8: the manifests of this slice's engine blocks. They declare
-// what each block permits — natures, validity and inputs — before any of them is built. The
-// blocks of slice 4 (`independent-review`, `approval-comment`, `preview-deployment`,
-// `browser-qa`, `github-merge`, `post-merge`, `cleanup`) carry only a manifest here.
-//
-// `spec-structure`, `benchmark-sources`, `command`, `red-test`, `build-verify`,
-// `sandboxed-review` and `scope-reconcile` are built: their definitions — manifest included —
-// live in their own files, so there is one source of truth for each. Every other block is a
-// `BlockDefinition` whose `create` reports it is not built yet.
+// PLAN-13-R2 §2.1, §3 and §3.8: the engine blocks. Their definitions — manifest included — live
+// in their own files, so there is one source of truth for each.
 
-const MANIFESTS: Readonly<Record<string, BlockManifest>> = {
-  'independent-review': {
-    name: 'independent-review',
-    kind: 'module',
-    natures: ['execution-record', 'attest'],
-    validWhile: ['same-sha', 'same-fingerprint', 'same-fingerprint-or-clean-update'],
-    server: ['attestation', 'require-check'],
-    inputs: {
-      'forbid-same-family': { type: 'boolean', default: true },
-      angles: { type: 'string-list', required: true, minItems: 1 },
-    },
-  },
-
-  // PLAN-13-R4 §3.2 (R21): the owner approves with GitHub's button, read by attestation.
-  'approval-review': {
-    name: 'approval-review',
-    kind: 'module',
-    natures: ['attest'],
-    validWhile: ['same-sha', 'same-fingerprint', 'same-fingerprint-or-clean-update'],
-    server: ['attestation', 'require-check'],
-    inputs: {},
-  },
-
-  'approval-comment': {
-    name: 'approval-comment',
-    kind: 'module',
-    natures: ['attest', 'recompute'],
-    validWhile: ['same-sha', 'same-fingerprint', 'same-fingerprint-or-clean-update'],
-    server: ['attestation', 'require-check'],
-    inputs: {
-      command: { type: 'string', default: '/approve' },
-      'code-length': { type: 'integer', min: 4, max: 40, default: 7 },
-    },
-  },
-
-  'preview-deployment': {
-    name: 'preview-deployment',
-    kind: 'module',
-    natures: ['recompute'],
-    server: ['require-check'],
-    inputs: {
-      environment: { type: 'string', required: true },
-      creator: { type: 'string' },
-      'url-pattern': { type: 'string' },
-    },
-  },
-
-  'browser-qa': {
-    name: 'browser-qa',
-    kind: 'module',
-    natures: ['recompute'],
-    validWhile: ['same-sha'],
-    server: ['require-check'],
-    inputs: {
-      command: { type: 'command', required: true },
-      'preview-stage': { type: 'string', required: true },
-      criteria: {
-        type: 'object',
-        required: true,
-        fields: {
-          file: { type: 'string', required: true },
-          section: { type: 'string', required: true },
-          'id-prefix': { type: 'string', required: true },
-        },
-      },
-      'pass-env': { type: 'string-list' },
-      'timeout-minutes': { type: 'integer', min: 1, max: 120, default: 30 },
-    },
-  },
-
-  'github-merge': {
-    name: 'github-merge',
-    kind: 'module',
-    natures: ['recompute'],
-    server: [],
-    inputs: {
-      method: { type: 'string', enum: ['merge', 'squash', 'rebase'], default: 'merge' },
-      'timeout-minutes': { type: 'integer', min: 1, max: 1440, default: 360 },
-      'poll-seconds': { type: 'integer', min: 10, max: 300, default: 30 },
-    },
-  },
-
-  'post-merge': {
-    name: 'post-merge',
-    kind: 'module',
-    natures: ['recompute'],
-    server: [],
-    inputs: {
-      'merge-stage': { type: 'string', required: true },
-      checks: { type: 'string-list' },
-      deployment: {
-        type: 'object',
-        fields: {
-          environment: { type: 'string', required: true },
-          creator: { type: 'string' },
-        },
-      },
-    },
-  },
-
-  cleanup: {
-    name: 'cleanup',
-    kind: 'module',
-    natures: ['recompute'],
-    server: [],
-    inputs: {
-      'merge-stage': { type: 'string', required: true },
-      'delete-branch': { type: 'boolean', default: true },
-      'remove-folder': { type: 'boolean', default: true },
-    },
-  },
-};
-
-const ENGINE_MAJOR = 1;
-const ENGINE_USES = /^ai-workflows\/([a-z][a-z0-9-]*)@([1-9][0-9]*)$/;
-
-/** The blocks of slice 4. Until they are built their gate blocks the piece saying so. */
-const SLICE_FOUR: ReadonlySet<string> = new Set([
-  'independent-review',
-  'approval-review',
-  'approval-comment',
-  'preview-deployment',
-  'browser-qa',
-  'github-merge',
-  'post-merge',
-  'cleanup',
-]);
-
-/** A gate that always blocks, naming the slice that will build it. */
-function notBuilt(name: string): BlockDefinition {
-  const slice = SLICE_FOUR.has(name) ? 4 : 2;
-  return {
-    manifest: MANIFESTS[name] as BlockManifest,
-    create: () => () => {
-      throw new Error(`block "ai-workflows/${name}@1" is not built yet (slice ${slice})`);
-    },
-  };
-}
-
-/** The blocks of this slice that are actually built, with their definitions and manifests. */
+/** The blocks built so far, by name. */
 const BUILT: Readonly<Record<string, BlockDefinition>> = {
   'spec-structure': specStructureBlock,
   'benchmark-sources': benchmarkSourcesBlock,
@@ -167,21 +28,20 @@ const BUILT: Readonly<Record<string, BlockDefinition>> = {
   'build-verify': buildVerifyBlock,
   'sandboxed-review': sandboxedReviewBlock,
   'scope-reconcile': scopeReconcileBlock,
-  // PLAN-13-R3 §3.6: its gate next to the agent arrives in slice 4, but the judge can already
-  // read the owner's approval published on the pull request.
-  'approval-comment': {
-    manifest: MANIFESTS['approval-comment'] as BlockManifest,
-    create: () => () => {
-      throw new Error('block "ai-workflows/approval-comment@1" is not built yet (slice 4)');
-    },
-    server: { attestation: approvalCommentAttestation },
-  },
+  'independent-review': independentReviewBlock,
+  'approval-review': approvalReviewBlock,
+  'approval-comment': approvalCommentBlock,
+  'preview-deployment': previewDeploymentBlock,
+  'browser-qa': browserQaBlock,
+  'github-merge': githubMergeBlock,
+  'post-merge': postMergeBlock,
+  cleanup: cleanupBlock,
 };
 
-export const ENGINE_BLOCKS: Readonly<Record<string, BlockDefinition>> = Object.fromEntries([
-  ...Object.keys(MANIFESTS).map((name) => [name, notBuilt(name)] as const),
-  ...Object.entries(BUILT),
-]);
+const ENGINE_MAJOR = 1;
+const ENGINE_USES = /^ai-workflows\/([a-z][a-z0-9-]*)@([1-9][0-9]*)$/;
+
+export const ENGINE_BLOCKS: Readonly<Record<string, BlockDefinition>> = BUILT;
 
 /** The definition of `ai-workflows/<name>@<major>`, or undefined when it does not exist. */
 export function engineBlock(uses: string): BlockDefinition | undefined {
