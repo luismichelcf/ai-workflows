@@ -192,7 +192,8 @@ function githubLines(stage: RecipeStage, words: ExplainWords): readonly string[]
   // A review block reads the verdicts the agents publish on the piece's issue; every other
   // attestation reads what the owner published on the pull request (PLAN-13-R4 §3.1, §7).
   const verdictOfReview =
-    mode === 'attestation' && stage.gate.uses === 'ai-workflows/sandboxed-review@1';
+    mode === 'attestation' &&
+    (stage.gate.uses === 'ai-workflows/sandboxed-review@1' || stage.gate.uses === 'ai-workflows/independent-review@1');
   const lines = [verdictOfReview ? words.attestationVerdicts : words.github[mode]];
   if (mode === 'require-check' && stage.nature === 'execution-record') {
     lines.push(words.githubOrder);

@@ -100,9 +100,9 @@ describe('§2.1: engine blocks have manifests', () => {
     'scope-reconcile': { natures: ['recompute'] },
     'independent-review': { natures: ['execution-record', 'attest'], validWhile: ['same-sha', 'same-fingerprint', 'same-fingerprint-or-clean-update'] },
     'approval-comment': { natures: ['attest', 'recompute'], validWhile: ['same-sha', 'same-fingerprint', 'same-fingerprint-or-clean-update'] },
-    'preview-deployment': { natures: ['recompute'] },
+    'preview-deployment': { natures: ['recompute'], validWhile: ['same-sha'] },
     'browser-qa': { natures: ['recompute'], validWhile: ['same-sha'] },
-    'github-merge': { natures: ['recompute'] },
+    'github-merge': { natures: ['recompute'], validWhile: ['same-sha'] },
     'post-merge': { natures: ['recompute'] },
     cleanup: { natures: ['recompute'] },
   };

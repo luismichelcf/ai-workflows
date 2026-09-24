@@ -72,7 +72,7 @@ const EXPECTED_TEMPLATE_ES = [
   '5. Revisores independientes aprueban el cambio final.',
   '   Cuándo: solo si el cambio toca «seguridad y permisos» o «producción».',
   '   Vale mientras el código no cambie, salvo por actualizaciones sin conflictos con la versión principal.',
-  '   En GitHub: se busca la aprobación publicada en el PR.',
+  '   En GitHub: se buscan los veredictos publicados en el issue de la pieza.',
   '   En GitHub, una actualización con la versión principal pide aprobarla otra vez.',
   '   Si no se cumple: la pieza se detiene hasta corregirlo.',
   '6. El dueño aprueba lo que se ve con el botón «Approve» de GitHub.',
