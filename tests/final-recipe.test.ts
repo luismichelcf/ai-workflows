@@ -296,10 +296,11 @@ describe('the manifests of the final blocks', () => {
   });
 
   it('browser-qa must point at an earlier preview-deployment stage', async () => {
-    const rows = replaced(finalRecipe(), 'preview-stage: preview', 'preview-stage: review');
-    const row = rowOf(rows, 'preview-stage: review');
+    // `approval` appears once in its row; `review` would also match inside `preview-stage`.
+    const rows = replaced(finalRecipe(), 'preview-stage: preview', 'preview-stage: approval');
+    const row = rowOf(rows, 'preview-stage: approval');
     expect(await errorsOf(rows)).toContainEqual(
-      at(place(rows, row, 'review'), /input "preview-stage" must name an earlier stage that uses ai-workflows\/preview-deployment@1/),
+      at(place(rows, row, 'approval'), /input "preview-stage" must name an earlier stage that uses ai-workflows\/preview-deployment@1/),
     );
   });
 
