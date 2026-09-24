@@ -63,13 +63,15 @@ describe('mergeQueue', () => {
     ['no page information', queueAnswer([entry(1, 'b1', 'm0', 7)], null)],
     ['a repeated position', queueAnswer([entry(1, 'b1', 'm0', 7), entry(1, 'b2', 'b1', 8)])],
     ['a position that is not a positive integer', queueAnswer([entry(0, 'b1', 'm0', 7)])],
-    ['an entry without its base', queueAnswer([{ position: 1, headCommit: { oid: 'b1' }, pullRequest: { number: 7 } }])],
+    ['an entry without its pull request', queueAnswer([{ position: 1, headCommit: { oid: 'b1' }, baseCommit: { oid: 'm0' } }])],
     ['no list at all', ok({ data: { repository: { mergeQueue: null } } })],
   ];
   for (const [what, answer] of unconfirmable) {
-    it(`throws on ${what}`, async () => {
+    it(`throws on ${what}, as a hard error (never "not ready yet", which would be read again)`, async () => {
       const gh = fakeGh([[/graphql/, answer]]);
-      await expect(createJudgeGitHub({ repository: REPO, runner: gh.runner }).mergeQueue('main')).rejects.toThrow();
+      const read = createJudgeGitHub({ repository: REPO, runner: gh.runner }).mergeQueue('main');
+      await expect(read).rejects.toThrow();
+      await expect(read).rejects.not.toBeInstanceOf(MergeQueueNotReady);
     });
   }
 });

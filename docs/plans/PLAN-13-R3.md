@@ -192,9 +192,9 @@ del servidor: `git ls-tree -r -z --full-tree <head>` y `git cat-file blob <head>
   interpolado), igual que `candado-cola` de Socialabs: sin lista confirmable (página extra, posición
   ausente o repetida, SHA del grupo que no aparece) → técnico. Nunca se pregunta a qué PR pertenece
   el commit del grupo (lección de #1091). El evento `merge_group` puede llegar antes de que la lista
-  muestre el grupo (observado en GitHub): si el grupo no aparece todavía, o su entrada aún no trae
-  sus commits, se relee hasta 6 veces con pausas de 2, 4, 8, 15 y 30 s antes de rendirse; una
-  lectura que falla es técnica al momento. Lo mismo hace el job de la prueba roja (§5).
+  muestre el grupo (observado en GitHub): si el grupo no aparece todavía, o alguna entrada aún no
+  trae sus commits, se lee hasta 6 veces en total (pausas de 2, 4, 8, 15 y 30 s) antes de
+  rendirse; una lectura que falla por otra causa es técnica al momento. Lo mismo hace el job de la prueba roja (§5).
 - En un grupo, cada PR se juzga con su cabeza (`pullRequest.headRefOid`) contra el commit
   confiable (§3.1), salvo `require-check`, que se lee sobre el **SHA del grupo** (un verde de la cabeza del
   PR no acredita al grupo). El grupo pasa solo si pasan todos sus PRs.
@@ -692,3 +692,14 @@ tercera pasada:** el evento `merge_group` llega antes de que la lista de la cola
 del grupo; la prueba roja del grupo no lo encontraba, fallaba y la cola expulsaba el PR → el juez y
 la prueba roja releen la lista hasta 6 veces con pausas crecientes antes de rendirse, y el comando
 imprime su resumen en el registro de la corrida.
+
+**Ronda 5** (un revisor, sobre la ronda 4): confirmó que la relectura nunca da verde y pidió
+pruebas que fijen las pausas exactas y que un error de lectura no se reintente (añadidas), tratar
+una entrada que existe pero aún no trae sus commits como «todavía no lista» (se relee) y no repetir
+notas idénticas. **Ronda 6** (un revisor, sobre la ronda 5): **aprueba sin bloqueantes**. Menores
+aplicados: las listas no confirmables de la cola se prueban como errores duros (nunca «no lista»).
+Pendientes anotados en §12 del plan: el motivo publicado cuando la cola nunca se completa dice «no
+aparece» sin el último detalle, y una entrada cualquiera aún sin commits hace esperar a todo el
+grupo (del lado seguro; se comprobará con una cola de más de 5 PRs en la rebanada 5).
+
+**Recorrido real final** sobre el commit con todas las correcciones: ver la evidencia del PR #18.

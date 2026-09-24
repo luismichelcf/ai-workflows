@@ -585,7 +585,7 @@ comportamiento; el orquestador escribe las pruebas rojas y el constructor las po
 - [x] **2. Bloques:** registro de bloques, manifiestos, bloques módulo y comando, vigencias de §3.3
       y los bloques genéricos de §4.1 portados desde las compuertas existentes. (RC-03, RC-07…RC-10,
       CN-01…CN-04, CN-09…CN-11)
-- [ ] **3. El juez:** acción reutilizable y plantilla de workflow, procedencia desde la base,
+- [x] **3. El juez:** acción reutilizable y plantilla de workflow, procedencia desde la base,
       `pull_request_target` y `merge_group`, frontera del merge, `server:`, interruptor de dos llaves.
       (RC-06, SV-01…SV-09, CN-05, CN-08)
 - [ ] **4. Etapas finales genéricas:** revisión independiente, visto bueno, vista previa, QA de
@@ -625,8 +625,15 @@ Rebanadas 1 → 2 → 3 → 4 en orden; 5 puede empezar tras 3; 6 tras 4 y 5; 7 
   `validate` de RC-08 más el orden de fases y la validación contra manifiestos, y `{tests}` como
   argumentos sin consola.
 - Siguen abiertos:
-  - **Rebanada 3:** toda etapa `pre-merge` con `server:`; el juez no corre bloques módulo del
-    proyecto (corren en el proceso del motor).
+  - Resueltos en la rebanada 3 ([PLAN-13-R3](PLAN-13-R3.md)): toda etapa `pre-merge` lleva
+    `server:` (validado con los manifiestos); el juez no corre bloques del proyecto; R19.
+  - **De la rebanada 3, sin bloquear:** con una cola de más de 5 PRs, una entrada que GitHub aún
+    no armó hace esperar a todo el grupo (del lado seguro; se comprueba en la rebanada 5); el motivo
+    publicado cuando la lista de la cola nunca se completa podría llevar el último detalle; `init`
+    que escriba los workflows del juez y el sellado del SHA del motor en el paquete (rebanada 6); la
+    atestación `/approve-judge-change` acepta un código de 7 caracteres, que alguien con permiso de
+    empujar podría igualar fabricando un commit (a proponer: exigir más caracteres); las notas del
+    rastro salen como `::error::` en el registro aunque la corrida sea verde.
   - **Rebanada 4:** `required: false` y `retry` en ejecución (hoy `compileRecipe` los rechaza);
     conectar `run`, `status` y `stop` del binario a la receta, y de dónde toma el CLI el tipo
     declarado y el constructor de una pieza; publicar el veredicto de `sandboxed-review` como
