@@ -41,7 +41,7 @@ import { chain, pipeline, recorder, stage } from './helpers.js';
 
 /** Cases that cannot run yet, and what each is waiting for. */
 export const NOT_YET_EXECUTABLE: Record<string, string> = {
-  'CN-07': 'needs the editor hooks installed in a project (slice 4)',
+  'CN-07': 'needs the editor hooks installed in a project and wired to the recipe (slice 5, PLAN-13-R4 §0)',
 };
 
 const ALL = Array.from({ length: 13 }, (_, index) => `CN-${String(index + 1).padStart(2, '0')}`);
