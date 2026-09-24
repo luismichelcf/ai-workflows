@@ -402,6 +402,92 @@ function validatePieces(root: YamlNode, issues: LocatedIssue[]): void {
   }
 }
 
+/** PLAN-13-R4 §6: the summary file must be a relative path with no escape. */
+function validateMessages(root: YamlNode, issues: LocatedIssue[]): void {
+  const summary = yamlField(yamlField(root, 'messages'), 'summary');
+  if (summary === null) return;
+  const fileNode = yamlField(summary, 'file');
+  if (fileNode === null) return;
+  const file = yamlWord(fileNode);
+  const leaves = file.split(/[\\/]+/).includes('..');
+  if (isAbsolute(file) || /^[A-Za-z]:/.test(file) || leaves) {
+    add(issues, fileNode, `summary file "${file}" must be a relative path with no ".."`);
+  }
+}
+
+const AGENT_ACCOUNT_USERS = new Set([
+  'ai-workflows/approval-review@1',
+  'ai-workflows/independent-review@1',
+]);
+
+/**
+ * PLAN-13-R4 §1.1 and §5: the stages that publish as the agents need the declared identity,
+ * and the two combinations of `required: false` that cannot be read.
+ */
+function validateAgentAndOptional(
+  root: YamlNode,
+  stages: readonly YamlNode[],
+  issues: LocatedIssue[],
+): void {
+  const hasAccount = yamlField(root, 'agent-account') !== null;
+  const hasOwner = yamlField(root, 'owner') !== null;
+  const hasPieces = yamlField(root, 'pieces') !== null;
+
+  for (const stage of stages) {
+    const usesNode = yamlField(yamlField(stage, 'gate'), 'uses');
+    const uses = yamlWord(usesNode);
+
+    if (AGENT_ACCOUNT_USERS.has(uses)) {
+      if (!hasAccount) {
+        add(issues, usesNode, `block "${uses}" needs agent-account: in the recipe`);
+      }
+      if (uses === 'ai-workflows/approval-review@1' && !hasOwner) {
+        add(issues, usesNode, `block "${uses}" needs owner: in the recipe`);
+      }
+      if (uses === 'ai-workflows/independent-review@1' && !hasPieces) {
+        add(issues, usesNode, `block "${uses}" needs pieces: in the recipe`);
+      }
+    }
+
+    const server = yamlField(stage, 'server');
+    if (
+      uses === 'ai-workflows/sandboxed-review@1' &&
+      server !== null &&
+      yamlMap(server) === undefined &&
+      yamlWord(server) === 'attestation'
+    ) {
+      if (!hasAccount) {
+        add(issues, server, `block "${uses}" with server: attestation needs agent-account: in the recipe`);
+      }
+      if (!hasPieces) {
+        add(issues, server, `block "${uses}" with server: attestation needs pieces: in the recipe`);
+      }
+    }
+
+    const requiredNode = yamlField(stage, 'required');
+    if (yamlValue(requiredNode) === false) {
+      if (yamlValue(yamlField(stage, 'needs-human')) === true) {
+        add(issues, requiredNode, 'required: false cannot wait for a person');
+      }
+      if ((yamlWord(yamlField(stage, 'phase')) || 'pre-merge') === 'merge') {
+        add(issues, requiredNode, 'the merge stage is always required');
+      }
+    }
+  }
+}
+
+/**
+ * PLAN-13-R4 §1.1, §5 and §6: the rules `validate` (the full `checkRecipe`) enforces on top of
+ * the strict reader — they need nothing from a block manifest, but they are not part of
+ * `parseRecipe`, which reads a recipe without asking each stage how GitHub checks it.
+ */
+export function validateRecipeExtras(root: YamlNode): LocatedIssue[] {
+  const issues: LocatedIssue[] = [];
+  validateMessages(root, issues);
+  validateAgentAndOptional(root, listNodes(yamlField(root, 'stages')), issues);
+  return issues;
+}
+
 /** §1.2 rules 2, 4 and 5: the shape of `server:` that needs no manifest. */
 function validateServerForms(
   root: YamlNode,

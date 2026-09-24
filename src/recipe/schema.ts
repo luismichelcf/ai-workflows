@@ -51,6 +51,47 @@ export const recipeSchema = {
       pattern: '^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$',
       description: 'GitHub owner login.',
     },
+    'agent-account': {
+      type: 'string',
+      pattern: '^[A-Za-z0-9][A-Za-z0-9-]{0,38}\\[bot\\]$',
+      description: 'R21: the GitHub app identity (<slug>[bot]) the agents publish with.',
+    },
+    messages: {
+      type: 'object',
+      additionalProperties: false,
+      description: 'PLAN-13-R4 §6: the owner-facing messages.',
+      properties: {
+        summary: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['file', 'section'],
+          description: 'Where the three-line summary is read from.',
+          properties: {
+            file: {
+              type: 'string',
+              minLength: 1,
+              description: 'Relative path that may carry {piece}.',
+            },
+            section: {
+              type: 'string',
+              minLength: 1,
+              description: 'Heading whose first lines are read.',
+            },
+          },
+        },
+        'max-length': {
+          type: 'integer',
+          minimum: 140,
+          maximum: 5000,
+          description: 'Longest allowed message; 700 by default.',
+        },
+        'banned-words': {
+          type: 'array',
+          items: { type: 'string', minLength: 1 },
+          description: 'Extra banned words on top of the engine defaults.',
+        },
+      },
+    },
     classify: {
       ...pathClasses,
       description: 'Named file groups.',

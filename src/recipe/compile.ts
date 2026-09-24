@@ -430,13 +430,6 @@ export async function compileRecipe(
     };
 
   for (const stage of recipe.stages) {
-    if (stage.retry !== undefined) {
-      throw new Error(`stage "${stage.id}": retry is not available until slice 4`);
-    }
-    if (stage.required === false) {
-      throw new Error(`stage "${stage.id}": required: false is not available until slice 4`);
-    }
-
     const definition = await resolveStageBlock(stage, rootDeps, groups);
     const inputs = blockInputs(definition.manifest, stage.gate.with);
     const engineDeps: EngineBlockDeps = {
@@ -470,6 +463,12 @@ export async function compileRecipe(
           baseRef: deps.baseRef,
         }),
       ...(stage.needsHuman ? { needsHuman: true } : {}),
+      // PLAN-13-R4 §5: `required: false` and `retry` reach the engine as written. The recipe
+      // measures the wait in seconds; the engine measures it in milliseconds.
+      required: stage.required,
+      ...(stage.retry === undefined
+        ? {}
+        : { retry: { attempts: stage.retry.attempts, waitMs: stage.retry.waitSeconds * 1000 } }),
       gate: sealedGate(gate, root),
     });
   }
