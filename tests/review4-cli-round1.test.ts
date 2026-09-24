@@ -201,7 +201,7 @@ describe('what the owner is told (§6)', () => {
       ...HOLD_AFTER('approval'),
     ], MESSAGES));
     await runAgentCli(['run', PIECE], p.deps());
-    const [message] = agentMessages(p.github);
+    const [message] = agentMessages(p.github).filter((comment) => comment.body.includes('owner-message:approval'));
     expect(message?.body).toContain(`/approve ${p.head.slice(0, 7)}`);
     expect(message?.body).not.toMatch(/botón|button/);
   });
@@ -218,7 +218,7 @@ describe('what the owner is told (§6)', () => {
       ...HOLD_AFTER('checks'),
     ], MESSAGES), { 'fail.mjs': fail });
     await runAgentCli(['run', PIECE], p.deps());
-    const [message] = agentMessages(p.github);
+    const [message] = agentMessages(p.github).filter((comment) => comment.body.includes('owner-message:blocked'));
     expect(message?.body).toContain('Las comprobaciones del proyecto pasan');
     expect(message?.body).not.toMatch(/Users|secreto|stack/);
   });
@@ -253,7 +253,7 @@ describe('what the owner is told (§6)', () => {
         await createGitStore({ port: p.remote.port() }).reserve(PIECE, 'otra-sesion', 15 * 60_000);
       },
     }));
-    expect(agentMessages(p.github)).toHaveLength(0);
+    expect(agentMessages(p.github).filter((comment) => comment.body.includes('owner-message:approval'))).toHaveLength(0);
     expect(output.text).toMatch(/[Oo]tra sesión|[Aa]nother session/);
   });
 
@@ -308,7 +308,7 @@ function synced() {
   const p = project(RECIPE(HOLD_AFTER('x').slice(0, 2).concat(['    phase: merge', '    nature: recompute', '    gate:', '      run: node hold.mjs'])));
   const origin = mkdtempSync(join(tmpdir(), 'aiw-origin-'));
   folders.push(origin);
-  execFileSync('git', ['init', '-q', '--bare', origin]);
+  execFileSync('git', ['init', '-q', '--bare', '--initial-branch=main', origin]);
   git(p.root, 'remote', 'add', 'origin', origin);
   git(p.root, 'push', '-q', 'origin', 'main', BRANCH);
   const other = mkdtempSync(join(tmpdir(), 'aiw-other-'));

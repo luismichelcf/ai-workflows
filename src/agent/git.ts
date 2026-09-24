@@ -116,6 +116,8 @@ export async function snapshotTree(root: string): Promise<string> {
 
 export interface RemoteGitOptions {
   readonly root: string;
+  /** `owner/name`: the push always goes to this repository on GitHub, never to whatever `origin` is. */
+  readonly repository: string;
   /** The agents' installation token, minted per push; absent means the account `gh` is using. */
   readonly token?: () => Promise<string>;
 }
@@ -123,9 +125,13 @@ export interface RemoteGitOptions {
 /**
  * The real `RemoteGit` over `git`: push, delete and read the head of a remote branch. The token
  * arrives through `http.extraheader` in the child's environment — `GIT_CONFIG_count/KEY_0/VALUE_0`
- * — and never on the command line.
+ * — and never on the command line. The target is always `https://github.com/<repository>.git`:
+ * the `origin` remote could point at another host, and the authenticated upload must not follow it.
+ * The upload runs with `--no-verify`, so no hook of the piece can rewrite what the engine pushes.
  */
 export function createRemoteGit(options: RemoteGitOptions): RemoteGit {
+  const url = `https://github.com/${options.repository}.git`;
+
   const authEnv = async (): Promise<NodeJS.ProcessEnv | undefined> => {
     if (options.token === undefined) return undefined;
     const token = await options.token();
@@ -140,7 +146,7 @@ export function createRemoteGit(options: RemoteGitOptions): RemoteGit {
   return {
     async branchHead(branch: string): Promise<string | undefined> {
       const extra = await authEnv();
-      const result = await runGit(options.root, ['ls-remote', '--heads', 'origin', branch], extra);
+      const result = await runGit(options.root, ['ls-remote', '--heads', url, branch], extra);
       if (!result.ok) {
         throw new Error(result.stderr.trim() || `git could not read the head of ${branch}`);
       }
@@ -153,7 +159,7 @@ export function createRemoteGit(options: RemoteGitOptions): RemoteGit {
       const extra = await authEnv();
       const result = await runGit(
         options.root,
-        ['push', 'origin', `${sha}:refs/heads/${branch}`],
+        ['push', '--no-verify', url, `${sha}:refs/heads/${branch}`],
         extra,
       );
       if (!result.ok) throw new Error(result.stderr.trim() || 'git push failed');
@@ -163,7 +169,7 @@ export function createRemoteGit(options: RemoteGitOptions): RemoteGit {
       const extra = await authEnv();
       const result = await runGit(
         options.root,
-        ['push', 'origin', '--delete', `--force-with-lease=${branch}:${sha}`, branch],
+        ['push', '--no-verify', url, '--delete', `--force-with-lease=${branch}:${sha}`, branch],
         extra,
       );
       if (!result.ok) throw new Error(result.stderr.trim() || 'git could not delete the branch');

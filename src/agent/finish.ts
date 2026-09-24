@@ -49,6 +49,8 @@ interface CleanupEvidence {
   readonly branch: string;
   readonly headSha: string;
   readonly folder: string;
+  /** `remove-folder: false` asks `finish` to keep the folder AND the local branch. */
+  readonly removeFolder: boolean;
 }
 
 /** The last passed `cleanup` entry's evidence, the only schema `finish` reads. */
@@ -63,7 +65,8 @@ function cleanupEvidence(
     const headSha = block === undefined ? undefined : asString(block['headSha']);
     const folder = block === undefined ? undefined : asString(block['folder']);
     if (branch !== undefined && headSha !== undefined && folder !== undefined) {
-      return { branch, headSha, folder };
+      const removeFolder = block === undefined ? undefined : block['removeFolder'];
+      return { branch, headSha, folder, removeFolder: removeFolder !== false };
     }
   }
   return undefined;
@@ -165,72 +168,82 @@ export async function finishPiece(options: FinishOptions): Promise<FinishResult>
     }
 
     const notes: string[] = [];
-    if (isDirectory(evidence.folder)) {
-      if (samePath(evidence.folder, mainRoot)) {
-        return {
-          ok: false,
-          text: es
-            ? 'La carpeta de la pieza es la copia principal; nunca se retira.'
-            : 'The piece folder is the main copy; it is never retired.',
-        };
-      }
-      if (!(await gitIsClean(evidence.folder))) {
-        return {
-          ok: false,
-          text: es
-            ? 'La carpeta tiene cambios sin guardar: guárdalos o descártalos y vuelve a ejecutar finish.'
-            : 'The folder has unsaved changes: save or discard them and run finish again.',
-        };
-      }
-      const head = await gitHead(evidence.folder);
-      if (head !== evidence.headSha) {
-        return {
-          ok: false,
-          text: es
-            ? `La carpeta no está en la cabeza fusionada (${head}); no se retira.`
-            : `The folder is not at the merged head (${head}); it is not retired.`,
-        };
-      }
-      if (cwdInside(evidence.folder)) process.chdir(mainRoot);
-      const removed = await runGit(mainRoot, ['worktree', 'remove', evidence.folder]);
-      if (!removed.ok) {
-        return {
-          ok: false,
-          text: es
-            ? `No se pudo retirar la carpeta: ${safeTerminalText(removed.stderr.trim())}`
-            : `The folder could not be retired: ${safeTerminalText(removed.stderr.trim())}`,
-        };
-      }
-      notes.push(es ? 'carpeta retirada' : 'folder retired');
-    } else if (await repairRegistry(mainRoot, evidence.folder)) {
-      notes.push(es ? 'registro de la carpeta reparado' : 'folder registry repaired');
-    }
-
-    const branchExists = await runGit(mainRoot, [
-      'rev-parse',
-      '--verify',
-      '--quiet',
-      `refs/heads/${evidence.branch}`,
-    ]);
-    if (branchExists.ok) {
-      const tip = branchExists.stdout.trim();
-      if (tip === evidence.headSha) {
-        const deleted = await runGit(mainRoot, ['branch', '-D', evidence.branch]);
-        if (!deleted.ok) {
+    if (!evidence.removeFolder) {
+      // PLAN-13-R4 §3.8: `remove-folder: false` asks cleanup to keep the folder, and `finish`
+      // honours it: neither the folder nor its branch is touched, and the command ends well.
+      notes.push(
+        es
+          ? 'la limpieza pidió conservar la carpeta y la rama; no se retiró nada'
+          : 'cleanup asked to keep the folder and the branch; nothing was retired',
+      );
+    } else {
+      if (isDirectory(evidence.folder)) {
+        if (samePath(evidence.folder, mainRoot)) {
           return {
             ok: false,
             text: es
-              ? `No se pudo borrar la rama local: ${safeTerminalText(deleted.stderr.trim())}`
-              : `The local branch could not be deleted: ${safeTerminalText(deleted.stderr.trim())}`,
+              ? 'La carpeta de la pieza es la copia principal; nunca se retira.'
+              : 'The piece folder is the main copy; it is never retired.',
           };
         }
-        notes.push(es ? 'rama local borrada' : 'local branch deleted');
-      } else {
-        notes.push(
-          es
-            ? `la rama local apunta a otra versión (${tip}); no se tocó`
-            : `the local branch points at another version (${tip}); it was left alone`,
-        );
+        if (!(await gitIsClean(evidence.folder))) {
+          return {
+            ok: false,
+            text: es
+              ? 'La carpeta tiene cambios sin guardar: guárdalos o descártalos y vuelve a ejecutar finish.'
+              : 'The folder has unsaved changes: save or discard them and run finish again.',
+          };
+        }
+        const head = await gitHead(evidence.folder);
+        if (head !== evidence.headSha) {
+          return {
+            ok: false,
+            text: es
+              ? `La carpeta no está en la cabeza fusionada (${head}); no se retira.`
+              : `The folder is not at the merged head (${head}); it is not retired.`,
+          };
+        }
+        if (cwdInside(evidence.folder)) process.chdir(mainRoot);
+        const removed = await runGit(mainRoot, ['worktree', 'remove', evidence.folder]);
+        if (!removed.ok) {
+          return {
+            ok: false,
+            text: es
+              ? `No se pudo retirar la carpeta: ${safeTerminalText(removed.stderr.trim())}`
+              : `The folder could not be retired: ${safeTerminalText(removed.stderr.trim())}`,
+          };
+        }
+        notes.push(es ? 'carpeta retirada' : 'folder retired');
+      } else if (await repairRegistry(mainRoot, evidence.folder)) {
+        notes.push(es ? 'registro de la carpeta reparado' : 'folder registry repaired');
+      }
+
+      const branchExists = await runGit(mainRoot, [
+        'rev-parse',
+        '--verify',
+        '--quiet',
+        `refs/heads/${evidence.branch}`,
+      ]);
+      if (branchExists.ok) {
+        const tip = branchExists.stdout.trim();
+        if (tip === evidence.headSha) {
+          const deleted = await runGit(mainRoot, ['branch', '-D', evidence.branch]);
+          if (!deleted.ok) {
+            return {
+              ok: false,
+              text: es
+                ? `No se pudo borrar la rama local: ${safeTerminalText(deleted.stderr.trim())}`
+                : `The local branch could not be deleted: ${safeTerminalText(deleted.stderr.trim())}`,
+            };
+          }
+          notes.push(es ? 'rama local borrada' : 'local branch deleted');
+        } else {
+          notes.push(
+            es
+              ? `la rama local apunta a otra versión (${tip}); no se tocó`
+              : `the local branch points at another version (${tip}); it was left alone`,
+          );
+        }
       }
     }
 

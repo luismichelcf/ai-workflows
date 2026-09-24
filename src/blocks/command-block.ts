@@ -8,6 +8,7 @@ import {
   type JsonValue,
 } from '../contract.js';
 import { resolveExecutable, type ExecutableEnvironment } from '../exec.js';
+import { childEnvironment } from '../git-env.js';
 import { DEFAULT_STDOUT_BYTES, type GroupExit, type ProcessGroupControl } from '../process-group.js';
 import { confirmEmptyGroup } from './confirm-empty.js';
 
@@ -203,6 +204,8 @@ export function createCommandGate(options: CommandGateOptions): Gate {
       args: [...resolved.prefixArgs, ...args],
       cwd: options.root,
       stdin: standardInput(context, options.withValue),
+      // The agents' own credentials never reach a command the piece runs (PLAN-13-R4 §8).
+      environment: childEnvironment(),
       ...(resolved.env === undefined ? {} : { env: resolved.env }),
       timeoutMs,
       stdoutBytes,
