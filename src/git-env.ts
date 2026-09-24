@@ -19,9 +19,13 @@ const SECRET_ENV: readonly string[] = [
   'AI_WORKFLOWS_APP_ID',
   'AI_WORKFLOWS_APP_KEY_FILE',
 ];
+/** Windows does not tell the case of an environment name apart, so neither does this removal. */
+const SECRET_ENV_UPPER = new Set(SECRET_ENV.map((name) => name.toUpperCase()));
 
 function withoutSecrets(environment: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  for (const key of SECRET_ENV) delete environment[key];
+  for (const key of Object.keys(environment)) {
+    if (SECRET_ENV_UPPER.has(key.toUpperCase())) delete environment[key];
+  }
   return environment;
 }
 

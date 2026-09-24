@@ -76,27 +76,42 @@ export async function serverAccepts(
 }
 
 /**
- * PLAN-13-R4 §7: the events whose commit the judge can actually read. The head is fetched
- * strictly elsewhere; here each event's own commit is brought in on its own, and one that cannot
- * be fetched is dropped — never a permanent technical block. If dropping it leaves a builder
- * that changed something or an angle uncovered, the normal decision says so.
+ * PLAN-13-R4 §2.2 and §7: the events the judge can decide with, and the commits the remote no
+ * longer has. The head is fetched strictly elsewhere; here each event's own commit is brought in
+ * on its own. Every builder event counts, whatever its commit: it still excludes its session and
+ * family, and the commit only says whether that builder changed something. A commit the remote
+ * is missing (a `not our ref`, an unadvertised object, a ref that does not exist) is marked
+ * `unavailable`; a verdict about it cannot decide, but a builder still excludes. Any other fetch
+ * failure — the network, a 5xx, permissions — is technical and is rethrown, never swallowed into
+ * an ignored event.
  */
+export interface FetchableEvents {
+  readonly events: readonly PieceEvent[];
+  /** The shas the remote no longer has, so their events cannot be read as evidence. */
+  readonly unavailable: ReadonlySet<string>;
+}
+
+const MISSING_OBJECT = /not our ref|unadvertised object|couldn't find remote ref|no such remote ref/i;
+
+function isMissingObject(error: unknown): boolean {
+  return error instanceof Error && MISSING_OBJECT.test(error.message);
+}
+
 export async function fetchableEvents(
   context: Pick<ServerAttestContext, 'fetchObjects' | 'head'>,
   events: readonly PieceEvent[],
-): Promise<PieceEvent[]> {
-  const usable: PieceEvent[] = [];
+): Promise<FetchableEvents> {
+  const unavailable = new Set<string>();
+  const checked = new Set<string>([context.head]);
   for (const event of events) {
-    if (event.sha === context.head) {
-      usable.push(event);
-      continue;
-    }
+    if (checked.has(event.sha)) continue;
+    checked.add(event.sha);
     try {
       await context.fetchObjects([event.sha]);
-      usable.push(event);
-    } catch {
-      // GitHub no longer delivers that commit: the event simply does not count.
+    } catch (error) {
+      if (!isMissingObject(error)) throw error;
+      unavailable.add(event.sha);
     }
   }
-  return usable;
+  return { events, unavailable };
 }

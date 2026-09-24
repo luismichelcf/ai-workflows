@@ -117,6 +117,8 @@ export interface AgentCliDeps {
   beforeMessages?(): Promise<void>;
   /** Only for tests: runs just before `sync` moves the head. */
   beforeFastForward?(): Promise<void>;
+  /** Only for tests: runs just before renewing and writing each clean-update record of `sync`. */
+  beforeCleanUpdateRecord?(index: number): Promise<void>;
 }
 
 function spanish(locale: string): boolean {
@@ -959,7 +961,10 @@ async function commandSync(args: readonly string[], deps: AgentCliDeps): Promise
       from = to;
     }
 
-    for (const step of steps) {
+    for (const [index, step] of steps.entries()) {
+      // The hook runs before the renewal, so a piece taken in this window is seen: the record is
+      // not written and the head is not moved. `index` is only there for the tests.
+      if (deps.beforeCleanUpdateRecord !== undefined) await deps.beforeCleanUpdateRecord(index);
       const renewed = await store.renew(piece, runId, LEASE_MS);
       if (!renewed.ok) {
         return { ok: false, text: busyText(recipe.locale) };

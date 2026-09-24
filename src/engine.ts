@@ -521,14 +521,17 @@ class StoreReadFailure extends Error {
 }
 
 /**
- * Marks the error the effect's own work threw, so it can be told apart from a failure of the
- * store around it. `runEffect` wraps the effect with this; the store hands the very same object
- * back, and the wrapper rethrows the original motive instead of dressing it up as a store
- * failure. A failure of the store's own bookkeeping is never wrapped, so it still blocks as one.
+ * The effect's own work failed while the store had claimed it. The failure left the effect
+ * neither confirmed nor untouched, so it is in doubt — but it is deliberately NOT an
+ * `EffectNeedsReconciliation`: the reconciler of the block must not fire on this same run, only
+ * on the next one, when the store reports the record as pending or uncertain. The engine's own
+ * retry/optional decision still treats `EffectFailed` as an effect in doubt (never retried, never
+ * waved through). Its message is the effect's own motive, never a store failure; a failure of the
+ * store's own bookkeeping is not wrapped by this and so still blocks as a store failure.
  */
 class EffectFailed extends Error {
-  constructor(override readonly cause: unknown) {
-    super('the effect failed');
+  constructor(readonly failure: unknown) {
+    super(describeUnknown(failure));
     this.name = 'EffectFailed';
   }
 }
@@ -1067,9 +1070,10 @@ export function createEngine(options: EngineOptions): Engine {
                 try {
                   return await effect();
                 } catch (error) {
-                  // A failure of the effect's own work is marked: the store still records the
-                  // effect as uncertain, but the engine reports the effect's motive, never
-                  // "store failed". The classes the engine translates itself pass through.
+                  // A failure of the effect's own work is marked as an effect in doubt so the
+                  // engine never retries it nor lets an optional stage carry on. The classes the
+                  // engine translates itself, and the reconciler of the block, pass through
+                  // untouched: this failure must not be mistaken for a store failure.
                   if (
                     error instanceof EffectNeedsReconciliation
                     || error instanceof EffectRefusedBecauseParked
@@ -1080,13 +1084,13 @@ export function createEngine(options: EngineOptions): Engine {
                   throw new EffectFailed(error);
                 }
               }).catch((error: unknown) => {
-                // A pending or uncertain record and a refusal because the piece is parked are
-                // facts the wrapper above must see as their own class. The effect's own failure
-                // travels with its motive. Anything else out of the store is a store failure: it
-                // is never retried and never waved through.
-                if (error instanceof EffectFailed) throw error.cause;
+                // An effect's own failure travels as `EffectFailed`, with its motive. A pending
+                // or uncertain record and a refusal because the piece is parked are facts the
+                // wrapper above must see as their own class. Anything else out of the store is a
+                // store failure: it is never retried and never waved through.
                 if (
-                  error instanceof EffectNeedsReconciliation
+                  error instanceof EffectFailed
+                  || error instanceof EffectNeedsReconciliation
                   || error instanceof EffectRefusedBecauseParked
                   || error instanceof ProcessTreeSurvived
                 ) {
@@ -1458,8 +1462,11 @@ export function createEngine(options: EngineOptions): Engine {
                 }
                 if (controller.signal.aborted) return abortedOutcome();
                 // An effect left in doubt is never retried, however many attempts are asked
-                // for: repeating it is how a second pull request gets opened.
-                const inDoubt = error instanceof EffectNeedsReconciliation;
+                // for: repeating it is how a second pull request gets opened. The effect's own
+                // failure (`EffectFailed`) leaves it uncertain in the store just like a record
+                // the next run finds `pending`/`uncertain` does.
+                const inDoubt =
+                  error instanceof EffectNeedsReconciliation || error instanceof EffectFailed;
                 if (!inDoubt && attempt < attempts) {
                   retryable = true;
                 } else {

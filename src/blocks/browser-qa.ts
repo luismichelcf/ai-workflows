@@ -112,6 +112,8 @@ const CREDENTIAL_ENV_NAMES: readonly string[] = [
   'AI_WORKFLOWS_APP_ID',
   'AI_WORKFLOWS_APP_KEY_FILE',
 ];
+/** Windows does not tell the case of an environment name apart, so neither does this check. */
+const CREDENTIAL_ENV_NAMES_UPPER = new Set(CREDENTIAL_ENV_NAMES.map((name) => name.toUpperCase()));
 
 /** The fresh environment of the QA command: system minimum, `pass-env`, and `AI_WORKFLOWS_*`. */
 function commandEnvironment(
@@ -128,7 +130,9 @@ function commandEnvironment(
     if (value !== undefined) env[name] = value;
   }
   for (const [name, value] of Object.entries(extra)) env[name] = value;
-  for (const name of CREDENTIAL_ENV_NAMES) delete env[name];
+  for (const name of Object.keys(env)) {
+    if (CREDENTIAL_ENV_NAMES_UPPER.has(name.toUpperCase())) delete env[name];
+  }
   return env;
 }
 

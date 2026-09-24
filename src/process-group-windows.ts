@@ -449,8 +449,9 @@ try {
   exit 0
 } catch {
   if ($result) {
-    $message = ConvertTo-Json $_.Exception.Message -Compress
-    [System.IO.File]::WriteAllText($result, ('{"error":' + $message + '}'))
+    # Only that the process could not be started: never the raw exception, which can carry the
+    # launcher's own paths or the command line into a result that is read elsewhere.
+    [System.IO.File]::WriteAllText($result, '{"error":"could not start the process"}')
   }
   exit 1
 }
@@ -677,6 +678,28 @@ export function groupExitFromReport(
 }
 
 /**
+ * Merges environment layers the way Windows reads names: without regard to case, the last layer
+ * winning. Two keys that differ only in case are one variable to `CreateProcess`, so keeping
+ * both in the block would leave which one wins to chance.
+ */
+function mergeEnvironmentCaseInsensitive(
+  ...layers: ReadonlyArray<Readonly<Record<string, string | undefined>>>
+): NodeJS.ProcessEnv {
+  const merged: NodeJS.ProcessEnv = {};
+  const keyByUpper = new Map<string, string>();
+  for (const layer of layers) {
+    for (const [name, value] of Object.entries(layer)) {
+      const upper = name.toUpperCase();
+      const previous = keyByUpper.get(upper);
+      if (previous !== undefined && previous !== name) delete merged[previous];
+      keyByUpper.set(upper, name);
+      merged[name] = value;
+    }
+  }
+  return merged;
+}
+
+/**
  * The environment block `CreateProcess` reads with `CREATE_UNICODE_ENVIRONMENT`: every
  * `name=value` as UTF-16LE, each string closed by a null and the whole block by a second null,
  * sorted by name as the system expects. Building it in Node keeps the launcher's own variables
@@ -720,10 +743,10 @@ export function launchWindowsGroup(options: LaunchInGroupOptions): ProcessGroup 
   // itself starts with the engine's own environment (minus the agents' credentials), so PowerShell
   // can compile its helper on a machine that has never run it before; only the child receives the
   // caller's environment, never the launcher's variables (PLAN-13-R4 §8).
-  const childEnvironmentValues: NodeJS.ProcessEnv = {
-    ...(options.environment ?? childEnvironment()),
-    ...(options.env ?? {}),
-  };
+  const childEnvironmentValues = mergeEnvironmentCaseInsensitive(
+    options.environment ?? childEnvironment(),
+    options.env ?? {},
+  );
   const environmentFile = join(directory, 'environment.bin');
   writeFileSync(environmentFile, windowsEnvironmentBlock(childEnvironmentValues));
 

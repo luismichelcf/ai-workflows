@@ -14,6 +14,8 @@ export interface ReviewDecisionOptions {
   readonly forbidSameFamily: boolean;
   accepts(sha: string): Promise<boolean>;
   treeOf(sha: string): Promise<string>;
+  /** The shas whose commit cannot be read; see `SelectVerdictsOptions.unavailable`. */
+  readonly unavailable?: ReadonlySet<string>;
   readonly head: string;
   readonly spanish: boolean;
   /**
@@ -52,6 +54,12 @@ function sameFamilyReason(family: string, spanish: boolean): string {
     : `The reviewer and the builder are from the same family (${family}).`;
 }
 
+function unreadableVerdictReason(angle: string, spanish: boolean): string {
+  return spanish
+    ? `El veredicto del ángulo «${angle}» no se pudo leer y es más reciente que el que decide; no se puede aprobar a ciegas.`
+    : `The verdict of the angle "${angle}" could not be read and is newer than the deciding one; it cannot be approved blind.`;
+}
+
 function identityOf(identity: ExecutionIdentity): ExecutionIdentity {
   return { provider: identity.provider, model: identity.model, session: identity.session };
 }
@@ -76,7 +84,20 @@ export async function decideIndependentReview(
     angles: options.angles,
     accepts: options.accepts,
     treeOf: options.treeOf,
+    ...(options.unavailable === undefined ? {} : { unavailable: options.unavailable }),
   });
+
+  // PLAN-13-R4 §7: an unreadable verdict never decides. But if one of a requested angle is newer
+  // than the one that does, the angle cannot be settled: the newest word on it might be a REVISE
+  // nobody can read. That is technical, never an approval that ignores it.
+  for (const event of events) {
+    if (event.type !== 'verdict' || !options.angles.includes(event.angle)) continue;
+    if (options.unavailable?.has(event.sha) !== true) continue;
+    const deciding = selected.deciding.get(event.angle);
+    if (deciding !== undefined && event.at >= deciding.at) {
+      throw new Error(unreadableVerdictReason(event.angle, spanish));
+    }
+  }
 
   if (selected.builders.length === 0 || !selected.knownBuilder) {
     return { ok: false, reason: noBuilderReason(spanish) };

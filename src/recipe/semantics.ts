@@ -485,6 +485,8 @@ const CREDENTIAL_ENV_NAMES: readonly string[] = [
   'AI_WORKFLOWS_APP_ID',
   'AI_WORKFLOWS_APP_KEY_FILE',
 ];
+/** Windows does not tell the case of an environment name apart, so neither does this rule. */
+const CREDENTIAL_ENV_NAMES_UPPER = new Set(CREDENTIAL_ENV_NAMES.map((name) => name.toUpperCase()));
 
 /**
  * The owner's approval order must be a plain command that is not the judge's own, and the
@@ -509,7 +511,7 @@ function validateBlockInputValues(stages: readonly YamlNode[], issues: LocatedIs
       if (uses === 'ai-workflows/browser-qa@1' && key === 'pass-env') {
         for (const item of listNodes(pair.value)) {
           const name = yamlWord(item);
-          if (CREDENTIAL_ENV_NAMES.includes(name)) {
+          if (CREDENTIAL_ENV_NAMES_UPPER.has(name.toUpperCase())) {
             add(issues, item, `input "pass-env" cannot name ${name}: it carries the agents' credentials`);
           }
         }

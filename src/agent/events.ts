@@ -271,6 +271,11 @@ export interface SelectVerdictsOptions {
   accepts(sha: string): Promise<boolean>;
   /** The tree of a commit, to tell whether a builder changed something. */
   treeOf(sha: string): Promise<string>;
+  /**
+   * The shas whose commit cannot be read. A builder still excludes its session and family, but
+   * its commit cannot say whether it changed something; a verdict cannot decide, however.
+   */
+  readonly unavailable?: ReadonlySet<string>;
 }
 
 export interface SelectVerdictsResult {
@@ -293,6 +298,9 @@ export async function selectVerdicts(options: SelectVerdictsOptions): Promise<Se
   for (const event of options.events) {
     if (event.type !== 'builder') continue;
     builders.push(event.identity);
+    // A builder whose commit the remote no longer has still excludes its session and family;
+    // not being able to read its tree only means it cannot be shown to have changed something.
+    if (options.unavailable?.has(event.sha) === true) continue;
     const tree = await options.treeOf(event.sha);
     if (tree !== event.result) knownBuilder = true;
   }
@@ -301,6 +309,9 @@ export async function selectVerdicts(options: SelectVerdictsOptions): Promise<Se
   for (const event of options.events) {
     if (event.type !== 'verdict') continue;
     if (!options.angles.includes(event.angle)) continue;
+    // A verdict about a commit nobody can read cannot decide: it is handled by the caller, which
+    // refuses to approve while a newer, unreadable verdict of the same angle could say REVISE.
+    if (options.unavailable?.has(event.sha) === true) continue;
     if (!(await options.accepts(event.sha))) continue;
     const current = deciding.get(event.angle);
     if (current === undefined || event.at >= current.at) deciding.set(event.angle, event);

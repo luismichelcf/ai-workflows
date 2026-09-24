@@ -2,7 +2,7 @@ import type { Gate, GateContext, GateResult, JsonValue } from '../contract.js';
 import { parseEventComment, readPieceEvents, type PieceEvent } from '../agent/events.js';
 import { stillValidFor } from '../recipe/validity.js';
 import { decideIndependentReview } from './reviews.js';
-import { commitFingerprint, fetchableEvents, serverAccepts, treeOfCommit } from './review-commits.js';
+import { commitFingerprint, fetchableEvents, serverAccepts, treeOfCommit, type FetchableEvents } from './review-commits.js';
 import type { BlockDefinition, EngineBlockDeps, ServerAttestContext, ServerResult } from './definition.js';
 import { asStringList, isClean, isSpanish, judgedSha, requireAgent } from './final.js';
 import type { BlockManifest } from './manifest.js';
@@ -136,18 +136,24 @@ async function attestation(
   const angles = asStringList(inputs['angles']) ?? [];
   const forbidSameFamily = inputs['forbidSameFamily'] !== false;
   // PLAN-13-R4 §7: the head must be readable — without it nothing can be judged. Each event's
-  // commit may not be in the judge's checkout; it is brought in on its own and an event whose
-  // commit cannot be fetched is ignored (no count, no permanent block), so the decision below
-  // names whatever builder or angle that leaves missing.
+  // commit may not be in the judge's checkout; it is brought in on its own. A commit the remote
+  // is missing marks its event unreadable; a builder still excludes, a verdict cannot decide. Any
+  // other fetch failure (the network, a 5xx, permissions) is technical, never an ignored event.
   try {
     await context.fetchObjects([context.head]);
   } catch (error) {
     return { outcome: 'technical', reason: reasonOf(error) };
   }
-  const usable = await fetchableEvents(context, events);
+  let fetched: FetchableEvents;
+  try {
+    fetched = await fetchableEvents(context, events);
+  } catch (error) {
+    return { outcome: 'technical', reason: reasonOf(error) };
+  }
   try {
     const decision = await decideIndependentReview({
-      events: usable,
+      events: fetched.events,
+      unavailable: fetched.unavailable,
       angles,
       forbidSameFamily,
       accepts: (sha) =>

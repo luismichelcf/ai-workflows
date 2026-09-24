@@ -40,6 +40,8 @@ const CREDENTIAL_ENV_NAMES: readonly string[] = [
   'AI_WORKFLOWS_APP_ID',
   'AI_WORKFLOWS_APP_KEY_FILE',
 ];
+/** Windows does not tell the case of an environment name apart, so neither does this check. */
+const CREDENTIAL_ENV_NAMES_UPPER = new Set(CREDENTIAL_ENV_NAMES.map((name) => name.toUpperCase()));
 
 /**
  * The most output kept in memory. 32 MB is large enough to hold a whole test run — a run in a
@@ -313,7 +315,9 @@ function mergeShimEnvironment(shimEnv: Readonly<Record<string, string>>): NodeJS
         ? `${value}${separator}${existing}`
         : value;
   }
-  for (const name of CREDENTIAL_ENV_NAMES) delete merged[name];
+  for (const name of Object.keys(merged)) {
+    if (CREDENTIAL_ENV_NAMES_UPPER.has(name.toUpperCase())) delete merged[name];
+  }
   return merged;
 }
 

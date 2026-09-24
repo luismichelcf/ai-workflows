@@ -7,7 +7,7 @@ import { familyOf, requireDifferentBuilder } from '../identity.js';
 import type { ExecutionIdentity } from '../identity.js';
 import { parseEventComment, renderEventComment, type PieceEvent } from '../agent/events.js';
 import { decideIndependentReview } from './reviews.js';
-import { fetchableEvents, serverAccepts, treeOfCommit } from './review-commits.js';
+import { fetchableEvents, serverAccepts, treeOfCommit, type FetchableEvents } from './review-commits.js';
 import type { ServerAttestContext, ServerResult } from './definition.js';
 import {
   buildInvocation,
@@ -349,17 +349,24 @@ async function attestation(
 
   const angle = asString(inputs['angle']) ?? '';
   // PLAN-13-R4 §7: the head must be readable — without it nothing can be judged. Each event's
-  // commit is brought in on its own; an event whose commit cannot be fetched is ignored (no
-  // count, no permanent block), so the decision below names whatever it leaves missing.
+  // commit is brought in on its own. A commit the remote is missing marks its event unreadable; a
+  // builder still excludes, a verdict cannot decide. Any other fetch failure (the network, a 5xx,
+  // permissions) is technical, never an ignored event.
   try {
     await context.fetchObjects([context.head]);
   } catch (error) {
     return { outcome: 'technical', reason: reasonOf(error) };
   }
-  const usable = await fetchableEvents(context, events);
+  let fetched: FetchableEvents;
+  try {
+    fetched = await fetchableEvents(context, events);
+  } catch (error) {
+    return { outcome: 'technical', reason: reasonOf(error) };
+  }
   try {
     const decision = await decideIndependentReview({
-      events: usable,
+      events: fetched.events,
+      unavailable: fetched.unavailable,
       angles: angle.length === 0 ? [] : [angle],
       forbidSameFamily: inputs['forbidSameFamily'] !== false,
       stage: context.stage,
