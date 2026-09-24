@@ -265,7 +265,7 @@ describe('the final stages on GitHub, with the agents identity and the owner but
     const credentials = agentCredentialsFromEnv(process.env, w.folder);
     if (!('appId' in credentials)) throw new Error(`credentials: ${JSON.stringify(credentials)}`);
     const tokenSource = createAppTokenSource({ credentials, repository: REPO });
-    const edges = createAgentEdges({ repository: REPO, runner: createGhRunner(), tokenSource });
+    const edges = createAgentEdges({ repository: REPO, runner: createGhRunner(), tokenSource, root: w.folder });
     let crashed = false;
     const crashing = Object.create(edges.github) as typeof edges.github;
     crashing.createDraftPullRequest = async (o) => {

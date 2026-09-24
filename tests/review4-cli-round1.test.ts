@@ -145,7 +145,7 @@ describe('the GitHub edges', () => {
     let issued = 0;
     const tokenSource = { token: async () => `ghs_${++issued}`, account: async () => AGENT };
     const gh = fakeRunner();
-    const edges = createAgentEdges({ repository: 'duena/proyecto', runner: gh.runner, tokenSource });
+    const edges = createAgentEdges({ repository: 'duena/proyecto', runner: gh.runner, tokenSource, root: process.cwd() });
     await edges.github.issueTitle(13);
     await edges.github.issueTitle(13);
     expect(gh.calls.map((call) => call.env?.['GH_TOKEN'])).toEqual(['ghs_1', 'ghs_2']);
@@ -153,7 +153,7 @@ describe('the GitHub edges', () => {
 
   it('without a token source they run as the gh account, with no token in the environment', async () => {
     const gh = fakeRunner();
-    const edges = createAgentEdges({ repository: 'duena/proyecto', runner: gh.runner });
+    const edges = createAgentEdges({ repository: 'duena/proyecto', runner: gh.runner, root: process.cwd() });
     await edges.github.issueTitle(13);
     expect(gh.calls[0]?.env?.['GH_TOKEN']).toBeUndefined();
   });
