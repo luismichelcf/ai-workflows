@@ -127,6 +127,18 @@ function reasonOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/** What to say when a reservation could not be dropped: silence would hide a stuck lease. */
+function releaseFailureText(locale: string, error: unknown): string {
+  return spanish(locale)
+    ? `La reserva de la pieza no se pudo soltar: ${safeTerminalText(reasonOf(error))}`
+    : `The piece's reservation could not be released: ${safeTerminalText(reasonOf(error))}`;
+}
+
+/** Joins a note with whatever the run already had to say, never dropping either. */
+function appendNote(note: string, extra: string): string {
+  return note.length === 0 ? extra : `${note}\n${extra}`;
+}
+
 function refusal(locale: string, es: string, en: string): CommandOutput {
   return { ok: false, text: spanish(locale) ? es : en };
 }
@@ -539,24 +551,30 @@ async function deliverStart(
   const runId = `start-${randomUUID()}`;
   const held = await store.reserve(piece, runId, LEASE_MS);
   if (!held.ok) return '';
+  let note = '';
   try {
-    if ((await store.loadStatus(piece)) !== undefined) return '';
-    const op = `owner-message:start:${piece}`;
-    const summary = summaryLines(recipe, root, piece);
-    const rendered = renderOwnerMessage('start', {
-      locale: recipe.locale,
-      ...(summary === undefined ? {} : { summary }),
-      maxLength: messages.maxLength,
-      banned: [...DEFAULT_BANNED_TERMS, ...messages.bannedWords],
-    });
-    if ('refused' in rendered) return rendered.refused;
-    await messageEffect(store, piece, op, github, `${rendered.text}
+    if ((await store.loadStatus(piece)) === undefined) {
+      const op = `owner-message:start:${piece}`;
+      const summary = summaryLines(recipe, root, piece);
+      const rendered = renderOwnerMessage('start', {
+        locale: recipe.locale,
+        ...(summary === undefined ? {} : { summary }),
+        maxLength: messages.maxLength,
+        banned: [...DEFAULT_BANNED_TERMS, ...messages.bannedWords],
+      });
+      if ('refused' in rendered) note = rendered.refused;
+      else await messageEffect(store, piece, op, github, `${rendered.text}
 
 ${markerOf(op)}`, recipe.agentAccount);
-    return '';
+    }
   } finally {
-    await store.release(piece, runId).catch(() => undefined);
+    try {
+      await store.release(piece, runId);
+    } catch (error) {
+      note = appendNote(note, releaseFailureText(recipe.locale, error));
+    }
   }
+  return note;
 }
 
 async function deliverOutcomeMessages(
@@ -580,17 +598,24 @@ async function deliverOutcomeMessages(
       ? 'Otra sesión tiene la pieza en este momento; no se envió ningún aviso.'
       : 'Another session holds the piece right now; no message was sent.';
   }
+  let note = '';
   try {
     const now = await captureFacts(piece, store, root);
     if (!matchesOutcome(outcome.status, now, runId)) {
-      return spanish(recipe.locale)
+      note = spanish(recipe.locale)
         ? 'El aviso al dueño ya no corresponde: la pieza avanzó mientras tanto.'
         : 'The owner message no longer applies: the piece moved on meanwhile.';
+    } else {
+      note = await deliverMessage(kind, piece, outcome.status, recipe, store, github, root, now);
     }
-    return await deliverMessage(kind, piece, outcome.status, recipe, store, github, root, now);
   } finally {
-    await store.release(piece, runId).catch(() => undefined);
+    try {
+      await store.release(piece, runId);
+    } catch (error) {
+      note = appendNote(note, releaseFailureText(recipe.locale, error));
+    }
   }
+  return note;
 }
 
 interface ParsedArgs {
@@ -685,12 +710,13 @@ async function commandRun(args: readonly string[], deps: AgentCliDeps): Promise<
         }));
       declared = { ...declared, builders };
     } catch (error) {
+      // The issue cannot be read, so the run stops here — but nothing is written. A blind
+      // `saveStatus` would overwrite a park, a quarantine or another session's live run, and
+      // would leave a trace in a dry run and create a piece the store never saw. The failure is
+      // only said in the terminal; the state is left exactly as it was.
       const text = spanish(recipe.locale)
         ? `La corrida se detuvo por un fallo técnico al leer el issue de la pieza: ${safeTerminalText(reasonOf(error))}`
         : `The run stopped on a technical failure while reading the piece's issue: ${safeTerminalText(reasonOf(error))}`;
-      await store
-        .saveStatus({ piece, state: 'blocked:technical', reason: text }, existing?.version)
-        .catch(() => undefined);
       return { ok: false, text };
     }
   }
@@ -889,7 +915,8 @@ async function commandSync(args: readonly string[], deps: AgentCliDeps): Promise
   if (!held.ok) {
     return { ok: false, text: busyText(recipe.locale) };
   }
-  try {
+
+  const perform = async (): Promise<CommandOutput> => {
     const principal = await principalOf(edges.github);
     if (!principal.ok) return { ok: false, text: principal.text };
     try {
@@ -940,16 +967,30 @@ async function commandSync(args: readonly string[], deps: AgentCliDeps): Promise
       await recordCleanUpdate({ store, root, baseRef, piece, from: step.from, to: step.to, runId });
     }
 
+    // PLAN-13-R4 §8: the reservation is renewed right before the head moves, after the test
+    // hook and any re-read, so another session that took the piece in this window is seen and
+    // the head is left where it was.
+    if (deps.beforeFastForward !== undefined) await deps.beforeFastForward();
     const renewed = await store.renew(piece, runId, LEASE_MS);
     if (!renewed.ok) return { ok: false, text: busyText(recipe.locale) };
-    if (deps.beforeFastForward !== undefined) await deps.beforeFastForward();
     await gitText(root, ['merge', '--ff-only', remoteTip]);
     return { ok: true, text: spanish(recipe.locale) ? 'La pieza se actualizó con la base y quedó registrado.' : 'The piece was updated with the base and it was recorded.' };
+  };
+
+  let result: CommandOutput;
+  try {
+    result = await perform();
   } catch (error) {
-    return { ok: false, text: safeTerminalText(reasonOf(error)) };
-  } finally {
-    await store.release(piece, runId).catch(() => undefined);
+    result = { ok: false, text: safeTerminalText(reasonOf(error)) };
   }
+  // Dropping the reservation is reported too: a lease that will not go carries on until it
+  // lapses, and a silent failure would leave the piece looking held by a session that is gone.
+  try {
+    await store.release(piece, runId);
+  } catch (error) {
+    result = { ok: result.ok, text: appendNote(result.text, releaseFailureText(recipe.locale, error)) };
+  }
+  return result;
 }
 
 // ---------------------------------------------------------------------------------------------

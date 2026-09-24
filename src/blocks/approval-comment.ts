@@ -19,7 +19,7 @@ export const manifest: BlockManifest = {
   validWhile: ['same-sha', 'same-fingerprint', 'same-fingerprint-or-clean-update'],
   server: ['attestation', 'require-check'],
   inputs: {
-    command: { type: 'string', default: '/approve' },
+    command: { type: 'string', default: '/approve', pattern: '^/[a-z0-9][a-z0-9-]*$' },
     'code-length': { type: 'integer', min: 4, max: 40, default: 7 },
   },
 };
