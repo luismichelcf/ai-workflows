@@ -520,6 +520,19 @@ class StoreReadFailure extends Error {
   }
 }
 
+/**
+ * Marks the error the effect's own work threw, so it can be told apart from a failure of the
+ * store around it. `runEffect` wraps the effect with this; the store hands the very same object
+ * back, and the wrapper rethrows the original motive instead of dressing it up as a store
+ * failure. A failure of the store's own bookkeeping is never wrapped, so it still blocks as one.
+ */
+class EffectFailed extends Error {
+  constructor(override readonly cause: unknown) {
+    super('the effect failed');
+    this.name = 'EffectFailed';
+  }
+}
+
 /** The run is no longer the holder of the piece. Any further write would be over someone else. */
 class LeaseLost extends Error {
   constructor(readonly heldBy: string) {
@@ -1050,10 +1063,28 @@ export function createEngine(options: EngineOptions): Engine {
               throw new DryRunEffectRefused(operationId);
             }
           : <T extends JsonValue>(operationId: string, effect: () => Promise<T>): Promise<T> =>
-              store.runEffect(piece, operationId, effect).catch((error: unknown) => {
+              store.runEffect(piece, operationId, async (): Promise<T> => {
+                try {
+                  return await effect();
+                } catch (error) {
+                  // A failure of the effect's own work is marked: the store still records the
+                  // effect as uncertain, but the engine reports the effect's motive, never
+                  // "store failed". The classes the engine translates itself pass through.
+                  if (
+                    error instanceof EffectNeedsReconciliation
+                    || error instanceof EffectRefusedBecauseParked
+                    || error instanceof ProcessTreeSurvived
+                  ) {
+                    throw error;
+                  }
+                  throw new EffectFailed(error);
+                }
+              }).catch((error: unknown) => {
                 // A pending or uncertain record and a refusal because the piece is parked are
-                // facts the wrapper above must see as their own class. Anything else out of the
-                // store is a store failure: it is never retried and never waved through.
+                // facts the wrapper above must see as their own class. The effect's own failure
+                // travels with its motive. Anything else out of the store is a store failure: it
+                // is never retried and never waved through.
+                if (error instanceof EffectFailed) throw error.cause;
                 if (
                   error instanceof EffectNeedsReconciliation
                   || error instanceof EffectRefusedBecauseParked

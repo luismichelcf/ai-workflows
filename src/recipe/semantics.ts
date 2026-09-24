@@ -476,6 +476,48 @@ function validateAgentAndOptional(
   }
 }
 
+/** PLAN-13-R4 §5 and §6: the two `with:` values whose rule a manifest's shape cannot state. */
+const JUDGE_OWN_APPROVAL_COMMAND = '/approve-judge-change';
+/** The agents' credentials; the project's browser suite must never be handed one. */
+const CREDENTIAL_ENV_NAMES: readonly string[] = [
+  'GH_TOKEN',
+  'GITHUB_TOKEN',
+  'AI_WORKFLOWS_APP_ID',
+  'AI_WORKFLOWS_APP_KEY_FILE',
+];
+
+/**
+ * The owner's approval order must be a plain command that is not the judge's own, and the
+ * browser suite may not be handed the agents' credentials. Both are refused with line and
+ * column, at the value that carries the mistake.
+ */
+function validateBlockInputValues(stages: readonly YamlNode[], issues: LocatedIssue[]): void {
+  for (const stage of stages) {
+    const gate = yamlField(stage, 'gate');
+    const uses = yamlWord(yamlField(gate, 'uses'));
+    for (const pair of yamlMap(yamlField(gate, 'with'))?.items ?? []) {
+      const key = yamlWord(pair.key);
+      if (uses === 'ai-workflows/approval-comment@1' && key === 'command') {
+        if (yamlWord(pair.value) === JUDGE_OWN_APPROVAL_COMMAND) {
+          add(
+            issues,
+            pair.value,
+            `input "command" cannot be ${JUDGE_OWN_APPROVAL_COMMAND}: that is the judge's own order, not the owner's`,
+          );
+        }
+      }
+      if (uses === 'ai-workflows/browser-qa@1' && key === 'pass-env') {
+        for (const item of listNodes(pair.value)) {
+          const name = yamlWord(item);
+          if (CREDENTIAL_ENV_NAMES.includes(name)) {
+            add(issues, item, `input "pass-env" cannot name ${name}: it carries the agents' credentials`);
+          }
+        }
+      }
+    }
+  }
+}
+
 /**
  * PLAN-13-R4 §1.1, §5 and §6: the rules `validate` (the full `checkRecipe`) enforces on top of
  * the strict reader — they need nothing from a block manifest, but they are not part of
@@ -484,7 +526,9 @@ function validateAgentAndOptional(
 export function validateRecipeExtras(root: YamlNode): LocatedIssue[] {
   const issues: LocatedIssue[] = [];
   validateMessages(root, issues);
-  validateAgentAndOptional(root, listNodes(yamlField(root, 'stages')), issues);
+  const stages = listNodes(yamlField(root, 'stages'));
+  validateAgentAndOptional(root, stages, issues);
+  validateBlockInputValues(stages, issues);
   return issues;
 }
 

@@ -2,7 +2,7 @@ import type { Gate, GateContext, GateResult, JsonValue } from '../contract.js';
 import { parseEventComment, readPieceEvents, type PieceEvent } from '../agent/events.js';
 import { stillValidFor } from '../recipe/validity.js';
 import { decideIndependentReview } from './reviews.js';
-import { commitFingerprint, serverAccepts, treeOfCommit } from './review-commits.js';
+import { commitFingerprint, fetchableEvents, serverAccepts, treeOfCommit } from './review-commits.js';
 import type { BlockDefinition, EngineBlockDeps, ServerAttestContext, ServerResult } from './definition.js';
 import { asStringList, isClean, isSpanish, judgedSha, requireAgent } from './final.js';
 import type { BlockManifest } from './manifest.js';
@@ -135,12 +135,19 @@ async function attestation(
 
   const angles = asStringList(inputs['angles']) ?? [];
   const forbidSameFamily = inputs['forbidSameFamily'] !== false;
+  // PLAN-13-R4 §7: the head must be readable — without it nothing can be judged. Each event's
+  // commit may not be in the judge's checkout; it is brought in on its own and an event whose
+  // commit cannot be fetched is ignored (no count, no permanent block), so the decision below
+  // names whatever builder or angle that leaves missing.
   try {
-    // PLAN-13-R4 §7: the commits the events name may not be in the judge's checkout; they are
-    // brought in before any fingerprint or tree is read from them.
-    await context.fetchObjects([context.head, ...events.map((event) => event.sha)]);
+    await context.fetchObjects([context.head]);
+  } catch (error) {
+    return { outcome: 'technical', reason: reasonOf(error) };
+  }
+  const usable = await fetchableEvents(context, events);
+  try {
     const decision = await decideIndependentReview({
-      events,
+      events: usable,
       angles,
       forbidSameFamily,
       accepts: (sha) =>

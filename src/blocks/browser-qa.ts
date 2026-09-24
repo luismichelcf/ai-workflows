@@ -100,6 +100,19 @@ const SYSTEM_ENV = [
   'OS', 'PROCESSOR_ARCHITECTURE', 'PROCESSOR_IDENTIFIER', 'LANG', 'LC_ALL', 'USER', 'SHELL',
 ] as const;
 
+/**
+ * PLAN-13-R4 §5 and §6: the agents' credentials. The recipe validation already refuses a
+ * `pass-env` that names one, but the block removes them again here so a project cannot hand its
+ * browser suite a token by any other spelling (`GITHUB_TOKEN` in the runner's own environment,
+ * an inherited variable). They are deleted last, whatever `pass-env` or `extra` asked for.
+ */
+const CREDENTIAL_ENV_NAMES: readonly string[] = [
+  'GH_TOKEN',
+  'GITHUB_TOKEN',
+  'AI_WORKFLOWS_APP_ID',
+  'AI_WORKFLOWS_APP_KEY_FILE',
+];
+
 /** The fresh environment of the QA command: system minimum, `pass-env`, and `AI_WORKFLOWS_*`. */
 function commandEnvironment(
   passEnv: readonly string[],
@@ -115,6 +128,7 @@ function commandEnvironment(
     if (value !== undefined) env[name] = value;
   }
   for (const [name, value] of Object.entries(extra)) env[name] = value;
+  for (const name of CREDENTIAL_ENV_NAMES) delete env[name];
   return env;
 }
 

@@ -277,10 +277,27 @@ function reconcilableGate(
         );
       }
       if (typeof answer !== 'object' || answer === null) throw cannot(context.piece, operationId);
+      // Settling the effect is a store write. If it fails, the effect is STILL in doubt: the
+      // piece keeps blocking — even an optional stage — with the operation and the motive,
+      // never a generic store failure that could be waved through.
+      const settle = async (
+        outcome: { readonly confirmed: JsonValue } | { readonly didNotHappen: true },
+      ): Promise<void> => {
+        try {
+          await store.reconcileEffect(context.piece, operationId, outcome);
+        } catch (failure) {
+          const message = failure instanceof Error ? failure.message : String(failure);
+          throw new EffectStillInDoubt(
+            context.piece,
+            operationId,
+            `effect "${operationId}" is in doubt and settling it failed: ${message}`,
+          );
+        }
+      };
       if ('didNotHappen' in answer) {
-        await store.reconcileEffect(context.piece, operationId, { didNotHappen: true });
+        await settle({ didNotHappen: true });
       } else if ('confirmed' in answer) {
-        await store.reconcileEffect(context.piece, operationId, { confirmed: answer.confirmed });
+        await settle({ confirmed: answer.confirmed });
       } else {
         throw cannot(context.piece, operationId);
       }
