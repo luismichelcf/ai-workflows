@@ -551,8 +551,40 @@ reconcile?(operationId: string, context: GateContext): Promise<{ confirmed: Json
 finishPiece(o: { mainRoot: string; piece: string; store: Store; locale: string }): Promise<{ ok: boolean; text: string }>;
 
 // src/agent/events.ts (§2.2), usada por el bloque y por el juez
-selectVerdicts(o: { events: PieceEvent[]; head: string; validWhile: ValidWhile; angles: readonly string[];
-  accepts(sha: string): Promise<boolean> }): Promise<{ builders: ExecutionIdentity[]; deciding: VerdictEvent[] }>;
+selectVerdicts(o: { events: PieceEvent[]; angles: readonly string[];
+  accepts(sha: string): Promise<boolean>;            // la vigencia de la etapa: ¿un veredicto de `sha` cuenta para la cabeza?
+  treeOf(sha: string): Promise<string> })            // árbol de un commit, para saber si un constructor cambió algo
+  : Promise<{ builders: ExecutionIdentity[]; knownBuilder: boolean; deciding: Map<string, VerdictEvent> }>; // por ángulo
+```
+
+Firmas que añadieron las pruebas rojas (mismo espíritu; las fijan los archivos de `tests/`):
+
+```ts
+// src/agent/github.ts
+interface RemoteGit { branchHead(branch): Promise<string | undefined>; push(branch, sha): Promise<void>; deleteBranch(branch, sha): Promise<void> }
+interface IssueComment { id: number; author: string; authorType: 'User' | 'Bot'; viaApp: string | null; body: string; createdAt: string; updatedAt: string }
+interface PullRequestReview { author: string; authorType: 'User' | 'Bot'; state: string; commitId: string; submittedAt: string }
+createAgentGitHub(o: { repository: string; runner: GhRunnerWithEnv; token?: () => Promise<string> }): AgentGitHub;
+// el runner recibe (args, input?, env?) y el token viaja solo en env.GH_TOKEN; listas de una página (más → lanza)
+
+// src/recipe/compile.ts
+CompileRecipeDeps.agent?: { github: AgentGitHub; remote: RemoteGit; repository: string;
+  sleep(ms: number, signal: AbortSignal): Promise<void>; now(): number };
+// src/engine.ts
+EngineOptions.sleep?: (ms: number, signal: AbortSignal) => Promise<void>;
+// src/blocks/definition.ts
+ServerAttestContext.stage: string;   // la etapa juzgada (sandboxed-review busca su veredicto por etapa)
+
+// src/agent/cli.ts — el binario conectado a la receta
+runAgentCli(argv: readonly string[], deps: AgentCliDeps): Promise<{ ok: boolean; text: string }>;
+interface AgentCliDeps { cwd; env; github?: AgentGitHub; remote?: RemoteGit; statePort?: StatePort; repository?: string;
+  providers?: ProviderRunner; ghAccounts?(): Promise<string[]>; now?; sleep?;
+  beforeMessages?(): Promise<void>; beforeFastForward?(): Promise<void> }   // los dos últimos, solo para pruebas
+// src/messages.ts
+readOwnerSummary(document: string, section: string): string[] | undefined;
+// src/judge/cli.ts
+annotationFor(note: string): string;   // `::warning::` con el escape de GitHub
+// src/index.ts exporta además engineBlock
 ```
 
 `FinalBlockDeps` = `EngineBlockDeps` + `github: AgentGitHub` + `git` (push con cabecera) + `sleep`
