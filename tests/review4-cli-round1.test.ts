@@ -196,13 +196,13 @@ describe('what the owner is told (§6)', () => {
       '    needs-human: true',
       '    gate:',
       '      uses: ai-workflows/approval-comment@1',
-      '      with: { command: /approve }',
+      '      with: { command: /ok, code-length: 10 }',
       '    server: attestation',
       ...HOLD_AFTER('approval'),
     ], MESSAGES));
     await runAgentCli(['run', PIECE], p.deps());
     const [message] = agentMessages(p.github).filter((comment) => comment.body.includes('owner-message:approval'));
-    expect(message?.body).toContain(`/approve ${p.head.slice(0, 7)}`);
+    expect(message?.body).toContain(`/ok ${p.head.slice(0, 10)}`);
     expect(message?.body).not.toMatch(/botón|button/);
   });
 
@@ -261,7 +261,8 @@ describe('what the owner is told (§6)', () => {
     const p = project(APPROVAL);
     const op = `owner-message:approval:approval:${p.head}`;
     p.github.issueCommentsOf.set(Number(PIECE), [{ id: 1, author: OWNER, authorType: 'User', viaApp: null, body: `cito <!-- ai-workflows:message {"op":"${op}"} -->`, createdAt: '2026-09-24T09:00:00Z', updatedAt: '2026-09-24T09:00:00Z' }]);
-    p.github.failures.set('commentOnIssue', { when: 'before' });
+    // The first comment of a run is the `start` message; the failure hits the approval message.
+    p.github.failures.set('commentOnIssue', { when: 'before', skip: 1 });
     await runAgentCli(['run', PIECE], p.deps());
     await runAgentCli(['run', PIECE], p.deps());
     expect(agentMessages(p.github).filter((comment) => comment.body.includes('owner-message:approval'))).toHaveLength(1);
@@ -269,7 +270,8 @@ describe('what the owner is told (§6)', () => {
 
   it('a crash after sending: the next run does not send it again', async () => {
     const p = project(APPROVAL);
-    p.github.failures.set('commentOnIssue', { when: 'after' });
+    // The first comment of a run is the `start` message; the failure hits the approval message.
+    p.github.failures.set('commentOnIssue', { when: 'after', skip: 1 });
     await runAgentCli(['run', PIECE], p.deps());
     await runAgentCli(['run', PIECE], p.deps());
     expect(agentMessages(p.github).filter((comment) => comment.body.includes('owner-message:approval'))).toHaveLength(1);
