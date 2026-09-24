@@ -28,8 +28,18 @@ const MANIFESTS: Readonly<Record<string, BlockManifest>> = {
     server: ['attestation', 'require-check'],
     inputs: {
       'forbid-same-family': { type: 'boolean', default: true },
-      angles: { type: 'string-list' },
+      angles: { type: 'string-list', required: true, minItems: 1 },
     },
+  },
+
+  // PLAN-13-R4 §3.2 (R21): the owner approves with GitHub's button, read by attestation.
+  'approval-review': {
+    name: 'approval-review',
+    kind: 'module',
+    natures: ['attest'],
+    validWhile: ['same-sha', 'same-fingerprint', 'same-fingerprint-or-clean-update'],
+    server: ['attestation', 'require-check'],
+    inputs: {},
   },
 
   'approval-comment': {
@@ -49,7 +59,11 @@ const MANIFESTS: Readonly<Record<string, BlockManifest>> = {
     kind: 'module',
     natures: ['recompute'],
     server: ['require-check'],
-    inputs: {},
+    inputs: {
+      environment: { type: 'string', required: true },
+      creator: { type: 'string' },
+      'url-pattern': { type: 'string' },
+    },
   },
 
   'browser-qa': {
@@ -59,7 +73,19 @@ const MANIFESTS: Readonly<Record<string, BlockManifest>> = {
     validWhile: ['same-sha'],
     server: ['require-check'],
     inputs: {
-      command: { type: 'command' },
+      command: { type: 'command', required: true },
+      'preview-stage': { type: 'string', required: true },
+      criteria: {
+        type: 'object',
+        required: true,
+        fields: {
+          file: { type: 'string', required: true },
+          section: { type: 'string', required: true },
+          'id-prefix': { type: 'string', required: true },
+        },
+      },
+      'pass-env': { type: 'string-list' },
+      'timeout-minutes': { type: 'integer', min: 1, max: 120, default: 30 },
     },
   },
 
@@ -68,7 +94,11 @@ const MANIFESTS: Readonly<Record<string, BlockManifest>> = {
     kind: 'module',
     natures: ['recompute'],
     server: [],
-    inputs: {},
+    inputs: {
+      method: { type: 'string', enum: ['merge', 'squash', 'rebase'], default: 'merge' },
+      'timeout-minutes': { type: 'integer', min: 1, max: 1440, default: 360 },
+      'poll-seconds': { type: 'integer', min: 10, max: 300, default: 30 },
+    },
   },
 
   'post-merge': {
@@ -76,7 +106,17 @@ const MANIFESTS: Readonly<Record<string, BlockManifest>> = {
     kind: 'module',
     natures: ['recompute'],
     server: [],
-    inputs: {},
+    inputs: {
+      'merge-stage': { type: 'string', required: true },
+      checks: { type: 'string-list' },
+      deployment: {
+        type: 'object',
+        fields: {
+          environment: { type: 'string', required: true },
+          creator: { type: 'string' },
+        },
+      },
+    },
   },
 
   cleanup: {
@@ -84,7 +124,11 @@ const MANIFESTS: Readonly<Record<string, BlockManifest>> = {
     kind: 'module',
     natures: ['recompute'],
     server: [],
-    inputs: {},
+    inputs: {
+      'merge-stage': { type: 'string', required: true },
+      'delete-branch': { type: 'boolean', default: true },
+      'remove-folder': { type: 'boolean', default: true },
+    },
   },
 };
 
@@ -94,6 +138,7 @@ const ENGINE_USES = /^ai-workflows\/([a-z][a-z0-9-]*)@([1-9][0-9]*)$/;
 /** The blocks of slice 4. Until they are built their gate blocks the piece saying so. */
 const SLICE_FOUR: ReadonlySet<string> = new Set([
   'independent-review',
+  'approval-review',
   'approval-comment',
   'preview-deployment',
   'browser-qa',

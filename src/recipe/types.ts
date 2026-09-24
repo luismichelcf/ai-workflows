@@ -48,6 +48,21 @@ export interface RecipeStage {
   readonly retry?: { readonly attempts: number; readonly waitSeconds: number };
 }
 
+/** PLAN-13-R4 §6: the owner-facing messages, and the words they must avoid. */
+export interface RecipeMessages {
+  /** Where the three-line summary comes from; absent means none. */
+  readonly summary?: {
+    /** Relative path that may carry `{piece}`. */
+    readonly file: string;
+    /** Heading whose first lines are read. */
+    readonly section: string;
+  };
+  /** Longest allowed message, 140…5000; 700 by default. */
+  readonly maxLength: number;
+  /** Extra banned words on top of the engine defaults; empty by default. */
+  readonly bannedWords: readonly string[];
+}
+
 /** R19: how a branch names its piece, and where the piece declares its kind. */
 export interface RecipePieces {
   /** Branch patterns; `{piece}` appears exactly once in each. */
@@ -64,6 +79,10 @@ export interface Recipe {
   readonly version: 1;
   readonly locale: string;
   readonly owner?: string;
+  /** R21: the GitHub identity (`<slug>[bot]`) the agents publish with. */
+  readonly agentAccount?: string;
+  /** PLAN-13-R4 §6: optional; without it no owner message is sent. */
+  readonly messages?: RecipeMessages;
   /** R19: optional; without it the piece of a change is the pull request number. */
   readonly pieces?: RecipePieces;
   /** Named file classes retain declaration order for condition messages. */

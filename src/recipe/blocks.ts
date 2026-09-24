@@ -13,6 +13,7 @@ import { ENGINE_BLOCKS, engineBlockManifest } from '../blocks/registry.js';
 import { validateCommandLine } from './command-line.js';
 import { validGlob } from './glob.js';
 import { locatedRecipeErrors, parseRecipe, readStrictYaml } from './parse.js';
+import { validateRecipeExtras } from './semantics.js';
 import type { Recipe, RecipeError } from './types.js';
 import {
   nodeStart,
@@ -89,6 +90,9 @@ export async function checkRecipe(
     recipeIssues: [],
     fileErrors: [],
   };
+
+  // PLAN-13-R4 §1.1, §5 and §6: the rules that belong to the full check, not the strict reader.
+  location.recipeIssues.push(...validateRecipeExtras(strict.root));
 
   const stages = yamlSeq(yamlField(strict.root, 'stages'))?.items ?? [];
   for (const stage of stages) {
@@ -383,11 +387,14 @@ function checkInputs(
   }
 
   const context = { stage, stages };
+  // A missing input is reported at the `with:` map when there is one — the object that
+  // should have carried it — and at the `uses` value when there is no `with:` at all.
+  const anchor = withNode ?? usesNode;
   for (const [key, spec] of Object.entries(manifest.inputs)) {
     const node = provided.get(key);
     if (node === undefined) {
       if (isRequired(spec)) {
-        add(issues, usesNode, `missing required input "${key}" for block "${uses}"`);
+        add(issues, anchor, `missing required input "${key}" for block "${uses}"`);
       }
       continue;
     }
@@ -420,12 +427,7 @@ function validateInput(
   switch (spec.type) {
     case 'string':
       validateStringInput(node, spec, subject, issues);
-      if (inputName === 'red-stage') {
-        const value = yamlValue(node);
-        if (typeof value === 'string' && !namesEarlierRedTestStage(value, context)) {
-          add(issues, node, 'input "red-stage" must name an earlier stage that uses ai-workflows/red-test@1');
-        }
-      }
+      checkStageReference(node, inputName, context, issues);
       return;
     case 'integer':
       validateIntegerInput(node, spec, subject, issues);
@@ -434,10 +436,10 @@ function validateInput(
       if (typeof yamlValue(node) !== 'boolean') add(issues, node, `${subject} must be true or false`);
       return;
     case 'string-list':
-      validateListInput(node, subject, false, false, issues);
+      validateListInput(node, subject, false, false, spec.minItems, issues);
       return;
     case 'glob-list':
-      validateListInput(node, subject, true, spec.piece === true, issues);
+      validateListInput(node, subject, true, spec.piece === true, undefined, issues);
       return;
     case 'command':
       validateCommandInput(node, spec, inputName, subject, issues);
@@ -494,11 +496,16 @@ function validateListInput(
   subject: string,
   globs: boolean,
   allowPiece: boolean,
+  minItems: number | undefined,
   issues: LocatedIssue[],
 ): void {
   const list = yamlSeq(node);
   if (list === undefined) {
     add(issues, node, `${subject} must be a list`);
+    return;
+  }
+  if (minItems !== undefined && list.items.length < minItems) {
+    add(issues, node, `${subject} must have at least ${minItems} item`);
     return;
   }
   for (const item of list.items) {
@@ -597,8 +604,8 @@ function validateFields(
   }
 }
 
-/** True when `id` names a stage reachable through `after` that gates with red-test@1. */
-function namesEarlierRedTestStage(id: string, context: InputContext): boolean {
+/** True when `id` names a stage reachable through `after` whose gate uses `block`. */
+function namesEarlierStageUsing(id: string, block: string, context: InputContext): boolean {
   const byId = new Map<string, YamlNode>();
   for (const stage of context.stages) byId.set(yamlWord(yamlField(stage, 'id')), stage);
 
@@ -611,12 +618,33 @@ function namesEarlierRedTestStage(id: string, context: InputContext): boolean {
     if (current === id) {
       const ancestor = byId.get(current);
       const uses = yamlWord(yamlField(yamlField(ancestor ?? null, 'gate'), 'uses'));
-      return uses === 'ai-workflows/red-test@1';
+      return uses === block;
     }
     const ancestor = byId.get(current);
     cursor = yamlField(ancestor ?? null, 'after');
   }
   return false;
+}
+
+/** The inputs that must name an earlier stage using a given engine block. */
+const STAGE_REFERENCES: Readonly<Record<string, string>> = {
+  'red-stage': 'ai-workflows/red-test@1',
+  'preview-stage': 'ai-workflows/preview-deployment@1',
+  'merge-stage': 'ai-workflows/github-merge@1',
+};
+
+function checkStageReference(
+  node: YamlNode,
+  inputName: string,
+  context: InputContext,
+  issues: LocatedIssue[],
+): void {
+  const block = STAGE_REFERENCES[inputName];
+  if (block === undefined) return;
+  const value = yamlValue(node);
+  if (typeof value === 'string' && !namesEarlierStageUsing(value, block, context)) {
+    add(issues, node, `input "${inputName}" must name an earlier stage that uses ${block}`);
+  }
 }
 
 // ---------------------------------------------------------------------------------------
