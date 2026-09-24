@@ -139,6 +139,11 @@ function reasonOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/** Adds one note at most once: an identical note is never repeated in the report (§3.4). */
+function addNote(notes: string[], text: string): void {
+  if (!notes.includes(text)) notes[notes.length] = text;
+}
+
 function isSpanish(locale: string): boolean {
   return locale.toLowerCase().startsWith('es');
 }
@@ -436,7 +441,7 @@ async function judgeStage(stage: RecipeStage, work: StageWork): Promise<JudgedSt
 
     if (typeof server === 'object') {
       const result = await requireCheck(work.github, work.judgedSha, server.requireCheck, work.recipe.locale);
-      if (result.note !== undefined) work.notes.push(result.note);
+      if (result.note !== undefined) addNote(work.notes, result.note);
       return present(stage, result.outcome, result.reason);
     }
 
@@ -721,7 +726,7 @@ export async function runJudge(input: JudgeInput, deps: JudgeDeps): Promise<Judg
     : input.workflowRef.slice(prefix.length, at);
   const ref = at < 0 ? undefined : input.workflowRef.slice(at + 1);
   if (judgePath === undefined || judgePath.length === 0 || ref === undefined || ref.length === 0) {
-    notes.push(`procedencia no comprobada: ${input.workflowRef}`);
+    addNote(notes, `procedencia no comprobada: ${input.workflowRef}`);
     return finish();
   }
 
@@ -731,7 +736,7 @@ export async function runJudge(input: JudgeInput, deps: JudgeDeps): Promise<Judg
       ? ref.startsWith(`refs/heads/gh-readonly-queue/${principal}/`)
       : ref === `refs/heads/${principal}`;
   if (!expectedRef) {
-    notes.push(`procedencia no comprobada: ${ref}`);
+    addNote(notes, `procedencia no comprobada: ${ref}`);
     return finish();
   }
 
@@ -789,14 +794,14 @@ export async function runJudge(input: JudgeInput, deps: JudgeDeps): Promise<Judg
       traceContexts,
       locale,
     );
-    notes.push(...collected.notes);
+    for (const note of collected.notes) addNote(notes, note);
     if (collected.unofficial.length > 0) {
       const body = traceComment(collected.unofficial, locale);
       for (const target of targetList) {
         try {
           await github.upsertTraceComment(target.pr, body);
         } catch (error) {
-          notes.push(
+          addNote(notes, 
             pick(
               isSpanish(locale),
               `No se pudo escribir el rastro en el PR #${target.pr}: ${reasonOf(error)}`,
@@ -817,7 +822,7 @@ export async function runJudge(input: JudgeInput, deps: JudgeDeps): Promise<Judg
   };
 
   if (targets.ok === 'empty') {
-    notes.push(targets.note);
+    addNote(notes, targets.note);
     return finish();
   }
   if (targets.ok === 'technical') {
@@ -830,7 +835,7 @@ export async function runJudge(input: JudgeInput, deps: JudgeDeps): Promise<Judg
   // dropped and the rest are judged.
   const eventBase = text(field(field(input.event, 'pull_request'), 'base'), 'ref');
   if (input.eventName === 'pull_request_target' && eventBase !== undefined && eventBase !== principal) {
-    notes.push(`la rama destino del PR es "${eventBase}", no la principal: nada se publica`);
+    addNote(notes, `la rama destino del PR es "${eventBase}", no la principal: nada se publica`);
     return finish();
   }
   for (const target of targets.targets) {
@@ -842,7 +847,7 @@ export async function runJudge(input: JudgeInput, deps: JudgeDeps): Promise<Judg
       return conclude([], 'es');
     }
     if (pr.baseRef !== principal) {
-      notes.push(`la rama destino del PR #${target.pr} es "${pr.baseRef}", no la principal: no se juzga`);
+      addNote(notes, `la rama destino del PR #${target.pr} es "${pr.baseRef}", no la principal: no se juzga`);
       continue;
     }
     infos.set(target.pr, { headRef: pr.headRef, baseRef: pr.baseRef });
@@ -949,7 +954,7 @@ export async function runJudge(input: JudgeInput, deps: JudgeDeps): Promise<Judg
       try {
         live = await github.pullRequest(target.pr);
       } catch (error) {
-        notes.push(
+        addNote(notes, 
           pick(
             spanish,
             `no se pudo releer el PR #${target.pr}: ${reasonOf(error)}`,
@@ -959,7 +964,7 @@ export async function runJudge(input: JudgeInput, deps: JudgeDeps): Promise<Judg
         return conclude(pieces, recipe.locale);
       }
       if (live.headSha !== target.head) {
-        notes.push(
+        addNote(notes, 
           pick(
             spanish,
             `la cabeza del PR #${target.pr} cambió antes de publicar (${live.headSha}); no se publica veredicto`,
@@ -969,7 +974,7 @@ export async function runJudge(input: JudgeInput, deps: JudgeDeps): Promise<Judg
         moved = true;
       }
       if (live.baseRef !== principal) {
-        notes.push(
+        addNote(notes, 
           pick(
             spanish,
             `la rama destino del PR #${target.pr} pasó a ser "${live.baseRef}"; no se publica`,
@@ -1031,7 +1036,7 @@ export async function runJudge(input: JudgeInput, deps: JudgeDeps): Promise<Judg
       try {
         official = await officialRunId(github, newest, input.repository, judgePath, principal, input.serverUrl);
       } catch (error) {
-        notes.push(
+        addNote(notes, 
           pick(
             isSpanish(recipe.locale),
             `no se pudo comprobar el estado más reciente de ${targetContext}: ${reasonOf(error)}`,
@@ -1041,7 +1046,7 @@ export async function runJudge(input: JudgeInput, deps: JudgeDeps): Promise<Judg
         official = undefined;
       }
       if (official !== undefined && official > input.runId) {
-        notes.push(
+        addNote(notes, 
           pick(
             isSpanish(recipe.locale),
             `otra corrida oficial del juez publicó después (${official}); esta no publica`,
@@ -1060,7 +1065,7 @@ export async function runJudge(input: JudgeInput, deps: JudgeDeps): Promise<Judg
       try {
         live = await github.pullRequest(target.pr);
       } catch (error) {
-        notes.push(
+        addNote(notes, 
           pick(
             spanish,
             `no se pudo releer el PR #${target.pr} antes de publicar: ${reasonOf(error)}`,
@@ -1070,7 +1075,7 @@ export async function runJudge(input: JudgeInput, deps: JudgeDeps): Promise<Judg
         return conclude(pieces, recipe.locale);
       }
       if (live.baseRef !== principal) {
-        notes.push(
+        addNote(notes, 
           pick(
             spanish,
             `la rama destino del PR #${target.pr} es "${live.baseRef}"; no se publica`,

@@ -22,6 +22,7 @@ export {
 } from './gh-runner.js';
 export {
   createJudgeGitHub,
+  MergeQueueNotReady,
   type JudgeGitHub,
   type JudgeGitHubOptions,
   type JudgePullRequest,

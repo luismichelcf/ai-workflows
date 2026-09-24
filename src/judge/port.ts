@@ -26,6 +26,18 @@ export interface MergeQueueEntry {
   readonly prNumber: number;
 }
 
+/**
+ * Thrown when a merge queue entry already exists but the queue is still assembling it: the entry
+ * does not yet carry its head or base commit (PLAN-13-R3 §3.2). It is not a list that cannot be
+ * confirmed, but a list that is not ready yet, so the caller reads it again.
+ */
+export class MergeQueueNotReady extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'MergeQueueNotReady';
+  }
+}
+
 /** One check-run of the name the judge asked for. */
 export interface CheckRunSummary {
   /**
@@ -340,11 +352,18 @@ export function createJudgeGitHub(options: JudgeGitHubOptions): JudgeGitHub {
           throw new Error(`The merge queue of ${branch} repeats the position ${String(position)}: the list cannot be confirmed.`);
         }
         seen.add(position);
+        const prNumber = recordField(node, 'pullRequest')?.['number'];
+        if (typeof prNumber !== 'number') {
+          throw new Error(`A merge queue entry of ${branch} is missing its pull request.`);
+        }
+        // The queue can list an entry before it has finished building it: an entry without its head
+        // or base commit is not a list that cannot be confirmed, but one that is not ready yet.
         const headSha = textField(recordField(node, 'headCommit'), 'oid');
         const baseSha = textField(recordField(node, 'baseCommit'), 'oid');
-        const prNumber = recordField(node, 'pullRequest')?.['number'];
-        if (headSha === undefined || baseSha === undefined || typeof prNumber !== 'number') {
-          throw new Error(`A merge queue entry of ${branch} is missing its head, base or pull request.`);
+        if (headSha === undefined || baseSha === undefined) {
+          throw new MergeQueueNotReady(
+            `A merge queue entry of ${branch} does not carry its head or base commit yet.`,
+          );
         }
         result.push({ position, headSha, baseSha, prNumber });
       }

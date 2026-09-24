@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 
 import { createJudgeGitHub, type GhRun } from '../src/index.js';
+import { MergeQueueNotReady } from '../src/judge/port.js';
+import { waitForMergeQueue } from '../src/judge/checks.js';
 
 // PLAN-13-R3 §3.2, §3.4, §3.7 and §6: the port the judge talks to GitHub through, over `gh`.
 // `gh` is the external edge: here a fake runner answers by the arguments it receives. What is
@@ -263,4 +265,49 @@ describe('flock 4: the id of a check run', () => {
       await expect(createJudgeGitHub({ repository: REPO, runner: gh.runner }).checkRuns('abc', 'todo-verde')).rejects.toThrow();
     });
   }
+});
+
+describe('flock 5: waiting for the queue list to show the group', () => {
+  const entryOf = (head: string) => ({ position: 1, headSha: head, baseSha: 'm0', prNumber: 7 });
+
+  it('reads six times with pauses of 2, 4, 8, 15 and 30 seconds, then gives up without a read error', async () => {
+    let reads = 0;
+    const pauses: number[] = [];
+    const result = await waitForMergeQueue({ mergeQueue: async () => { reads += 1; return []; } }, 'main', 'g1', async (ms) => { pauses.push(ms); });
+    expect(reads).toBe(6);
+    expect(pauses).toEqual([2000, 4000, 8000, 15000, 30000]);
+    expect(result).toEqual({ ok: false, readFailed: false });
+  });
+
+  it('a read that fails is not retried', async () => {
+    let reads = 0;
+    const pauses: number[] = [];
+    const result = await waitForMergeQueue({ mergeQueue: async () => { reads += 1; throw new Error('HTTP 502'); } }, 'main', 'g1', async (ms) => { pauses.push(ms); });
+    expect(reads).toBe(1);
+    expect(pauses).toEqual([]);
+    expect(result).toEqual({ ok: false, readFailed: true, reason: expect.stringContaining('502') });
+  });
+
+  it('an entry still without its commits is "not ready yet", and is read again', async () => {
+    let reads = 0;
+    const result = await waitForMergeQueue({
+      mergeQueue: async () => {
+        reads += 1;
+        if (reads < 3) throw new MergeQueueNotReady('the entry of PR 7 has no head commit yet');
+        return [entryOf('g1')];
+      },
+    }, 'main', 'g1', async () => {});
+    expect(reads).toBe(3);
+    expect(result).toEqual({ ok: true, entries: [entryOf('g1')] });
+  });
+
+  it('the port says "not ready yet" for an entry whose head or base commit is still missing', async () => {
+    for (const node of [
+      { position: 1, headCommit: null, baseCommit: { oid: 'm0' }, pullRequest: { number: 7 } },
+      { position: 1, headCommit: { oid: 'g1' }, baseCommit: null, pullRequest: { number: 7 } },
+    ]) {
+      const gh = fakeGh([[/graphql/, queueAnswer([node])]]);
+      await expect(createJudgeGitHub({ repository: REPO, runner: gh.runner }).mergeQueue('main')).rejects.toBeInstanceOf(MergeQueueNotReady);
+    }
+  });
 });

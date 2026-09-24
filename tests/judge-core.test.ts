@@ -1848,3 +1848,22 @@ describe('flock 4: the judge and a queue that lists the group late', () => {
     expect(w.github.calls.filter((call) => call.startsWith('mergeQueue'))).toHaveLength(3);
   });
 });
+
+describe('flock 5', () => {
+  it('the trace of a covered attempt is noted once, however many PRs share the group', async () => {
+    const w = world();
+    const seven = behaviorPr(w, 7, 'feat/13-a');
+    const eight = w.pr(8, 'feat/14-b', { 'docs/plans/PLAN-14.md': lines('## En tres líneas', 'x', 'Tipo de cambio: comportamiento'), 'lib/b.ts': 'b\n' });
+    w.green(7, seven);
+    w.green(8, eight);
+    const group = mergeGroup(w, [7, 8]);
+    w.github.setCheck(group, 'todo-verde', green());
+    w.github.setCheck(group, 'ai-workflows/red-test', [
+      { id: 10, status: 'completed', conclusion: 'failure', app: 'github-actions', url: null },
+      { id: 11, status: 'completed', conclusion: 'success', app: 'github-actions', url: null },
+    ] as CheckRun[]);
+    w.github.pendingFromConsoleStep(group);
+    const report = await w.judge(groupInput(w, group));
+    expect(report.notes.filter((note) => /failure/.test(note))).toHaveLength(1);
+  });
+});

@@ -191,7 +191,10 @@ del servidor: `git ls-tree -r -z --full-tree <head>` y `git cat-file blob <head>
 - La lista de la cola se lee por GraphQL (`mergeQueue(branch).entries`, con variables, nunca texto
   interpolado), igual que `candado-cola` de Socialabs: sin lista confirmable (página extra, posición
   ausente o repetida, SHA del grupo que no aparece) → técnico. Nunca se pregunta a qué PR pertenece
-  el commit del grupo (lección de #1091).
+  el commit del grupo (lección de #1091). El evento `merge_group` puede llegar antes de que la lista
+  muestre el grupo (observado en GitHub): si el grupo no aparece todavía, o su entrada aún no trae
+  sus commits, se relee hasta 6 veces con pausas de 2, 4, 8, 15 y 30 s antes de rendirse; una
+  lectura que falla es técnica al momento. Lo mismo hace el job de la prueba roja (§5).
 - En un grupo, cada PR se juzga con su cabeza (`pullRequest.headRefOid`) contra el commit
   confiable (§3.1), salvo `require-check`, que se lee sobre el **SHA del grupo** (un verde de la cabeza del
   PR no acredita al grupo). El grupo pasa solo si pasan todos sus PRs.

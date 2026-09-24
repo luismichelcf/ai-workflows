@@ -1,7 +1,13 @@
 // PLAN-13-R3 §3.4 and §3.7: what the judge reads from GitHub about a SHA — the check of a stage,
 // and the states and check-runs that imitate the judge's own name.
 
-import type { CheckRunSummary, CommitStatus, JudgeGitHub, MergeQueueEntry } from './port.js';
+import {
+  MergeQueueNotReady,
+  type CheckRunSummary,
+  type CommitStatus,
+  type JudgeGitHub,
+  type MergeQueueEntry,
+} from './port.js';
 
 // The events of §3.2: only a run of one of these, of the judge's workflow, is an official status.
 export const JUDGE_EVENTS: readonly string[] = [
@@ -36,8 +42,9 @@ export type MergeQueueWait =
 /**
  * PLAN-13-R3 §3.2: a merge queue can list the group a moment after the event names it. The list is
  * read again, waiting, until the group appears — at most six reads with growing pauses — and only
- * then is its absence treated as a failure. A read that throws is never retried: it stays technical
- * at once, because it says nothing about whether the group is there.
+ * then is its absence treated as a failure. An entry the queue is still assembling (its commits are
+ * not there yet) counts as the group not appearing yet, so it is read again. Any other read that
+ * throws is never retried: it stays technical at once, because it says nothing about the group.
  */
 export async function waitForMergeQueue(
   github: Pick<JudgeGitHub, 'mergeQueue'>,
@@ -54,6 +61,7 @@ export async function waitForMergeQueue(
     try {
       queue = await github.mergeQueue(branch);
     } catch (error) {
+      if (error instanceof MergeQueueNotReady) continue;
       return { ok: false, readFailed: true, reason: reasonOf(error) };
     }
     if (queue.some((entry) => entry.headSha === sha)) return { ok: true, entries: queue };
