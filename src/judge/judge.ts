@@ -468,11 +468,11 @@ async function judgeStage(stage: RecipeStage, work: StageWork): Promise<JudgedSt
       return present(
         stage,
         'technical',
-        pick(
-          spanish,
-          'la comprobación del servidor de este bloque llega en la rebanada 4',
-          'the server check of this block arrives in slice 4',
-        ),
+          pick(
+            spanish,
+            `el bloque «${uses ?? stage.id}» no tiene comprobación del servidor`,
+            `the block "${uses ?? stage.id}" has no server check`,
+          ),
       );
     }
     const inputs = blockInputs(definition.manifest, stage.gate.with);

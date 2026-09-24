@@ -190,10 +190,10 @@ function pullRequestNode(node: unknown, what: string): AgentPullRequest {
   };
 }
 
-const BRANCH_PRS_QUERY = `query BranchPullRequests($owner: String!, $name: String!, $branch: String!) {
+const BRANCH_PRS_QUERY = `query BranchPullRequests($owner: String!, $name: String!, $branch: String!, $cursor: String) {
   repository(owner: $owner, name: $name) {
-    pullRequests(headRefName: $branch, states: [OPEN, CLOSED, MERGED], first: 100) {
-      pageInfo { hasNextPage }
+    pullRequests(headRefName: $branch, states: [OPEN, CLOSED, MERGED], first: 100, after: $cursor) {
+      pageInfo { hasNextPage endCursor }
       nodes {
         number url state isDraft headRefOid headRefName baseRefName body
         headRepository { nameWithOwner }
@@ -219,11 +219,11 @@ const PR_DETAIL_QUERY = `query PullRequestDetail($owner: String!, $name: String!
   }
 }`;
 
-const TIMELINE_QUERY = `query PullRequestHistory($owner: String!, $name: String!, $number: Int!) {
+const TIMELINE_QUERY = `query PullRequestHistory($owner: String!, $name: String!, $number: Int!, $cursor: String) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
-      timelineItems(itemTypes: [PULL_REQUEST_COMMIT, READY_FOR_REVIEW_EVENT, AUTO_MERGE_ENABLED_EVENT, ADDED_TO_MERGE_QUEUE_EVENT, HEAD_REF_FORCE_PUSHED_EVENT, MERGED_EVENT], first: 100) {
-        pageInfo { hasNextPage }
+      timelineItems(itemTypes: [PULL_REQUEST_COMMIT, READY_FOR_REVIEW_EVENT, AUTO_MERGE_ENABLED_EVENT, ADDED_TO_MERGE_QUEUE_EVENT, HEAD_REF_FORCE_PUSHED_EVENT, MERGED_EVENT], first: 100, after: $cursor) {
+        pageInfo { hasNextPage endCursor }
         nodes {
           __typename
           ... on PullRequestCommit { commit { oid committedDate } }
@@ -271,27 +271,41 @@ export function createAgentGitHub(options: AgentGitHubOptions): AgentGitHub {
     ...judge,
 
     async pullRequestsOfBranch(branch: string): Promise<AgentPullRequest[]> {
-      const parsed = await graphql(
-        BRANCH_PRS_QUERY,
-        [
+      // Every page is read to the end, following `pageInfo.endCursor` as the GraphQL `cursor`
+      // variable; the first call carries no cursor. A page that claims another without naming
+      // its cursor cannot be confirmed, so it throws instead of returning part of the truth.
+      const nodes: unknown[] = [];
+      let cursor: string | undefined;
+      for (;;) {
+        const variables: [string, string][] = [
           ['owner', owner],
           ['name', name],
           ['branch', branch],
-        ],
-        [],
-        `the pull requests of ${branch}`,
-      );
-      const list = recordField(recordField(recordField(parsed, 'data'), 'repository'), 'pullRequests');
-      if (list === undefined) throw new Error(`gh did not report the pull requests of ${branch}.`);
-      const hasNextPage = recordField(list, 'pageInfo')?.['hasNextPage'];
-      if (typeof hasNextPage !== 'boolean') {
-        throw new Error(`gh did not report whether the pull requests of ${branch} have another page.`);
+        ];
+        if (cursor !== undefined) variables.push(['cursor', cursor]);
+        const parsed = await graphql(
+          BRANCH_PRS_QUERY,
+          variables,
+          [],
+          `the pull requests of ${branch}`,
+        );
+        const list = recordField(recordField(recordField(parsed, 'data'), 'repository'), 'pullRequests');
+        if (list === undefined) throw new Error(`gh did not report the pull requests of ${branch}.`);
+        const pageInfo = recordField(list, 'pageInfo');
+        const hasNextPage = pageInfo === undefined ? undefined : pageInfo['hasNextPage'];
+        if (typeof hasNextPage !== 'boolean') {
+          throw new Error(`gh did not report whether the pull requests of ${branch} have another page.`);
+        }
+        const pageNodes = arrayField(list, 'nodes');
+        if (pageNodes === undefined) throw new Error(`gh did not report a list of pull requests for ${branch}.`);
+        for (const node of pageNodes) nodes.push(node);
+        if (!hasNextPage) break;
+        const endCursor = pageInfo?.['endCursor'];
+        if (typeof endCursor !== 'string' || endCursor.length === 0) {
+          throw new Error(`The pull requests of ${branch} claim another page without its cursor: the list cannot be confirmed.`);
+        }
+        cursor = endCursor;
       }
-      if (hasNextPage) {
-        throw new Error(`The pull requests of ${branch} do not fit in one page: the list cannot be confirmed.`);
-      }
-      const nodes = arrayField(list, 'nodes');
-      if (nodes === undefined) throw new Error(`gh did not report a list of pull requests for ${branch}.`);
       return nodes.map((node) => pullRequestNode(node, `pull request of ${branch}`));
     },
 
@@ -311,27 +325,39 @@ export function createAgentGitHub(options: AgentGitHubOptions): AgentGitHub {
     },
 
     async pullRequestHistory(n: number): Promise<PullRequestHistoryItem[]> {
-      const parsed = await graphql(
-        TIMELINE_QUERY,
-        [
+      // Every page is read to the end, in the order GitHub delivers it (never re-sorted by date).
+      const nodes: unknown[] = [];
+      let cursor: string | undefined;
+      for (;;) {
+        const variables: [string, string][] = [
           ['owner', owner],
           ['name', name],
-        ],
-        [['number', n]],
-        `the timeline of pull request ${String(n)}`,
-      );
-      const pr = recordField(recordField(recordField(parsed, 'data'), 'repository'), 'pullRequest');
-      const timeline = pr === undefined ? undefined : recordField(pr, 'timelineItems');
-      if (timeline === undefined) throw new Error(`gh did not report the timeline of pull request ${String(n)}.`);
-      const hasNextPage = recordField(timeline, 'pageInfo')?.['hasNextPage'];
-      if (typeof hasNextPage !== 'boolean') {
-        throw new Error(`gh did not report whether the timeline of pull request ${String(n)} has another page.`);
+        ];
+        if (cursor !== undefined) variables.push(['cursor', cursor]);
+        const parsed = await graphql(
+          TIMELINE_QUERY,
+          variables,
+          [['number', n]],
+          `the timeline of pull request ${String(n)}`,
+        );
+        const pr = recordField(recordField(recordField(parsed, 'data'), 'repository'), 'pullRequest');
+        const timeline = pr === undefined ? undefined : recordField(pr, 'timelineItems');
+        if (timeline === undefined) throw new Error(`gh did not report the timeline of pull request ${String(n)}.`);
+        const pageInfo = recordField(timeline, 'pageInfo');
+        const hasNextPage = pageInfo === undefined ? undefined : pageInfo['hasNextPage'];
+        if (typeof hasNextPage !== 'boolean') {
+          throw new Error(`gh did not report whether the timeline of pull request ${String(n)} has another page.`);
+        }
+        const pageNodes = arrayField(timeline, 'nodes');
+        if (pageNodes === undefined) throw new Error(`gh did not report the timeline of pull request ${String(n)}.`);
+        for (const node of pageNodes) nodes.push(node);
+        if (!hasNextPage) break;
+        const endCursor = pageInfo?.['endCursor'];
+        if (typeof endCursor !== 'string' || endCursor.length === 0) {
+          throw new Error(`The timeline of pull request ${String(n)} claims another page without its cursor: the list cannot be confirmed.`);
+        }
+        cursor = endCursor;
       }
-      if (hasNextPage) {
-        throw new Error(`The timeline of pull request ${String(n)} does not fit in one page: it cannot be confirmed.`);
-      }
-      const nodes = arrayField(timeline, 'nodes');
-      if (nodes === undefined) throw new Error(`gh did not report the timeline of pull request ${String(n)}.`);
       const items: PullRequestHistoryItem[] = [];
       for (const node of nodes) {
         const typename = textField(node, '__typename');

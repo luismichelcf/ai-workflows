@@ -12,6 +12,7 @@ export const manifest: BlockManifest = {
   name: 'preview-deployment',
   kind: 'module',
   natures: ['recompute'],
+  validWhile: ['same-sha'],
   server: ['require-check'],
   inputs: {
     environment: { type: 'string', required: true },

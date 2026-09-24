@@ -265,7 +265,7 @@ function createGate(inputs: QaInputs, deps: EngineBlockDeps): Gate {
     const agent = requireAgent(deps, spanish);
     const sha = judgedSha(context);
 
-    const pullDeps = { root: deps.root, recipe: deps.recipe, agent };
+    const pullDeps = { root: deps.root, recipe: deps.recipe, agent, store: deps.store };
     let pr;
     try {
       pr = await pullRequestOf(context.piece, sha, { create: true, context, deps: pullDeps });
@@ -383,6 +383,7 @@ export const browserQaBlock: BlockDefinition = {
       root: deps.root,
       recipe: deps.recipe,
       agent,
+      store: deps.store,
     });
     return outcome.handled ? outcome.answer : undefined;
   },

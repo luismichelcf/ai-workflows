@@ -5,7 +5,7 @@
 // the token or the key.
 
 import { createSign } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { readFileSync, realpathSync } from 'node:fs';
 import { isAbsolute, relative, resolve, sep } from 'node:path';
 
 export interface AgentCredentials {
@@ -25,9 +25,21 @@ export const APP_KEY_FILE_ENV = 'AI_WORKFLOWS_APP_KEY_FILE';
 /** A positive whole number, with no sign, no decimal point and no surrounding space. */
 const POSITIVE_INTEGER = /^[1-9][0-9]*$/;
 
-/** Whether `file` resolves inside `root`; `root` itself counts as inside. */
+/**
+ * The real path of a file or folder, resolving links and junctions. A path that does not exist
+ * yet is left as written: the check then compares spellings, never a resolved path it cannot read.
+ */
+function realOrWritten(path: string): string {
+  try {
+    return realpathSync.native(path);
+  } catch {
+    return resolve(path);
+  }
+}
+
+/** Whether `file` resolves inside `root`, however either is spelled or reached; `root` counts. */
 function isInsideProject(root: string, file: string): boolean {
-  const inside = relative(resolve(root), resolve(file));
+  const inside = relative(realOrWritten(root), realOrWritten(file));
   return inside === '' || (inside !== '..' && !inside.startsWith(`..${sep}`) && !isAbsolute(inside));
 }
 

@@ -1050,7 +1050,21 @@ export function createEngine(options: EngineOptions): Engine {
               throw new DryRunEffectRefused(operationId);
             }
           : <T extends JsonValue>(operationId: string, effect: () => Promise<T>): Promise<T> =>
-              store.runEffect(piece, operationId, effect);
+              store.runEffect(piece, operationId, effect).catch((error: unknown) => {
+                // A pending or uncertain record and a refusal because the piece is parked are
+                // facts the wrapper above must see as their own class. Anything else out of the
+                // store is a store failure: it is never retried and never waved through.
+                if (
+                  error instanceof EffectNeedsReconciliation
+                  || error instanceof EffectRefusedBecauseParked
+                  || error instanceof ProcessTreeSurvived
+                ) {
+                  throw error;
+                }
+                throw new StoreWriteFailure(
+                  `store failed while running effect "${operationId}": ${describeUnknown(error)}`,
+                );
+              });
 
         return {
           piece,
@@ -1336,12 +1350,14 @@ export function createEngine(options: EngineOptions): Engine {
           // attempt reaches the journal, saying how many there were.
           const attempts = stage.retry?.attempts ?? 1;
           const waitMs = stage.retry?.waitMs ?? 0;
+          // How many attempts actually ran, so the motive never claims more than were made.
+          let attemptsMade = 1;
           const counted = (reason: string): string =>
-            attempts > 1
+            attemptsMade > 1
               ? `${reason} (${
                   config.locale.startsWith('en')
-                    ? `after ${attempts} attempts`
-                    : `tras ${attempts} intentos`
+                    ? `after ${attemptsMade} attempts`
+                    : `tras ${attemptsMade} intentos`
                 })`
               : reason;
 
@@ -1350,6 +1366,7 @@ export function createEngine(options: EngineOptions): Engine {
           const stopHeartbeat = startHeartbeat();
           try {
             for (let attempt = 1; ; attempt += 1) {
+              attemptsMade = attempt;
               retryable = false;
               try {
                 raw = await stage.gate(context);
@@ -1396,6 +1413,12 @@ export function createEngine(options: EngineOptions): Engine {
                   // A refusal is a cancellation decision, not a gate failure. It is translated once,
                   // in the stage's catch, so it travels past this one without being journalled or
                   // turned into a `blocked:technical`.
+                  throw error;
+                }
+                if (error instanceof StoreWriteFailure) {
+                  // A store failure inside an effect is not a gate failure: it is never retried
+                  // and it blocks even an optional stage. It travels to the outer catch, which
+                  // records the technical block without touching the store again.
                   throw error;
                 }
                 const stopped = await readStatus();

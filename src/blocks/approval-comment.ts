@@ -50,7 +50,7 @@ function createGate(inputs: CommentInputs, deps: EngineBlockDeps): Gate {
     }
     const sha = judgedSha(context);
 
-    const pullDeps = { root: deps.root, recipe: deps.recipe, agent };
+    const pullDeps = { root: deps.root, recipe: deps.recipe, agent, store: deps.store };
     let pr;
     try {
       pr = await pullRequestOf(context.piece, sha, { create: true, context, deps: pullDeps });
@@ -113,6 +113,7 @@ export const approvalCommentBlock: BlockDefinition = {
       root: deps.root,
       recipe: deps.recipe,
       agent,
+      store: deps.store,
     });
     return outcome.handled ? outcome.answer : undefined;
   },

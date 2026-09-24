@@ -16,6 +16,7 @@ export const manifest: BlockManifest = {
   name: 'github-merge',
   kind: 'module',
   natures: ['recompute'],
+  validWhile: ['same-sha'],
   server: [],
   inputs: {
     method: { type: 'string', enum: ['merge', 'squash', 'rebase'], default: 'merge' },
@@ -61,7 +62,7 @@ function createGate(inputs: MergeInputs, deps: EngineBlockDeps): Gate {
     const agent = requireAgent(deps, spanish);
     const sha = judgedSha(context);
 
-    const pullDeps = { root: deps.root, recipe: deps.recipe, agent };
+    const pullDeps = { root: deps.root, recipe: deps.recipe, agent, store: deps.store };
     let pr;
     try {
       pr = await pullRequestOf(context.piece, sha, { create: true, context, deps: pullDeps });
@@ -73,11 +74,14 @@ function createGate(inputs: MergeInputs, deps: EngineBlockDeps): Gate {
     let detail = pr.detail;
     if (detail.state === 'MERGED') return merged(pr.number, sha, detail.mergeCommit ?? null);
 
+    // An earlier attempt may have left the ready effect in doubt. It is settled even when GitHub
+    // now shows the pull request ready, so a "ready" by someone else is never taken for the
+    // agents' own (PLAN-13-R4 §3.0.1).
+    const readyOp = `ready:${pr.number}:${sha}`;
+    const recorded = await deps.store.getEffect(context.piece, readyOp);
     if (detail.isDraft) {
       // If the ready effect is already recorded and the pull request is still a draft, someone
       // turned it back by hand: the effect is not repeated and the stage refuses.
-      const readyOp = `ready:${pr.number}:${sha}`;
-      const recorded = await deps.store.getEffect(context.piece, readyOp);
       if (recorded?.state === 'confirmed') {
         return {
           ok: false,
@@ -89,6 +93,11 @@ function createGate(inputs: MergeInputs, deps: EngineBlockDeps): Gate {
         return null;
       });
       detail = { ...detail, isDraft: false };
+    } else if (recorded !== undefined && recorded.state !== 'confirmed') {
+      await context.runEffect(readyOp, async () => {
+        await agent.github.markReady(pr.number);
+        return null;
+      });
     }
 
     await context.runEffect(`merge:${pr.number}:${sha}`, async () => {
@@ -151,6 +160,13 @@ function createGate(inputs: MergeInputs, deps: EngineBlockDeps): Gate {
 }
 
 function merged(number: number, headSha: string, mergeSha: string | null): GateResult {
+  // A pull request GitHub calls merged always carries the commit it merged: one without it is a
+  // reading that cannot be confirmed, never a pass with no commit.
+  if (mergeSha === null) {
+    throw new Error(
+      `pull request #${String(number)} is merged but does not report its merge commit`,
+    );
+  }
   const evidence: Record<string, JsonValue> = { pr: number, headSha, mergeSha };
   return { ok: true, evidence };
 }
@@ -205,6 +221,7 @@ export const githubMergeBlock: BlockDefinition = {
       root: deps.root,
       recipe: deps.recipe,
       agent,
+      store: deps.store,
     });
     if (prOutcome.handled) return prOutcome.answer;
     return await reconcilePriorEffects(operationId, context, deps);

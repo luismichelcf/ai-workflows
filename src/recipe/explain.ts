@@ -18,6 +18,8 @@ interface ExplainWords {
   readonly pieces: string;
   readonly declaredKind: (line: string, file: string) => string;
   readonly github: Readonly<Record<GitHubMode, string>>;
+  /** The attestation line of a review block that reads the piece's published verdicts. */
+  readonly attestationVerdicts: string;
   readonly githubOrder: string;
   readonly githubCleanUpdate: string;
   readonly declaredBuilder: string;
@@ -70,6 +72,7 @@ const EXPLAIN_WORDS: Record<Language, ExplainWords> = {
       attestation: '   En GitHub: se busca la aprobación publicada en el PR.',
       'local-only': '   En GitHub: solo se comprueba junto al agente.',
     },
+    attestationVerdicts: '   En GitHub: se buscan los veredictos publicados en el issue de la pieza.',
     githubOrder: '   El orden en que se escribió solo lo vigila el motor junto al agente.',
     githubCleanUpdate:
       '   En GitHub, una actualización con la versión principal pide aprobarla otra vez.',
@@ -122,6 +125,7 @@ const EXPLAIN_WORDS: Record<Language, ExplainWords> = {
       attestation: '   On GitHub: the approval published on the pull request is looked for.',
       'local-only': '   On GitHub: only checked next to the agent.',
     },
+    attestationVerdicts: "   On GitHub: the verdicts published on the piece's issue are looked for.",
     githubOrder:
       '   The order in which it was written is only watched by the engine next to the agent.',
     githubCleanUpdate:
@@ -185,7 +189,11 @@ function retryLine(stage: RecipeStage, words: ExplainWords): string | undefined 
 function githubLines(stage: RecipeStage, words: ExplainWords): readonly string[] {
   if (stage.phase !== 'pre-merge' || stage.server === undefined) return [];
   const mode = typeof stage.server === 'string' ? stage.server : 'require-check';
-  const lines = [words.github[mode]];
+  // A review block reads the verdicts the agents publish on the piece's issue; every other
+  // attestation reads what the owner published on the pull request (PLAN-13-R4 §3.1, §7).
+  const verdictOfReview =
+    mode === 'attestation' && stage.gate.uses === 'ai-workflows/sandboxed-review@1';
+  const lines = [verdictOfReview ? words.attestationVerdicts : words.github[mode]];
   if (mode === 'require-check' && stage.nature === 'execution-record') {
     lines.push(words.githubOrder);
   }

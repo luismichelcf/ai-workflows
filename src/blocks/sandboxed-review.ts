@@ -74,6 +74,18 @@ function readIdentity(value: unknown): ExecutionIdentity | undefined {
   return { provider, model, session };
 }
 
+/** Every declared builder of the change; `undefined` when one of them is not a real identity. */
+function readBuilders(value: unknown): ExecutionIdentity[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const builders: ExecutionIdentity[] = [];
+  for (const item of value) {
+    const identity = readIdentity(item);
+    if (identity === undefined) return undefined;
+    builders.push(identity);
+  }
+  return builders;
+}
+
 /** Every file under `root`, as paths relative to it with `/`, excluding `.git` and `node_modules`. */
 async function listFiles(root: string, prefix: string): Promise<string[]> {
   const here = prefix === '' ? root : join(root, prefix);
@@ -189,8 +201,10 @@ function createGate(inputs: ReviewInputs, deps: EngineBlockDeps): Gate {
     const change = readObject(context.change) ?? {};
     if (change['clean'] !== true) return { ok: false, reason: cleanReason(spanish) };
 
-    const builder = readIdentity(change['builder']);
-    if (builder === undefined) return { ok: false, reason: noBuilderReason(spanish) };
+    const builders = readBuilders(change['builders']);
+    if (builders === undefined || builders.length === 0) {
+      return { ok: false, reason: noBuilderReason(spanish) };
+    }
 
     const path = inputs.prompt.replaceAll('{piece}', context.piece);
     let promptText: string;
@@ -229,17 +243,19 @@ function createGate(inputs: ReviewInputs, deps: EngineBlockDeps): Gate {
     if (verdict === undefined) throw new Error('the reviewer gave no single VERDICT line');
 
     const sha = asString(change['sha']) ?? '';
-    const independence = requireDifferentBuilder(
-      [{ by: report.identity, sha, approved: verdict.approved }],
-      builder,
-      { differentProvider: false },
-    );
-    if (!independence.ok) return { ok: false, reason: independence.reason };
+    for (const builder of builders) {
+      const independence = requireDifferentBuilder(
+        [{ by: report.identity, sha, approved: verdict.approved }],
+        builder,
+        { differentProvider: false },
+      );
+      if (!independence.ok) return { ok: false, reason: independence.reason };
 
-    if (inputs.forbidSameFamily) {
-      const reviewerFamily = familyOf(report.identity);
-      if (reviewerFamily === familyOf(builder)) {
-        return { ok: false, reason: sameFamilyReason(reviewerFamily, spanish) };
+      if (inputs.forbidSameFamily) {
+        const reviewerFamily = familyOf(report.identity);
+        if (reviewerFamily === familyOf(builder)) {
+          return { ok: false, reason: sameFamilyReason(reviewerFamily, spanish) };
+        }
       }
     }
 
@@ -333,10 +349,14 @@ async function attestation(
 
   const angle = asString(inputs['angle']) ?? '';
   try {
+    // PLAN-13-R4 §7: the events' commits may not be in the judge's checkout, so they are brought
+    // in before any fingerprint is computed over them.
+    await context.fetchObjects([context.head, ...events.map((event) => event.sha)]);
     const decision = await decideIndependentReview({
       events,
       angles: angle.length === 0 ? [] : [angle],
       forbidSameFamily: inputs['forbidSameFamily'] !== false,
+      stage: context.stage,
       accepts: (sha) =>
         serverAccepts(context.root, context.trusted, context.head, sha, context.validWhile, context.recipe, context.piece),
       treeOf: (sha) => treeOfCommit(context.root, sha),

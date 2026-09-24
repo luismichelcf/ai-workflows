@@ -136,6 +136,9 @@ async function attestation(
   const angles = asStringList(inputs['angles']) ?? [];
   const forbidSameFamily = inputs['forbidSameFamily'] !== false;
   try {
+    // PLAN-13-R4 §7: the commits the events name may not be in the judge's checkout; they are
+    // brought in before any fingerprint or tree is read from them.
+    await context.fetchObjects([context.head, ...events.map((event) => event.sha)]);
     const decision = await decideIndependentReview({
       events,
       angles,

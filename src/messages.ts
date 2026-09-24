@@ -114,11 +114,21 @@ const ENGLISH_TEMPLATES: Templates = {
   close: () => 'The change is in.',
 };
 
+/**
+ * Neutralises the two halves of an HTML comment so no text the engine posts to a pull request
+ * or an issue can smuggle a marker (a forged event, a message mark) inside a comment.
+ */
+export function neutralizeHtmlComments(text: string): string {
+  return text.replace(/<!--/g, '&lt;!--').replace(/-->/g, '--&gt;');
+}
+
 /** Strips control characters and neutralises Markdown that could forge a link or a heading. */
 function cleanDetail(detail: string): string {
-  return safeTerminalText(detail)
-    .replace(/\]\(/g, ']\\(')
-    .replace(/^([ \t]*)#/gm, '$1\\#');
+  return neutralizeHtmlComments(
+    safeTerminalText(detail)
+      .replace(/\]\(/g, ']\\(')
+      .replace(/^([ \t]*)#/gm, '$1\\#'),
+  );
 }
 
 function compose(summary: readonly string[] | undefined, body: string, spanish: boolean): string {
@@ -144,13 +154,15 @@ export function renderOwnerMessage(
   const spanish = options.locale.toLowerCase().startsWith('es');
   const templates = spanish ? SPANISH_TEMPLATES : ENGLISH_TEMPLATES;
   const detail = options.detail === undefined ? undefined : cleanDetail(options.detail);
-  const summary = options.summary;
+  // Every line the engine posts is neutralised: a summary line could otherwise carry a marker.
+  const summary = options.summary?.map(neutralizeHtmlComments);
+  const link = options.link === undefined ? undefined : neutralizeHtmlComments(options.link);
 
-  const full = compose(summary, templates[kind]({ ...(detail === undefined ? {} : { detail }), ...(options.link === undefined ? {} : { link: options.link }) }), spanish);
+  const full = compose(summary, templates[kind]({ ...(detail === undefined ? {} : { detail }), ...(link === undefined ? {} : { link }) }), spanish);
   const fullBanned = findBannedTerms(full, options.banned);
   if (fullBanned.length === 0 && full.length <= options.maxLength) return { text: full };
 
-  const minimal = compose(summary, templates[kind](options.link === undefined ? {} : { link: options.link }), spanish);
+  const minimal = compose(summary, templates[kind](link === undefined ? {} : { link }), spanish);
   const minimalBanned = findBannedTerms(minimal, options.banned);
   if (minimalBanned.length > 0) {
     return {

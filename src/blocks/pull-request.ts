@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process';
 
-import type { GateContext, JsonValue } from '../contract.js';
+import type { GateContext, JsonValue, Store } from '../contract.js';
 import type { AgentPullRequest, PullRequestHistoryItem } from '../agent/github.js';
 import { gitEnvironment } from '../git-env.js';
 import { pieceOfBranch } from '../judge/pieces.js';
@@ -21,6 +21,8 @@ export interface PullRequestDeps {
   readonly root: string;
   readonly recipe: Recipe;
   readonly agent: AgentDeps;
+  /** The store, so an effect left in doubt is settled before any new refusal (PLAN-13-R4 §3.0). */
+  readonly store: Store;
 }
 
 /** The pull request of the piece, ready to be used, with the detail that confirmed it. */
@@ -145,8 +147,19 @@ export async function pullRequestOf(
   const already = merged[0];
   if (already !== undefined) return { number: already.number, url: already.url, detail: already };
 
-  // Push the judged SHA without force. A remote branch with commits that are not here is refused
-  // and sent to `sync`; an unknown remote head is refused the same way, never overwritten.
+  // Push the judged SHA without force. An earlier attempt that left the push in doubt is settled
+  // first, before any refusal, so the answer names the effect and it is never repeated blindly.
+  const pushOp = `push:${branch}:${sha}`;
+  const recordedPush = await deps.store.getEffect(piece, pushOp);
+  if (recordedPush !== undefined && recordedPush.state !== 'confirmed') {
+    await context.runEffect(pushOp, async () => {
+      await agent.remote.push(branch, sha);
+      return null;
+    });
+  }
+
+  // A remote branch with commits that are not here is refused and sent to `sync`; an unknown
+  // remote head is refused the same way, never overwritten.
   const remoteHead = await agent.remote.branchHead(branch);
   if (remoteHead !== undefined && remoteHead !== sha) {
     let ancestor = false;
@@ -165,7 +178,7 @@ export async function pullRequestOf(
     }
   }
 
-  await context.runEffect(`push:${branch}:${sha}`, async () => {
+  await context.runEffect(pushOp, async () => {
     await agent.remote.push(branch, sha);
     return null;
   });
@@ -180,10 +193,11 @@ export async function pullRequestOf(
 
   const open = prs.filter((pr) => pr.state === 'OPEN');
   if (open.length > 1) {
+    const numbers = open.map((pr) => `#${pr.number}`).join(', ');
     throw new Error(
       spanish
-        ? 'Hay más de un PR abierto en esta rama: no se puede saber cuál es el de la pieza.'
-        : 'More than one pull request is open on this branch: the piece\'s own cannot be told apart.',
+        ? `Hay más de un PR abierto en esta rama (${numbers}, efecto open-pr:${branch}:${sha}): no se puede saber cuál es el de la pieza.`
+        : `More than one pull request is open on this branch (${numbers}, effect open-pr:${branch}:${sha}): the piece's own cannot be told apart.`,
     );
   }
 
@@ -379,7 +393,13 @@ async function reconcileOpenPr(
   deps: PullRequestDeps,
 ): Promise<ReconcileAnswer> {
   const prs = await deps.agent.github.pullRequestsOfBranch(parts.branch);
-  const mine = prs.filter((pr) => hasMark(pr.body, `open-pr:${parts.branch}:${parts.sha}`));
+  // The mark alone does not confirm: the pull request must also be the agents' own. A mark
+  // copied onto another account's pull request proves nothing.
+  const mine = prs.filter(
+    (pr) =>
+      hasMark(pr.body, `open-pr:${parts.branch}:${parts.sha}`)
+      && (deps.recipe.agentAccount === undefined || pr.author === deps.recipe.agentAccount),
+  );
   if (mine.length > 1) return undefined;
   const found = mine[0];
   if (found !== undefined) return { confirmed: { number: found.number, url: found.url } satisfies JsonValue };
