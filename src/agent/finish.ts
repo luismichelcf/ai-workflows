@@ -1,6 +1,6 @@
-import { existsSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, realpathSync, rmSync, statSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
-import { join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 
 import type { JsonValue, Store } from '../contract.js';
 import { safeTerminalText } from '../safe-text.js';
@@ -72,23 +72,44 @@ function cleanupEvidence(
   return undefined;
 }
 
+/**
+ * One canonical spelling of a folder path for comparison. When the path exists, the filesystem's
+ * own real spelling is used (long names and canonical case, never an 8.3 short name such as
+ * `RUNNER~1`). When it does not — a folder `finish` is about to retire, or a registry entry left
+ * behind — the nearest existing parent is resolved the same way and the missing segments are
+ * re-attached. Windows folds the case, because it treats `RUNNER~1` and `runneradmin` as the same
+ * folder; POSIX keeps it, because `Docs` and `docs` are two different folders there.
+ */
+function canonicalPath(path: string): string {
+  const resolved = resolve(path);
+  let existing = resolved;
+  const missing: string[] = [];
+  for (;;) {
+    try {
+      const real = realpathSync.native(existing);
+      const joined = missing.length === 0 ? real : join(real, ...missing.reverse());
+      return process.platform === 'win32' ? joined.toLowerCase() : joined;
+    } catch {
+      const parent = dirname(existing);
+      if (parent === existing) {
+        const joined = missing.length === 0 ? resolved : join(resolved, ...missing.reverse());
+        return process.platform === 'win32' ? joined.toLowerCase() : joined;
+      }
+      missing.push(basename(existing));
+      existing = parent;
+    }
+  }
+}
+
 /** Whether the running process is inside `folder`, so removing it would lock the folder. */
 function cwdInside(folder: string): boolean {
-  const cwd = resolve(process.cwd());
-  const target = resolve(folder);
-  const normalized = process.platform === 'win32' ? target.toLowerCase() : target;
-  const here = process.platform === 'win32' ? cwd.toLowerCase() : cwd;
-  return (
-    here === normalized
-    || here.startsWith(`${normalized}\\`)
-    || here.startsWith(`${normalized}/`)
-  );
+  const here = canonicalPath(process.cwd());
+  const target = canonicalPath(folder);
+  return here === target || here.startsWith(`${target}\\`) || here.startsWith(`${target}/`);
 }
 
 function samePath(a: string, b: string): boolean {
-  const left = resolve(a);
-  const right = resolve(b);
-  return process.platform === 'win32' ? left.toLowerCase() === right.toLowerCase() : left === right;
+  return canonicalPath(a) === canonicalPath(b);
 }
 
 /** A plain directory check that never follows a broken link into a throw. */
