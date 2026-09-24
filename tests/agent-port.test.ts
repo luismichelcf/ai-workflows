@@ -5,7 +5,8 @@ import { createAgentGitHub, type GhRun } from '../src/index.js';
 // PLAN-13-R4 §9: the port the engine uses next to the agent, over `gh`. `gh` is the external
 // edge: a fake runner answers by the arguments it receives. Pinned: every call carries the
 // agents' token in its own environment and never in its arguments; values reach GraphQL as
-// variables; a list that cannot be confirmed (another page, a missing field) throws instead of
+// variables; lists are read page by page to the end (PLAN-13-R4 §9), and one that cannot be
+// confirmed (a next page without its cursor, a missing field) throws instead of
 // returning part of the truth; and the fields the reconciliation of §3.0.1 depends on.
 
 type Answer = GhRun | ((args: readonly string[], input?: string) => GhRun);
@@ -52,8 +53,15 @@ const prNode = (over: Record<string, unknown> = {}) => ({
   ...over,
 });
 
-const prList = (nodes: unknown[], hasNextPage: unknown = false) =>
-  ok({ data: { repository: { pullRequests: { pageInfo: { hasNextPage }, nodes } } } });
+const prList = (nodes: unknown[], hasNextPage: unknown = false, endCursor: unknown = null) =>
+  ok({ data: { repository: { pullRequests: { pageInfo: { hasNextPage, endCursor }, nodes } } } });
+
+/** Answers page by page: the call whose arguments carry `cursor=<c>` gets the page after `c`. */
+const paged = (pages: GhRun[], cursors: string[]) => (args: readonly string[]): GhRun => {
+  const cursor = args.find((arg) => arg.startsWith('cursor='))?.slice('cursor='.length);
+  const index = cursor === undefined ? 0 : cursors.indexOf(cursor) + 1;
+  return pages[index] ?? { exitCode: 1, stdout: '', stderr: `unexpected cursor ${String(cursor)}` };
+};
 
 describe('the agents token', () => {
   it('goes to every call in GH_TOKEN, never in the arguments', async () => {
@@ -106,7 +114,7 @@ describe('pullRequestsOfBranch', () => {
   });
 
   const unconfirmable: [string, GhRun][] = [
-    ['another page', prList([prNode()], true)],
+    ['a next page without its cursor', prList([prNode()], true, null)],
     ['no page information', prList([prNode()], null)],
     ['a pull request without its head', prList([prNode({ headRefOid: null })])],
     ['a state it does not know', prList([prNode({ state: 'LOCKED' })])],
@@ -118,11 +126,21 @@ describe('pullRequestsOfBranch', () => {
       await expect(github.pullRequestsOfBranch('feat/13-algo')).rejects.toThrow();
     });
   }
+
+  it('reads every page, following the cursor as a variable, and returns them all in order', async () => {
+    const { github, calls } = port([[/graphql/, paged([
+      prList([prNode({ number: 1 })], true, 'c1'),
+      prList([prNode({ number: 2 })], true, 'c2'),
+      prList([prNode({ number: 3 })], false, null),
+    ], ['c1', 'c2'])]]);
+    expect((await github.pullRequestsOfBranch('feat/13-algo')).map((pr) => pr.number)).toEqual([1, 2, 3]);
+    expect(calls.map((call) => call.args.find((arg) => arg.startsWith('cursor=')) ?? null)).toEqual([null, 'cursor=c1', 'cursor=c2']);
+  });
 });
 
 describe('pullRequestHistory', () => {
-  const timeline = (nodes: unknown[], hasNextPage: unknown = false) =>
-    ok({ data: { repository: { pullRequest: { timelineItems: { pageInfo: { hasNextPage }, nodes } } } } });
+  const timeline = (nodes: unknown[], hasNextPage: unknown = false, endCursor: unknown = null) =>
+    ok({ data: { repository: { pullRequest: { timelineItems: { pageInfo: { hasNextPage, endCursor }, nodes } } } } });
 
   it('translates the events the reconciliation reads, in order, with who and when', async () => {
     const { github } = port([[/graphql/, timeline([
@@ -144,8 +162,16 @@ describe('pullRequestHistory', () => {
     ]);
   });
 
-  it('throws when the history does not fit in one page or has no page information', async () => {
-    for (const answer of [timeline([], true), timeline([], null)]) {
+  it('reads a long history page by page, in the order GitHub gives it (never re-sorted by date)', async () => {
+    const { github } = port([[/graphql/, paged([
+      timeline([{ __typename: 'ReadyForReviewEvent', actor: { login: 'mi-motor', __typename: 'Bot' }, createdAt: '2026-09-24T10:05:00Z' }], true, 'c1'),
+      timeline([{ __typename: 'PullRequestCommit', commit: { oid: HEAD, committedDate: '2026-01-01T00:00:00Z' } }], false),
+    ], ['c1'])]]);
+    expect((await github.pullRequestHistory(7)).map((item) => item.type)).toEqual(['ready', 'head-changed']);
+  });
+
+  it('throws when a next page has no cursor or there is no page information', async () => {
+    for (const answer of [timeline([], true, null), timeline([], null)]) {
       const { github } = port([[/graphql/, answer]]);
       await expect(github.pullRequestHistory(7)).rejects.toThrow();
     }

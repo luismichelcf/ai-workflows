@@ -340,6 +340,8 @@ export interface FinalRunOptions {
   readonly locale?: string;
   /** The waits of retries and polls; by default they return at once and advance a fake clock. */
   readonly sleep?: (ms: number, signal: AbortSignal) => Promise<void>;
+  /** Stands in for the provider CLIs (a sandboxed review), which are the external edge. */
+  readonly providers?: { run(invocation: import('../src/index.js').Invocation): Promise<import('../src/index.js').RawRun> };
 }
 
 /** Runs `stages` (YAML rows under `stages:`) for piece 13 over `root`, talking to `github`. */
@@ -368,6 +370,7 @@ export async function runFinal(
     store,
     extraBlocks: { 'ai-workflows/hold@1': hold },
     agent: { github, remote: github, sleep, now, repository: REPO },
+    ...(options.providers === undefined ? {} : { providers: options.providers }),
   });
   const engine = createEngine({ config: compiled.config, store, describeChange: compiled.describeChange, sleep });
   const once = async (): Promise<FinalRun> => {
