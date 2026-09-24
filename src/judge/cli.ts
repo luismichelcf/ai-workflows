@@ -30,9 +30,18 @@ function splitList(value: string): string[] {
     .filter((entry) => entry.length > 0);
 }
 
-/** GitHub's annotation escaping: a newline inside an `::error::` must not start a second command. */
+/** GitHub's annotation escaping: a newline inside a command must not start a second one. */
 function escapeAnnotation(value: string): string {
   return value.replace(/%/g, '%25').replace(/\r/g, '%0D').replace(/\n/g, '%0A');
+}
+
+/**
+ * PLAN-13-R4 §7: a trace note is a `::warning::`, never an `::error::` — a note that a state
+ * imitates the judge's name is not a failure of this run. Escaping keeps a note from starting
+ * a second command.
+ */
+export function annotationFor(note: string): string {
+  return `::warning::${escapeAnnotation(note)}`;
 }
 
 async function appendSummary(summary: string): Promise<void> {
@@ -131,7 +140,7 @@ async function judgeCommand(): Promise<number> {
     await appendSummary(report.summary);
     printSummary(report.summary);
     for (const note of report.notes) {
-      process.stdout.write(`::error::${escapeAnnotation(note)}\n`);
+      process.stdout.write(`${annotationFor(note)}\n`);
     }
     return 0;
   } catch (error) {

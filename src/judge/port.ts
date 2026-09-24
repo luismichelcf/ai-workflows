@@ -6,6 +6,8 @@
 // than GitHub allows, and values that reach GraphQL as variables instead of spliced into the query.
 
 import { createGhRunner, type GhRun, type GhRunner } from '../gh-runner.js';
+import type { IssueComment } from '../agent/events.js';
+import type { PullRequestReview } from '../approval/review.js';
 import type { PullRequestComment } from '../locks/signoff.js';
 
 /** A pull request as the judge reads it. Every field is text: a missing one is refused, not guessed. */
@@ -72,6 +74,10 @@ export interface JudgeGitHub {
   /** Throws when the queue list cannot be confirmed. An empty queue is `[]`. */
   mergeQueue(branch: string): Promise<MergeQueueEntry[]>;
   comments(n: number): Promise<PullRequestComment[]>;
+  /** Every comment on an issue, with the fields the event rules depend on. */
+  issueComments(n: number): Promise<IssueComment[]>;
+  /** Every review of a pull request, in submission order. */
+  reviews(n: number): Promise<PullRequestReview[]>;
   checkRuns(sha: string, name: string): Promise<CheckRunSummary[]>;
   /** Newest first, by `created_at`. */
   statuses(sha: string): Promise<CommitStatus[]>;
@@ -399,6 +405,78 @@ export function createJudgeGitHub(options: JudgeGitHubOptions): JudgeGitHub {
         });
       }
       return comments;
+    },
+
+    async issueComments(n: number): Promise<IssueComment[]> {
+      const parsed = ensureOk(
+        await run(['api', `${base}/issues/${String(n)}/comments`, '--paginate', '--slurp']),
+        `the comments of issue ${String(n)}`,
+      );
+      const comments: IssueComment[] = [];
+      for (const item of flattenPages(parsed, `the comments of issue ${String(n)}`)) {
+        const body = textField(item, 'body');
+        const id = isRecord(item) ? item['id'] : undefined;
+        const user = recordField(item, 'user');
+        const author = textField(user, 'login');
+        const authorType = textField(user, 'type');
+        const createdAt = textField(item, 'created_at');
+        const updatedAt = textField(item, 'updated_at');
+        if (
+          body === undefined
+          || typeof id !== 'number'
+          || author === undefined
+          || authorType === undefined
+          || createdAt === undefined
+          || updatedAt === undefined
+        ) {
+          throw new Error(`gh returned a comment on issue ${String(n)} without its id, body, author or dates.`);
+        }
+        const viaApp = textField(isRecord(item) ? item['performed_via_github_app'] : undefined, 'slug');
+        comments.push({
+          id,
+          author,
+          authorType: authorType === 'Bot' ? 'Bot' : 'User',
+          viaApp: viaApp ?? null,
+          body,
+          createdAt,
+          updatedAt,
+        });
+      }
+      return comments;
+    },
+
+    async reviews(n: number): Promise<PullRequestReview[]> {
+      const parsed = ensureOk(
+        await run(['api', `${base}/pulls/${String(n)}/reviews`, '--paginate', '--slurp']),
+        `the reviews of pull request ${String(n)}`,
+      );
+      const reviews: PullRequestReview[] = [];
+      for (const item of flattenPages(parsed, `the reviews of pull request ${String(n)}`)) {
+        const user = recordField(item, 'user');
+        const author = textField(user, 'login');
+        const authorType = textField(user, 'type');
+        const state = textField(item, 'state');
+        const commitId = textField(item, 'commit_id');
+        const submittedAt = textField(item, 'submitted_at');
+        if (
+          author === undefined
+          || authorType === undefined
+          || state === undefined
+          || commitId === undefined
+          || submittedAt === undefined
+        ) {
+          throw new Error(`gh returned a review of pull request ${String(n)} without its author, state, commit or date.`);
+        }
+        reviews.push({
+          author,
+          authorType: authorType === 'Bot' ? 'Bot' : 'User',
+          state,
+          commitId,
+          submittedAt,
+        });
+      }
+      reviews.sort((a, b) => a.submittedAt.localeCompare(b.submittedAt));
+      return reviews;
     },
 
     async checkRuns(sha: string, checkName: string): Promise<CheckRunSummary[]> {

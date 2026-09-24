@@ -17,6 +17,7 @@ export {
   DEFAULT_GH_TIMEOUT_MS,
   type GhRun,
   type GhRunner,
+  type GhRunnerWithEnv,
   type GhRunnerOptions,
   type GhExecutable,
 } from './gh-runner.js';
@@ -117,7 +118,7 @@ export { recipeSchema } from './recipe/schema.js';
 export { parseRecipe } from './recipe/parse.js';
 export { checkRecipe } from './recipe/blocks.js';
 export type { CheckRecipeResult } from './recipe/blocks.js';
-export { engineBlockManifest } from './blocks/registry.js';
+export { engineBlockManifest, engineBlock } from './blocks/registry.js';
 export type {
   BlockDefinition,
   EngineBlockDeps,
@@ -156,7 +157,55 @@ export { runRedTestCheck } from './judge/red-test-check.js';
 export { appliesIfFor } from './recipe/applies.js';
 export { explainRecipe } from './recipe/explain.js';
 export { recipeCommand } from './recipe/command.js';
-export { DEFAULT_BANNED_TERMS, findBannedTerms } from './messages.js';
+export {
+  DEFAULT_BANNED_TERMS,
+  findBannedTerms,
+  readOwnerSummary,
+  renderOwnerMessage,
+  type OwnerMessageKind,
+  type OwnerMessageOptions,
+} from './messages.js';
+export {
+  agentCredentialsFromEnv,
+  createAppTokenSource,
+  APP_ID_ENV,
+  APP_KEY_FILE_ENV,
+  type AgentCredentials,
+  type AgentCredentialsResult,
+  type AppTokenSource,
+  type AppTokenSourceOptions,
+  type FetchLike,
+  type FetchInit,
+  type FetchResponse,
+} from './agent/identity.js';
+export {
+  createAgentGitHub,
+  type AgentGitHub,
+  type AgentGitHubOptions,
+  type AgentPullRequest,
+  type PullRequestHistoryItem,
+  type RemoteGit,
+} from './agent/github.js';
+export {
+  parseEventComment,
+  renderEventComment,
+  readPieceEvents,
+  selectVerdicts,
+  slugOf,
+  type BuilderEvent,
+  type VerdictEvent,
+  type PieceEvent,
+  type IssueComment,
+  type EventRules,
+  type SelectVerdictsOptions,
+  type SelectVerdictsResult,
+} from './agent/events.js';
+export {
+  decideReviewApproval,
+  type PullRequestReview,
+  type ReviewApprovalOptions,
+} from './approval/review.js';
+export { annotationFor } from './judge/cli.js';
 export type { Recipe, RecipeStage, RecipeCondition, RecipeError, RecipePieces } from './recipe/types.js';
 export type { BlockManifest, InputSpec, ValidWhile, ServerMode } from './blocks/manifest.js';
 export {

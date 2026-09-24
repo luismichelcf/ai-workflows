@@ -525,7 +525,7 @@ async function judgeFilesNote(
   const valid = comments.some((comment) => {
     const order = evaluateOwnerOrder(comment, {
       order: '/approve-judge-change',
-      minCodeLength: 7,
+      minCodeLength: 16,
       productOwners: owners,
       locale: work.recipe.locale,
     });
@@ -533,7 +533,7 @@ async function judgeFilesNote(
   });
   if (valid) return {};
 
-  const wanted = `/approve-judge-change ${work.target.head.slice(0, 7)}`;
+  const wanted = `/approve-judge-change ${work.target.head.slice(0, 16)}`;
   return {
     note: pick(
       spanish,
