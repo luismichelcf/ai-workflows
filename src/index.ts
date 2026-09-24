@@ -208,6 +208,8 @@ export {
   type PullRequestReview,
   type ReviewApprovalOptions,
 } from './approval/review.js';
+export { runAgentCli, ghAccounts, type AgentCliDeps } from './agent/cli.js';
+export { finishPiece, type FinishOptions, type FinishResult } from './agent/finish.js';
 export { annotationFor } from './judge/cli.js';
 export type { Recipe, RecipeStage, RecipeCondition, RecipeError, RecipePieces } from './recipe/types.js';
 export type { BlockManifest, InputSpec, ValidWhile, ServerMode } from './blocks/manifest.js';
