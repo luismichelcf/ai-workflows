@@ -2,7 +2,7 @@ import { readFile, readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import type { Gate, GateResult, JsonValue } from '../contract.js';
-import type { BlockDefinition, EngineBlockDeps } from './definition.js';
+import type { BlockDefinition, EngineBlockDeps, ServerContext, ServerResult } from './definition.js';
 import type { BlockManifest } from './manifest.js';
 import { analyzeDocument, canonicalText, collectSourceUrls, countDistinctSources } from '../gates.js';
 import { classifyFiles } from '../recipe/glob.js';
@@ -25,8 +25,9 @@ export const manifest: BlockManifest = {
   name: 'benchmark-sources',
   kind: 'module',
   natures: ['structure'],
+  server: ['recompute', 'require-check'],
   inputs: {
-    files: { type: 'glob-list', required: true },
+    files: { type: 'glob-list', required: true, piece: true },
     categories: {
       type: 'object-list',
       items: {
@@ -341,6 +342,98 @@ function createGate(
   };
 }
 
+function reasonOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/** The files of a commit (already listed) that match any of the globs, in sorted order. */
+function matchingNames(all: readonly string[], globs: readonly string[]): string[] {
+  const matched = new Set<string>();
+  for (const file of all) {
+    for (const glob of globs) {
+      if (classifyFiles({ hit: [glob] }, [file]).length > 0) {
+        matched.add(file);
+        break;
+      }
+    }
+  }
+  return [...matched].sort();
+}
+
+/**
+ * PLAN-13-R3 §1.3: the same count, read from the judged commit. On the server it never asks a
+ * source to answer (`check-reachable: true` is refused on GitHub by `validate`), so the evidence
+ * it leaves says exactly what it checked: counts, and nothing about reachability.
+ */
+async function recompute(
+  inputs: Record<string, unknown>,
+  context: ServerContext,
+): Promise<ServerResult> {
+  const spanish = isSpanish(context.locale);
+  const piece = context.piece;
+  const globs = asStringList(inputs['files']).map((glob) => glob.replaceAll('{piece}', piece));
+  const categories = readCategories(inputs['categories']);
+  const minTotal = typeof inputs['minTotal'] === 'number' ? inputs['minTotal'] : 0;
+  const sections = asStringList(inputs['sections']);
+  const waiver = asString(inputs['waiver']);
+  const spec = asString(inputs['spec']);
+
+  if (waiver !== undefined && spec !== undefined) {
+    const specPath = spec.replaceAll('{piece}', piece);
+    let specText: string | undefined;
+    try {
+      specText = await context.files.read(specPath);
+    } catch (error) {
+      return { outcome: 'technical', reason: reasonOf(error) };
+    }
+    if (specText !== undefined) {
+      const motive = waiverMotive(specText, waiver);
+      if (motive !== undefined) return { outcome: 'skipped', reason: motive };
+    }
+  }
+
+  let all: string[];
+  try {
+    all = await context.files.list();
+  } catch (error) {
+    return { outcome: 'technical', reason: reasonOf(error) };
+  }
+
+  const candidates = matchingNames(all, globs);
+  if (candidates.length === 0) {
+    return {
+      outcome: 'rejected',
+      reason: spanish
+        ? `No hay benchmark en ${quoted(globs.join(', '), spanish)}.`
+        : `There is no benchmark in ${quoted(globs.join(', '), spanish)}.`,
+    };
+  }
+
+  let lastReason: string | undefined;
+  for (const file of candidates) {
+    let text: string | undefined;
+    try {
+      text = await context.files.read(file);
+    } catch (error) {
+      return { outcome: 'technical', reason: reasonOf(error) };
+    }
+    if (text === undefined) continue;
+    const result = await evaluateFile(file, text, sections, categories, minTotal, false, spanish);
+    if (result.ok) {
+      // On the server the sources are never asked to answer: the evidence says so, so nobody
+      // reads this pass as proof that they respond.
+      const evidence =
+        typeof result.evidence === 'object' && result.evidence !== null
+          ? { ...result.evidence, 'check-reachable': false }
+          : result.evidence;
+      return { outcome: 'passed', evidence };
+    }
+    lastReason = result.reason;
+  }
+
+  return { outcome: 'rejected', reason: lastReason ?? '' };
+}
+
 export const benchmarkSourcesBlock: BlockDefinition = {
   manifest,
   create(inputs, deps) {
@@ -355,4 +448,5 @@ export const benchmarkSourcesBlock: BlockDefinition = {
       deps,
     );
   },
+  server: { recompute },
 };

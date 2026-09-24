@@ -31,7 +31,8 @@
   "files": [
     "dist",
     "schema",
-    "templates"
+    "templates",
+    "action.yml"
   ],
   "types": "./dist/index.d.ts",
   "dependencies": {

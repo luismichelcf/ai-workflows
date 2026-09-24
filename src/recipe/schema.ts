@@ -20,6 +20,13 @@ const pathClasses = {
   additionalProperties: globList,
 } as const;
 
+const branchPatterns = {
+  type: 'array',
+  minItems: 1,
+  uniqueItems: true,
+  items: { type: 'string', minLength: 1 },
+} as const;
+
 const conditionRef = { $ref: '#/definitions/condition' } as const;
 
 /** The editor and parser consume this same object for the recipe's structural rules. */
@@ -85,6 +92,40 @@ export const recipeSchema = {
       propertyNames: { pattern: identifier },
       additionalProperties: { type: 'string', minLength: 1 },
       description: 'Owner-facing names for classes, kinds and lanes.',
+    },
+    pieces: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['branch'],
+      description: 'R19: how a branch names its piece, and where that piece declares its kind.',
+      properties: {
+        branch: {
+          ...branchPatterns,
+          description: 'Branch name patterns; {piece} appears exactly once in each.',
+        },
+        'exclude-branches': {
+          ...branchPatterns,
+          description: 'Branches that never join the main line; they cannot contain {piece}.',
+        },
+        'declared-kind': {
+          type: 'object',
+          additionalProperties: false,
+          required: ['file', 'line'],
+          description: 'Where a piece declares its change kind.',
+          properties: {
+            file: {
+              type: 'string',
+              minLength: 1,
+              description: 'Relative path that carries {piece}.',
+            },
+            line: {
+              type: 'string',
+              minLength: 1,
+              description: 'Non-empty label the declaring line starts with.',
+            },
+          },
+        },
+      },
     },
     stages: {
       type: 'array',

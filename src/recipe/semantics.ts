@@ -1,3 +1,5 @@
+import { isAbsolute } from 'node:path';
+
 import { validGlob } from './glob.js';
 import { validateCommandLine } from './command-line.js';
 import {
@@ -335,6 +337,109 @@ function validateCycles(
   }
 }
 
+/** R19: how a branch names its piece, and where that piece declares its kind. */
+function keyNode(node: YamlNode, key: string): YamlNode {
+  for (const pair of yamlMap(node)?.items ?? []) {
+    if (yamlWord(pair.key) === key) return pair.key;
+  }
+  return null;
+}
+
+const BRANCH_CHARS = /^[A-Za-z0-9._/*-]*$/;
+
+/** R19 §1.1: the syntax of a branch pattern, and of an exclusion. */
+function validateBranchPattern(item: YamlNode, requirePiece: boolean): string | undefined {
+  const pattern = yamlWord(item);
+  const occurrences = pattern.split('{piece}').length - 1;
+  if (requirePiece && occurrences !== 1) {
+    return `branch pattern "${pattern}" must contain {piece} exactly once`;
+  }
+  if (!requirePiece && occurrences > 0) {
+    return 'an excluded branch cannot contain {piece}';
+  }
+  if (!BRANCH_CHARS.test(pattern.split('{piece}').join(''))) {
+    return `unsupported character in branch pattern "${pattern}"`;
+  }
+  if (pattern.includes('*{piece}') || pattern.includes('{piece}*')) {
+    return `a star cannot touch {piece} in branch pattern "${pattern}"`;
+  }
+  return undefined;
+}
+
+/** R19 §1.1: the file that carries a piece's declared kind. */
+function validateDeclaredKindFile(item: YamlNode): string | undefined {
+  const file = yamlWord(item);
+  const leaves = file.split(/[\\/]+/).includes('..');
+  if (!file.includes('{piece}') || isAbsolute(file) || leaves) {
+    return `declared-kind file "${file}" must be a relative path with {piece} and no ".."`;
+  }
+  return undefined;
+}
+
+/** R19: `pieces:`, its patterns and the declared kind. */
+function validatePieces(root: YamlNode, issues: LocatedIssue[]): void {
+  const pieces = yamlField(root, 'pieces');
+  if (pieces === null) return;
+
+  for (const item of listNodes(yamlField(pieces, 'branch'))) {
+    const complaint = validateBranchPattern(item, true);
+    if (complaint !== undefined) add(issues, item, complaint);
+  }
+  for (const item of listNodes(yamlField(pieces, 'exclude-branches'))) {
+    const complaint = validateBranchPattern(item, false);
+    if (complaint !== undefined) add(issues, item, complaint);
+  }
+
+  const declaredKind = yamlField(pieces, 'declared-kind');
+  if (declaredKind === null) return;
+  if (yamlField(root, 'kinds') === null) {
+    add(issues, keyNode(pieces, 'declared-kind'), 'declared-kind needs kinds: in the recipe');
+  }
+  const fileNode = yamlField(declaredKind, 'file');
+  if (fileNode !== null) {
+    const complaint = validateDeclaredKindFile(fileNode);
+    if (complaint !== undefined) add(issues, fileNode, complaint);
+  }
+}
+
+/** §1.2 rules 2, 4 and 5: the shape of `server:` that needs no manifest. */
+function validateServerForms(
+  root: YamlNode,
+  stages: readonly YamlNode[],
+  issues: LocatedIssue[],
+): void {
+  const hasOwner = yamlField(root, 'owner') !== null;
+  for (const stage of stages) {
+    const server = yamlField(stage, 'server');
+    if (server === null) continue;
+
+    const isCheck = yamlMap(server) !== undefined;
+    const mode = isCheck ? 'require-check' : yamlWord(server);
+    const phase = yamlWord(yamlField(stage, 'phase')) || 'pre-merge';
+
+    if ((phase === 'merge' || phase === 'post-merge') && mode !== 'local-only') {
+      add(issues, server, 'a merge or post-merge stage only takes server: local-only');
+      continue;
+    }
+
+    if (isCheck) {
+      const nameNode = yamlField(server, 'require-check');
+      const name = yamlWord(nameNode);
+      if (name.length > 100) {
+        add(issues, nameNode, 'a required check name has 1 to 100 characters');
+      }
+      if (name === 'ai-workflows' || name === 'ai-workflows/advisory') {
+        add(issues, nameNode, "cannot require the judge's own status");
+      }
+    }
+
+    const uses = yamlWord(yamlField(yamlField(stage, 'gate'), 'uses'));
+    if (mode === 'attestation' && uses === 'ai-workflows/approval-comment@1' && !hasOwner) {
+      add(issues, server, 'server: attestation of approval-comment needs owner: in the recipe');
+    }
+  }
+}
+
 export function validateSemantics(root: YamlNode): LocatedIssue[] {
   const issues: LocatedIssue[] = [];
   const classify = yamlField(root, 'classify');
@@ -355,6 +460,8 @@ export function validateSemantics(root: YamlNode): LocatedIssue[] {
   }
 
   validateVocabulary(root, stages, declared, issues);
+  validatePieces(root, issues);
+  validateServerForms(root, stages, issues);
   validatePhases(stages, stagesNode, issues);
   validateStageRules(stages, issues);
   validateStageLinks(stages, issues);

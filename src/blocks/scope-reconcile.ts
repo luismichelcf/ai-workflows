@@ -1,6 +1,6 @@
 import type { GateResult } from '../contract.js';
 import { effectiveKind } from '../recipe/kind.js';
-import type { BlockDefinition } from './definition.js';
+import type { BlockDefinition, ServerContext, ServerResult } from './definition.js';
 import type { BlockManifest } from './manifest.js';
 
 // PLAN-13-R2 §3.7 (CN-10): `scope-reconcile@1` recomputes the effective kind from the files
@@ -13,6 +13,7 @@ export const manifest: BlockManifest = {
   name: 'scope-reconcile',
   kind: 'module',
   natures: ['recompute'],
+  server: ['recompute', 'require-check'],
   inputs: {},
 };
 
@@ -33,6 +34,29 @@ function asStringList(value: unknown): string[] {
 
 function reasonOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * PLAN-13-R3 §1.3: on the server the judge already judges with the effective kind, so this block
+ * only records that reconciliation: it always passes, with the declared and effective kinds and
+ * the rules that raised it.
+ */
+async function recompute(
+  _inputs: Record<string, unknown>,
+  context: ServerContext,
+): Promise<ServerResult> {
+  const { facts, recipe } = context;
+  let effective;
+  try {
+    effective = effectiveKind(recipe, facts.declaredKind, facts.files);
+  } catch (error) {
+    return { outcome: 'technical', reason: reasonOf(error) };
+  }
+  const declared = facts.declaredKind ?? recipe.kinds?.default ?? '';
+  return {
+    outcome: 'passed',
+    evidence: { declared, effective: effective.kind, raisedBy: effective.raisedBy },
+  };
 }
 
 export const scopeReconcileBlock: BlockDefinition = {
@@ -61,4 +85,5 @@ export const scopeReconcileBlock: BlockDefinition = {
       };
     };
   },
+  server: { recompute },
 };

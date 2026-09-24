@@ -40,6 +40,7 @@ export const manifest: BlockManifest = {
   kind: 'module',
   natures: ['recompute', 'attest'],
   validWhile: ['same-sha', 'same-fingerprint-or-clean-update'],
+  server: ['attestation', 'require-check'],
   inputs: {
     reviewer: {
       type: 'object',

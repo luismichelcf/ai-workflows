@@ -27,6 +27,7 @@ export const manifest: BlockManifest = {
   kind: 'module',
   natures: ['recompute', 'execution-record'],
   validWhile: ['forever'],
+  server: ['require-check'],
   inputs: {
     command: { type: 'command', required: true, requireTests: true },
     tests: { type: 'glob-list', default: ['**/*.test.ts', '**/*.test.tsx'] },

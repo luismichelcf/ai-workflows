@@ -21,8 +21,34 @@ export interface SignOffRules {
   readonly headSha: string;
 }
 
+/** The rules of any owner order, not only the sign-off: the judge reuses them for its own files. */
+export interface OwnerOrderRules {
+  /** The command, exactly as written at the start of the line (`/visto-bueno`, `/approve`…). */
+  readonly order: string;
+  /** The shortest code that names one version. */
+  readonly minCodeLength: number;
+  readonly productOwners: readonly string[];
+  /** The language of the motive; Spanish by default, because the local motor speaks Spanish. */
+  readonly locale?: string;
+}
+
+/** What one comment carries: whether it holds a genuine order, and the code it names. */
+export interface OwnerOrderEvaluation {
+  readonly ok: boolean;
+  readonly hadOrder: boolean;
+  /** The code the order wrote, when there was exactly one genuine order. */
+  readonly code: string;
+  readonly reason: string;
+}
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 /** An order alone on its line: the command and exactly one token, nothing else. */
-const SIGN_OFF_LINE = /^\/visto-bueno\s+(\S+)$/;
+function orderLinePattern(order: string): RegExp {
+  return new RegExp(`^${escapeRegExp(order)}\\s+(\\S+)$`);
+}
 
 /**
  * An opening fence: up to three spaces, then three or more backticks or three or more tildes.
@@ -253,10 +279,10 @@ function closesFence(raw: string, fence: Fence): boolean {
 
 /**
  * Every line that could be an order, marked as hidden when it sits where an order would not
- * really be written. A line counts only when it is exactly `/visto-bueno <sha>`; the caller
+ * really be written. A line counts only when it is exactly `<order> <code>`; the caller
  * decides what a hidden one means.
  */
-function collectOrderLines(body: string): readonly OrderLine[] {
+function collectOrderLines(body: string, pattern: RegExp): readonly OrderLine[] {
   const orders: OrderLine[] = [];
   // A fenced block is literal text until its own marker closes it, so tags and quotes inside
   // are content, not regions. HTML comments, <details> and <pre> hide their contents from
@@ -337,7 +363,7 @@ function collectOrderLines(body: string): readonly OrderLine[] {
     if (scan.touched) continue;
 
     const line = raw.trim();
-    const match = SIGN_OFF_LINE.exec(line);
+    const match = pattern.exec(line);
     if (match?.[1] === undefined) continue;
 
     // Four or more columns of indentation make an indented code block; a tab counts as
@@ -351,20 +377,28 @@ function collectOrderLines(body: string): readonly OrderLine[] {
 }
 
 /**
- * Reads what a comment really carries: how many orders, and if exactly one, whether it is
- * genuine and names the current head.
+ * Reads what a comment carries for one order: how many orders, and if exactly one, whether it is
+ * genuine and which code it names. It does not yet decide whether that code names the version
+ * wanted: the sign-off wants the current head, while `approval-comment` on the server may accept a
+ * candidate with the same fingerprint. Kept apart so both use the same reading.
  */
-function evaluateSignOff(comment: PullRequestComment, rules: SignOffRules): SignOffEvaluation {
-  const orders = collectOrderLines(comment.body);
+export function evaluateOwnerOrder(
+  comment: PullRequestComment,
+  rules: OwnerOrderRules,
+): OwnerOrderEvaluation {
+  const spanish = (rules.locale ?? 'es').toLowerCase().startsWith('es');
+  const orders = collectOrderLines(comment.body, orderLinePattern(rules.order));
   const genuine = orders.filter((order) => !order.hidden);
   const hadOrder = orders.length > 0;
-  const noOrder = (): SignOffEvaluation => ({
+  const noOrder = (): OwnerOrderEvaluation => ({
     ok: false,
     hadOrder,
-    sha: '',
-    reason: 'No hay ninguna orden /visto-bueno en su propia línea en este comentario.',
+    code: '',
+    reason: spanish
+      ? `No hay ninguna orden ${rules.order} en su propia línea en este comentario.`
+      : `There is no ${rules.order} order on its own line in this comment.`,
   });
-  const rejected = (reason: string): SignOffEvaluation => ({ ok: false, hadOrder, sha: '', reason });
+  const rejected = (reason: string): OwnerOrderEvaluation => ({ ok: false, hadOrder, code: '', reason });
 
   const first = genuine[0];
   if (first === undefined) {
@@ -375,7 +409,9 @@ function evaluateSignOff(comment: PullRequestComment, rules: SignOffRules): Sign
   // Two orders in one comment are ambiguous: nobody can say which version was approved.
   if (genuine.length > 1) {
     return rejected(
-      `Este comentario trae ${genuine.length} órdenes /visto-bueno: no queda claro cuál vale, así que ninguna cuenta.`,
+      spanish
+        ? `Este comentario trae ${genuine.length} órdenes ${rules.order}: no queda claro cuál vale, así que ninguna cuenta.`
+        : `This comment brings ${genuine.length} ${rules.order} orders: it is not clear which one counts, so none does.`,
     );
   }
 
@@ -383,18 +419,24 @@ function evaluateSignOff(comment: PullRequestComment, rules: SignOffRules): Sign
   // so an edited comment no longer proves what the owner approved.
   if (comment.edited) {
     return rejected(
-      'El comentario fue editado después de publicarse: cualquiera con permiso de escritura pudo cambiar la orden, así que no cuenta.',
+      spanish
+        ? 'El comentario fue editado después de publicarse: cualquiera con permiso de escritura pudo cambiar la orden, así que no cuenta.'
+        : 'The comment was edited after it was posted: anyone with write access could have changed the order, so it does not count.',
     );
   }
   if (comment.performedViaApp) {
     return rejected(
-      'El comentario se publicó a través de una aplicación: no prueba que lo escribiera el dueño.',
+      spanish
+        ? 'El comentario se publicó a través de una aplicación: no prueba que lo escribiera el dueño.'
+        : 'The comment was posted through an app: it does not prove the owner wrote it.',
     );
   }
   // A bot or organization account is never the person whose sign-off this process needs.
   if (comment.authorType !== 'User') {
     return rejected(
-      `El comentario no lo escribió una cuenta de persona ("${comment.authorType}"): su visto bueno no cuenta.`,
+      spanish
+        ? `El comentario no lo escribió una cuenta de persona ("${comment.authorType}"): su visto bueno no cuenta.`
+        : `The comment was not written by a person's account ("${comment.authorType}"): its approval does not count.`,
     );
   }
   // Empty logins never match; a login is ASCII and compared without case, so a character
@@ -404,30 +446,56 @@ function evaluateSignOff(comment: PullRequestComment, rules: SignOffRules): Sign
   const isOwner = LOGIN.test(comment.author)
     && rules.productOwners.some((owner) => LOGIN.test(owner) && owner.toLowerCase() === author);
   if (!isOwner) {
-    return rejected(`El autor "${comment.author}" no es un product owner: su visto bueno no cuenta.`);
+    return rejected(
+      spanish
+        ? `El autor "${comment.author}" no es un product owner: su visto bueno no cuenta.`
+        : `The author "${comment.author}" is not a product owner: their approval does not count.`,
+    );
   }
 
-  if (first.sha.length < MIN_SHA_PREFIX) {
+  if (first.sha.length < rules.minCodeLength) {
     return rejected(
-      `"${first.sha}" no es un código de versión válido: hacen falta al menos ${MIN_SHA_PREFIX} caracteres.`,
+      spanish
+        ? `"${first.sha}" no es un código de versión válido: hacen falta al menos ${rules.minCodeLength} caracteres.`
+        : `"${first.sha}" is not a valid version code: at least ${rules.minCodeLength} characters are needed.`,
     );
   }
   if (!HEX_SHA.test(first.sha)) {
     return rejected(
-      `"${first.sha}" no es un código de versión válido: debe ser hexadecimal.`,
-    );
-  }
-  // Name both versions: the author sees which one they approved and which one is live now.
-  // A code longer than the head fails the prefix test too, and gets the same message.
-  if (!rules.headSha.toLowerCase().startsWith(first.sha.toLowerCase())) {
-    return rejected(
-      `El visto bueno es para ${first.sha.slice(0, 7)}, pero la versión actual es ` +
-        `${rules.headSha.slice(0, 7)}: un visto bueno no cubre una versión distinta.`,
+      spanish
+        ? `"${first.sha}" no es un código de versión válido: debe ser hexadecimal.`
+        : `"${first.sha}" is not a valid version code: it must be hexadecimal.`,
     );
   }
 
+  return { ok: true, hadOrder, code: first.sha, reason: '' };
+}
+
+/** Reads one sign-off: a genuine order from an owner naming exactly the current head. */
+function evaluateSignOff(comment: PullRequestComment, rules: SignOffRules): SignOffEvaluation {
+  const order = evaluateOwnerOrder(comment, {
+    order: '/visto-bueno',
+    minCodeLength: MIN_SHA_PREFIX,
+    productOwners: rules.productOwners,
+  });
+  if (!order.ok) {
+    return { ok: false, hadOrder: order.hadOrder, sha: '', reason: order.reason };
+  }
+  // Name both versions: the author sees which one they approved and which one is live now.
+  // A code longer than the head fails the prefix test too, and gets the same message.
+  if (!rules.headSha.toLowerCase().startsWith(order.code.toLowerCase())) {
+    return {
+      ok: false,
+      hadOrder: order.hadOrder,
+      sha: '',
+      reason:
+        `El visto bueno es para ${order.code.slice(0, 7)}, pero la versión actual es ` +
+        `${rules.headSha.slice(0, 7)}: un visto bueno no cubre una versión distinta.`,
+    };
+  }
+
   // A code names the head; the result reports that head, never the shorter code written.
-  return { ok: true, hadOrder, sha: rules.headSha, reason: '' };
+  return { ok: true, hadOrder: order.hadOrder, sha: rules.headSha, reason: '' };
 }
 
 /**

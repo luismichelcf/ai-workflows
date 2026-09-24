@@ -1,5 +1,6 @@
 import type { BlockDefinition } from './definition.js';
 import type { BlockManifest } from './manifest.js';
+import { approvalCommentAttestation } from '../judge/attest.js';
 import { benchmarkSourcesBlock } from './benchmark-sources.js';
 import { buildVerifyBlock } from './build-verify.js';
 import { commandBlock } from './command.js';
@@ -24,6 +25,7 @@ const MANIFESTS: Readonly<Record<string, BlockManifest>> = {
     kind: 'module',
     natures: ['execution-record', 'attest'],
     validWhile: ['same-sha', 'same-fingerprint', 'same-fingerprint-or-clean-update'],
+    server: ['attestation', 'require-check'],
     inputs: {
       'forbid-same-family': { type: 'boolean', default: true },
       angles: { type: 'string-list' },
@@ -35,6 +37,7 @@ const MANIFESTS: Readonly<Record<string, BlockManifest>> = {
     kind: 'module',
     natures: ['attest', 'recompute'],
     validWhile: ['same-sha', 'same-fingerprint', 'same-fingerprint-or-clean-update'],
+    server: ['attestation', 'require-check'],
     inputs: {
       command: { type: 'string', default: '/approve' },
       'code-length': { type: 'integer', min: 4, max: 40, default: 7 },
@@ -45,6 +48,7 @@ const MANIFESTS: Readonly<Record<string, BlockManifest>> = {
     name: 'preview-deployment',
     kind: 'module',
     natures: ['recompute'],
+    server: ['require-check'],
     inputs: {},
   },
 
@@ -53,6 +57,7 @@ const MANIFESTS: Readonly<Record<string, BlockManifest>> = {
     kind: 'module',
     natures: ['recompute'],
     validWhile: ['same-sha'],
+    server: ['require-check'],
     inputs: {
       command: { type: 'command' },
     },
@@ -62,6 +67,7 @@ const MANIFESTS: Readonly<Record<string, BlockManifest>> = {
     name: 'github-merge',
     kind: 'module',
     natures: ['recompute'],
+    server: [],
     inputs: {},
   },
 
@@ -69,6 +75,7 @@ const MANIFESTS: Readonly<Record<string, BlockManifest>> = {
     name: 'post-merge',
     kind: 'module',
     natures: ['recompute'],
+    server: [],
     inputs: {},
   },
 
@@ -76,6 +83,7 @@ const MANIFESTS: Readonly<Record<string, BlockManifest>> = {
     name: 'cleanup',
     kind: 'module',
     natures: ['recompute'],
+    server: [],
     inputs: {},
   },
 };
@@ -114,6 +122,15 @@ const BUILT: Readonly<Record<string, BlockDefinition>> = {
   'build-verify': buildVerifyBlock,
   'sandboxed-review': sandboxedReviewBlock,
   'scope-reconcile': scopeReconcileBlock,
+  // PLAN-13-R3 §3.6: its gate next to the agent arrives in slice 4, but the judge can already
+  // read the owner's approval published on the pull request.
+  'approval-comment': {
+    manifest: MANIFESTS['approval-comment'] as BlockManifest,
+    create: () => () => {
+      throw new Error('block "ai-workflows/approval-comment@1" is not built yet (slice 4)');
+    },
+    server: { attestation: approvalCommentAttestation },
+  },
 };
 
 export const ENGINE_BLOCKS: Readonly<Record<string, BlockDefinition>> = Object.fromEntries([

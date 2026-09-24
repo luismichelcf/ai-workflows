@@ -4,6 +4,7 @@ import type { Recipe, RecipeCondition, RecipeStage } from './types.js';
 type Clause = keyof RecipeCondition;
 type Phase = RecipeStage['phase'];
 type Validity = RecipeStage['validWhile'];
+type GitHubMode = 'recompute' | 'require-check' | 'attestation' | 'local-only';
 
 interface ExplainWords {
   readonly heading: (count: number) => string;
@@ -14,6 +15,11 @@ interface ExplainWords {
   readonly and: string;
   readonly condition: Readonly<Record<Clause, (items: readonly string[]) => string>>;
   readonly validity: Readonly<Record<Validity, string>>;
+  readonly pieces: string;
+  readonly declaredKind: (line: string, file: string) => string;
+  readonly github: Readonly<Record<GitHubMode, string>>;
+  readonly githubOrder: string;
+  readonly githubCleanUpdate: string;
   readonly declaredBuilder: string;
   readonly requiredFailure: string;
   readonly optionalFailure: string;
@@ -53,6 +59,20 @@ const EXPLAIN_WORDS: Record<Language, ExplainWords> = {
         'Vale mientras el código no cambie, salvo por actualizaciones sin conflictos con la versión principal.',
       forever: 'Vale siempre, una vez cumplido.',
     },
+    pieces:
+      'Cada pieza se reconoce por el nombre de su rama; una rama sin pieza nunca se fusiona.',
+    declaredKind: (line, file) =>
+      `Su tipo de cambio lo declara la línea «${line}» de «${file}».`,
+    github: {
+      recompute: '   En GitHub: se vuelve a comprobar antes de fusionar.',
+      'require-check':
+        '   En GitHub: se exige que un check lo confirme en verde sobre esta misma versión.',
+      attestation: '   En GitHub: se busca la aprobación publicada en el PR.',
+      'local-only': '   En GitHub: solo se comprueba junto al agente.',
+    },
+    githubOrder: '   El orden en que se escribió solo lo vigila el motor junto al agente.',
+    githubCleanUpdate:
+      '   En GitHub, una actualización con la versión principal pide aprobarla otra vez.',
     declaredBuilder: 'Quién construyó lo declara la pieza; el motor no puede comprobarlo.',
     requiredFailure: 'Si no se cumple: la pieza se detiene hasta corregirlo.',
     optionalFailure: 'Si no se cumple: se avisa y la pieza sigue.',
@@ -91,6 +111,21 @@ const EXPLAIN_WORDS: Record<Language, ExplainWords> = {
         'Valid while the code does not change, except for conflict-free updates from the main line.',
       forever: 'Valid for good once met.',
     },
+    pieces:
+      'Each piece is recognized by the name it works under; work without a piece never joins the main line.',
+    declaredKind: (line, file) =>
+      `Its kind of change is declared by the line "${line}" of "${file}".`,
+    github: {
+      recompute: '   On GitHub: checked again before joining the main line.',
+      'require-check':
+        '   On GitHub: a check must confirm it in green on this same version.',
+      attestation: '   On GitHub: the approval published on the pull request is looked for.',
+      'local-only': '   On GitHub: only checked next to the agent.',
+    },
+    githubOrder:
+      '   The order in which it was written is only watched by the engine next to the agent.',
+    githubCleanUpdate:
+      '   On GitHub, an update with the main version asks for it to be approved again.',
     declaredBuilder: 'Who built it is declared by the piece; the engine cannot check it.',
     requiredFailure: 'If it fails: the piece stops until it is fixed.',
     optionalFailure: 'If it fails: you are told and the piece carries on.',
@@ -146,11 +181,31 @@ function retryLine(stage: RecipeStage, words: ExplainWords): string | undefined 
     : words.retryWait(retry.attempts, retry.waitSeconds);
 }
 
+/** §1.4: what GitHub does with a pre-merge stage, and what it cannot see. */
+function githubLines(stage: RecipeStage, words: ExplainWords): readonly string[] {
+  if (stage.phase !== 'pre-merge' || stage.server === undefined) return [];
+  const mode = typeof stage.server === 'string' ? stage.server : 'require-check';
+  const lines = [words.github[mode]];
+  if (mode === 'require-check' && stage.nature === 'execution-record') {
+    lines.push(words.githubOrder);
+  }
+  if (mode === 'attestation' && stage.validWhile === 'same-fingerprint-or-clean-update') {
+    lines.push(words.githubCleanUpdate);
+  }
+  return lines;
+}
+
 export function explainRecipe(recipe: Recipe): string {
   const words = EXPLAIN_WORDS[languageOf(recipe.locale)];
   const stages = orderedStages(recipe);
   const lines = [words.heading(stages.length)];
   let phase: Phase | undefined;
+
+  if (recipe.pieces !== undefined) {
+    lines.push('', words.pieces);
+    const declared = recipe.pieces.declaredKind;
+    if (declared !== undefined) lines.push(words.declaredKind(declared.line, declared.file));
+  }
 
   for (const [index, stage] of stages.entries()) {
     if (stage.phase !== phase) {
@@ -164,6 +219,7 @@ export function explainRecipe(recipe: Recipe): string {
     lines.push(`${index + 1}. ${summary}`);
     lines.push(`   ${words.whenLabel}: ${when(stage.appliesIf, recipe.labels, words)}.`);
     lines.push(`   ${words.validity[stage.validWhile]}`);
+    lines.push(...githubLines(stage, words));
     // Who built the piece is only declared by the piece (PLAN-13-R2 §3.3): say so, so nobody
     // reads the engine's approval as proof of who wrote the code.
     if (stage.gate.uses === 'ai-workflows/sandboxed-review@1') {

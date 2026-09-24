@@ -46,6 +46,12 @@ export interface RunTestsOptions {
   readonly timeoutMs: number;
   readonly piece: string;
   readonly signal: AbortSignal;
+  /**
+   * PLAN-13-R3 §5: when given, the test processes run with exactly this environment and inherit
+   * nothing else. The unprivileged `red-test` job hands in a copy of its own environment with
+   * every token, secret, password and key removed, so a test can neither read nor leak them.
+   */
+  readonly environment?: NodeJS.ProcessEnv;
 }
 
 /** The real environment `resolveExecutable` needs, so the resolver stays a pure function. */
@@ -187,15 +193,17 @@ export async function runTests(options: RunTestsOptions): Promise<TestGroupResul
   const resolved = resolveExecutable(program, executableEnvironment());
   if (!resolved.ok) return { kind: 'technical', reason: `could not start ${program}: ${resolved.reason}` };
 
-  const group = DEFAULT_PROCESS_GROUPS.launch({
+  const launchOptions = {
     command: resolved.command,
     args: [...resolved.prefixArgs, ...args],
     cwd: options.root,
     stdin: '',
     ...(resolved.env === undefined ? {} : { env: resolved.env }),
+    ...(options.environment === undefined ? {} : { environment: options.environment }),
     timeoutMs: options.timeoutMs,
     stdoutBytes: TEST_STDOUT_BYTES,
-  });
+  };
+  const group = DEFAULT_PROCESS_GROUPS.launch(launchOptions);
 
   // Cancellation must be honoured at once: the wait races the signal, and on abort the group
   // is terminated and confirmed right there.

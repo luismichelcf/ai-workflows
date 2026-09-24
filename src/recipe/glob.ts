@@ -1,9 +1,13 @@
-/** The recipe deliberately supports only path segments, not shell glob extensions. */
-export function validGlob(pattern: string): boolean {
-  if (pattern.length === 0 || pattern.startsWith('/') || pattern.startsWith('!')) return false;
-  if (/[{}[\]\\\uFF01-\uFF60]/u.test(pattern)) return false;
+/**
+ * The recipe deliberately supports only path segments, not shell glob extensions. A block's
+ * path inputs may carry the `{piece}` placeholder (PLAN-13-R2 §1.1/§2.1); class globs may not.
+ */
+export function validGlob(pattern: string, allowPiece = false): boolean {
+  const candidate = allowPiece ? pattern.split('{piece}').join('PIECE') : pattern;
+  if (candidate.length === 0 || candidate.startsWith('/') || candidate.startsWith('!')) return false;
+  if (/[{}[\]\\\uFF01-\uFF60]/u.test(candidate)) return false;
 
-  return pattern.split('/').every((segment) => {
+  return candidate.split('/').every((segment) => {
     if (segment.length === 0 || segment === '.' || segment === '..') return false;
     return !segment.includes('**') || segment === '**';
   });

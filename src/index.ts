@@ -20,6 +20,27 @@ export {
   type GhRunnerOptions,
   type GhExecutable,
 } from './gh-runner.js';
+export {
+  createJudgeGitHub,
+  MergeQueueNotReady,
+  type JudgeGitHub,
+  type JudgeGitHubOptions,
+  type JudgePullRequest,
+  type MergeQueueEntry,
+  type CheckRunSummary,
+  type CommitStatus,
+} from './judge/port.js';
+export {
+  runJudge,
+  type JudgeInput,
+  type JudgeReport,
+  type JudgeDeps,
+  type JudgeStageReport,
+  type JudgePieceReport,
+  type JudgePublished,
+  type StageOutcome as JudgeStageOutcome,
+  type JudgeVerdict,
+} from './judge/judge.js';
 export { createEngine } from './engine.js';
 export {
   launchInGroup,
@@ -102,7 +123,12 @@ export type {
   EngineBlockDeps,
   ProviderRunner,
   ProviderRunOptions,
+  ServerCapability,
+  ServerContext,
+  ServerAttestContext,
+  ServerResult,
 } from './blocks/definition.js';
+export type { Unofficial } from './judge/checks.js';
 export {
   compileRecipe,
   runProviderInGroup,
@@ -115,17 +141,24 @@ export { classifyFiles } from './recipe/glob.js';
 export { effectiveKind, type EffectiveKind } from './recipe/kind.js';
 export {
   describeChangeFromGit,
+  describeChangeFromCommits,
+  gitProjectFiles,
+  diskProjectFiles,
   type ChangeFacts,
   type ChangeBuilder,
   type ChangeDeclared,
   type DescribeChangeFromGitOptions,
+  type DescribeChangeFromCommitsOptions,
+  type ProjectFiles,
 } from './recipe/facts.js';
+export { pieceOfBranch, readDeclaredKind } from './judge/pieces.js';
+export { runRedTestCheck } from './judge/red-test-check.js';
 export { appliesIfFor } from './recipe/applies.js';
 export { explainRecipe } from './recipe/explain.js';
 export { recipeCommand } from './recipe/command.js';
 export { DEFAULT_BANNED_TERMS, findBannedTerms } from './messages.js';
-export type { Recipe, RecipeStage, RecipeCondition, RecipeError } from './recipe/types.js';
-export type { BlockManifest, InputSpec, ValidWhile } from './blocks/manifest.js';
+export type { Recipe, RecipeStage, RecipeCondition, RecipeError, RecipePieces } from './recipe/types.js';
+export type { BlockManifest, InputSpec, ValidWhile, ServerMode } from './blocks/manifest.js';
 export {
   parseHookInput,
   decideToolUse,

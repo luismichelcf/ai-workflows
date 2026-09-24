@@ -84,6 +84,11 @@ export interface LaunchInGroupOptions {
   readonly cwd: string;
   readonly stdin: string;
   readonly env?: Readonly<Record<string, string>>;
+  /**
+   * The whole environment of the group when given: the process's own is not inherited, and the
+   * `env` of a shim, if any, is laid over this one. Absent means the process's own is inherited.
+   */
+  readonly environment?: NodeJS.ProcessEnv;
   /** Milliseconds before the group is given up on. Absent means no limit. */
   readonly timeoutMs?: number;
   /** Most stdout kept, in bytes. More than this is a technical failure. */
@@ -249,7 +254,7 @@ function launchPosix(options: LaunchInGroupOptions): ProcessGroup {
     detached: true,
     shell: false,
     stdio: ['pipe', 'pipe', 'pipe'],
-    ...(options.env === undefined ? {} : { env: { ...process.env, ...options.env } }),
+    env: { ...(options.environment ?? process.env), ...(options.env ?? {}) },
   });
   // A stream error on a child that never started must not crash the engine.
   child.stdin?.on('error', () => {});
