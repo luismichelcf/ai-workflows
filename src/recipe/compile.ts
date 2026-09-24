@@ -224,6 +224,18 @@ function sealedGate(gate: Gate, root: string): Gate {
 }
 
 /**
+ * PLAN-13-R4 §3.0.1 and §5: an effect that stays in doubt keeps blocking, optional stage or
+ * not. It is the same class the engine already refuses to retry and to wave through, carrying
+ * both the operation and the motive that could not settle it.
+ */
+class EffectStillInDoubt extends EffectNeedsReconciliation {
+  constructor(piece: string, operationId: string, motive: string) {
+    super(piece, operationId, 'uncertain');
+    this.message = motive;
+  }
+}
+
+/**
  * PLAN-13-R4 §3.0.1: an engine block with effects exports `reconcile`. When its gate leaves an
  * effect in doubt (`EffectNeedsReconciliation`), the reconciler reads the outside world, settles
  * the effect in the store, and the block is run one more time — never retried blindly. A
@@ -239,8 +251,12 @@ function reconcilableGate(
   const reconcile = definition.reconcile;
   if (reconcile === undefined) return gate;
 
-  const cannot = (operationId: string): Error =>
-    new Error(`effect "${operationId}" is in doubt and the block cannot reconcile it`);
+  const cannot = (piece: string, operationId: string): Error =>
+    new EffectStillInDoubt(
+      piece,
+      operationId,
+      `effect "${operationId}" is in doubt and the block cannot reconcile it`,
+    );
 
   return async (context: GateContext): Promise<GateResult> => {
     try {
@@ -254,17 +270,19 @@ function reconcilableGate(
         answer = await reconcile(inputs, operationId, context, engineDeps);
       } catch (failure) {
         const message = failure instanceof Error ? failure.message : String(failure);
-        throw new Error(
+        throw new EffectStillInDoubt(
+          context.piece,
+          operationId,
           `effect "${operationId}" is in doubt and reconciling it failed: ${message}`,
         );
       }
-      if (typeof answer !== 'object' || answer === null) throw cannot(operationId);
+      if (typeof answer !== 'object' || answer === null) throw cannot(context.piece, operationId);
       if ('didNotHappen' in answer) {
         await store.reconcileEffect(context.piece, operationId, { didNotHappen: true });
       } else if ('confirmed' in answer) {
         await store.reconcileEffect(context.piece, operationId, { confirmed: answer.confirmed });
       } else {
-        throw cannot(operationId);
+        throw cannot(context.piece, operationId);
       }
       // The effect is settled now: run the block one more time, and only once.
       return await gate(context);

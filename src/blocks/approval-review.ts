@@ -58,7 +58,7 @@ function createGate(deps: EngineBlockDeps): Gate {
     }
     const sha = judgedSha(context);
 
-    const pullDeps = { root: deps.root, recipe: deps.recipe, agent };
+    const pullDeps = { root: deps.root, recipe: deps.recipe, agent, store: deps.store };
     let pr;
     try {
       pr = await pullRequestOf(context.piece, sha, { create: true, context, deps: pullDeps });
@@ -129,13 +129,6 @@ async function attestation(
   } catch (error) {
     return { outcome: 'technical', reason: reasonOf(error) };
   }
-  if (context.validWhile === 'same-fingerprint') {
-    try {
-      await context.fetchObjects([context.head]);
-    } catch {
-      // A head that cannot be fetched simply fails the fingerprint comparison below.
-    }
-  }
   const result = await decideReviewApproval({
     reviews,
     owner,
@@ -145,6 +138,9 @@ async function attestation(
     locale: context.locale,
     prUrl: `#${context.pullRequest}`,
     sameFingerprint: async (commit) => {
+      // PLAN-13-R4 §7: the approved commit may not be in the judge's checkout; it is fetched
+      // before its fingerprint is computed. A fetch that fails is technical, never a silent no.
+      await context.fetchObjects([context.head, commit]);
       const [headFingerprint, commitFingerprintValue] = await Promise.all([
         commitFingerprint(context.root, context.trusted, context.head, context.recipe, context.piece),
         commitFingerprint(context.root, context.trusted, commit, context.recipe, context.piece),
@@ -174,6 +170,7 @@ export const approvalReviewBlock: BlockDefinition = {
       root: deps.root,
       recipe: deps.recipe,
       agent,
+      store: deps.store,
     });
     return outcome.handled ? outcome.answer : undefined;
   },

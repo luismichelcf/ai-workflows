@@ -24,7 +24,10 @@ export interface ChangeBuilder {
 
 export interface ChangeDeclared {
   readonly kind?: string;
+  /** A single declared builder, kept for callers written before the list (PLAN-13-R4 §2.2). */
   readonly builder?: ChangeBuilder;
+  /** Every builder of the piece, in the order they were declared. */
+  readonly builders?: readonly ChangeBuilder[];
 }
 
 export interface ChangeFacts {
@@ -40,7 +43,10 @@ export interface ChangeFacts {
   readonly kind: string;
   readonly lane?: string;
   readonly clean: boolean;
+  /** The single declared builder, for callers written before the list (PLAN-13-R4 §2.2). */
   readonly builder?: ChangeBuilder;
+  /** Every declared builder of the piece; a reviewer must differ from each (PLAN-13-R4 §2.2). */
+  readonly builders: readonly ChangeBuilder[];
 }
 
 export interface DescribeChangeFromGitOptions {
@@ -223,6 +229,7 @@ export async function describeChangeFromGit(
   const classes = classifyFiles(recipe.classify, files);
   const effective = effectiveKind(recipe, declared.kind, files);
   const builder = declared.builder;
+  const builders = declared.builders ?? (builder === undefined ? [] : [builder]);
 
   return {
     piece,
@@ -238,6 +245,7 @@ export async function describeChangeFromGit(
     ...(effective.lane === undefined ? {} : { lane: effective.lane }),
     clean: snapshot === headTree,
     ...(builder === undefined ? {} : { builder }),
+    builders,
   };
 }
 
@@ -289,6 +297,7 @@ export async function describeChangeFromCommits(
     kind: effective.kind,
     ...(effective.lane === undefined ? {} : { lane: effective.lane }),
     clean: true,
+    builders: [],
   };
 }
 

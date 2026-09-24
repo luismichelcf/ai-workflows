@@ -16,6 +16,12 @@ export interface ReviewDecisionOptions {
   treeOf(sha: string): Promise<string>;
   readonly head: string;
   readonly spanish: boolean;
+  /**
+   * For a `sandboxed-review`, the stage whose own published verdict counts; a verdict tagged
+   * with another stage is never evidence here. Omitted means the independent review of the
+   * piece, which counts only verdicts that no stage published (PLAN-13-R4 §3.1).
+   */
+  readonly stage?: string;
 }
 
 export type ReviewDecision =
@@ -58,8 +64,15 @@ export async function decideIndependentReview(
   options: ReviewDecisionOptions,
 ): Promise<ReviewDecision> {
   const { spanish } = options;
+  // A verdict published by a stage (a `sandboxed-review`) never covers an angle of the piece's
+  // independent review; the stage that published it reads it through its own `stage`.
+  const events = options.events.filter(
+    (event) =>
+      event.type !== 'verdict'
+      || (options.stage === undefined ? event.stage === undefined : event.stage === options.stage),
+  );
   const selected = await selectVerdicts({
-    events: options.events,
+    events,
     angles: options.angles,
     accepts: options.accepts,
     treeOf: options.treeOf,

@@ -432,10 +432,13 @@ export function createJudgeGitHub(options: JudgeGitHubOptions): JudgeGitHub {
           throw new Error(`gh returned a comment on issue ${String(n)} without its id, body, author or dates.`);
         }
         const viaApp = textField(isRecord(item) ? item['performed_via_github_app'] : undefined, 'slug');
+        if (authorType !== 'User' && authorType !== 'Bot') {
+          throw new Error(`gh returned a comment on issue ${String(n)} whose author type it does not know (${authorType}).`);
+        }
         comments.push({
           id,
           author,
-          authorType: authorType === 'Bot' ? 'Bot' : 'User',
+          authorType,
           viaApp: viaApp ?? null,
           body,
           createdAt,
@@ -467,9 +470,12 @@ export function createJudgeGitHub(options: JudgeGitHubOptions): JudgeGitHub {
         ) {
           throw new Error(`gh returned a review of pull request ${String(n)} without its author, state, commit or date.`);
         }
+        if (authorType !== 'User' && authorType !== 'Bot') {
+          throw new Error(`gh returned a review of pull request ${String(n)} whose author type it does not know (${authorType}).`);
+        }
         reviews.push({
           author,
-          authorType: authorType === 'Bot' ? 'Bot' : 'User',
+          authorType,
           state,
           commitId,
           submittedAt,

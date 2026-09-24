@@ -61,6 +61,12 @@ export interface EventRules {
 }
 
 const MARKER = '<!-- ai-workflows:event';
+/**
+ * The exact shape `renderEventComment` writes: one readable line, a blank line, then the marker
+ * and nothing else. A marker buried in a sentence, a second marker, or any text after it means
+ * the comment is not the engine's own published event, so it is refused rather than read.
+ */
+const EVENT_SHAPE = /^([^\n]+)\n+<!-- ai-workflows:event ([^\n]*) -->$/;
 const FULL_SHA = /^[0-9a-f]{40}$/i;
 const BUILDER_KEYS = ['version', 'type', 'op', 'piece', 'sha', 'identity', 'result', 'source'] as const;
 const VERDICT_KEYS = [
@@ -129,12 +135,14 @@ export function parseEventComment(
   comment: IssueComment,
   rules: EventRules,
 ): PieceEvent | { invalid: string } | undefined {
-  const start = comment.body.indexOf(MARKER);
-  if (start < 0) return undefined;
+  if (!comment.body.includes(MARKER)) return undefined;
 
-  const after = comment.body.slice(start + MARKER.length);
-  const end = after.indexOf('-->');
-  const raw = (end < 0 ? after : after.slice(0, end)).trim();
+  const match = EVENT_SHAPE.exec(comment.body);
+  if (match === null) {
+    return { invalid: 'the event marker is not the exact shape the engine writes' };
+  }
+  const raw = (match[2] ?? '').trim();
+  if (raw.length === 0) return { invalid: 'the event marker does not carry valid JSON' };
 
   let parsed: unknown;
   try {
