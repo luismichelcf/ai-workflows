@@ -536,6 +536,19 @@ class EffectFailed extends Error {
   }
 }
 
+/**
+ * The motive a person reads when an effect's own work failed: the effect's reason alone, without
+ * the `EffectFailed` wrapper nor the class prefix of the thrown value. The state does not change —
+ * the effect is still in doubt and the block is still technical — only the wording is trimmed, so
+ * a git failure reads as `fatal: …` instead of `EffectFailed: Error: fatal: …`.
+ */
+function effectFailureReason(failure: unknown): string {
+  if (failure instanceof Error) {
+    return failure.message.length > 0 ? failure.message : failure.name;
+  }
+  return describeUnknown(failure);
+}
+
 /** The run is no longer the holder of the piece. Any further write would be over someone else. */
 class LeaseLost extends Error {
   constructor(readonly heldBy: string) {
@@ -1470,7 +1483,11 @@ export function createEngine(options: EngineOptions): Engine {
                 if (!inDoubt && attempt < attempts) {
                   retryable = true;
                 } else {
-                  const reason = counted(describeUnknown(error));
+                  const reason = counted(
+                    error instanceof EffectFailed
+                      ? effectFailureReason(error.failure)
+                      : describeUnknown(error),
+                  );
                   await record(stage.name, 'failed', reason);
                   // An optional failure is recorded and the piece carries on; only the
                   // processes that survived or an effect in doubt still stop it.

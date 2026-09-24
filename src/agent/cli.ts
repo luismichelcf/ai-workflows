@@ -63,8 +63,12 @@ export interface CreateAgentEdgesOptions {
   readonly runner: GhRunnerWithEnv;
   /** The app token source; without it the calls run as the account `gh` is logged in as. */
   readonly tokenSource?: AgentTokenSource;
-  /** The repository the git side pushes in; defaults to the current folder. */
-  readonly root?: string;
+  /**
+   * The folder of the piece the git side pushes from. It is mandatory on purpose: assuming the
+   * current folder could push from the engine's own repository instead of the piece's, an
+   * invisible mistake (PLAN-13-R4 §4, §8).
+   */
+  readonly root: string;
 }
 
 export interface AgentEdges {
@@ -89,7 +93,7 @@ export function createAgentEdges(options: CreateAgentEdgesOptions): AgentEdges {
     ...(token === undefined ? {} : { token }),
   });
   const remote = createRemoteGit({
-    root: options.root ?? process.cwd(),
+    root: options.root,
     repository: options.repository,
     ...(token === undefined ? {} : { token }),
   });
