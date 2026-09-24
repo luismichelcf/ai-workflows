@@ -226,12 +226,17 @@ del servidor: `git ls-tree -r -z --full-tree <head>` y `git cat-file blob <head>
 
 Se leen, para el SHA de §3.2, los check-runs con ese nombre exacto (`commits/<sha>/check-runs?
 check_name=X&filter=latest`, paginado) y el último estado de cada contexto igual a `X`
-(`commits/<sha>/statuses`, paginado). Sin ninguno → `waiting` «falta el check X». Alguno sin
-terminar (`queued`, `in_progress`, `pending`) → `waiting`. Alguno terminado distinto de `success`
-(incluidos `skipped`, `neutral`, `cancelled`, `failure`, `error`, `timed_out`) → `rejected` que lo
-nombra con su conclusión. Todos `success` → `passed` (SV-01). El juez nunca corre una suite.
-Límite declarado (como `todo-verde` hoy): un workflow deliberado puede publicar un check con ese
-nombre (R13).
+(`commits/<sha>/statuses`, paginado). **Decide el check-run más reciente** (el de mayor número),
+igual que el último estado de cada contexto: un PR que apuntaba a otra rama deja sobre su cabeza
+una prueba roja vieja en `failure` que la corrida nueva reemplaza. Sin ninguno → `waiting` «falta
+el check X». El más reciente sin terminar (`queued`, `in_progress`, o el estado `pending`) →
+`waiting`. Terminado distinto de `success` (incluidos `skipped`, `neutral`, `cancelled`,
+`failure`, `error`, `timed_out`) → `rejected` que lo nombra con su conclusión. Si hay check-run y
+estado con ese nombre, los dos deben estar en verde. Varios check-runs sin número con que
+ordenarlos → técnico. Todo en verde → `passed` (SV-01). El juez nunca corre una suite.
+Límite declarado (R13, como `todo-verde` hoy): un workflow deliberado puede publicar un check con
+ese nombre, y ahora uno posterior en verde tapa un fallo anterior; el juez lo deja en las notas y
+el resumen («un intento anterior terminó en …»), sin cambiar el veredicto.
 
 ### 3.5 Archivos del juez y atestación del dueño (SV-04, RC-06)
 
@@ -675,3 +680,12 @@ ese nombre** (el de mayor número), igual que el último estado de cada contexto
 en `on`/`advisory`, si en `workflow_run` falla la lectura de los PRs, el paso publica `error` sobre
 el SHA aunque su PR apunte a otra rama (transitorio, del lado seguro); `edited` también vuelve a
 correr la prueba roja al cambiar el título o la descripción (minutos de CI).
+
+**Ronda 4** (un revisor, sobre el cambio de la ronda 3): confirmó la regla del más reciente y pidió
+(1) reescribir §3.4 y dejar rastro cuando un intento más reciente tapa uno anterior no verde
+(aplicado, dentro de R13, arriba) y (2) pruebas para tres cambios sin prueba (puerto con números
+inválidos o faltantes, rastro al fallar la lectura de un PR). **Carrera real encontrada en la
+tercera pasada:** el evento `merge_group` llega antes de que la lista de la cola muestre el commit
+del grupo; la prueba roja del grupo no lo encontraba, fallaba y la cola expulsaba el PR → el juez y
+la prueba roja releen la lista hasta 6 veces con pausas crecientes antes de rendirse, y el comando
+imprime su resumen en el registro de la corrida.

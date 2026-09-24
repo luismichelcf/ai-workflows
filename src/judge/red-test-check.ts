@@ -16,8 +16,9 @@ import {
   type ChangeFacts,
 } from '../recipe/facts.js';
 import type { Recipe, RecipeStage } from '../recipe/types.js';
+import { waitForMergeQueue } from './checks.js';
 import { pieceOfBranch, readDeclaredKind } from './pieces.js';
-import type { JudgeGitHub, MergeQueueEntry } from './port.js';
+import type { JudgeGitHub } from './port.js';
 import { escapeReportText } from './summary.js';
 
 // PLAN-13-R3 §5: the unprivileged job `ai-workflows/red-test`. For every piece the `red-test`
@@ -40,6 +41,13 @@ const FORBIDDEN_ENV = /TOKEN|SECRET|PASSWORD|KEY|^ACTIONS_|^GH_/i;
 
 function reasonOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/** Waits for real, unless the caller injects its own pause (the tests pass one that returns at once). */
+function realSleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
 }
 
 /**
@@ -161,6 +169,7 @@ async function collectPullRequests(
   event: unknown,
   github: PullRequests,
   branch: string,
+  sleep: (ms: number) => Promise<void>,
 ): Promise<CollectResult> {
   if (eventName === 'pull_request') {
     const pull = fieldOf(event, 'pull_request');
@@ -186,12 +195,18 @@ async function collectPullRequests(
   if (eventName === 'merge_group') {
     const groupSha = stringOf(fieldOf(fieldOf(event, 'merge_group'), 'head_sha'));
     if (groupSha === undefined) return { ok: false, reason: 'La carga del grupo no trae su SHA.' };
-    let queue: MergeQueueEntry[];
-    try {
-      queue = await github.mergeQueue(branch);
-    } catch (error) {
-      return { ok: false, reason: `No se pudo leer la cola de fusión: ${reasonOf(error)}` };
+    // §5, §3.2: the queue may list the group a moment after the event names it. The list is read
+    // again, waiting, until it shows the group; a read that throws fails at once.
+    const read = await waitForMergeQueue(github, branch, groupSha, sleep);
+    if (!read.ok) {
+      return {
+        ok: false,
+        reason: read.readFailed
+          ? `No se pudo leer la cola de fusión: ${read.reason}`
+          : `La cola de fusión no lista el grupo ${groupSha}.`,
+      };
     }
+    const queue = read.entries;
     const index = queue.findIndex((entry) => entry.headSha === groupSha);
     if (index === -1) {
       return { ok: false, reason: `La cola de fusión no lista el grupo ${groupSha}.` };
@@ -520,9 +535,12 @@ export async function runRedTestCheck(
   deps: {
     github: Pick<JudgeGitHub, 'defaultBranch' | 'branchHead' | 'mergeQueue' | 'pullRequest'>;
     fetchObjects(shas: string[]): Promise<void>;
+    /** Waits between re-reads of a queue that has not listed the group yet. Defaults to a real timer. */
+    sleep?: (ms: number) => Promise<void>;
   },
 ): Promise<{ ok: boolean; summary: string }> {
   const { eventName, event, root } = input;
+  const sleep = deps.sleep ?? realSleep;
 
   let branch: string;
   try {
@@ -541,7 +559,7 @@ export async function runRedTestCheck(
     };
   }
 
-  const collected = await collectPullRequests(eventName, event, deps.github, branch);
+  const collected = await collectPullRequests(eventName, event, deps.github, branch, sleep);
   if (!collected.ok) return { ok: false, summary: renderSummary([], 'es', collected.reason) };
 
   const shas = new Set<string>([trusted]);

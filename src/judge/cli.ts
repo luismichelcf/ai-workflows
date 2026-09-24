@@ -41,6 +41,12 @@ async function appendSummary(summary: string): Promise<void> {
   await appendFile(file, summary.endsWith('\n') ? summary : `${summary}\n`, 'utf8');
 }
 
+/** §6: the summary also goes to the run log, so the motive of a failure is seen there too. */
+function printSummary(summary: string): void {
+  if (summary.length === 0) return;
+  process.stdout.write(summary.endsWith('\n') ? summary : `${summary}\n`);
+}
+
 async function readEvent(): Promise<unknown> {
   const path = env('GITHUB_EVENT_PATH');
   if (path.length === 0) throw new Error('GITHUB_EVENT_PATH is not set');
@@ -123,6 +129,7 @@ async function judgeCommand(): Promise<number> {
   try {
     const report = await runJudge(input, { github, fetchObjects: fetcher(root, env('GH_TOKEN')) });
     await appendSummary(report.summary);
+    printSummary(report.summary);
     for (const note of report.notes) {
       process.stdout.write(`::error::${escapeAnnotation(note)}\n`);
     }
@@ -151,6 +158,7 @@ async function redTestCommand(): Promise<number> {
       { github, fetchObjects: fetcher(root, env('GH_TOKEN')) },
     );
     await appendSummary(result.summary);
+    printSummary(result.summary);
     return result.ok ? 0 : 1;
   } catch (error) {
     process.stderr.write(`la prueba roja no pudo terminar: ${reasonOf(error)}\n`);

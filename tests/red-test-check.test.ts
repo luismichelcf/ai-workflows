@@ -114,8 +114,13 @@ function project(extra: Readonly<Record<string, string>> = {}) {
     async branchHead() {
       return github.mainHead;
     },
+    /** Successive answers of the queue list, for a queue that shows the group late; then `queue`. */
+    queueSequence: [] as Entry[][],
+    queueReads: 0,
     async mergeQueue() {
-      return github.queue;
+      github.queueReads += 1;
+      const next = github.queueSequence.shift();
+      return next ?? github.queue;
     },
     async pullRequest(n: number) {
       const pr = prs.get(n);
@@ -150,7 +155,7 @@ function project(extra: Readonly<Record<string, string>> = {}) {
       };
     },
     deps() {
-      return { github, fetchObjects: async () => {} };
+      return { github, fetchObjects: async () => {}, sleep: async () => {} };
     },
   };
 }
@@ -439,5 +444,43 @@ describe('flock 2: red-test-check and a PR into another branch', () => {
     const result = await runRedTestCheck(event, p.deps());
     expect(result.ok).toBe(false);
     expect(result.summary).toMatch(/develop/);
+  });
+});
+
+describe('flock 4: a queue that lists the group late', () => {
+  const groupEvent = (p: ReturnType<typeof project>, head: string, base: string) => ({
+    eventName: 'merge_group',
+    event: { merge_group: { head_sha: head, base_sha: base } },
+    root: p.root,
+    repository: 'duena/proyecto',
+  });
+
+  function oneGroup() {
+    const p = project();
+    p.pr(7, 'feat/13-bono', { 'src/bonus.mjs': BONUS(1000), 'tests/bonus.test.mjs': BONUS_TEST });
+    git(p.root, 'switch', '-q', '--detach', p.main);
+    git(p.root, 'merge', '-q', '--no-ff', '--no-edit', 'pr-7');
+    const g1 = git(p.root, 'rev-parse', 'HEAD');
+    git(p.root, 'switch', '-q', 'main');
+    p.github.queue = [{ position: 1, headSha: g1, baseSha: p.main, prNumber: 7 }];
+    p.checkout(g1);
+    return { p, g1 };
+  }
+
+  it('reads the list again, waiting, until it shows the group', async () => {
+    const { p, g1 } = oneGroup();
+    p.github.queueSequence = [[], []];
+    const result = await runRedTestCheck(groupEvent(p, g1, p.main), p.deps());
+    expect(result, result.summary).toEqual({ ok: true, summary: expect.any(String) });
+    expect(p.github.queueReads).toBe(3);
+  });
+
+  it('gives up after several reads that never show the group, and fails', async () => {
+    const { p, g1 } = oneGroup();
+    p.github.queueSequence = Array.from({ length: 50 }, () => []);
+    const result = await runRedTestCheck(groupEvent(p, g1, p.main), p.deps());
+    expect(result.ok).toBe(false);
+    expect(p.github.queueReads).toBeGreaterThan(1);
+    expect(p.github.queueReads).toBeLessThan(50);
   });
 });

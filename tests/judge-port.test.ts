@@ -244,3 +244,23 @@ describe('publishing', () => {
     expect(planted.calls.at(-1)?.args).toEqual(expect.arrayContaining(['--method', 'POST']));
   });
 });
+
+
+describe('flock 4: the id of a check run', () => {
+  const page = (runs: unknown[]) => ok([{ check_runs: runs }]);
+  const run = (id: unknown) => ({ ...(id === 'absent' ? {} : { id }), name: 'todo-verde', status: 'completed', conclusion: 'success', app: { slug: 'github-actions' }, html_url: null });
+
+  for (const bad of ['5', 0, 1.5, -3]) {
+    it(`throws on an id that is not a positive integer (${JSON.stringify(bad)})`, async () => {
+      const gh = fakeGh([[/check-runs/, page([run(bad)])]]);
+      await expect(createJudgeGitHub({ repository: REPO, runner: gh.runner }).checkRuns('abc', 'todo-verde')).rejects.toThrow();
+    });
+  }
+
+  for (const missing of ['absent', null]) {
+    it(`throws when several runs of the name cannot be ordered (one id ${String(missing)})`, async () => {
+      const gh = fakeGh([[/check-runs/, page([run(missing), run(7)])]]);
+      await expect(createJudgeGitHub({ repository: REPO, runner: gh.runner }).checkRuns('abc', 'todo-verde')).rejects.toThrow();
+    });
+  }
+});

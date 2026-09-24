@@ -1,7 +1,7 @@
 // PLAN-13-R3 §3.4 and §3.7: what the judge reads from GitHub about a SHA — the check of a stage,
 // and the states and check-runs that imitate the judge's own name.
 
-import type { CheckRunSummary, CommitStatus, JudgeGitHub } from './port.js';
+import type { CheckRunSummary, CommitStatus, JudgeGitHub, MergeQueueEntry } from './port.js';
 
 // The events of §3.2: only a run of one of these, of the judge's workflow, is an official status.
 export const JUDGE_EVENTS: readonly string[] = [
@@ -18,6 +18,47 @@ export const JUDGE_CONTEXTS: readonly string[] = ['ai-workflows', 'ai-workflows/
 export interface CheckOutcome {
   readonly outcome: 'passed' | 'waiting' | 'rejected' | 'technical';
   readonly reason?: string;
+  /**
+   * PLAN-13-R3 §3.4 (R13): an older check-run of the same name that the newest, green one replaced,
+   * when that older attempt did not end in `success`. It changes no verdict: the judge only says it.
+   */
+  readonly note?: string;
+}
+
+/** The pauses before each re-read of a queue that has not listed the group yet (PLAN-13-R3 §3.2). */
+export const MERGE_QUEUE_PAUSES_MS: readonly number[] = [2_000, 4_000, 8_000, 15_000, 30_000];
+
+export type MergeQueueWait =
+  | { readonly ok: true; readonly entries: readonly MergeQueueEntry[] }
+  | { readonly ok: false; readonly readFailed: true; readonly reason: string }
+  | { readonly ok: false; readonly readFailed: false };
+
+/**
+ * PLAN-13-R3 §3.2: a merge queue can list the group a moment after the event names it. The list is
+ * read again, waiting, until the group appears — at most six reads with growing pauses — and only
+ * then is its absence treated as a failure. A read that throws is never retried: it stays technical
+ * at once, because it says nothing about whether the group is there.
+ */
+export async function waitForMergeQueue(
+  github: Pick<JudgeGitHub, 'mergeQueue'>,
+  branch: string,
+  sha: string,
+  sleep: (ms: number) => Promise<void>,
+): Promise<MergeQueueWait> {
+  for (let attempt = 0; attempt <= MERGE_QUEUE_PAUSES_MS.length; attempt += 1) {
+    if (attempt > 0) {
+      const pause = MERGE_QUEUE_PAUSES_MS[attempt - 1];
+      if (pause !== undefined) await sleep(pause);
+    }
+    let queue: readonly MergeQueueEntry[];
+    try {
+      queue = await github.mergeQueue(branch);
+    } catch (error) {
+      return { ok: false, readFailed: true, reason: reasonOf(error) };
+    }
+    if (queue.some((entry) => entry.headSha === sha)) return { ok: true, entries: queue };
+  }
+  return { ok: false, readFailed: false };
 }
 
 function reasonOf(error: unknown): string {
@@ -55,6 +96,17 @@ export async function requireCheck(
     statuses = (await github.statuses(sha)).filter((status) => status.context === name);
   } catch (error) {
     return { outcome: 'technical', reason: reasonOf(error) };
+  }
+
+  // Several runs of one name cannot be ordered when any of them lacks an id: GitHub always sends
+  // it, so a list like that is refused rather than guessed (a single run without an id still stands).
+  if (runs.length > 1 && runs.some((run) => run.id === undefined)) {
+    return {
+      outcome: 'technical',
+      reason: spanish
+        ? `Hay varios check-runs «${name}» y alguno no trae id: no se puede decidir cuál es el más reciente.`
+        : `There are several check-runs "${name}" and one has no id: the most recent cannot be decided.`,
+    };
   }
 
   // The most recent run is the one with the greatest id (GitHub numbers them in order); a run
@@ -100,7 +152,37 @@ export async function requireCheck(
         : `The check ${name} ended ${latest.state}.`,
     };
   }
-  return { outcome: 'passed' };
+
+  // The newest run is green; if an older attempt of the same name ended otherwise, the judge says
+  // which one it replaced. It is a trace (R13), never a change of the verdict.
+  const note = replacedAttemptNote(runs, latestRun, name, spanish);
+  return note === undefined ? { outcome: 'passed' } : { outcome: 'passed', note };
+}
+
+/**
+ * PLAN-13-R3 §3.4 (R13): names the older, non-green check-run of the same name that a newer green
+ * one replaced, or nothing when the newest run is not the single green attempt.
+ */
+function replacedAttemptNote(
+  runs: readonly CheckRunSummary[],
+  latest: CheckRunSummary | undefined,
+  name: string,
+  spanish: boolean,
+): string | undefined {
+  if (latest === undefined || latest.id === undefined) return undefined;
+  if (latest.status !== 'completed' || latest.conclusion !== 'success') return undefined;
+  const latestId = latest.id;
+  let previous: CheckRunSummary | undefined;
+  for (const run of runs) {
+    if (run === latest || run.id === undefined || run.id >= latestId) continue;
+    if (run.status !== 'completed' || run.conclusion === 'success') continue;
+    if (previous === undefined || previous.id === undefined || run.id > previous.id) previous = run;
+  }
+  if (previous === undefined) return undefined;
+  const conclusion = conclusionOf(previous);
+  return spanish
+    ? `${name}: un intento anterior terminó en ${conclusion} y lo reemplazó uno más reciente`
+    : `${name}: an earlier attempt ended ${conclusion} and a more recent one replaced it`;
 }
 
 /** PLAN-13-R3 §3.7: one state or check-run that is not the judge's own. */

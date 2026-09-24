@@ -199,8 +199,13 @@ class FakeGitHub implements JudgeGitHub {
     return answer;
   }
 
+  /** Successive answers of the queue list before `queue` (a queue that shows the group late). */
+  queueSequence: { position: number; headSha: string; baseSha: string; prNumber: number }[][] = [];
+
   async mergeQueue(branch: string) {
     this.calls.push(`mergeQueue ${branch}`);
+    const next = this.queueSequence.shift();
+    if (next !== undefined) return next;
     if (this.queue instanceof Error) throw this.queue;
     return this.queue;
   }
@@ -359,6 +364,7 @@ function world(mainFiles: Readonly<Record<string, string>> = {}, options: { read
     judge(overrides = {}) {
       return runJudge(self.input(overrides), {
         github,
+        sleep: async () => {},
         fetchObjects: async (shas) => {
           const missing = shas.filter((sha) => gone.has(sha));
           if (missing.length > 0) throw new Error(`fatal: remote error: upload-pack: not our ref ${missing.join(' ')}`);
@@ -1760,5 +1766,85 @@ describe('flock 3: English reasons when a sign-off is refused', () => {
     const report = await w.judge();
     const reason = stageOf(report, 'owner-approval')?.reason ?? '';
     expect(reason).not.toMatch(/no es la versión|comentario|dueñ|versión juzgada/i);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Flock review, round 4.
+
+describe('flock 4', () => {
+  const runOf = (id: number | undefined, status: string, conclusion: string | null): CheckRun =>
+    ({ ...(id === undefined ? {} : { id }), status, conclusion, app: 'github-actions', url: null }) as CheckRun;
+
+  async function judgedWith(runs: CheckRun[], statuses: { state: string }[] = []) {
+    const w = world();
+    const head = behaviorPr(w);
+    w.green(7, head);
+    w.github.setCheck(head, 'ai-workflows/red-test', runs);
+    for (const status of statuses) w.github.addStatus(head, { context: 'ai-workflows/red-test', state: status.state, targetUrl: null });
+    w.github.pendingFromConsoleStep(head);
+    const report = await w.judge();
+    return { w, report };
+  }
+
+  it('a newer attempt that covers an earlier one that was not green passes, and the report says so (R13 trace)', async () => {
+    const { report } = await judgedWith([runOf(10, 'completed', 'failure'), runOf(11, 'completed', 'success')]);
+    expect(stageOf(report, 'red-test')?.outcome).toBe('passed');
+    expect(`${report.notes.join(' ')} ${report.summary}`).toMatch(/ai-workflows\/red-test[\s\S]*failure/);
+  });
+
+  it('positive: a single green attempt leaves no such note', async () => {
+    const { report } = await judgedWith([runOf(11, 'completed', 'success')]);
+    expect(report.notes.join(' ')).not.toMatch(/failure/);
+  });
+
+  it('a newest failed check-run is rejected even when a status of that name is green', async () => {
+    const { report } = await judgedWith([runOf(12, 'completed', 'failure')], [{ state: 'success' }]);
+    expect(stageOf(report, 'red-test')?.outcome).toBe('rejected');
+  });
+
+  it('several check-runs where one has no id cannot be ordered: technical', async () => {
+    const { report } = await judgedWith([runOf(undefined, 'completed', 'success'), runOf(13, 'completed', 'failure')]);
+    expect(stageOf(report, 'red-test')?.outcome).toBe('technical');
+  });
+
+  it('when reading one PR of the target list fails, error is published and the trace is still collected', async () => {
+    const w = world();
+    const head = behaviorPr(w);
+    w.green(7, head);
+    w.github.openWithHead.set(head, [7, 99]);
+    w.github.runs.set(RUN, { path: WORKFLOW, event: 'workflow_run', headBranch: 'main' });
+    w.github.addStatus(head, { context: 'ai-workflows', state: 'success', targetUrl: 'https://example.com/imitado' });
+    w.github.pendingFromConsoleStep(head);
+    const report = await w.judge({ eventName: 'workflow_run', event: { workflow_run: { event: 'pull_request', head_sha: head, pull_requests: [] }, repository: { full_name: REPO } } });
+    expect(w.github.on()).toEqual([expect.objectContaining({ sha: head, state: 'error' })]);
+    expect(report.unofficial).toEqual([expect.objectContaining({ url: 'https://example.com/imitado' })]);
+  });
+
+  it('with same-sha, a refused sign-off says in English what is wrong', async () => {
+    const recipe = RECIPE.replace('locale: es', 'locale: en').replace('    valid-while: same-fingerprint\n', '    valid-while: same-sha\n');
+    const w = world({ '.ai-workflows/pipeline.yml': recipe });
+    const head = behaviorPr(w);
+    w.green(7, head);
+    w.github.commentList.set(7, [byOwner('/visto-bueno 1234567')]);
+    w.github.pendingFromConsoleStep(head);
+    const report = await w.judge();
+    expect(stageOf(report, 'owner-approval')?.reason ?? '').toMatch(/version|head/i);
+  });
+});
+
+describe('flock 4: the judge and a queue that lists the group late', () => {
+  it('reads the list again until it shows the group, then judges it', async () => {
+    const w = world();
+    const seven = behaviorPr(w, 7, 'feat/13-a');
+    w.green(7, seven);
+    const group = mergeGroup(w, [7]);
+    w.github.setCheck(group, 'todo-verde', green());
+    w.github.setCheck(group, 'ai-workflows/red-test', green());
+    w.github.queueSequence = [[], []];
+    w.github.pendingFromConsoleStep(group);
+    await w.judge(groupInput(w, group));
+    expect(w.github.on()).toEqual([expect.objectContaining({ sha: group, state: 'success' })]);
+    expect(w.github.calls.filter((call) => call.startsWith('mergeQueue'))).toHaveLength(3);
   });
 });

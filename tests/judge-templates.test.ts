@@ -235,3 +235,10 @@ describe('flock 2: off never blocks', () => {
     expect(body).toMatch(/off/);
   });
 });
+
+describe('flock 4: the command says its verdict in the run log', () => {
+  it('writes the summary to its standard output as well, not only to the step summary', () => {
+    const cli = readFileSync(new URL('../src/judge/cli.ts', import.meta.url), 'utf8');
+    expect(cli).toMatch(/process\.stdout\.write\([^)]*summary/);
+  });
+});

@@ -32,6 +32,7 @@ import {
   collectUnofficial,
   officialRunId,
   requireCheck,
+  waitForMergeQueue,
   type Unofficial,
 } from './checks.js';
 import { pieceOfBranch, readDeclaredKind } from './pieces.js';
@@ -104,6 +105,15 @@ export interface JudgeDeps {
   /** Brings commit objects the judge did not check out, with the token of one single command. */
   fetchObjects(shas: string[]): Promise<void>;
   readonly now?: () => Date;
+  /** Waits between re-reads of a queue that has not listed the group yet. Defaults to a real timer. */
+  readonly sleep?: (ms: number) => Promise<void>;
+}
+
+/** Waits for real, unless the caller injects its own pause (the tests pass one that returns at once). */
+function realSleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -158,13 +168,19 @@ async function mergeGroupTargets(
   github: JudgeGitHub,
   principal: string,
   sha: string,
+  sleep: (ms: number) => Promise<void>,
 ): Promise<Targets> {
-  let queue;
-  try {
-    queue = await github.mergeQueue(principal);
-  } catch (error) {
-    return { ok: 'technical', sha, reason: reasonOf(error) };
+  // §3.2: the queue may list the group a moment after the event names it; it is read again,
+  // waiting, and only a list that never shows it is a failure. A read that throws is technical now.
+  const read = await waitForMergeQueue(github, principal, sha, sleep);
+  if (!read.ok) {
+    return {
+      ok: 'technical',
+      sha,
+      reason: read.readFailed ? read.reason : `el SHA ${sha} no aparece en la lista de la cola`,
+    };
   }
+  const queue = read.entries;
   const index = queue.findIndex((entry) => entry.headSha === sha);
   if (index < 0) {
     return { ok: 'technical', sha, reason: `el SHA ${sha} no aparece en la lista de la cola` };
@@ -190,6 +206,7 @@ async function resolveTargets(
   input: JudgeInput,
   github: JudgeGitHub,
   principal: string,
+  sleep: (ms: number) => Promise<void>,
 ): Promise<Targets> {
   const event = input.event;
   switch (input.eventName) {
@@ -257,7 +274,7 @@ async function resolveTargets(
         }
       }
       if (triggered === 'merge_group') {
-        return mergeGroupTargets(github, principal, head);
+        return mergeGroupTargets(github, principal, head, sleep);
       }
       return { ok: 'empty', note: `workflow_run de un evento no juzgado (${triggered ?? 'desconocido'})` };
     }
@@ -266,7 +283,7 @@ async function resolveTargets(
       if (head === undefined) {
         return { ok: 'technical', sha: '', reason: 'merge_group sin head_sha' };
       }
-      return mergeGroupTargets(github, principal, head);
+      return mergeGroupTargets(github, principal, head, sleep);
     }
     default:
       return { ok: 'empty', note: `evento no juzgado: ${input.eventName}` };
@@ -292,6 +309,8 @@ interface StageWork {
   readonly github: JudgeGitHub;
   readonly judgePath: string;
   readonly alsoProtect: readonly string[];
+  /** The run's notes: a stage may add a trace here (a check that replaced an earlier one). */
+  readonly notes: string[];
   fetchObjects(shas: string[]): Promise<void>;
 }
 
@@ -417,6 +436,7 @@ async function judgeStage(stage: RecipeStage, work: StageWork): Promise<JudgedSt
 
     if (typeof server === 'object') {
       const result = await requireCheck(work.github, work.judgedSha, server.requireCheck, work.recipe.locale);
+      if (result.note !== undefined) work.notes.push(result.note);
       return present(stage, result.outcome, result.reason);
     }
 
@@ -661,6 +681,7 @@ function describeVerdict(pieces: readonly JudgedPr[], locale: string): string {
 
 export async function runJudge(input: JudgeInput, deps: JudgeDeps): Promise<JudgeReport> {
   const { github } = deps;
+  const sleep = deps.sleep ?? realSleep;
   const notes: string[] = [];
   const published: JudgePublished[] = [];
   const finish = (
@@ -737,7 +758,7 @@ export async function runJudge(input: JudgeInput, deps: JudgeDeps): Promise<Judg
     return finish();
   }
 
-  const targets = await resolveTargets(input, github, principal);
+  const targets = await resolveTargets(input, github, principal, sleep);
   const judgedSha = targets.ok === 'empty' ? '' : targets.sha;
   const infos = new Map<number, PrInfo>();
   const targetList: Target[] = [];
@@ -910,6 +931,7 @@ export async function runJudge(input: JudgeInput, deps: JudgeDeps): Promise<Judg
           fetchObjects: deps.fetchObjects,
           judgePath,
           alsoProtect: input.alsoProtect,
+          notes,
         }),
       );
     }
