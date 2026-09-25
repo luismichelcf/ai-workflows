@@ -68,9 +68,14 @@ function fakeGitHub(options: { crashAfter?: string } = {}) {
     seq,
   };
   const calls: string[] = [];
+  // The process dies once, at the first matching call; what runs after is the recovery.
+  let armed = options.crashAfter !== undefined;
   const crash = (label: string) => {
     calls.push(label);
-    if (options.crashAfter !== undefined && label.startsWith(options.crashAfter)) throw new Error(`caída simulada después de ${label}`);
+    if (armed && options.crashAfter !== undefined && label.startsWith(options.crashAfter)) {
+      armed = false;
+      throw new Error(`caída simulada después de ${label}`);
+    }
   };
   const port: SandboxPort = {
     async permissions() {
@@ -392,7 +397,8 @@ describe('restoration puts back only what this run wrote last', () => {
 });
 
 describe('recovery of an abandoned run', () => {
-  const crashes = ['createRef:' + LOCK, 'setVariable:on', 'putRuleset', `createIssue:pieza ${RUN}`, 'commitToMain:escribe'];
+  // Prefixes of the fake's labels: the harness puts its own marker in titles and messages.
+  const crashes = ['createRef:' + LOCK, 'setVariable:on', 'putRuleset', 'createIssue:', 'commitToMain:'];
 
   for (const label of crashes) {
     it(`after a crash at ${label}, recovery ends in the snapshot or stops naming the conflict, and only then releases`, async () => {
@@ -417,12 +423,12 @@ describe('recovery of an abandoned run', () => {
   }
 
   it('two issues with the marker of one intention is a conflict: recovery stops and keeps the lock', async () => {
-    const gh = fakeGitHub({ crashAfter: `createIssue:pieza ${RUN}` });
+    const gh = fakeGitHub({ crashAfter: 'createIssue:' });
     const sandbox = createSandbox({ port: gh.port, run: RUN });
     await sandbox.acquire();
     await sandbox.createIssue(`pieza ${RUN}`).catch(() => undefined);
     const marker = [...gh.state.issues.values()][0]?.title ?? '';
-    await gh.port.createIssue(marker, '');
+    await gh.port.createIssue(marker, '').catch(() => undefined);
     const recovered = await recoverSandbox({ port: gh.port });
     expect(recovered.ok).toBe(false);
     expect(gh.state.refs.has(LOCK)).toBe(true);

@@ -19,6 +19,7 @@
     "prepare": "tsc",
     "test": "vitest run",
     "test:github": "vitest run --config vitest.github.config.ts",
+    "test:github:recover": "vitest run --config vitest.recover.config.ts",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
     "check": "tsc --noEmit && vitest run"
