@@ -216,6 +216,18 @@ describe('every call names the repository (found in the real run: `gh pr ready` 
   });
 });
 
+describe('markReady (found in the real run: `gh pr ready` answers with text, not JSON)', () => {
+  it('succeeds when gh answers success with no JSON at all', async () => {
+    const { github } = port([[/.*/, { exitCode: 0, stdout: '', stderr: '✓ Pull request #7 is marked as "ready for review"' }]]);
+    await expect(github.markReady(7)).resolves.toBeUndefined();
+  });
+
+  it('still fails, naming the pull request, when gh fails', async () => {
+    const { github } = port([[/.*/, { exitCode: 1, stdout: '', stderr: 'GraphQL: something broke' }]]);
+    await expect(github.markReady(7)).rejects.toThrow(/7/);
+  });
+});
+
 describe('writes', () => {
   it('creates a draft pull request with the body on stdin, never in the arguments', async () => {
     const body = 'Refs #13\n<!-- ai-workflows:op open-pr:feat/13-algo:aaaa -->';
