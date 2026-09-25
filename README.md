@@ -305,8 +305,10 @@ request whose paths cannot be read, or an internal error is a refusal, never a p
 
 **Limits.** The hooks are help, level A: `--no-verify`, the shell, MCP tools, another machine or a
 false branch name get past them; the judge is the layer that holds (a pull request whose branch
-names no piece, or a piece without its evidence, is refused). If `node` itself is missing, or the
-hook runs past its 30 seconds, Claude Code lets the tool through. Claude Code runs project hooks
+names no piece, or a piece without its evidence, is refused). If `node` itself is missing, the
+hook runs past its 30 seconds, or the process dies by a signal (out of memory), Claude Code lets
+the tool through. With a broken recipe the shell rule stops comments, reviews and `gh api` writes;
+other `gh` commands that write (`pr create`, `pr merge`, `pr edit`) are not judged there. Claude Code runs project hooks
 only in a folder it trusts. Codex and OpenCode are not covered yet: their builders are covered by
 the git hooks and the judge.
 
