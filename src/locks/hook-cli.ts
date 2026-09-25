@@ -111,7 +111,10 @@ function runGit(cwd: string, args: readonly string[], gitPath = 'git'): Promise<
         maxBuffer: 64 * 1024 * 1024,
         windowsHide: true,
         encoding: 'utf8',
-        env: childEnvironment(),
+        // Every git call of the hook answers in the neutral language, so "not a repository" and
+        // "must run in a work tree" are read the same whatever the user's locale says
+        // (PLAN-13-R5 §1.2, round 3).
+        env: childEnvironment({ LC_ALL: 'C', LANGUAGE: 'C' }),
       },
       (error, stdout, stderr) => {
         done({ ok: error === null, stdout: stdout ?? '', stderr: stderr ?? '' });

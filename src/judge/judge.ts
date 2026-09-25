@@ -1026,11 +1026,16 @@ export async function runJudge(input: JudgeInput, deps: JudgeDeps): Promise<Judg
         try {
           before = await github.pullRequest(candidate.number);
         } catch (error) {
-          addNote(notes, pick(
+          // The head cannot be confirmed before writing, so nothing is published on it; and, like
+          // the other unreadable reads, the run ends failed once the remaining pull requests were
+          // judged (PLAN-13-R5 §2.6, round 3), in the recipe's language.
+          const reason = pick(
             isSpanish(currentRecipe.locale),
             `no se pudo releer el PR #${String(candidate.number)} antes de publicar: ${reasonOf(error)}`,
             `pull request #${String(candidate.number)} could not be re-read before publishing: ${reasonOf(error)}`,
-          ));
+          );
+          addNote(notes, reason);
+          failures.push(reason);
           break;
         }
         if (before.headSha !== live.headSha || before.baseRef !== principal) {
