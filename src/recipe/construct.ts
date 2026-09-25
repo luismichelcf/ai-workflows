@@ -3,6 +3,7 @@ import { isMap, type Node } from 'yaml';
 import type {
   Recipe,
   RecipeCondition,
+  RecipeHooks,
   RecipeMessages,
   RecipePieces,
   RecipeStage,
@@ -74,6 +75,10 @@ function constructPieces(node: YamlNode): RecipePieces {
   };
 }
 
+function constructHooks(node: YamlNode): RecipeHooks {
+  return { papers: (yamlValue(yamlField(node, 'papers')) ?? []) as string[] };
+}
+
 function constructMessages(node: YamlNode): RecipeMessages {
   const summary = yamlField(node, 'summary');
   const maxLength = yamlValue(yamlField(node, 'max-length'));
@@ -98,6 +103,7 @@ export function constructRecipe(root: Node): Recipe {
   const lanes = yamlField(root, 'lanes');
   const labels = yamlField(root, 'labels');
   const pieces = yamlField(root, 'pieces');
+  const hooks = yamlField(root, 'hooks');
   const stageNodes = yamlSeq(yamlField(root, 'stages'))?.items ?? [];
   const owner = yamlField(root, 'owner');
   const agentAccount = yamlField(root, 'agent-account');
@@ -129,5 +135,6 @@ export function constructRecipe(root: Node): Recipe {
       labels: yamlValue(labels) as Record<string, string>,
     }),
     ...(pieces === null ? {} : { pieces: constructPieces(pieces) }),
+    ...(hooks === null ? {} : { hooks: constructHooks(hooks) }),
   };
 }

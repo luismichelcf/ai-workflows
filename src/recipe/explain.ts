@@ -17,6 +17,8 @@ interface ExplainWords {
   readonly validity: Readonly<Record<Validity, string>>;
   readonly pieces: string;
   readonly declaredKind: (line: string, file: string) => string;
+  /** PLAN-13-R5 §1.1: where one may write while no piece is open. */
+  readonly noPiece: (papers: readonly string[]) => string;
   readonly github: Readonly<Record<GitHubMode, string>>;
   /** The attestation line of a review block that reads the piece's published verdicts. */
   readonly attestationVerdicts: string;
@@ -65,6 +67,8 @@ const EXPLAIN_WORDS: Record<Language, ExplainWords> = {
       'Cada pieza se reconoce por el nombre de su rama; una rama sin pieza nunca se fusiona.',
     declaredKind: (line, file) =>
       `Su tipo de cambio lo declara la línea «${line}» de «${file}».`,
+    noPiece: (papers) =>
+      `Sin una pieza activa solo se puede escribir en: ${papers.join(', ')}`,
     github: {
       recompute: '   En GitHub: se vuelve a comprobar antes de fusionar.',
       'require-check':
@@ -118,6 +122,8 @@ const EXPLAIN_WORDS: Record<Language, ExplainWords> = {
       'Each piece is recognized by the name it works under; work without a piece never joins the main line.',
     declaredKind: (line, file) =>
       `Its kind of change is declared by the line "${line}" of "${file}".`,
+    noPiece: (papers) =>
+      `Without an active piece, the only folders you may write to are: ${papers.join(', ')}`,
     github: {
       recompute: '   On GitHub: checked again before joining the main line.',
       'require-check':
@@ -214,6 +220,10 @@ export function explainRecipe(recipe: Recipe): string {
     lines.push('', words.pieces);
     const declared = recipe.pieces.declaredKind;
     if (declared !== undefined) lines.push(words.declaredKind(declared.line, declared.file));
+  }
+
+  if (recipe.hooks !== undefined && recipe.hooks.papers.length > 0) {
+    lines.push('', words.noPiece(recipe.hooks.papers));
   }
 
   for (const [index, stage] of stages.entries()) {

@@ -22,6 +22,18 @@ export interface LockContext {
   readonly libre?: boolean;
   /** Folders, relative to `cwd`, where papers may be written without a piece. */
   readonly paperPaths: readonly string[];
+  /**
+   * PLAN-13-R5 §1.3: the orders only the owner writes, read from the recipe's approval stages.
+   * Absent means the v0.3.0 behaviour: only `/visto-bueno` is known.
+   */
+  readonly ownerOrders?: readonly string[];
+  /** PLAN-13-R5 §1.3: refuse the terminal forms that approve a pull request. */
+  readonly forbidPullRequestApproval?: boolean;
+  /**
+   * PLAN-13-R5 §1.4: the recipe of this working copy could not be read or validated, with the
+   * problem at file:line:column. Only `.ai-workflows/` stays writable, and rule 0 is stricter.
+   */
+  readonly brokenRecipe?: string;
 }
 
 export type LockDecision = { readonly allow: true } | { readonly allow: false; readonly reason: string };
@@ -81,9 +93,21 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
 //
 // This is help, not a guarantee: an agent can still write a template holding `<sha>` in one step
 // and fill it in with the shell in another, never naming the order where this hook can read it.
-const SHELL_TOOLS = new Set(['Bash', 'PowerShell', 'Monitor']);
-const SHELL_SIGN_OFF = /\/visto-bueno/i;
-const FILE_SIGN_OFF_LINE = /^\/visto-bueno\s+(\S.*)$/i;
+export const SHELL_TOOLS = new Set(['Bash', 'PowerShell', 'Monitor']);
+/** Without a recipe the lock knows only the v0.3.0 order, so old callers keep working. */
+const DEFAULT_OWNER_ORDERS: readonly string[] = ['/visto-bueno'];
+/** The terminal forms a person uses to approve a pull request (PLAN-13-R5 §1.3). */
+const PULL_REQUEST_REVIEW = /\bgh\s+pr\s+review\b/;
+const REVIEW_APPROVE_FLAG = /(^|\s)(--approve|-a)(\s|$)/;
+const API_PULL_REVIEWS = /pulls\/\d+\/reviews/;
+/** Publishing to GitHub from the shell, the strict rule of a broken recipe (§1.4). */
+const GH_PR_COMMENT = /\bgh\s+pr\s+comment\b/;
+const GH_ISSUE_COMMENT = /\bgh\s+issue\s+comment\b/;
+const GH_API = /\bgh\s+api\b/;
+const API_METHOD = /(?:-x|--method)\s+(\S+)/i;
+const API_SENDS_FIELDS = /(^|\s)(-f|--field|--input)(\s|$)/;
+/** A line the server reads as any order: `/word value`, the shape of every approval. */
+const ORDER_SHAPED_LINE = /^\/(\S+)\s+(\S.*)$/;
 
 interface SignOffText {
   readonly text: string;
@@ -91,18 +115,52 @@ interface SignOffText {
   readonly stripPlus: boolean;
 }
 
-/** True when one line, trimmed, is a line the server would read as the owner's order. */
-function isSignOffOrderLine(rawLine: string, stripPlus: boolean): boolean {
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/** True when one line, trimmed, is a line the server would read as one of the owner's orders. */
+function isOwnerOrderLine(rawLine: string, stripPlus: boolean, orders: readonly string[]): boolean {
   let line = rawLine.trim();
   if (stripPlus) line = line.replace(/^\+/, '').trim();
 
-  const value = FILE_SIGN_OFF_LINE.exec(line)?.[1];
-  return value !== undefined && !value.startsWith('<');
+  for (const order of orders) {
+    const value = new RegExp(`^${escapeRegExp(order)}\\s+(\\S.*)$`, 'i').exec(line)?.[1];
+    if (value !== undefined && !value.startsWith('<')) return true;
+  }
+  return false;
 }
 
-/** True when any line of the text the tool is about to write would be read as the order. */
-function writesSignOffLine(text: string, stripPlus: boolean): boolean {
-  return text.split(/\r?\n/).some((line) => isSignOffOrderLine(line, stripPlus));
+/** True when any line of the text the tool is about to write would be read as an order. */
+function writesOwnerOrderLine(text: string, stripPlus: boolean, orders: readonly string[]): boolean {
+  return text.split(/\r?\n/).some((line) => isOwnerOrderLine(line, stripPlus, orders));
+}
+
+/** True when any line has the shape of an order, whatever its word is (broken-recipe mode). */
+function writesOrderShapedLine(text: string, stripPlus: boolean): boolean {
+  return text.split(/\r?\n/).some((rawLine) => {
+    let line = rawLine.trim();
+    if (stripPlus) line = line.replace(/^\+/, '').trim();
+    const value = ORDER_SHAPED_LINE.exec(line)?.[2];
+    return value !== undefined && !value.startsWith('<');
+  });
+}
+
+/** True when a shell command asks GitHub to approve a pull request. */
+function approvesPullRequest(command: string): boolean {
+  if (PULL_REQUEST_REVIEW.test(command) && REVIEW_APPROVE_FLAG.test(command)) return true;
+  return GH_API.test(command) && API_PULL_REVIEWS.test(command) && /approve/i.test(command);
+}
+
+/** True when a shell command publishes something on GitHub (broken-recipe mode). */
+function publishesToGitHub(command: string): boolean {
+  if (GH_PR_COMMENT.test(command) || GH_ISSUE_COMMENT.test(command) || PULL_REQUEST_REVIEW.test(command)) {
+    return true;
+  }
+  if (!GH_API.test(command)) return false;
+  const method = API_METHOD.exec(command)?.[1];
+  if (method !== undefined && method.toUpperCase() !== 'GET') return true;
+  return API_SENDS_FIELDS.test(command);
 }
 
 /**
@@ -151,15 +209,17 @@ function fileSignOffTexts(toolName: string, toolInput: unknown): SignOffText[] |
 }
 
 /**
- * Rule 0 of the editor hook: refuse any tool call that would write the owner's sign-off itself.
- * Returns `undefined` when the call may continue to the folder rules.
+ * Rule 0 of the editor hook: no tool call writes one of the owner's approval orders itself, and no
+ * shell approves a pull request. The orders come from the recipe (`context.ownerOrders`); without
+ * them the v0.3.0 behaviour is kept exactly. Returns `undefined` when the call may continue.
  */
-function signOffRefusal(toolName: string, toolInput: unknown): LockDecision | undefined {
+function ownerRuleRefusal(toolName: string, toolInput: unknown, context: LockContext): LockDecision | undefined {
+  const orders = context.ownerOrders ?? DEFAULT_OWNER_ORDERS;
   const order: LockDecision = {
     allow: false,
     reason:
-      'El visto bueno del dueño solo lo da él. No escribas tú `/visto-bueno <sha>` con su cuenta: ' +
-      'pídeselo al dueño y que sea él quien lo escriba en el PR.',
+      'La aprobación del dueño solo la da él. No escribas tú la orden de aprobación con su cuenta: ' +
+      'pídeselo al dueño y que sea él quien la escriba.',
   };
 
   if (SHELL_TOOLS.has(toolName)) {
@@ -177,11 +237,21 @@ function signOffRefusal(toolName: string, toolInput: unknown): LockDecision | un
       return {
         allow: false,
         reason:
-          'No pude leer el comando de esta herramienta: el candado se niega a adivinar si iba a escribir el visto bueno del dueño. Revisa el formato de tool_input.',
+          'No pude leer el comando de esta herramienta: el candado se niega a adivinar si iba a escribir una orden del dueño. Revisa el formato de tool_input.',
       };
     }
     // Shell text can fill a placeholder in before GitHub sees it, so any appearance is refused.
-    return SHELL_SIGN_OFF.test(command) ? order : undefined;
+    const lower = command.toLowerCase();
+    if (orders.some((entry) => lower.includes(entry.toLowerCase()))) return order;
+    if (context.forbidPullRequestApproval === true && approvesPullRequest(command)) {
+      return {
+        allow: false,
+        reason:
+          'Aprobar un pull request solo lo hace el dueño. Un agente no puede publicar la aprobación ' +
+          'del dueño con su cuenta: pídeselo a él.',
+      };
+    }
+    return undefined;
   }
 
   const texts = fileSignOffTexts(toolName, toolInput);
@@ -190,15 +260,98 @@ function signOffRefusal(toolName: string, toolInput: unknown): LockDecision | un
     return {
       allow: false,
       reason:
-        'No pude leer lo que esta herramienta iba a escribir: el candado se niega a adivinar si era el visto bueno del dueño. Revisa el formato de tool_input.',
+        'No pude leer lo que esta herramienta iba a escribir: el candado se niega a adivinar si era ' +
+        'una orden del dueño. Revisa el formato de tool_input.',
     };
   }
 
-  return texts.some(({ text, stripPlus }) => writesSignOffLine(text, stripPlus)) ? order : undefined;
+  return texts.some(({ text, stripPlus }) => writesOwnerOrderLine(text, stripPlus, orders))
+    ? order
+    : undefined;
+}
+
+/** What to say in broken-recipe mode: the problem, and the only door that stays open. */
+function brokenRecipeReason(context: LockContext): string {
+  return (
+    `La receta no es válida (${context.brokenRecipe}). Hasta repararla solo se puede escribir dentro ` +
+    'de .ai-workflows/: el candado no deja pasar nada más por si acaso.'
+  );
+}
+
+/** Rule 0 in broken-recipe mode: publishing to GitHub and any order-shaped line are refused. */
+function brokenOrderRefusal(input: HookInput, context: LockContext): LockDecision | undefined {
+  if (SHELL_TOOLS.has(input.toolName)) {
+    const record = asRecord(input.toolInput);
+    const command = record?.command;
+    if (typeof command !== 'string' && input.toolName === 'Monitor' && asRecord(record?.ws)) {
+      return undefined;
+    }
+    if (typeof command !== 'string') {
+      return { allow: false, reason: brokenRecipeReason(context) };
+    }
+    return publishesToGitHub(command) ? { allow: false, reason: brokenRecipeReason(context) } : undefined;
+  }
+
+  if (!isCoveredWriteTool(input.toolName)) return undefined;
+  const texts = fileSignOffTexts(input.toolName, input.toolInput);
+  if (texts === undefined) return { allow: false, reason: brokenRecipeReason(context) };
+  return texts.some(({ text, stripPlus }) => writesOrderShapedLine(text, stripPlus))
+    ? { allow: false, reason: brokenRecipeReason(context) }
+    : undefined;
+}
+
+/**
+ * The owner rule alone, without the folder rules. `runHook` calls it once on the whole request so
+ * that writing an order is refused wherever the target folder lives, and `decideToolUse` uses it
+ * as the first rule of a whole decision.
+ */
+export function orderRefusal(input: HookInput, context: LockContext): LockDecision | undefined {
+  if (context.brokenRecipe !== undefined) return brokenOrderRefusal(input, context);
+  return ownerRuleRefusal(input.toolName, input.toolInput, context);
+}
+
+/** The whole decision under a broken recipe: repair folder only, and the stricter rule 0. */
+function decideBrokenToolUse(input: HookInput, context: LockContext): LockDecision {
+  const order = brokenOrderRefusal(input, context);
+  if (order !== undefined) return order;
+  if (SHELL_TOOLS.has(input.toolName)) return { allow: true };
+  if (!isCoveredWriteTool(input.toolName)) return { allow: true };
+
+  const root = readAbsolute(context.projectRoot);
+  if (!root.ok) {
+    return { allow: false, reason: brokenRecipeReason(context) };
+  }
+  const repair = readAbsolute(`${root.path.display}/.ai-workflows`);
+  if (!repair.ok) return { allow: false, reason: brokenRecipeReason(context) };
+
+  const targets = writeTargets(input.toolName, input.toolInput);
+  if (targets === undefined || targets.length === 0) {
+    // Under a broken recipe an unreadable write is refused, never passed by doubt.
+    return { allow: false, reason: brokenRecipeReason(context) };
+  }
+
+  const projectDrive = root.path.windows ? /^([A-Za-z]):/.exec(root.path.display)?.[1] : undefined;
+  const readings = targets.map((target) => readAgainst(target, input.cwd, projectDrive));
+  for (const reading of readings) {
+    if (!reading.ok) return { allow: false, reason: brokenRecipeReason(context) };
+  }
+
+  const inside = readings
+    .flatMap((reading) => (reading.ok ? [reading.path] : []))
+    .filter((target) => isUnder(target, root.path));
+  // Paths outside the project are not this lock's business, broken recipe or not.
+  if (inside.length === 0) return { allow: true };
+  if (inside.every((target) => isUnder(target, repair.path))) return { allow: true };
+  return { allow: false, reason: brokenRecipeReason(context) };
+}
+
+/** True when the tool is one of the writing surfaces this lock judges by its path. */
+export function isCoveredWriteTool(toolName: string): boolean {
+  return CLAUDE_FILE_TOOLS.has(toolName) || toolName === 'NotebookEdit' || toolName === 'apply_patch';
 }
 
 /** The paths a covered tool will write, or `undefined` when the request cannot be read. */
-function writeTargets(toolName: string, toolInput: unknown): string[] | undefined {
+export function writeTargets(toolName: string, toolInput: unknown): string[] | undefined {
   if (toolName === 'apply_patch') {
     const record = asRecord(toolInput);
     if (!record) return undefined;
@@ -230,9 +383,12 @@ function writeTargets(toolName: string, toolInput: unknown): string[] | undefine
  * with the shell in another, never naming the order where this hook can read it.
  */
 export function decideToolUse(input: HookInput, context: LockContext): LockDecision {
+  // A broken recipe replaces every rule: only the recipe can be repaired, and rule 0 is stricter.
+  if (context.brokenRecipe !== undefined) return decideBrokenToolUse(input, context);
+
   // Rule 0: no agent writes the owner's sign-off for him. Checked before every other rule, and
   // unaffected by a piece or a /libre folder, because those open writing, never the sign-off.
-  const signOff = signOffRefusal(input.toolName, input.toolInput);
+  const signOff = ownerRuleRefusal(input.toolName, input.toolInput, context);
   if (signOff) return signOff;
 
   // Shell tools are covered only by the sign-off rule above: their command is not a path this
@@ -240,10 +396,8 @@ export function decideToolUse(input: HookInput, context: LockContext): LockDecis
   // stage, not what they run.
   if (SHELL_TOOLS.has(input.toolName)) return { allow: true };
 
-  const isCovered =
-    CLAUDE_FILE_TOOLS.has(input.toolName) || input.toolName === 'NotebookEdit' || input.toolName === 'apply_patch';
   // Rule 1: everything the hook is not wired to passes untouched.
-  if (!isCovered) return { allow: true };
+  if (!isCoveredWriteTool(input.toolName)) return { allow: true };
 
   // Rule 2: the guarded folder is the configured project root, never the hook's cwd, which moves
   // with every `cd`. A root the lock cannot read as an absolute path cannot be guarded at all:

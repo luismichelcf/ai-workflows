@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 
@@ -1175,6 +1175,47 @@ async function commandDoctor(deps: AgentCliDeps): Promise<CommandOutput> {
       ? es ? `git ${version.stdout.trim()}: correcto.` : `git ${version.stdout.trim()}: fine.`
       : es ? 'git es antiguo: hace falta 2.38 o más.' : 'git is too old: 2.38 or newer is needed.',
   );
+
+  // PLAN-13-R5 §1.5: a missing engine or a missing hook is said here, because the hook itself
+  // cannot start without the engine and would block the tools instead of explaining.
+  const engineBin = join(root, 'node_modules', 'ai-workflows', 'dist', 'bin.js');
+  if (existsSync(engineBin)) {
+    lines.push(es ? 'Motor instalado junto al proyecto.' : 'Engine installed next to the project.');
+  } else {
+    lines.push(
+      es
+        ? 'Falta node_modules/ai-workflows/dist/bin.js: los ganchos del editor bloquearán.'
+        : 'node_modules/ai-workflows/dist/bin.js is missing: the editor hooks will block.',
+    );
+  }
+
+  let settingsHook = false;
+  try {
+    const settings = JSON.parse(readFileSync(join(root, '.claude', 'settings.json'), 'utf8')) as {
+      hooks?: { PreToolUse?: { hooks?: { command?: unknown; args?: unknown }[] }[] };
+    };
+    const groups = settings.hooks?.PreToolUse ?? [];
+    settingsHook = groups.some((group) =>
+      (group.hooks ?? []).some(
+        (handler) =>
+          handler.command === 'node' &&
+          Array.isArray(handler.args) &&
+          handler.args.includes('hook'),
+      ),
+    );
+  } catch {
+    settingsHook = false;
+  }
+  const hooksPath = (await runGit(root, ['config', '--local', '--get', 'core.hooksPath'])).stdout.trim();
+  if (settingsHook && hooksPath === '.ai-workflows/githooks') {
+    lines.push(es ? 'Ganchos del editor y de git: instalados.' : 'Editor and git hooks: installed.');
+  } else {
+    lines.push(
+      es
+        ? 'Ganchos del editor o de git: faltan. Ejecuta: ai-workflows hooks install --apply'
+        : 'Editor or git hooks: missing. Run: ai-workflows hooks install --apply',
+    );
+  }
 
   if (!loaded.ok) {
     lines.push(es ? 'La receta no es válida:' : 'The recipe is not valid:');
