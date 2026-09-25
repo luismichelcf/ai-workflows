@@ -590,7 +590,7 @@ comportamiento; el orquestador escribe las pruebas rojas y el constructor las po
 - [x] **3. El juez:** acción reutilizable y plantilla de workflow, procedencia desde la base,
       `pull_request_target` y `merge_group`, frontera del merge, `server:`, interruptor de dos llaves.
       (RC-06, SV-01…SV-09, CN-05, CN-08)
-- [ ] **4. Etapas finales genéricas:** revisión independiente, visto bueno, vista previa, QA de
+- [x] **4. Etapas finales genéricas:** revisión independiente, visto bueno, vista previa, QA de
       navegador, fusión, post-merge, limpieza y mensajes al dueño por plantilla. (CN-06, CN-12, CN-13)
 - [ ] **5. Suite negativa completa** en `ai-workflows-pruebas` contra GitHub real, con informe.
 - [ ] **6. Ensayo general:** copia de Socialabs sin producción, servicios de prueba, receta de
@@ -634,12 +634,19 @@ Rebanadas 1 → 2 → 3 → 4 en orden; 5 puede empezar tras 3; 6 tras 4 y 5; 7 
     publicado cuando la lista de la cola nunca se completa podría llevar el último detalle; `init`
     que escriba los workflows del juez y el sellado del SHA del motor en el paquete (rebanada 6); la
     atestación `/approve-judge-change` acepta un código de 7 caracteres, que alguien con permiso de
-    empujar podría igualar fabricando un commit (a proponer: exigir más caracteres); las notas del
-    rastro salen como `::error::` en el registro aunque la corrida sea verde.
-  - **Rebanada 4:** `required: false` y `retry` en ejecución (hoy `compileRecipe` los rechaza);
-    conectar `run`, `status` y `stop` del binario a la receta, y de dónde toma el CLI el tipo
-    declarado y el constructor de una pieza; publicar el veredicto de `sandboxed-review` como
-    evento autenticado; salida saneada en `pause`, `resume`, `stop` y `doctor`.
+    empujar podría igualar fabricando un commit (resuelto en la rebanada 4: R20, 16 caracteres);
+    las notas del rastro salían como `::error::` (resuelto en la rebanada 4: `::warning::`).
+  - Resueltos en la rebanada 4 ([PLAN-13-R4](PLAN-13-R4.md)): `required: false` y `retry`; el
+    binario conectado a la receta; tipo declarado y constructores leídos de la rama, el plan y el
+    issue; veredictos publicados como eventos; salida saneada; R20 y R21.
+  - **De la rebanada 4, sin bloquear:** CN-07 (ganchos del editor conectados a la receta) pasa a la
+    rebanada 5; `cleanup` no libera zonas (nadie las reserva aún); sin `agent-account`, un aviso al
+    dueño puede repetirse tras una caída (la conciliación solo reconoce comentarios de la
+    aplicación); si todos los eventos de constructor son ilegibles, la revisión se rechaza por «no
+    se sabe quién construyó»; un veredicto ilegible posterior en `same-sha` deja la revisión
+    técnica hasta un veredicto nuevo; el lanzador de Windows informa «no se pudo iniciar» sin
+    detalle; sin prueba: la respuesta inútil de un `reconcile` de proyecto, la fusión sin distinguir
+    mayúsculas del bloque de entorno de Windows y los avisos de «no se pudo soltar la reserva».
   - **A proponer al dueño:** `applies-if` sobre la etapa de fusión.
   - **Costo aceptado del saneado:** una receta rechaza emojis compuestos (👩‍💻), banderas con
     etiquetas y el guion suave que deja Word; los acentos, «», —, ¿¡ y los emojis simples pasan.

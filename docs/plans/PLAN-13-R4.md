@@ -854,3 +854,29 @@ como los del motor; y pidió fijar con prueba que un veredicto ilegible más rec
 su ángulo deja la revisión técnica. Declarado: el lanzador de Windows informa «no se pudo iniciar» sin
 el detalle de la excepción (puede llevar rutas); si todos los eventos de constructor son ilegibles, la
 revisión se rechaza por «no se sabe quién construyó».
+
+**Ronda 5** (un revisor sobre la ronda 4): **aprueba sin bloqueantes**.
+
+## 16. Recorrido real en GitHub
+
+En `socialabs-margin/ai-workflows-pruebas`, con la aplicación real de los agentes
+(`socialabs-agentes[bot]`, instalada solo en ese repositorio), la cola nativa y su estado exigido
+`candado-cola`, despliegues creados por la prueba en lugar del proveedor y el botón «Approve» de la
+dueña pulsado desde fuera de la PC de los agentes (`tests/github/final-stages.github.test.ts`).
+
+- **Pasada 1:** la aprobación no llegó a tiempo (se acabó la espera de 30 min). Encontró que
+  `createAgentEdges` usaba en silencio la carpeta del proceso para subir → la carpeta de la pieza es
+  obligatoria.
+- **Pasada 2:** identidad del robot, dos sesiones a la vez (una trabaja, la otra lo dice), la
+  aprobación con el botón y la vista previa, bien; CN-13 real en verde. Encontró que `gh pr ready`
+  sin `--repo` usaba el repositorio de la carpeta → nombra el repositorio.
+- **Pasada 3:** encontró que `gh pr ready` responde texto y el puerto exigía JSON (el efecto sí
+  ocurría) → juzga solo el código de salida. CN-13 real en verde otra vez.
+- **Pasada 4:** **2 de 2 en verde.** Recorrido completo: PR abierto por la aplicación, espera de la
+  aprobación, «Approve» de la dueña, vista previa, salida del borrador, cola nativa, **fusionado**
+  (PR #78, commit `820c1e5`), producción comprobada, rama remota borrada y carpeta y rama local
+  retiradas. CN-13: tras la caída simulada después de abrir el PR, la reanudación lo encontró por su
+  marca y no abrió otro. Repositorio de pruebas limpio al final.
+
+Los tres arreglos de las pasadas 1 a 3 llevaron su prueba roja (`tests/agent-port.test.ts`,
+`tests/review4-cli-round1.test.ts`) y su revisión por delta.
