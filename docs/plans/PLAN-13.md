@@ -107,6 +107,7 @@ permanente (§8.2).
 | R19 | **El juez sabe de qué pieza es un PR por el nombre de su rama, y qué tipo declaró por una línea del plan de la pieza** (23-sep, al abrir la rebanada 3), como hoy en Socialabs: `feat/13-algo` es la pieza 13, una rama «libre» nunca se fusiona, y «Tipo de cambio: …» en el plan dice el tipo. La receta lo declara en una sección corta (`pieces:`). El tipo declarado sigue siendo palabra de la pieza (nivel A); las rutas lo suben si hace falta (nivel B). Descartados: ignorar lo declarado y usar solo las rutas (un cambio solo visual pasaría por todo el carril completo, contra R10) y leerlo de la descripción del PR (el motor local no la tiene antes de abrir el PR). Detalle en [PLAN-13-R3](PLAN-13-R3.md) §1.1. |
 | R20 | **La autorización de cambios al juez exige 16 caracteres** (23-sep, al abrir la rebanada 4). `/approve-judge-change` pide al menos los 16 primeros caracteres de la versión: con 7, alguien con permiso de subir código puede fabricar en minutos otra versión que empiece igual; con 16 tomaría años. El dueño copia el texto que le muestra el juez, así que no le cuesta más. Descartados: dejar 7 (hueco abierto) y el código completo (incómodo sin ganar seguridad real). |
 | R21 | **Los agentes publican con su propia identidad de GitHub y el dueño aprueba con el botón «Approve»** (23-sep, tras un estudio de cómo lo hace la industria: GitHub, Copilot, Devin, Cursor, Claude, Kubernetes). Una aplicación de GitHub del dueño (gratis, sin asiento) sube, abre PRs, publica y fusiona; como el PR ya no es del dueño, GitHub le deja aprobarlo, también desde el celular, y la aprobación queda amarrada a la versión. Cierra además el hueco de que un agente con la cuenta del dueño escriba el visto bueno por él, siempre que la sesión del dueño no esté abierta en la PC de los agentes (paso de instalación, se declara). El comentario con código se conserva como respaldo y para la copia fiel de Socialabs (R10), que cambia solo al integrar. Descartados: seguir con el comentario y cambiar después (el hueco sigue abierto) y endurecer solo el comentario (no cierra el hueco principal). Detalle en [PLAN-13-R4](PLAN-13-R4.md) §1. |
+| R22 | **En el repositorio de ensayo, la suite usa la cuenta del dueño abierta en la PC** (25-sep, al diseñar la rebanada 5): para preparar y restaurar su configuración (protecciones, variable, workflows) y para escribir las órdenes del dueño que los controles positivos necesitan (`/visto-bueno`, `/approve-judge-change`). Es un simulacro en un repositorio de juguete y el informe lo declara; los «Approve» con botón siguen siendo del dueño desde fuera de la PC. Nada de esto se permite fuera del ensayo ni toca Socialabs. Descartados: que el dueño escriba esas órdenes a mano (unos 4 comentarios más durante 1–2 horas) y una segunda aplicación de GitHub para administrar el ensayo (15 minutos del dueño; más limpio, sin ganar seguridad fuera del ensayo). Detalle en [PLAN-13-R5](PLAN-13-R5.md) §2.2. |
 
 Decisiones de construcción tomadas por el orquestador (el dueño decide qué, el orquestador cómo):
 YAML 1.2 con esquema publicado (§3.2), condiciones estructuradas sin lenguaje de expresiones en v1
@@ -403,8 +404,10 @@ interruptor no puede ser solo «dejar de publicar». Dos llaves, coordinadas:
 - **Cada PR se juzga por separado.** El tipo de cambio sale del diff recomputado, sin almacén ni
   proveedores. Un PR de papeles, o cualquier PR cuyas etapas aplicables no dependan del componente
   caído, se juzga normalmente aunque otro PR esté en `blocked:technical`.
-- Fallas que el juez sabe manejar con `on`: error interno del motor, proveedor de modelos caído,
-  almacén ilegible. Solo bloquean las etapas que dependen de ellas, con motivo.
+- Fallas que se saben manejar con `on`: error interno del motor, proveedor de modelos caído,
+  almacén ilegible. Solo bloquean las etapas que dependen de ellas, con motivo, y donde vive esa
+  dependencia: el juez no depende del almacén ni de los proveedores, así que esas dos solo bloquean
+  junto al agente (precisión de la rebanada 5, §8.3).
 - **Límite declarado:** si la API de estados de GitHub o GitHub Actions están caídas, ningún estado
   exigido puede publicarse, tampoco `todo-verde`, y ni siquiera el verde «motor apagado» de `off`.
   El remedio es el mismo de hoy para cualquier check: el dueño lo quita de la protección.
@@ -511,6 +514,10 @@ crear el PR y antes de registrarlo. Cada uno con el control positivo de PLAN-997
   almacén ilegible, cuando llegan un PR de papeles y un PR de otra pieza que no depende del
   componente caído, entonces ambos se juzgan normalmente y entran a la cola, y solo el PR afectado
   queda `blocked:technical` con motivo. Con `off` y `advisory`, ninguno queda bloqueado.
+  *Precisión (rebanada 5):* el `blocked:technical` aparece **donde vive la dependencia caída**. El
+  juez no lee el almacén ni llama a proveedores (§5.2, §5.3), así que con el almacén ilegible o un
+  proveedor caído la pieza afectada queda técnica junto al agente y su PR se juzga normalmente en el
+  servidor; un fallo interno del motor al juzgar un PR deja ese PR en error técnico en el servidor.
 - **SV-04** Dado un workflow ajeno que publica un estado con el mismo nombre, entonces la siguiente
   corrida del juez lo reporta en el PR como estado de origen no oficial (rastro, R13; no se promete
   impedir el merge). Dado un PR que modifica el workflow del juez, `.ai-workflows/` o la versión fijada de la acción,

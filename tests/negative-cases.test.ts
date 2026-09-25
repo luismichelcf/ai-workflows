@@ -1,3 +1,4 @@
+import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -8,6 +9,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import {
   EffectNeedsReconciliation,
   createEngine,
+  installHooks,
   createMemoryStore,
   parseTestRun,
   requireDifferentBuilder,
@@ -23,6 +25,7 @@ import {
 } from '../src/index.js';
 
 import { runBlock } from './block-harness.js';
+import { buildEngine, type BuiltEngine } from './built-engine.js';
 import { commit, git, removeRepositories, repository, write } from './git-fixtures.js';
 import { chain, pipeline, recorder, stage } from './helpers.js';
 
@@ -40,9 +43,7 @@ import { chain, pipeline, recorder, stage } from './helpers.js';
 // shrinking it.
 
 /** Cases that cannot run yet, and what each is waiting for. */
-export const NOT_YET_EXECUTABLE: Record<string, string> = {
-  'CN-07': 'needs the editor hooks installed in a project and wired to the recipe (slice 5, PLAN-13-R4 §0)',
-};
+export const NOT_YET_EXECUTABLE: Record<string, string> = {};
 
 const ALL = Array.from({ length: 13 }, (_, index) => `CN-${String(index + 1).padStart(2, '0')}`);
 const executed = new Set<string>();
@@ -505,6 +506,106 @@ describe('CN-08 merging from a free folder', () => {
   });
 });
 
+// CN-07 runs with the hooks installed by `ai-workflows hooks install --apply` and executed exactly as
+// written: the Claude hook as the command and arguments of .claude/settings.json (with the
+// substitution Claude Code does of ${CLAUDE_PROJECT_DIR}), and the git hook through a real
+// `git commit`. The engine behind them is the compiled one (PLAN-13-R5 §1.6).
+
+const CN07_RECIPE = [
+  'version: 1',
+  'locale: es',
+  'owner: duena',
+  'pieces:',
+  '  branch: ["*/{piece}-*"]',
+  '  exclude-branches: ["libre/*"]',
+  'hooks:',
+  '  papers: ["docs"]',
+  'stages:',
+  '  - id: merge',
+  '    summary: "Se une"',
+  '    phase: merge',
+  '    nature: recompute',
+  '    gate:',
+  '      uses: ai-workflows/github-merge@1',
+  '',
+].join('
+');
+
+describe('CN-07 writing code without an active piece', () => {
+  ran('CN-07');
+
+  let engine: BuiltEngine;
+  beforeAll(() => {
+    engine = buildEngine();
+  }, 180_000);
+  afterAll(() => engine.remove());
+  afterEach(removeRepositories);
+
+  async function installed(branch: string): Promise<string> {
+    const root = repository({ '.ai-workflows/pipeline.yml': CN07_RECIPE, 'src/a.mjs': 'export const a = 1;
+', 'docs/nota.md': 'nota
+' });
+    git(root, 'switch', '-q', '-C', branch);
+    engine.install(root);
+    const result = await installHooks({ root, apply: true });
+    if (!result.ok) throw new Error(result.text);
+    return root;
+  }
+
+  /** Runs the Claude hook of .claude/settings.json as Claude Code would, on one Write. */
+  function claudeHook(root: string, file: string): { status: number | null; stdout: string } {
+    const settings = JSON.parse(readFileSync(join(root, '.claude', 'settings.json'), 'utf8')) as {
+      hooks: { PreToolUse: { hooks: { command: string; args: string[] }[] }[] };
+    };
+    const handler = settings.hooks.PreToolUse.flatMap((group) => group.hooks).find((item) => item.command === 'node');
+    if (handler === undefined) throw new Error('no node hook in the settings');
+    const args = handler.args.map((arg) => arg.replaceAll('${CLAUDE_PROJECT_DIR}', root));
+    const stdin = JSON.stringify({ tool_name: 'Write', tool_input: { file_path: join(root, file), content: 'x
+' }, cwd: root, hook_event_name: 'PreToolUse' });
+    const output = spawnSync(process.execPath, args, { cwd: root, input: stdin, encoding: 'utf8' });
+    return { status: output.status, stdout: output.stdout };
+  }
+
+  const tryCommit = (root: string, file: string) => {
+    write(root, file, 'nuevo
+');
+    git(root, 'add', file);
+    return spawnSync('git', ['commit', '-q', '-m', 'intento'], { cwd: root, encoding: 'utf8' });
+  };
+
+  it('is refused by the editor hook and by git on a branch that names no piece', async () => {
+    const root = await installed('arreglo-rapido');
+    const before = git(root, 'rev-parse', 'HEAD');
+
+    const editor = claudeHook(root, 'src/b.mjs');
+    expect(editor.status).toBe(0);
+    expect(JSON.parse(editor.stdout)).toMatchObject({ hookSpecificOutput: { permissionDecision: 'deny', permissionDecisionReason: expect.stringMatching(/pieza/) } });
+
+    const committed = tryCommit(root, 'src/b.mjs');
+    expect(committed.status).not.toBe(0);
+    expect(`${committed.stderr}${committed.stdout}`).toMatch(/src\/b\.mjs/);
+    expect(git(root, 'rev-parse', 'HEAD')).toBe(before);
+  });
+
+  it('positive control: on a piece branch both let the code through', async () => {
+    const root = await installed('feat/13-boton');
+    expect(claudeHook(root, 'src/b.mjs')).toEqual({ status: 0, stdout: '' });
+    expect(tryCommit(root, 'src/b.mjs').status).toBe(0);
+  });
+
+  it('positive control: without a piece, the papers still pass', async () => {
+    const root = await installed('arreglo-rapido');
+    expect(claudeHook(root, 'docs/otra.md')).toEqual({ status: 0, stdout: '' });
+    expect(tryCommit(root, 'docs/otra.md').status).toBe(0);
+  });
+
+  it('with the engine missing, the Claude hook blocks (exit 2) instead of letting the tool through', async () => {
+    const root = await installed('feat/13-boton');
+    rmSync(join(root, 'node_modules'), { recursive: true, force: true });
+    expect(claudeHook(root, 'src/b.mjs').status).toBe(2);
+  });
+});
+
 describe('the report of the thirteen', () => {
   it('declares a reason for each pending case', () => {
     for (const [name, waiting] of Object.entries(NOT_YET_EXECUTABLE)) {
@@ -512,8 +613,8 @@ describe('the report of the thirteen', () => {
     }
   });
 
-  it('has exactly one pending case', () => {
-    expect(Object.keys(NOT_YET_EXECUTABLE)).toHaveLength(1);
+  it('has no pending case', () => {
+    expect(Object.keys(NOT_YET_EXECUTABLE)).toHaveLength(0);
   });
 });
 
