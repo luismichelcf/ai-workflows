@@ -76,6 +76,24 @@ describe('pull requests the run merged', () => {
   });
 });
 
+describe('round 2: a merge the run did not expect', () => {
+  it('a tracked pull request that GitHub merged although the run never noted it is reported, not accepted in silence', async () => {
+    const gh = fakeGitHub();
+    const setup = createSandbox({ port: gh.port, run: RUN });
+    await setup.acquire();
+    const file = await attachSandbox({ port: gh.port, run: RUN });
+    gh.openPr(964, 'feat/964-nunca', RUN);
+    await file.trackPullRequest(964, 'feat/964-nunca');
+    gh.mergeByQueue(964, { squash: true });
+
+    const result = await setup.restore();
+
+    expect(result.ok).toBe(false);
+    expect(result.problems.join('\n')).toContain('964');
+    expect(gh.state.refs.has(LOCK)).toBe(true);
+  });
+});
+
 describe('a read that fails is not an absence', () => {
   it('acquire refuses to take a snapshot when the variable cannot be read, and creates no lock', async () => {
     const gh = fakeGitHub();

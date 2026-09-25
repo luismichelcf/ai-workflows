@@ -191,6 +191,16 @@ describe('what the report may not carry', () => {
     });
   }
 
+  it('a compare link with three dots is a legitimate link, not a climb out', () => {
+    const records = allGood().map((record) => (record.id === 'CN-03' ? { ...record, evidence: [`https://github.com/${REPO}/compare/abc1234...def5678`] } : record));
+    expect(renderSuiteReport(records, META).complete).toBe(true);
+  });
+
+  it('the header values are audited too', () => {
+    expect(() => renderSuiteReport(allGood(), { ...META, repository: 'C:\\Users\\alguien\\repo' })).toThrow();
+    expect(() => renderSuiteReport(allGood(), { ...META, engineSha: 'ghs_16C7e42F292c6912E7710c838347Ae178B4a' })).toThrow();
+  });
+
   it('escapes markup that came from a record', () => {
     const records = allGood().map((record) => (record.id === 'CN-03' ? { ...record, attempt: 'rama <script>x</script> | celda [enlace](https://example.com)' } : record));
     const text = renderSuiteReport(records, META).text;

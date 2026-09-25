@@ -152,6 +152,34 @@ describe('a read that fails in the judgement from the issue is never a quiet gre
     expect(t.published).toEqual([expect.objectContaining({ sha: t.head, state: 'error' })]);
   });
 
+  // Round 2: the statuses cannot be read before publishing (§3.8 c cannot be decided): no verdict is
+  // published on top of what may be a newer one, the head gets its error, and the run fails.
+  it('statuses that cannot be read: no verdict, an error on the head, and the run fails', async () => {
+    const t = setup({ statuses: async () => { throw new Error('HTTP 502 al leer estados'); } } as Partial<JudgeGitHub>);
+    await expect(t.judge()).rejects.toThrow(/502/);
+    expect(t.published.map((entry) => entry.state)).not.toContain('success');
+    expect(t.published.map((entry) => entry.state)).not.toContain('pending');
+    expect(t.published).toEqual([expect.objectContaining({ sha: t.head, state: 'error' })]);
+  });
+
+  it('a verdict that cannot be published makes the run fail after the other pull requests were judged', async () => {
+    const other = 'd'.repeat(40);
+    const seen: string[] = [];
+    const t = setup({
+      openPullRequests: async () => [
+        { number: 7, headRef: 'feat/13-boton', headSha: 'e'.repeat(40), baseRef: 'main' },
+        { number: 8, headRef: 'fix/13-otra', headSha: other, baseRef: 'main' },
+      ],
+      pullRequest: async (n: number) => ({ number: n, state: 'open', headSha: n === 7 ? 'e'.repeat(40) : other, headRef: n === 7 ? 'feat/13-boton' : 'fix/13-otra', baseRef: 'main', headRepo: 'duena/proyecto' }),
+      publishStatus: async (sha: string) => {
+        seen.push(sha);
+        if (sha === 'e'.repeat(40)) throw new Error('no se pudo publicar');
+      },
+    } as Partial<JudgeGitHub>);
+    await expect(t.judge()).rejects.toThrow(/publicar/);
+    expect(seen).toContain(other);
+  });
+
   it('an error status that cannot be published for one pull request does not stop the others', async () => {
     const other = 'd'.repeat(40);
     let first = true;
