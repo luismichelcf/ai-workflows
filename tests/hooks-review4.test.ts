@@ -58,16 +58,20 @@ describe('an approval flag glued to a separator or carrying a value still approv
   });
 });
 
-describe('the words of the next command are not flags of gh', () => {
-  for (const command of [
-    'gh pr review 5 -c -b "ok" && ls -la',
-    'gh pr review 5 -c -b x; find . -name "*.ts"',
-    'gh pr view 5; tar -xaf archivo.tar',
-  ]) {
-    it(`lets ${JSON.stringify(command)} through`, () => {
-      expect(decideToolUse(bash(command), withPiece).allow).toBe(true);
+// Round 5 replaced reading the shell with an over-approximation on the whole text (see
+// tests/hooks-review5.test.ts): a chain that names gh, a review and an approval-shaped flag of
+// ANOTHER command is refused on purpose, and the reason tells the agent to run them separately.
+// A chain with no review in it still passes.
+describe('the words of the next command, under the over-approximation of round 5', () => {
+  for (const command of ['gh pr review 5 -c -b "ok" && ls -la', 'gh pr review 5 -c -b x; find . -name "*.ts"']) {
+    it(`refuses ${JSON.stringify(command)} (declared cost)`, () => {
+      expect(decideToolUse(bash(command), withPiece).allow).toBe(false);
     });
   }
+
+  it('lets a chain with no review through', () => {
+    expect(decideToolUse(bash('gh pr view 5; tar -xaf archivo.tar'), withPiece).allow).toBe(true);
+  });
 });
 
 describe('the reading is linear, and a command too large to read is refused', () => {

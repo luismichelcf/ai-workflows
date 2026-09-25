@@ -96,7 +96,16 @@ omisión del bloque, `/approve`; corregido en la parvada, §10) y, siempre, `/ap
 
 Para la aprobación con botón (R21), la misma familia de regla en herramientas de terminal: se
 rechaza `gh pr review` con `--approve`/`-a` y `gh api` hacia `…/pulls/<n>/reviews` que lleve
-`APPROVE`. **Es ayuda de nivel A y se declara así:** hay otras formas de aprobar (el navegador, otro
+`APPROVE`. **Cómo se lee la orden (decidido tras la quinta ronda de la parvada, §10):** no se
+interpreta la consola. Cada intento de leerla como la lee la consola dejó una forma nueva de pasar
+(saltos de línea, redirecciones en medio, sustituciones, la continuación de PowerShell, comillas
+sueltas, `bash -c "…"`). La regla **sobreaproxima** sobre el texto entero, normalizado (sin
+continuaciones de línea, comillas, barras invertidas ni acentos graves): una orden que nombra `gh`,
+una revisión y algo con forma de aprobar, en cualquier parte, se rechaza; con receta rota, una orden
+que nombra `gh` y algo que escribe en GitHub, también. Puede rechazar una cadena inocente (el motivo
+pide separar las órdenes); nunca deja pasar una de estas por cómo se escribió, y responde en tiempo
+lineal. Una orden de más de 65 536 caracteres se rechaza sin leerla. **Es ayuda de nivel A y se
+declara así:** hay otras formas de aprobar (el navegador, otro
 programa, una orden disfrazada). El cierre real es el paso de instalación de R21 (la sesión del
 dueño fuera de la PC de los agentes); `doctor` ya avisa si la encuentra. La suite comprueba que
 todo lo que escriben los agentes en GitHub sale de la aplicación, no de la cuenta del dueño
