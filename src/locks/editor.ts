@@ -115,12 +115,17 @@ const MAX_COMMAND_LENGTH = 65_536;
 /**
  * The command with the console's quoting and line continuations removed, so the whole-text searches
  * see one flat line. `\` + end of line and backtick + end of line join the two lines first; then the
- * remaining `\`, backtick, `'` and `"` are dropped. No pattern backtracks: the cost is linear.
+ * obvious disguises are dropped (`^`, cmd's escape; the literal `$()` and `${…}` up to the next
+ * `}`); finally the remaining `\`, backtick, `'` and `"` are dropped. No pattern backtracks: each
+ * replacement scans the text once, so the cost is linear.
  */
 function normalizedCommand(command: string): string {
   return command
     .replace(/\\\r?\n/g, '')
     .replace(/`\r?\n/g, '')
+    .replace(/\^/g, '')
+    .replace(/\$\(\)/g, '')
+    .replace(/\$\{[^}]*\}/g, '')
     .replace(/['"`\\]/g, '');
 }
 
@@ -138,8 +143,13 @@ const REVIEWS_PATH = /\/reviews\b/i;
 const INPUT_FLAG = /--input(?:=|\b)/i;
 /** The GraphQL mutations that add or submit a pull request review. */
 const GRAPHQL_APPROVE = /(?:add|submit)PullRequestReview\b/i;
-/** The word APPROVE, whatever its case, as the reviews and GraphQL rules read it. */
-const WORD_APPROVE = /approve/i;
+/** The word `graphql`, so a body read from a file cannot hide the mutation (round 6). */
+const WORD_GRAPHQL = /\bgraphql\b/i;
+/**
+ * The word APPROVE, whatever its case, as the reviews and GraphQL rules read it. Not `APPROVED`:
+ * reading the reviews filtered by that state is a read, not an approval (round 6).
+ */
+const WORD_APPROVE = /approve(?!d)/i;
 /** The gh subcommands that write on GitHub; broken-recipe mode refuses any of them (§1.4). */
 const WRITE_WORDS = /\b(?:comment|review|create|merge|edit|close|delete|reopen|ready)\b/i;
 /** The word `api` of `gh api`, the other subcommand that can write. */
@@ -221,6 +231,8 @@ function approvesPullRequest(command: string): boolean {
   if (REVIEWS_PATH.test(text) && (WORD_APPROVE.test(text) || INPUT_FLAG.test(text) || text.includes('@'))) {
     return true;
   }
+  // The GraphQL twin: the mutation is hidden in a file named by `@` or `--input`.
+  if (WORD_GRAPHQL.test(text) && (text.includes('@') || INPUT_FLAG.test(text))) return true;
   return GRAPHQL_APPROVE.test(text) && WORD_APPROVE.test(text);
 }
 
