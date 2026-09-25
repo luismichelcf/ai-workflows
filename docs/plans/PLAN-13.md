@@ -646,6 +646,16 @@ Rebanadas 1 → 2 → 3 → 4 en orden; 5 puede empezar tras 3; 6 tras 4 y 5; 7 
   - **Después de v1, a proponer al dueño:** un modelo de decisión rápido (p. ej. Jev de
     TypeSafe) solo como alarma que sube la exigencia, nunca la baja, y primero en modo sombra;
     implica un servicio y un gasto nuevos (conversación del 22-sep).
+  - **Al cerrar la rebanada 4, a proponer al dueño: módulos profundos por proceso** (conversación
+    del 24-sep), para que la revisión de arquitectura deje de hacerse a mano en cada pieza y pase
+    a ser ocasional. Tres puntos: (1) en el motor, el plan de cada pieza nombra los módulos que
+    crea y qué tan chica es su interfaz frente a lo que esconde, y sin eso no pasa a construcción;
+    (2) en el motor, el ángulo de revisión `arquitectura` lleva una lista concreta (módulos que solo
+    reenvían, una decisión repartida en varios lugares, una interfaz tan compleja como lo que
+    esconde) y puede rechazar un cambio que empeore la estructura; (3) en la receta de Socialabs
+    (rebanada 7, R05), el bloque «barrido de arquitectura» corre solo cada cierto número de piezas.
+    El desorden del conjunto con el tiempo no se evita del todo: el barrido se vuelve raro, no
+    desaparece.
 - Notas menores de la última revisión de la rebanada 2 (no bloquean): endurecer dos pruebas propias de `tests/review-round5.test.ts` (fijar la respuesta exacta de arrendamiento vencido y hacer fallar la relectura después del tercer intento); el motivo de una renovación fallida al escribir «en curso» dice primero «save»; cada etapa hace una renovación de arrendamiento más (en el almacén de GitHub es un commit); investigar la prueba inestable de `tests/integrity.test.ts` sobre el latido del arrendamiento.
 - Límites declarados en la rebanada 2: en Linux, un proceso que crea a propósito su propia sesión
   sale del grupo del bloque (nivel A); una prueba editada y restaurada sin commit no se detecta
