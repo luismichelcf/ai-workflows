@@ -1,6 +1,8 @@
 import { execFileSync } from 'node:child_process';
 import { appendFileSync } from 'node:fs';
 
+import { agentCredentialsFromEnv, createAppTokenSource } from '../../src/index.js';
+
 import type { CaseRecord } from './report.js';
 
 // PLAN-13-R5 §2.2: the harness every real GitHub test goes through. One run, one lock, one
@@ -891,8 +893,10 @@ export function createGhSandboxPort(repository: string): SandboxPort {
     const commit = JSON.parse(runGh(['api', `repos/${repo}/git/commits/${sha}`])) as { tree: { sha: string } };
     return commit.tree.sha;
   };
+  // The REST ref endpoints want the name without its leading `refs/` (creating one wants it whole).
+  const refPath = (name: string): string => name.replace(/^refs\//, '');
   const refSha = (name: string): string | undefined => {
-    const result = tryGh(['api', `repos/${repo}/git/ref/${name}`]);
+    const result = tryGh(['api', `repos/${repo}/git/ref/${refPath(name)}`]);
     if (!result.ok) return undefined;
     const parsed = JSON.parse(result.out) as { object?: { sha?: string } };
     return parsed.object?.sha;
@@ -900,12 +904,16 @@ export function createGhSandboxPort(repository: string): SandboxPort {
   return {
     async permissions() {
       const view = JSON.parse(runGh(['api', `repos/${repo}`])) as { permissions?: { admin?: boolean } };
+      // R21, R22: the agents' app must be installed on this repository only. The owner's session
+      // cannot list an installation's repositories, so the app itself answers, with its own
+      // installation token (the same credentials the suite uses to act as the agents).
       let appOnlyHere = false;
-      const installed = tryGh(['api', `repos/${repo}/installation`]);
-      if (installed.ok) {
-        const installation = JSON.parse(installed.out) as { id: number };
-        const list = tryGh(['api', `user/installations/${installation.id}/repositories?per_page=100`]);
-        if (list.ok) appOnlyHere = (JSON.parse(list.out) as { total_count?: number }).total_count === 1;
+      const credentials = agentCredentialsFromEnv(process.env, process.cwd());
+      if ('appId' in credentials) {
+        const token = await createAppTokenSource({ credentials, repository: repo }).token();
+        const listed = execFileSync('gh', ['api', 'installation/repositories?per_page=100'], { encoding: 'utf8', env: { ...process.env, GH_TOKEN: token } });
+        const repositories = JSON.parse(listed) as { total_count?: number; repositories?: { full_name: string }[] };
+        appOnlyHere = repositories.total_count === 1 && repositories.repositories?.[0]?.full_name.toLowerCase() === repo.toLowerCase();
       }
       return { admin: view.permissions?.admin === true, appOnlyHere };
     },
@@ -920,12 +928,12 @@ export function createGhSandboxPort(repository: string): SandboxPort {
     },
     async updateRef(name, sha, expected) {
       if (refSha(name) !== expected) return 'conflict';
-      const result = tryGh(['api', '-X', 'PATCH', `repos/${repo}/git/refs/${name}`, '-f', `sha=${sha}`, '-f', 'force=true']);
+      const result = tryGh(['api', '-X', 'PATCH', `repos/${repo}/git/refs/${refPath(name)}`, '-f', `sha=${sha}`, '-F', 'force=true']);
       return result.ok ? 'updated' : 'conflict';
     },
     async deleteRef(name, expected) {
       if (refSha(name) !== expected) return 'conflict';
-      runGh(['api', '-X', 'DELETE', `repos/${repo}/git/refs/${name}`]);
+      runGh(['api', '-X', 'DELETE', `repos/${repo}/git/refs/${refPath(name)}`]);
       return 'deleted';
     },
     async writeCommit(files, parent) {
@@ -976,7 +984,7 @@ export function createGhSandboxPort(repository: string): SandboxPort {
       const tree = o.tree === undefined ? treeOfCommit(o.expectedHead) : treeOfCommit(o.tree);
       const created = JSON.parse(runGh(['api', '-X', 'POST', `repos/${repo}/git/commits`, '--input', '-'],
         JSON.stringify({ message: o.message, tree, parents: [o.expectedHead] }))) as { sha: string };
-      const updated = tryGh(['api', '-X', 'PATCH', `repos/${repo}/git/refs/heads/main`, '-f', `sha=${created.sha}`, '-f', 'force=false']);
+      const updated = tryGh(['api', '-X', 'PATCH', `repos/${repo}/git/refs/heads/main`, '-f', `sha=${created.sha}`, '-F', 'force=false']);
       if (!updated.ok) return 'conflict';
       return { sha: created.sha, tree };
     },

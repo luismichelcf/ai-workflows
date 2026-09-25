@@ -37,8 +37,7 @@ let sandbox: Sandbox;
 
 const pullRequests = (branch: string): string[] =>
   gh('pr', 'list', '--repo', REPO, '--head', branch, '--state', 'all', '--json', 'number', '--jq', '.[].number')
-    .split('
-')
+    .split('\n')
     .filter(Boolean);
 
 /** Hands every pull request of the branch to the harness, so the run's restoration closes it. */
