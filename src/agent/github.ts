@@ -428,7 +428,9 @@ export function createAgentGitHub(options: AgentGitHubOptions): AgentGitHub {
     },
 
     async markReady(pr: number): Promise<void> {
-      ensureOk(await run(['pr', 'ready', String(pr)]), `pull request ${String(pr)}`);
+      // `--repo` names the repository explicitly: `gh pr ready` must never fall back to the
+      // repository of the folder the process happens to run in (found in the real run).
+      ensureOk(await run(['pr', 'ready', String(pr), '--repo', options.repository]), `pull request ${String(pr)}`);
     },
 
     async enableAutoMerge(pr: number, o): Promise<void> {
