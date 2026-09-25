@@ -81,6 +81,8 @@ export interface SandboxPort {
   putRuleset(body: Record<string, unknown>): Promise<void>;
   workflowEnabled(path: string): Promise<boolean>;
   setWorkflowEnabled(path: string, on: boolean): Promise<void>;
+  /** Whether a file existed on main at that commit (optional: without it, assumed to exist). */
+  fileAt?(ref: string, path: string): Promise<boolean>;
   inventory(): Promise<SandboxInventory>;
   createIssue(title: string, body?: string): Promise<number>;
   findIssues(marker: string): Promise<number[]>;
@@ -805,7 +807,13 @@ function makeSandbox(port: SandboxPort, run: string): { sandbox: Sandbox; adopt:
       await serialize(async () => {
         await refresh();
         const before = await port.workflowEnabled(path);
-        if (!(path in state.snapshot.workflows)) state.snapshot.workflows[path] = before;
+        // The snapshot of a workflow is taken the first time the run touches it; a workflow whose
+        // file the run itself added was not there at the snapshot, so it is recorded off (seen in
+        // the real run: recorded on, the restoration tried to enable a workflow it had removed).
+        if (!(path in state.snapshot.workflows)) {
+          const existed = port.fileAt === undefined ? true : await port.fileAt(state.snapshot.main.head, path);
+          state.snapshot.workflows[path] = existed ? before : false;
+        }
         const index = await addIntention({ op: 'set-workflow', resource: 'workflow', path, before, after: on });
         await port.setWorkflowEnabled(path, on);
         await markDone(index);
@@ -1181,7 +1189,21 @@ export function createGhSandboxPort(repository: string): SandboxPort {
     async putRuleset(body) {
       api('PUT', `repos/${repo}/rulesets/${rulesetId()}`, pickRuleset(body));
     },
+    async fileAt(ref, path) {
+      const found = tryGh(['api', `repos/${repo}/contents/${path}?ref=${ref}`]);
+      if (found.ok) return true;
+      if (isNotFound(found.error)) return false;
+      throw new Error(`no se pudo leer ${path} en ${ref}: ${found.error}`);
+    },
     async workflowEnabled(path) {
+      // A workflow whose file is not on main does not run, whatever GitHub still keeps of it: after
+      // the restoration removes a workflow the run added, GitHub still answers `active` for it
+      // (seen in the real run). Only a 404 means absent; anything else is an error.
+      const file = tryGh(['api', `repos/${repo}/contents/${path}`]);
+      if (!file.ok) {
+        if (isNotFound(file.error)) return false;
+        throw new Error(`no se pudo leer el archivo del workflow ${path}: ${file.error}`);
+      }
       const result = tryGh(['api', `repos/${repo}/actions/workflows/${workflowFile(path)}`]);
       if (result.ok) return (JSON.parse(result.out) as { state?: string }).state === 'active';
       if (isNotFound(result.error)) return false;

@@ -272,12 +272,14 @@ describe('flock 4: the id of a check run', () => {
 describe('flock 5: waiting for the queue list to show the group', () => {
   const entryOf = (head: string) => ({ position: 1, headSha: head, baseSha: 'm0', prNumber: 7 });
 
-  it('reads six times with pauses of 2, 4, 8, 15 and 30 seconds, then gives up without a read error', async () => {
+  // PLAN-13-R5 (COLA-6 on real GitHub): a minute was too short with six pull requests at once; the
+  // pauses now grow and settle at a minute, about five minutes in all (tests/queue-wait.test.ts).
+  it('reads ten times with pauses of 2, 4, 8, 15, 30 seconds and four of a minute, then gives up without a read error', async () => {
     let reads = 0;
     const pauses: number[] = [];
     const result = await waitForMergeQueue({ mergeQueue: async () => { reads += 1; return []; } }, 'main', 'g1', async (ms) => { pauses.push(ms); });
-    expect(reads).toBe(6);
-    expect(pauses).toEqual([2000, 4000, 8000, 15000, 30000]);
+    expect(reads).toBe(10);
+    expect(pauses).toEqual([2000, 4000, 8000, 15000, 30000, 60000, 60000, 60000, 60000]);
     expect(result).toEqual({ ok: false, readFailed: false });
   });
 
