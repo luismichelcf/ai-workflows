@@ -4,6 +4,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+import { childEnvironment } from './git-env.js';
 import {
   collectExit,
   DEFAULT_STDOUT_BYTES,
@@ -269,47 +270,50 @@ namespace AiWorkflows {
       return active;
     }
 
-    public static bool Launch(string application, string commandLine, string cwd, IntPtr stdin, IntPtr stdout, IntPtr stderr, IntPtr job, out IntPtr process, out int processId) {
-      // The child must never see the launcher's own variables (the job name, the result path):
-      // they are cleared from this process before CreateProcess inherits its environment. Only
-      // the launcher's own names are removed — anything else named AIW_ belongs to the
-      // project and travels to the child untouched.
-      string[] own = new string[] {
-        "AIW_MODE", "AIW_JOB", "AIW_RESULT", "AIW_STDIN", "AIW_APP",
-        "AIW_CMDLINE", "AIW_CWD", "AIW_ASSEMBLY", "AIW_SOURCE_FILE"
-      };
-      foreach (string key in own) {
-        Environment.SetEnvironmentVariable(key, null);
-      }
-      STARTUPINFO startup = new STARTUPINFO();
-      startup.cb = Marshal.SizeOf(typeof(STARTUPINFO));
-      startup.dwFlags = 256;
-      startup.hStdInput = stdin;
-      startup.hStdOutput = stdout;
-      startup.hStdError = stderr;
-      PROCESS_INFORMATION created;
-      System.Text.StringBuilder line = new System.Text.StringBuilder(commandLine);
-      bool ok = CreateProcess(application, line, IntPtr.Zero, IntPtr.Zero, true, 4u, IntPtr.Zero, cwd, ref startup, out created);
-      if (!ok) {
-        process = IntPtr.Zero;
-        processId = 0;
+    public static bool Launch(string application, string commandLine, string cwd, string environmentPath, IntPtr stdin, IntPtr stdout, IntPtr stderr, IntPtr job, out IntPtr process, out int processId) {
+      process = IntPtr.Zero;
+      processId = 0;
+      // The child's environment is handed over whole as a ready-made Unicode block (the UTF-16LE
+      // block Windows expects): the launcher's own variables — the job name, the result path —
+      // are never inherited. A block that cannot be read is a failure to start, never a silent
+      // inheritance of this process's environment.
+      IntPtr environment = IntPtr.Zero;
+      try {
+        byte[] block = File.ReadAllBytes(environmentPath);
+        if (block.Length == 0) return false;
+        environment = Marshal.AllocHGlobal(block.Length);
+        Marshal.Copy(block, 0, environment, block.Length);
+      } catch (Exception) {
         return false;
       }
-      if (!AssignProcessToJobObject(job, created.hProcess)) {
-        // The child is still suspended and cannot be in the job, so it would never be killed
-        // with the group. End it here and report a technical failure; no process is left loose.
-        TerminateProcess(created.hProcess, 1);
+      try {
+        STARTUPINFO startup = new STARTUPINFO();
+        startup.cb = Marshal.SizeOf(typeof(STARTUPINFO));
+        startup.dwFlags = 256;
+        startup.hStdInput = stdin;
+        startup.hStdOutput = stdout;
+        startup.hStdError = stderr;
+        PROCESS_INFORMATION created;
+        System.Text.StringBuilder line = new System.Text.StringBuilder(commandLine);
+        // 0x4 CREATE_SUSPENDED | 0x400 CREATE_UNICODE_ENVIRONMENT: the block below is UTF-16LE.
+        bool ok = CreateProcess(application, line, IntPtr.Zero, IntPtr.Zero, true, 0x404u, environment, cwd, ref startup, out created);
+        if (!ok) return false;
+        if (!AssignProcessToJobObject(job, created.hProcess)) {
+          // The child is still suspended and cannot be in the job, so it would never be killed
+          // with the group. End it here and report a technical failure; no process is left loose.
+          TerminateProcess(created.hProcess, 1);
+          CloseHandle(created.hThread);
+          CloseHandle(created.hProcess);
+          return false;
+        }
+        ResumeThread(created.hThread);
         CloseHandle(created.hThread);
-        CloseHandle(created.hProcess);
-        process = IntPtr.Zero;
-        processId = 0;
-        return false;
+        process = created.hProcess;
+        processId = created.dwProcessId;
+        return true;
+      } finally {
+        Marshal.FreeHGlobal(environment);
       }
-      ResumeThread(created.hThread);
-      CloseHandle(created.hThread);
-      process = created.hProcess;
-      processId = created.dwProcessId;
-      return true;
     }
   }
 }
@@ -388,6 +392,7 @@ try {
   $commandLine = $env:AIW_CMDLINE
   $childCwd = $env:AIW_CWD
   $stdinPath = $env:AIW_STDIN
+  $environmentBlock = $env:AIW_ENV_BLOCK
 
   $job = [AiWorkflows.Native]::CreateJob($jobName)
   if ($job -eq [IntPtr]::Zero) {
@@ -401,7 +406,7 @@ try {
   [void][AiWorkflows.Native]::SetHandleInformation($err, 1, 1)
   $process = [IntPtr]::Zero
   $childPid = 0
-  $ok = [AiWorkflows.Native]::Launch($application, $commandLine, $childCwd, $stdin, $out, $err, $job, [ref]$process, [ref]$childPid)
+  $ok = [AiWorkflows.Native]::Launch($application, $commandLine, $childCwd, $environmentBlock, $stdin, $out, $err, $job, [ref]$process, [ref]$childPid)
   if ($stdin -ne [IntPtr]::Zero) { [void][AiWorkflows.Native]::CloseHandle($stdin) }
   if (-not $ok) {
     [System.IO.File]::WriteAllText($result, '{"error":"could not start the process"}')
@@ -444,8 +449,9 @@ try {
   exit 0
 } catch {
   if ($result) {
-    $message = ConvertTo-Json $_.Exception.Message -Compress
-    [System.IO.File]::WriteAllText($result, ('{"error":' + $message + '}'))
+    # Only that the process could not be started: never the raw exception, which can carry the
+    # launcher's own paths or the command line into a result that is read elsewhere.
+    [System.IO.File]::WriteAllText($result, '{"error":"could not start the process"}')
   }
   exit 1
 }
@@ -671,6 +677,46 @@ export function groupExitFromReport(
   };
 }
 
+/**
+ * Merges environment layers the way Windows reads names: without regard to case, the last layer
+ * winning. Two keys that differ only in case are one variable to `CreateProcess`, so keeping
+ * both in the block would leave which one wins to chance.
+ */
+function mergeEnvironmentCaseInsensitive(
+  ...layers: ReadonlyArray<Readonly<Record<string, string | undefined>>>
+): NodeJS.ProcessEnv {
+  const merged: NodeJS.ProcessEnv = {};
+  const keyByUpper = new Map<string, string>();
+  for (const layer of layers) {
+    for (const [name, value] of Object.entries(layer)) {
+      const upper = name.toUpperCase();
+      const previous = keyByUpper.get(upper);
+      if (previous !== undefined && previous !== name) delete merged[previous];
+      keyByUpper.set(upper, name);
+      merged[name] = value;
+    }
+  }
+  return merged;
+}
+
+/**
+ * The environment block `CreateProcess` reads with `CREATE_UNICODE_ENVIRONMENT`: every
+ * `name=value` as UTF-16LE, each string closed by a null and the whole block by a second null,
+ * sorted by name as the system expects. Building it in Node keeps the launcher's own variables
+ * out of the child: only what the caller asked for travels.
+ */
+function windowsEnvironmentBlock(environment: Readonly<Record<string, string | undefined>>): Buffer {
+  const entries = Object.entries(environment)
+    .filter((entry): entry is [string, string] => typeof entry[1] === 'string')
+    .sort((left, right) => {
+      const a = left[0].toLowerCase();
+      const b = right[0].toLowerCase();
+      return a < b ? -1 : a > b ? 1 : 0;
+    });
+  const text = `${entries.map(([name, value]) => `${name}=${value}\0`).join('')}\0`;
+  return Buffer.from(text, 'utf16le');
+}
+
 export function launchWindowsGroup(options: LaunchInGroupOptions): ProcessGroup {
   const job = `Local\\ai-workflows-${randomUUID()}`;
   // The logon session is recorded when the group starts, not only once the launcher reports:
@@ -693,10 +739,21 @@ export function launchWindowsGroup(options: LaunchInGroupOptions): ProcessGroup 
 
   const application = options.command;
   const commandLine = [application, ...options.args].map(quoteWindowsArgument).join(' ');
+  // The child's environment is built here and written as a ready-made Windows block. The launcher
+  // itself starts with the engine's own environment (minus the agents' credentials), so PowerShell
+  // can compile its helper on a machine that has never run it before; only the child receives the
+  // caller's environment, never the launcher's variables (PLAN-13-R4 §8).
+  const childEnvironmentValues = mergeEnvironmentCaseInsensitive(
+    options.environment ?? childEnvironment(),
+    options.env ?? {},
+  );
+  const environmentFile = join(directory, 'environment.bin');
+  writeFileSync(environmentFile, windowsEnvironmentBlock(childEnvironmentValues));
+
   const environment: NodeJS.ProcessEnv = {
-    ...(options.environment ?? process.env),
-    ...(options.env ?? {}),
+    ...childEnvironment(),
     AIW_MODE: 'launch',
+    AIW_ENV_BLOCK: environmentFile,
     AIW_JOB: job,
     AIW_RESULT: resultFile,
     AIW_STDIN: stdinFile,
@@ -828,7 +885,7 @@ export async function checkWindowsQuarantine(job: string): Promise<{ empty: true
     windowsHide: true,
     stdio: ['ignore', 'ignore', 'ignore'],
     env: {
-      ...process.env,
+      ...childEnvironment(),
       AIW_MODE: 'check',
       AIW_JOB: job,
       AIW_RESULT: resultFile,

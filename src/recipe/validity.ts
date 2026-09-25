@@ -150,6 +150,19 @@ export async function recordCleanUpdate(options: RecordCleanUpdateOptions): Prom
   } catch (error) {
     throw new Error(`${to} is not a clean update of ${from}: ${reasonOf(error)}`);
   }
+  // PLAN-13-R4 §8: writing a record the journal already holds is a no-op. `sync` records every
+  // step before it moves the head, so a crash between the records and the move makes the next
+  // run pass the same steps again; without this, each retry would duplicate the chain.
+  const journal = await store.journal(piece);
+  const already = journal.some(
+    (entry) =>
+      entry.stage === '@clean-update'
+      && entry.outcome === 'passed'
+      && stringField(entry.evidence, 'from') === from
+      && stringField(entry.evidence, 'to') === to
+      && stringField(entry.evidence, 'base') === base,
+  );
+  if (already) return;
   await store.append(piece, {
     stage: '@clean-update',
     outcome: 'passed',

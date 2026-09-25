@@ -392,6 +392,7 @@ function serverAttestContext(stage: RecipeStage, work: StageWork): ServerAttestC
     validWhile: stage.validWhile,
     ...(work.recipe.owner === undefined ? {} : { owner: work.recipe.owner }),
     pullRequest: work.target.pr,
+    stage: stage.id,
     github: work.github,
     fetchObjects: work.fetchObjects,
   };
@@ -467,11 +468,11 @@ async function judgeStage(stage: RecipeStage, work: StageWork): Promise<JudgedSt
       return present(
         stage,
         'technical',
-        pick(
-          spanish,
-          'la comprobación del servidor de este bloque llega en la rebanada 4',
-          'the server check of this block arrives in slice 4',
-        ),
+          pick(
+            spanish,
+            `el bloque «${uses ?? stage.id}» no tiene comprobación del servidor`,
+            `the block "${uses ?? stage.id}" has no server check`,
+          ),
       );
     }
     const inputs = blockInputs(definition.manifest, stage.gate.with);
@@ -525,7 +526,7 @@ async function judgeFilesNote(
   const valid = comments.some((comment) => {
     const order = evaluateOwnerOrder(comment, {
       order: '/approve-judge-change',
-      minCodeLength: 7,
+      minCodeLength: 16,
       productOwners: owners,
       locale: work.recipe.locale,
     });
@@ -533,7 +534,7 @@ async function judgeFilesNote(
   });
   if (valid) return {};
 
-  const wanted = `/approve-judge-change ${work.target.head.slice(0, 7)}`;
+  const wanted = `/approve-judge-change ${work.target.head.slice(0, 16)}`;
   return {
     note: pick(
       spanish,

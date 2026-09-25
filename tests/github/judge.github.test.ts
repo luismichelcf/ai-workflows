@@ -404,7 +404,7 @@ describe.sequential('the judge on GitHub (PLAN-13-R3 §7)', () => {
     });
     const refused = await settled(recipePr.head, 'ai-workflows', ['failure']);
     expect(refused.description).toContain('/approve-judge-change');
-    gh('pr', 'comment', String(recipePr.number), '--repo', REPO, '--body', `/approve-judge-change ${recipePr.head.slice(0, 7)}`);
+    gh('pr', 'comment', String(recipePr.number), '--repo', REPO, '--body', `/approve-judge-change ${recipePr.head.slice(0, 16)}`);
     const accepted = await waitFor('judge after the attestation', () => {
       const status = latest(recipePr.head);
       return status?.state === 'success' ? status : undefined;

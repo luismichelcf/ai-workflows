@@ -40,6 +40,7 @@ export interface InputSpecStringList {
   readonly type: 'string-list';
   readonly required?: boolean;
   readonly default?: readonly string[];
+  readonly minItems?: number;
 }
 
 export interface InputSpecCommand {

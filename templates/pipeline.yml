@@ -7,6 +7,7 @@
 version: 1
 locale: es
 owner: tu-cuenta-de-github            # quien da el visto bueno y toma las decisiones
+agent-account: "tu-motor[bot]"        # la identidad de GitHub con la que publican los agentes
 
 classify:                             # qué rutas son de cada clase: datos, no código
   security: ["**/*auth*", "**/*permission*"]
@@ -85,19 +86,18 @@ stages:
     valid-while: same-fingerprint-or-clean-update
     gate:
       uses: ai-workflows/independent-review@1
-      with: { forbid-same-family: true }
+      with: { forbid-same-family: true, angles: [arquitectura, seguridad] }
     server: attestation
 
   - id: owner-approval
-    summary: "El dueño aprueba lo que se ve"
+    summary: "El dueño aprueba lo que se ve con el botón «Approve» de GitHub"
     after: review
     nature: attest
     needs-human: true
     applies-if: { touches-any: [visible] }
     valid-while: same-fingerprint
     gate:
-      uses: ai-workflows/approval-comment@1
-      with: { command: /approve }
+      uses: ai-workflows/approval-review@1   # o approval-comment@1 si los agentes publican con tu cuenta
     server: attestation
 
   - id: merge
@@ -116,14 +116,16 @@ stages:
     nature: recompute
     gate:
       uses: ai-workflows/post-merge@1
+      with: { merge-stage: merge }
     server: local-only
 
   - id: cleanup
-    summary: "Se limpia la carpeta de trabajo y se liberan las reservas de la pieza"
+    summary: "Se borra la rama y se retira la carpeta de trabajo de la pieza"
     after: after-merge
     phase: post-merge
     nature: recompute
     retry: { attempts: 3, wait-seconds: 30 }
     gate:
       uses: ai-workflows/cleanup@1
+      with: { merge-stage: merge }
     server: local-only

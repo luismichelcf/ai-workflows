@@ -3,8 +3,12 @@ import { readFile, readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import type { Gate, GateContext, GateResult, JsonValue } from '../contract.js';
-import { requireDifferentBuilder } from '../identity.js';
+import { familyOf, requireDifferentBuilder } from '../identity.js';
 import type { ExecutionIdentity } from '../identity.js';
+import { parseEventComment, renderEventComment, type PieceEvent } from '../agent/events.js';
+import { decideIndependentReview } from './reviews.js';
+import { fetchableEvents, serverAccepts, treeOfCommit, type FetchableEvents } from './review-commits.js';
+import type { ServerAttestContext, ServerResult } from './definition.js';
 import {
   buildInvocation,
   parseRun,
@@ -22,18 +26,6 @@ import { refuseDryRun } from './test-run.js';
 // saying it approves, and the reviewer's own text claiming to be someone else proves nothing.
 
 const EXCLUDED_DIRECTORIES: ReadonlySet<string> = new Set(['.git', 'node_modules']);
-
-/** The families behind the provider names and the model prefixes of this house. */
-const FAMILIES: Readonly<Record<string, string>> = {
-  claude: 'anthropic',
-  anthropic: 'anthropic',
-  codex: 'openai',
-  openai: 'openai',
-  gemini: 'google',
-  google: 'google',
-  antigravity: 'google',
-  deepseek: 'deepseek',
-};
 
 export const manifest: BlockManifest = {
   name: 'sandboxed-review',
@@ -82,16 +74,16 @@ function readIdentity(value: unknown): ExecutionIdentity | undefined {
   return { provider, model, session };
 }
 
-/** The family a reviewer or builder belongs to, from its provider or its model prefix. */
-function familyOf(identity: ExecutionIdentity): string {
-  const provider = identity.provider.toLowerCase();
-  const byProvider = FAMILIES[provider];
-  if (byProvider !== undefined) return byProvider;
-
-  const model = identity.model.toLowerCase();
-  const slash = model.indexOf('/');
-  const token = slash >= 0 ? model.slice(0, slash) : model.split('-')[0] ?? model;
-  return FAMILIES[token] ?? token;
+/** Every declared builder of the change; `undefined` when one of them is not a real identity. */
+function readBuilders(value: unknown): ExecutionIdentity[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const builders: ExecutionIdentity[] = [];
+  for (const item of value) {
+    const identity = readIdentity(item);
+    if (identity === undefined) return undefined;
+    builders.push(identity);
+  }
+  return builders;
 }
 
 /** Every file under `root`, as paths relative to it with `/`, excluding `.git` and `node_modules`. */
@@ -209,8 +201,10 @@ function createGate(inputs: ReviewInputs, deps: EngineBlockDeps): Gate {
     const change = readObject(context.change) ?? {};
     if (change['clean'] !== true) return { ok: false, reason: cleanReason(spanish) };
 
-    const builder = readIdentity(change['builder']);
-    if (builder === undefined) return { ok: false, reason: noBuilderReason(spanish) };
+    const builders = readBuilders(change['builders']);
+    if (builders === undefined || builders.length === 0) {
+      return { ok: false, reason: noBuilderReason(spanish) };
+    }
 
     const path = inputs.prompt.replaceAll('{piece}', context.piece);
     let promptText: string;
@@ -249,23 +243,55 @@ function createGate(inputs: ReviewInputs, deps: EngineBlockDeps): Gate {
     if (verdict === undefined) throw new Error('the reviewer gave no single VERDICT line');
 
     const sha = asString(change['sha']) ?? '';
-    const independence = requireDifferentBuilder(
-      [{ by: report.identity, sha, approved: verdict.approved }],
-      builder,
-      { differentProvider: false },
-    );
-    if (!independence.ok) return { ok: false, reason: independence.reason };
+    for (const builder of builders) {
+      const independence = requireDifferentBuilder(
+        [{ by: report.identity, sha, approved: verdict.approved }],
+        builder,
+        { differentProvider: false },
+      );
+      if (!independence.ok) return { ok: false, reason: independence.reason };
 
-    if (inputs.forbidSameFamily) {
-      const reviewerFamily = familyOf(report.identity);
-      if (reviewerFamily === familyOf(builder)) {
-        return { ok: false, reason: sameFamilyReason(reviewerFamily, spanish) };
+      if (inputs.forbidSameFamily) {
+        const reviewerFamily = familyOf(report.identity);
+        if (reviewerFamily === familyOf(builder)) {
+          return { ok: false, reason: sameFamilyReason(reviewerFamily, spanish) };
+        }
       }
     }
 
     if (!verdict.approved) {
       const text = textWithoutVerdict(report.text ?? '');
       return { ok: false, reason: text.length > 0 ? text : reviseWithoutTextReason(spanish) };
+    }
+
+    // PLAN-13-R4 §2: its own approved verdict is published as an event, so its server
+    // attestation has something to read. Without the agents' identity there is nothing to
+    // publish, and a stage that only runs next to the agent needs none.
+    if (deps.agent !== undefined && deps.recipe.agentAccount !== undefined) {
+      const event: PieceEvent = {
+        type: 'verdict',
+        op: `verdict:${context.stage}:${sha}`,
+        piece: context.piece,
+        sha,
+        identity: {
+          provider: report.identity.provider,
+          model: report.identity.model,
+          effort: inputs.effort ?? '',
+          session: report.identity.session,
+        },
+        angle: inputs.angle,
+        approved: true,
+        workspace: { before, after: before },
+        stage: context.stage,
+        at: '',
+      };
+      await context.runEffect(`verdict:${context.stage}:${sha}`, async () => {
+        await deps.agent?.github.commentOnIssue(
+          Number(context.piece),
+          renderEventComment(event, context.locale),
+        );
+        return null;
+      });
     }
 
     return {
@@ -283,6 +309,87 @@ function createGate(inputs: ReviewInputs, deps: EngineBlockDeps): Gate {
       } satisfies JsonValue,
     };
   };
+}
+
+function reasonOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * PLAN-13-R4 §3.1 and §7: the verdict this block published for its stage and head, decided with
+ * the same function as the independent review. A verdict of another stage never counts.
+ */
+async function attestation(
+  inputs: Record<string, unknown>,
+  context: ServerAttestContext,
+): Promise<ServerResult> {
+  const spanish = isSpanish(context.locale);
+  const agentAccount = context.recipe.agentAccount;
+  if (agentAccount === undefined) {
+    return {
+      outcome: 'technical',
+      reason: spanish
+        ? 'La receta no declara la identidad con la que publican los agentes.'
+        : 'The recipe does not declare the identity the agents publish with.',
+    };
+  }
+
+  let comments;
+  try {
+    comments = await context.github.issueComments(Number(context.piece));
+  } catch (error) {
+    return { outcome: 'technical', reason: reasonOf(error) };
+  }
+  const events: PieceEvent[] = [];
+  for (const comment of comments) {
+    const parsed = parseEventComment(comment, { agentAccount, piece: context.piece });
+    if (parsed === undefined || 'invalid' in parsed) continue;
+    if (parsed.type === 'builder' || parsed.stage === context.stage) events.push(parsed);
+  }
+
+  const angle = asString(inputs['angle']) ?? '';
+  // PLAN-13-R4 §7: the head must be readable — without it nothing can be judged. Each event's
+  // commit is brought in on its own. A commit the remote is missing marks its event unreadable; a
+  // builder still excludes, a verdict cannot decide. Any other fetch failure (the network, a 5xx,
+  // permissions) is technical, never an ignored event.
+  try {
+    await context.fetchObjects([context.head]);
+  } catch (error) {
+    return { outcome: 'technical', reason: reasonOf(error) };
+  }
+  let fetched: FetchableEvents;
+  try {
+    fetched = await fetchableEvents(context, events);
+  } catch (error) {
+    return { outcome: 'technical', reason: reasonOf(error) };
+  }
+  try {
+    const decision = await decideIndependentReview({
+      events: fetched.events,
+      unavailable: fetched.unavailable,
+      angles: angle.length === 0 ? [] : [angle],
+      forbidSameFamily: inputs['forbidSameFamily'] !== false,
+      stage: context.stage,
+      accepts: (sha) =>
+        serverAccepts(context.root, context.trusted, context.head, sha, context.validWhile, context.recipe, context.piece),
+      treeOf: (sha) => treeOfCommit(context.root, sha),
+      head: context.head,
+      spanish,
+    });
+    return decision.ok
+      ? { outcome: 'passed', evidence: decision.evidence as JsonValue }
+      : { outcome: 'rejected', reason: decision.reason };
+  } catch (error) {
+    return { outcome: 'technical', reason: reasonOf(error) };
+  }
+}
+
+function splitVerdict(operationId: string): { readonly stage: string; readonly sha: string } | undefined {
+  if (!operationId.startsWith('verdict:')) return undefined;
+  const rest = operationId.slice('verdict:'.length);
+  const last = rest.lastIndexOf(':');
+  if (last < 0) return undefined;
+  return { stage: rest.slice(0, last), sha: rest.slice(last + 1) };
 }
 
 export const sandboxedReviewBlock: BlockDefinition = {
@@ -303,5 +410,22 @@ export const sandboxedReviewBlock: BlockDefinition = {
       },
       deps,
     );
+  },
+  server: { attestation },
+  async reconcile(_inputs, operationId, context, deps) {
+    const parts = splitVerdict(operationId);
+    const agent = deps.agent;
+    if (parts === undefined || agent === undefined || deps.recipe.agentAccount === undefined) {
+      return undefined;
+    }
+    const comments = await agent.github.issueComments(Number(context.piece));
+    const found = comments.some((comment) => {
+      const parsed = parseEventComment(comment, {
+        agentAccount: deps.recipe.agentAccount as string,
+        piece: context.piece,
+      });
+      return parsed !== undefined && !('invalid' in parsed) && parsed.op === operationId;
+    });
+    return found ? { confirmed: null } : { didNotHappen: true };
   },
 };

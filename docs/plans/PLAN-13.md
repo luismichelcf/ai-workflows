@@ -105,6 +105,8 @@ permanente (§8.2).
 | R17 | **Constructor desde la rebanada 2: DeepSeek V4.1 Flash `high`** por OpenCode (22-sep, porque se agota la cuota de ChatGPT). Relevo: GPT-6 Sol `high`, por cuota, autenticación o dos intentos fallidos. La revisión del spec sigue con Sol y la del código con la parvada Claude (R12). |
 | R18 | **La misma conversación es el mismo revisor, aunque cambie de modelo** (23-sep, en la revisión del PR #17). Un modelo que construyó y luego, en la misma sesión, cambia de modelo para revisar, no cuenta como independiente: ya sabe lo que escribió. La identidad de ejecución para juzgar independencia es proveedor + sesión; el modelo y el esfuerzo se siguen registrando, pero no separan dos ejecuciones de la misma sesión. Precisa §1.1 («Identidad»). |
 | R19 | **El juez sabe de qué pieza es un PR por el nombre de su rama, y qué tipo declaró por una línea del plan de la pieza** (23-sep, al abrir la rebanada 3), como hoy en Socialabs: `feat/13-algo` es la pieza 13, una rama «libre» nunca se fusiona, y «Tipo de cambio: …» en el plan dice el tipo. La receta lo declara en una sección corta (`pieces:`). El tipo declarado sigue siendo palabra de la pieza (nivel A); las rutas lo suben si hace falta (nivel B). Descartados: ignorar lo declarado y usar solo las rutas (un cambio solo visual pasaría por todo el carril completo, contra R10) y leerlo de la descripción del PR (el motor local no la tiene antes de abrir el PR). Detalle en [PLAN-13-R3](PLAN-13-R3.md) §1.1. |
+| R20 | **La autorización de cambios al juez exige 16 caracteres** (23-sep, al abrir la rebanada 4). `/approve-judge-change` pide al menos los 16 primeros caracteres de la versión: con 7, alguien con permiso de subir código puede fabricar en minutos otra versión que empiece igual; con 16 tomaría años. El dueño copia el texto que le muestra el juez, así que no le cuesta más. Descartados: dejar 7 (hueco abierto) y el código completo (incómodo sin ganar seguridad real). |
+| R21 | **Los agentes publican con su propia identidad de GitHub y el dueño aprueba con el botón «Approve»** (23-sep, tras un estudio de cómo lo hace la industria: GitHub, Copilot, Devin, Cursor, Claude, Kubernetes). Una aplicación de GitHub del dueño (gratis, sin asiento) sube, abre PRs, publica y fusiona; como el PR ya no es del dueño, GitHub le deja aprobarlo, también desde el celular, y la aprobación queda amarrada a la versión. Cierra además el hueco de que un agente con la cuenta del dueño escriba el visto bueno por él, siempre que la sesión del dueño no esté abierta en la PC de los agentes (paso de instalación, se declara). El comentario con código se conserva como respaldo y para la copia fiel de Socialabs (R10), que cambia solo al integrar. Descartados: seguir con el comentario y cambiar después (el hueco sigue abierto) y endurecer solo el comentario (no cierra el hueco principal). Detalle en [PLAN-13-R4](PLAN-13-R4.md) §1. |
 
 Decisiones de construcción tomadas por el orquestador (el dueño decide qué, el orquestador cómo):
 YAML 1.2 con esquema publicado (§3.2), condiciones estructuradas sin lenguaje de expresiones en v1
@@ -588,7 +590,7 @@ comportamiento; el orquestador escribe las pruebas rojas y el constructor las po
 - [x] **3. El juez:** acción reutilizable y plantilla de workflow, procedencia desde la base,
       `pull_request_target` y `merge_group`, frontera del merge, `server:`, interruptor de dos llaves.
       (RC-06, SV-01…SV-09, CN-05, CN-08)
-- [ ] **4. Etapas finales genéricas:** revisión independiente, visto bueno, vista previa, QA de
+- [x] **4. Etapas finales genéricas:** revisión independiente, visto bueno, vista previa, QA de
       navegador, fusión, post-merge, limpieza y mensajes al dueño por plantilla. (CN-06, CN-12, CN-13)
 - [ ] **5. Suite negativa completa** en `ai-workflows-pruebas` contra GitHub real, con informe.
 - [ ] **6. Ensayo general:** copia de Socialabs sin producción, servicios de prueba, receta de
@@ -632,18 +634,35 @@ Rebanadas 1 → 2 → 3 → 4 en orden; 5 puede empezar tras 3; 6 tras 4 y 5; 7 
     publicado cuando la lista de la cola nunca se completa podría llevar el último detalle; `init`
     que escriba los workflows del juez y el sellado del SHA del motor en el paquete (rebanada 6); la
     atestación `/approve-judge-change` acepta un código de 7 caracteres, que alguien con permiso de
-    empujar podría igualar fabricando un commit (a proponer: exigir más caracteres); las notas del
-    rastro salen como `::error::` en el registro aunque la corrida sea verde.
-  - **Rebanada 4:** `required: false` y `retry` en ejecución (hoy `compileRecipe` los rechaza);
-    conectar `run`, `status` y `stop` del binario a la receta, y de dónde toma el CLI el tipo
-    declarado y el constructor de una pieza; publicar el veredicto de `sandboxed-review` como
-    evento autenticado; salida saneada en `pause`, `resume`, `stop` y `doctor`.
+    empujar podría igualar fabricando un commit (resuelto en la rebanada 4: R20, 16 caracteres);
+    las notas del rastro salían como `::error::` (resuelto en la rebanada 4: `::warning::`).
+  - Resueltos en la rebanada 4 ([PLAN-13-R4](PLAN-13-R4.md)): `required: false` y `retry`; el
+    binario conectado a la receta; tipo declarado y constructores leídos de la rama, el plan y el
+    issue; veredictos publicados como eventos; salida saneada; R20 y R21.
+  - **De la rebanada 4, sin bloquear:** CN-07 (ganchos del editor conectados a la receta) pasa a la
+    rebanada 5; `cleanup` no libera zonas (nadie las reserva aún); sin `agent-account`, un aviso al
+    dueño puede repetirse tras una caída (la conciliación solo reconoce comentarios de la
+    aplicación); si todos los eventos de constructor son ilegibles, la revisión se rechaza por «no
+    se sabe quién construyó»; un veredicto ilegible posterior en `same-sha` deja la revisión
+    técnica hasta un veredicto nuevo; el lanzador de Windows informa «no se pudo iniciar» sin
+    detalle; sin prueba: la respuesta inútil de un `reconcile` de proyecto, la fusión sin distinguir
+    mayúsculas del bloque de entorno de Windows y los avisos de «no se pudo soltar la reserva».
   - **A proponer al dueño:** `applies-if` sobre la etapa de fusión.
   - **Costo aceptado del saneado:** una receta rechaza emojis compuestos (👩‍💻), banderas con
     etiquetas y el guion suave que deja Word; los acentos, «», —, ¿¡ y los emojis simples pasan.
   - **Después de v1, a proponer al dueño:** un modelo de decisión rápido (p. ej. Jev de
     TypeSafe) solo como alarma que sube la exigencia, nunca la baja, y primero en modo sombra;
     implica un servicio y un gasto nuevos (conversación del 22-sep).
+  - **Al cerrar la rebanada 4, a proponer al dueño: módulos profundos por proceso** (conversación
+    del 24-sep), para que la revisión de arquitectura deje de hacerse a mano en cada pieza y pase
+    a ser ocasional. Tres puntos: (1) en el motor, el plan de cada pieza nombra los módulos que
+    crea y qué tan chica es su interfaz frente a lo que esconde, y sin eso no pasa a construcción;
+    (2) en el motor, el ángulo de revisión `arquitectura` lleva una lista concreta (módulos que solo
+    reenvían, una decisión repartida en varios lugares, una interfaz tan compleja como lo que
+    esconde) y puede rechazar un cambio que empeore la estructura; (3) en la receta de Socialabs
+    (rebanada 7, R05), el bloque «barrido de arquitectura» corre solo cada cierto número de piezas.
+    El desorden del conjunto con el tiempo no se evita del todo: el barrido se vuelve raro, no
+    desaparece.
 - Notas menores de la última revisión de la rebanada 2 (no bloquean): endurecer dos pruebas propias de `tests/review-round5.test.ts` (fijar la respuesta exacta de arrendamiento vencido y hacer fallar la relectura después del tercer intento); el motivo de una renovación fallida al escribir «en curso» dice primero «save»; cada etapa hace una renovación de arrendamiento más (en el almacén de GitHub es un commit); investigar la prueba inestable de `tests/integrity.test.ts` sobre el latido del arrendamiento.
 - Límites declarados en la rebanada 2: en Linux, un proceso que crea a propósito su propia sesión
   sale del grupo del bloque (nivel A); una prueba editada y restaurada sin commit no se detecta

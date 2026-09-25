@@ -420,10 +420,8 @@ describe('what a valid recipe reads as', () => {
     expect(byId.get('red-test')?.validWhile).toBe('forever');
     expect(byId.get('owner-approval')?.needsHuman).toBe(true);
     expect(byId.get('owner-approval')?.validWhile).toBe('same-fingerprint');
-    expect(byId.get('owner-approval')?.gate).toEqual({
-      uses: 'ai-workflows/approval-comment@1',
-      with: { command: '/approve' },
-    });
+    // PLAN-13-R4 R21: the example approves with GitHub's button.
+    expect(byId.get('owner-approval')?.gate).toEqual({ uses: 'ai-workflows/approval-review@1' });
     expect(byId.get('merge')?.phase).toBe('merge');
     expect(byId.get('cleanup')?.phase).toBe('post-merge');
     expect(byId.get('cleanup')?.retry).toEqual({ attempts: 3, waitSeconds: 30 });

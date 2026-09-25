@@ -1,6 +1,7 @@
 import { isDeepStrictEqual } from 'node:util';
 
 import {
+  EffectNeedsReconciliation,
   EffectRefusedBecauseParked,
   InvalidPipeline,
   ProcessTreeSurvived,
@@ -89,6 +90,30 @@ const leaseHeartbeatMs = (leaseMs: number): number => Math.max(1, Math.floor(lea
  * transitions themselves; five seconds would have spent the whole allowance on watching.
  */
 const DEFAULT_CANCELLATION_POLL_MS = 30_000;
+
+/**
+ * The wait between the attempts of a retried stage. It ends on its own after `ms`, or at once
+ * when the run's signal aborts — which is how a stop parked during the wait becomes a park
+ * instead of a failure. A zero wait still yields, so a retry never turns into a busy loop that
+ * starves the cancellation watch.
+ */
+const defaultSleep = (ms: number, signal: AbortSignal): Promise<void> =>
+  new Promise<void>((resolve, reject) => {
+    if (signal.aborted) {
+      reject(signal.reason ?? new Error('aborted'));
+      return;
+    }
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      reject(signal.reason ?? new Error('aborted'));
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    timer.unref?.();
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
 
 type GateVerdict =
   | { readonly kind: 'passed'; readonly evidence?: JsonValue }
@@ -495,6 +520,35 @@ class StoreReadFailure extends Error {
   }
 }
 
+/**
+ * The effect's own work failed while the store had claimed it. The failure left the effect
+ * neither confirmed nor untouched, so it is in doubt — but it is deliberately NOT an
+ * `EffectNeedsReconciliation`: the reconciler of the block must not fire on this same run, only
+ * on the next one, when the store reports the record as pending or uncertain. The engine's own
+ * retry/optional decision still treats `EffectFailed` as an effect in doubt (never retried, never
+ * waved through). Its message is the effect's own motive, never a store failure; a failure of the
+ * store's own bookkeeping is not wrapped by this and so still blocks as a store failure.
+ */
+class EffectFailed extends Error {
+  constructor(readonly failure: unknown) {
+    super(describeUnknown(failure));
+    this.name = 'EffectFailed';
+  }
+}
+
+/**
+ * The motive a person reads when an effect's own work failed: the effect's reason alone, without
+ * the `EffectFailed` wrapper nor the class prefix of the thrown value. The state does not change —
+ * the effect is still in doubt and the block is still technical — only the wording is trimmed, so
+ * a git failure reads as `fatal: …` instead of `EffectFailed: Error: fatal: …`.
+ */
+function effectFailureReason(failure: unknown): string {
+  if (failure instanceof Error) {
+    return failure.message.length > 0 ? failure.message : failure.name;
+  }
+  return describeUnknown(failure);
+}
+
 /** The run is no longer the holder of the piece. Any further write would be over someone else. */
 class LeaseLost extends Error {
   constructor(readonly heldBy: string) {
@@ -573,6 +627,7 @@ export function createEngine(options: EngineOptions): Engine {
   // and run every gate twice.
   const leaseId = `${runId}#${instanceSerial}`;
   const now = options.now ?? Date.now;
+  const sleep = options.sleep ?? defaultSleep;
   const requestedLeaseMs = options.leaseMs ?? DEFAULT_LEASE_MS;
   const reserveLeaseMs = Math.max(requestedLeaseMs, MIN_LEASE_MS);
   const cancellationPollMs = options.cancellationPollMs ?? DEFAULT_CANCELLATION_POLL_MS;
@@ -1024,7 +1079,40 @@ export function createEngine(options: EngineOptions): Engine {
               throw new DryRunEffectRefused(operationId);
             }
           : <T extends JsonValue>(operationId: string, effect: () => Promise<T>): Promise<T> =>
-              store.runEffect(piece, operationId, effect);
+              store.runEffect(piece, operationId, async (): Promise<T> => {
+                try {
+                  return await effect();
+                } catch (error) {
+                  // A failure of the effect's own work is marked as an effect in doubt so the
+                  // engine never retries it nor lets an optional stage carry on. The classes the
+                  // engine translates itself, and the reconciler of the block, pass through
+                  // untouched: this failure must not be mistaken for a store failure.
+                  if (
+                    error instanceof EffectNeedsReconciliation
+                    || error instanceof EffectRefusedBecauseParked
+                    || error instanceof ProcessTreeSurvived
+                  ) {
+                    throw error;
+                  }
+                  throw new EffectFailed(error);
+                }
+              }).catch((error: unknown) => {
+                // An effect's own failure travels as `EffectFailed`, with its motive. A pending
+                // or uncertain record and a refusal because the piece is parked are facts the
+                // wrapper above must see as their own class. Anything else out of the store is a
+                // store failure: it is never retried and never waved through.
+                if (
+                  error instanceof EffectFailed
+                  || error instanceof EffectNeedsReconciliation
+                  || error instanceof EffectRefusedBecauseParked
+                  || error instanceof ProcessTreeSurvived
+                ) {
+                  throw error;
+                }
+                throw new StoreWriteFailure(
+                  `store failed while running effect "${operationId}": ${describeUnknown(error)}`,
+                );
+              });
 
         return {
           piece,
@@ -1197,7 +1285,7 @@ export function createEngine(options: EngineOptions): Engine {
       // collected so the rehearsal can end by naming what it could not check.
       const unchecked: string[] = [];
 
-      for (const stage of order) {
+      stageLoop: for (const stage of order) {
         try {
           // A signal can arrive between stages. Honour it before any more work is written.
           if (controller.signal.aborted) return abortedOutcome();
@@ -1305,66 +1393,131 @@ export function createEngine(options: EngineOptions): Engine {
           const parkedByStop = await writeRunning(stage);
           if (parkedByStop !== undefined) return { outcome: 'parked', status: parkedByStop };
 
+          // PLAN-13-R4 §5: a retried stage runs its gate again after a rejection or an
+          // ordinary error, waiting between attempts under the run's signal. Only its last
+          // attempt reaches the journal, saying how many there were.
+          const attempts = stage.retry?.attempts ?? 1;
+          const waitMs = stage.retry?.waitMs ?? 0;
+          // How many attempts actually ran, so the motive never claims more than were made.
+          let attemptsMade = 1;
+          const counted = (reason: string): string =>
+            attemptsMade > 1
+              ? `${reason} (${
+                  config.locale.startsWith('en')
+                    ? `after ${attemptsMade} attempts`
+                    : `tras ${attemptsMade} intentos`
+                })`
+              : reason;
+
           let raw: unknown;
+          let retryable = false;
           const stopHeartbeat = startHeartbeat();
           try {
-            raw = await stage.gate(context);
-          } catch (error) {
-            if (error instanceof ProcessTreeSurvived) {
-              // PLAN-13-R2 §2.2: unlike every other failure after a cancellation, this one is
-              // always registered as `failed` and leaves the piece blocked with its quarantine
-              // stored, even when the piece was parked or the run had lost the lease. Losing
-              // track of a live process is worse than losing the parking, so neither write
-              // demands the lease; the status write retries a race and re-reads.
-              let reason =
-                `stage "${stage.name}" left processes that could not be confirmed empty: ` +
-                error.message;
-              if (!dryRun) {
-                const entry = freezeEntry({
-                  stage: stage.name,
-                  outcome: 'failed',
-                  at: now(),
-                  runId,
-                  pipeline,
-                  reason,
-                });
-                try {
-                  await store.append(piece, entry);
-                } catch (appendError) {
-                  // The quarantine is what stops the next run: a journal that refused the entry
-                  // is reported in the motive rather than allowed to lose the write.
-                  reason += ` (the journal could not record the failure: ${describeUnknown(appendError)})`;
+            for (let attempt = 1; ; attempt += 1) {
+              attemptsMade = attempt;
+              retryable = false;
+              try {
+                raw = await stage.gate(context);
+              } catch (error) {
+                if (error instanceof ProcessTreeSurvived) {
+                  // PLAN-13-R2 §2.2: unlike every other failure after a cancellation, this one is
+                  // always registered as `failed` and leaves the piece blocked with its quarantine
+                  // stored, even when the piece was parked or the run had lost the lease. Losing
+                  // track of a live process is worse than losing the parking, so neither write
+                  // demands the lease; the status write retries a race and re-reads.
+                  let reason =
+                    `stage "${stage.name}" left processes that could not be confirmed empty: ` +
+                    error.message;
+                  if (!dryRun) {
+                    const entry = freezeEntry({
+                      stage: stage.name,
+                      outcome: 'failed',
+                      at: now(),
+                      runId,
+                      pipeline,
+                      reason,
+                    });
+                    try {
+                      await store.append(piece, entry);
+                    } catch (appendError) {
+                      // The quarantine is what stops the next run: a journal that refused the entry
+                      // is reported in the motive rather than allowed to lose the write.
+                      reason += ` (the journal could not record the failure: ${describeUnknown(appendError)})`;
+                    }
+                  }
+                  return await finish(blockedStatus(stage.name, reason), {
+                    overParked: true,
+                    quarantine: error.quarantine,
+                  });
+                }
+                if (error instanceof DryRunEffectRefused) {
+                  // The stage could not be evaluated without acting. A healthy pipeline in dry
+                  // mode is not broken: note it as not evaluated, keep checking the rest, and
+                  // leave no trace.
+                  unchecked.push(stage.name);
+                  continue stageLoop;
+                }
+                if (error instanceof EffectRefusedBecauseParked) {
+                  // A refusal is a cancellation decision, not a gate failure. It is translated once,
+                  // in the stage's catch, so it travels past this one without being journalled or
+                  // turned into a `blocked:technical`.
+                  throw error;
+                }
+                if (error instanceof StoreWriteFailure) {
+                  // A store failure inside an effect is not a gate failure: it is never retried
+                  // and it blocks even an optional stage. It travels to the outer catch, which
+                  // records the technical block without touching the store again.
+                  throw error;
+                }
+                const stopped = await readStatus();
+                if (stopped !== undefined && stopped.status.state === 'parked') {
+                  return { outcome: 'parked', status: stopped.status };
+                }
+                if (controller.signal.aborted) return abortedOutcome();
+                // An effect left in doubt is never retried, however many attempts are asked
+                // for: repeating it is how a second pull request gets opened. The effect's own
+                // failure (`EffectFailed`) leaves it uncertain in the store just like a record
+                // the next run finds `pending`/`uncertain` does.
+                const inDoubt =
+                  error instanceof EffectNeedsReconciliation || error instanceof EffectFailed;
+                if (!inDoubt && attempt < attempts) {
+                  retryable = true;
+                } else {
+                  const reason = counted(
+                    error instanceof EffectFailed
+                      ? effectFailureReason(error.failure)
+                      : describeUnknown(error),
+                  );
+                  await record(stage.name, 'failed', reason);
+                  // An optional failure is recorded and the piece carries on; only the
+                  // processes that survived or an effect in doubt still stop it.
+                  if (stage.required === false && !inDoubt) continue stageLoop;
+                  // await: a store failure in finish() must reach this stage's catch, not reject run().
+                  return await finish(
+                    blockedStatus(stage.name, `gate of stage "${stage.name}" threw: ${reason}`),
+                  );
                 }
               }
-              return await finish(blockedStatus(stage.name, reason), {
-                overParked: true,
-                quarantine: error.quarantine,
-              });
+
+              if (!retryable) {
+                const tried = classifyGateResult(raw);
+                // A person who has not answered is pending, never retried. A skip is an
+                // answer: it is neither a rejection nor an error.
+                if (tried.kind === 'rejected' && stage.needsHuman !== true && attempt < attempts) {
+                  retryable = true;
+                } else {
+                  break;
+                }
+              }
+
+              // The wait is under the run's signal: a stop that lands during it parks the
+              // piece, and the checks after the loop read that stored status.
+              try {
+                await sleep(waitMs, controller.signal);
+              } catch {
+                break;
+              }
             }
-            if (error instanceof DryRunEffectRefused) {
-              // The stage could not be evaluated without acting. A healthy pipeline in dry
-              // mode is not broken: note it as not evaluated, keep checking the rest, and
-              // leave no trace.
-              unchecked.push(stage.name);
-              continue;
-            }
-            if (error instanceof EffectRefusedBecauseParked) {
-              // A refusal is a cancellation decision, not a gate failure. It is translated once,
-              // in the stage's catch, so it travels past this one without being journalled or
-              // turned into a `blocked:technical`.
-              throw error;
-            }
-            const stopped = await readStatus();
-            if (stopped !== undefined && stopped.status.state === 'parked') {
-              return { outcome: 'parked', status: stopped.status };
-            }
-            if (controller.signal.aborted) return abortedOutcome();
-            const reason = describeUnknown(error);
-            await record(stage.name, 'failed', reason);
-            // await: a store failure in finish() must reach this stage's catch, not reject run().
-            return await finish(
-              blockedStatus(stage.name, `gate of stage "${stage.name}" threw: ${reason}`),
-            );
           } finally {
             stopHeartbeat();
           }
@@ -1401,13 +1554,17 @@ export function createEngine(options: EngineOptions): Engine {
                 reason: verdict.reason,
               });
             }
-            await record(stage.name, 'rejected', verdict.reason);
+            const reason = counted(verdict.reason);
+            await record(stage.name, 'rejected', reason);
+            // An optional stage that is rejected is recorded and the piece carries on; it is
+            // attempted again on the next run, because a rejection is not settled evidence.
+            if (stage.required === false) continue;
             // await: a store failure in finish() must reach this stage's catch, not reject run().
             return await finish({
               piece,
               stage: stage.name,
               state: 'blocked:rejected',
-              reason: verdict.reason,
+              reason,
             });
           }
 

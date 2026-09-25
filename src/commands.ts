@@ -31,6 +31,19 @@ const MAX_TIMEOUT_MS = 2 ** 31 - 1;
 const MAX_REASON_CHARS = 3900;
 
 /**
+ * PLAN-13-R4 §5 and §6: the agents' credentials. A gate command is a child of the engine and
+ * must never inherit one, however the engine's own environment was set.
+ */
+const CREDENTIAL_ENV_NAMES: readonly string[] = [
+  'GH_TOKEN',
+  'GITHUB_TOKEN',
+  'AI_WORKFLOWS_APP_ID',
+  'AI_WORKFLOWS_APP_KEY_FILE',
+];
+/** Windows does not tell the case of an environment name apart, so neither does this check. */
+const CREDENTIAL_ENV_NAMES_UPPER = new Set(CREDENTIAL_ENV_NAMES.map((name) => name.toUpperCase()));
+
+/**
  * The most output kept in memory. 32 MB is large enough to hold a whole test run — a run in a
  * real project prints plenty — while still bounding a command that prints gigabytes. Only the
  * tail matters (the failure is at the end), so when the limit is passed the end is kept and the
@@ -95,8 +108,9 @@ export function runGateCommand(command: GateCommand): Promise<CheckResult> {
     };
     if (command.cwd !== undefined) options.cwd = command.cwd;
     // The shim may set variables the program needs: pnpm exports NODE_PATH so its bins find the
-    // modules installed beside them. They are laid over the engine's own environment.
-    if (resolved.env !== undefined) options.env = mergeShimEnvironment(resolved.env);
+    // modules installed beside them. They are laid over the engine's own environment, which
+    // ALWAYS drops the agents' credentials first: a gate command must never inherit a token.
+    options.env = mergeShimEnvironment(resolved.env ?? {});
     // On POSIX, a new process group lets a timeout kill grandchildren, not only the child.
     if (process.platform !== 'win32') options.detached = true;
 
@@ -288,7 +302,8 @@ function resolveGateCommand(command: string): ResolvedExecutable {
  * the shim's value goes in front of any the engine already had and keeps the existing one after
  * it, separated the way the platform separates PATH entries (`;` on Windows, `:` on POSIX). That
  * is exactly what the shim's own `%NODE_PATH%` reference does; a plain overwrite would hide the
- * folders the engine already had.
+ * folders the engine already had. The agents' credentials are removed last, whatever the shim or
+ * the engine's own environment carried (PLAN-13-R4 §5 and §6).
  */
 function mergeShimEnvironment(shimEnv: Readonly<Record<string, string>>): NodeJS.ProcessEnv {
   const separator = process.platform === 'win32' ? ';' : ':';
@@ -299,6 +314,9 @@ function mergeShimEnvironment(shimEnv: Readonly<Record<string, string>>): NodeJS
       name.toUpperCase() === 'NODE_PATH' && existing !== undefined && existing.length > 0
         ? `${value}${separator}${existing}`
         : value;
+  }
+  for (const name of Object.keys(merged)) {
+    if (CREDENTIAL_ENV_NAMES_UPPER.has(name.toUpperCase())) delete merged[name];
   }
   return merged;
 }

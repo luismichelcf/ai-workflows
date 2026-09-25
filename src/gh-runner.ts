@@ -12,6 +12,18 @@ export interface GhRun {
 /** Runs `gh` with these arguments, feeding `input` to its stdin when given. Never through a shell. */
 export type GhRunner = (args: readonly string[], input?: string) => Promise<GhRun>;
 
+/**
+ * A `gh` runner that also takes environment variables for one single call. The agents' token
+ * travels this way — in the child's environment, never in an argument, a URL or a log. A
+ * `GhRunner` is a `GhRunnerWithEnv` that never uses the third parameter, so callers that do
+ * not need a per-call environment still accept one.
+ */
+export type GhRunnerWithEnv = (
+  args: readonly string[],
+  input?: string,
+  env?: Readonly<Record<string, string>>,
+) => Promise<GhRun>;
+
 /** A program to run in place of `gh`, already resolved: never a shell, never a `.cmd`. */
 export interface GhExecutable {
   readonly command: string;
@@ -68,7 +80,7 @@ function mergeShimEnvironment(shimEnv: Readonly<Record<string, string>>): NodeJS
   return merged;
 }
 
-export function createGhRunner(options: GhRunnerOptions = {}): GhRunner {
+export function createGhRunner(options: GhRunnerOptions = {}): GhRunnerWithEnv {
   const timeoutMs = options.timeoutMs ?? DEFAULT_GH_TIMEOUT_MS;
   // A limit that is not a finite, positive number is not a limit. `NaN` and negative
   // values would otherwise reach `setTimeout` and either fire immediately or never, and an
@@ -80,7 +92,7 @@ export function createGhRunner(options: GhRunnerOptions = {}): GhRunner {
     );
   }
 
-  return (args, input) =>
+  return (args, input, extraEnv) =>
     new Promise<GhRun>((resolve, reject) => {
       // An explicit executable wins; otherwise `gh` is resolved once, without a shell.
       // A failed resolution rejects this one call with its own reason instead of throwing here.
@@ -119,6 +131,13 @@ export function createGhRunner(options: GhRunnerOptions = {}): GhRunner {
       env['NO_COLOR'] = '1';
       env['GH_PROMPT_DISABLED'] = '1';
       env['GH_NO_UPDATE_NOTIFIER'] = '1';
+
+      // The per-call environment comes last, so a caller can add the agents' GH_TOKEN to this
+      // one call without changing anything the caller did not ask for. It never becomes an
+      // argument, so it cannot show up in a command line or in `gh`'s own messages.
+      if (extraEnv !== undefined) {
+        for (const [name, value] of Object.entries(extraEnv)) env[name] = value;
+      }
 
       const spawnOptions: SpawnOptions = {
         // Never a shell, so gh's arguments cannot be re-parsed. `windowsHide` avoids a

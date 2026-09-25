@@ -1,6 +1,12 @@
 import { isMap, type Node } from 'yaml';
 
-import type { Recipe, RecipeCondition, RecipePieces, RecipeStage } from './types.js';
+import type {
+  Recipe,
+  RecipeCondition,
+  RecipeMessages,
+  RecipePieces,
+  RecipeStage,
+} from './types.js';
 import { yamlField, yamlMap, yamlSeq, yamlValue, yamlWord, type YamlNode } from './validation.js';
 
 function camel(key: string): string {
@@ -68,6 +74,24 @@ function constructPieces(node: YamlNode): RecipePieces {
   };
 }
 
+function constructMessages(node: YamlNode): RecipeMessages {
+  const summary = yamlField(node, 'summary');
+  const maxLength = yamlValue(yamlField(node, 'max-length'));
+  const banned = yamlValue(yamlField(node, 'banned-words'));
+  return {
+    ...(summary === null
+      ? {}
+      : {
+          summary: {
+            file: yamlWord(yamlField(summary, 'file')),
+            section: yamlWord(yamlField(summary, 'section')),
+          },
+        }),
+    maxLength: (maxLength ?? 700) as number,
+    bannedWords: (banned ?? []) as string[],
+  };
+}
+
 export function constructRecipe(root: Node): Recipe {
   const classify = yamlField(root, 'classify');
   const kinds = yamlField(root, 'kinds');
@@ -76,6 +100,8 @@ export function constructRecipe(root: Node): Recipe {
   const pieces = yamlField(root, 'pieces');
   const stageNodes = yamlSeq(yamlField(root, 'stages'))?.items ?? [];
   const owner = yamlField(root, 'owner');
+  const agentAccount = yamlField(root, 'agent-account');
+  const messages = yamlField(root, 'messages');
   const elevations = yamlSeq(yamlField(kinds, 'elevate'))?.items ?? [];
   return {
     version: 1,
@@ -83,6 +109,8 @@ export function constructRecipe(root: Node): Recipe {
     classify: (yamlValue(classify) ?? {}) as Record<string, string[]>,
     stages: stageNodes.map(constructStage),
     ...(owner === null ? {} : { owner: yamlWord(owner) }),
+    ...(agentAccount === null ? {} : { agentAccount: yamlWord(agentAccount) }),
+    ...(messages === null ? {} : { messages: constructMessages(messages) }),
     ...(kinds === null ? {} : {
       kinds: {
         names: (yamlValue(yamlField(kinds, 'names')) ?? []) as string[],

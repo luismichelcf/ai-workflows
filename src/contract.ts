@@ -149,6 +149,19 @@ export interface StageConfig {
    * (`waiting:decision`).
    */
   readonly needsHuman?: boolean;
+  /**
+   * Whether a rejection or an ordinary failure of this stage stops the piece. Defaults to
+   * `true`. An optional stage is recorded as rejected/failed and the piece carries on; it is
+   * attempted again on the next run, because only `passed` and `skipped` evidence is reused.
+   */
+  readonly required?: boolean;
+  /**
+   * How many times the gate is tried in total, and how long to wait between tries. Omitted
+   * means a single try. Only a rejection (`ok: false`) or an ordinary thrown error is retried;
+   * a skip, a pending person, a surviving process group, an effect in doubt, a lost lease or a
+   * store failure never is.
+   */
+  readonly retry?: { readonly attempts: number; readonly waitMs: number };
   readonly gate: Gate;
 }
 
@@ -248,6 +261,20 @@ export class EffectNeedsReconciliation extends Error {
   ) {
     super(`effect "${operationId}" of piece ${piece} is ${effectState} and needs reconciliation`);
     this.name = 'EffectNeedsReconciliation';
+  }
+}
+
+/**
+ * Thrown when an effect was left in doubt and nothing could settle it: the block has no
+ * reconciler, its reconciler failed or answered uselessly, or the store failed while writing
+ * the settlement. It extends `EffectNeedsReconciliation`, so the engine keeps the piece
+ * `blocked:technical` even in an optional stage — an effect in doubt is never waved through —
+ * and its message names the operation and the motive that could not settle it.
+ */
+export class EffectStillInDoubt extends EffectNeedsReconciliation {
+  constructor(piece: PieceId, operationId: string, motive: string) {
+    super(piece, operationId, 'uncertain');
+    this.message = motive;
   }
 }
 
@@ -433,6 +460,12 @@ export interface EngineOptions {
   readonly confirmQuarantine?: (quarantine: JsonValue) => Promise<string | undefined>;
   /** Injected so runs are reproducible and tests do not depend on the wall clock. */
   readonly now?: () => number;
+  /**
+   * How the wait between the attempts of a retried stage happens, under the run's cancellation
+   * signal. The default waits for real and rejects as soon as the signal aborts; injected so
+   * tests never sleep.
+   */
+  readonly sleep?: (ms: number, signal: AbortSignal) => Promise<void>;
   readonly leaseMs?: number;
   /**
    * How often a running stage watches the store for a park recorded by another controller.

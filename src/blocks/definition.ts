@@ -1,8 +1,9 @@
-import type { Gate, JsonValue, Store } from '../contract.js';
+import type { Gate, GateContext, JsonValue, Store } from '../contract.js';
 import type { Invocation, RawRun } from '../providers.js';
 import type { ChangeFacts, ProjectFiles } from '../recipe/facts.js';
 import type { Recipe } from '../recipe/types.js';
 import type { JudgeGitHub } from '../judge/port.js';
+import type { AgentGitHub, RemoteGit } from '../agent/github.js';
 import type { BlockManifest, ValidWhile } from './manifest.js';
 
 // PLAN-13-R2 §2.1, §5 and §6: a block is its manifest plus the factory that builds its gate.
@@ -27,18 +28,41 @@ export interface ProviderRunOptions {
  * The privileged `recordCleanUpdate` is deliberately not part of `GateContext`: project
  * blocks cannot write the journal records that prove a clean update.
  */
+/**
+ * PLAN-13-R4 §3.0: the GitHub edge a final block talks to. It arrives through
+ * `CompileRecipeDeps.agent` and is passed to each final block when it is created; without it a
+ * final stage cannot publish as the agents and stays technical.
+ */
+export interface AgentDeps {
+  readonly github: AgentGitHub;
+  /** The other half of the edge: push, delete and read the head of a remote branch. */
+  readonly remote: RemoteGit;
+  /** `owner/name`, as GitHub reports it. */
+  readonly repository: string;
+  sleep(ms: number, signal: AbortSignal): Promise<void>;
+  now(): number;
+}
+
 export interface EngineBlockDeps {
   readonly root: string;
   readonly baseRef: string;
   readonly store: Store;
   readonly providers: ProviderRunner;
   readonly recipe: Recipe;
+  /** PLAN-13-R4 §3.0: present only for the final stages that talk to GitHub. */
+  readonly agent?: AgentDeps;
   recordCleanUpdate(update: {
     readonly piece: string;
     readonly from: string;
     readonly to: string;
   }): Promise<void>;
 }
+
+/** PLAN-13-R4 §3.0.1: what a block's reconciler answers about an effect left in doubt. */
+export type ReconcileAnswer =
+  | { readonly confirmed: JsonValue }
+  | { readonly didNotHappen: true }
+  | undefined;
 
 /** One engine block: what it declares, and how its gate is built from its inputs. */
 export interface BlockDefinition {
@@ -49,6 +73,16 @@ export interface BlockDefinition {
    * without a capability is not recomputable or attestable there, and the judge says so.
    */
   readonly server?: ServerCapability;
+  /**
+   * PLAN-13-R4 §3.0.1: read the outside world to settle an effect left in doubt by a crash.
+   * `undefined` means the answer cannot be established, so the piece stays technical.
+   */
+  reconcile?(
+    inputs: Record<string, unknown>,
+    operationId: string,
+    context: GateContext,
+    deps: EngineBlockDeps,
+  ): Promise<ReconcileAnswer>;
 }
 
 /** PLAN-13-R3 §1.3: what the judge hands a server recompute. */
@@ -76,6 +110,8 @@ export interface ServerAttestContext extends ServerContext {
   readonly owner?: string;
   readonly recipe: Recipe;
   readonly pullRequest: number;
+  /** PLAN-13-R4 §7: the stage being judged (a `sandboxed-review` finds its verdict by stage). */
+  readonly stage: string;
   readonly github: JudgeGitHub;
   /** Brings commit objects the judge did not check out (a replaced head, a candidate). */
   fetchObjects(shas: string[]): Promise<void>;

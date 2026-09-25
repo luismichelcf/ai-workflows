@@ -590,19 +590,23 @@ describe('RC-06 and SV-04: the judge judges with the recipe of main, and guards 
       const head = w.pr(7, 'feat/13', { 'docs/plans/PLAN-13.md': PLAN('comportamiento'), 'app/page.tsx': 'x\n', [path]: 'changed\n' });
       w.green(7, head);
       w.github.pendingFromConsoleStep(head);
-      await w.judge();
+      const report = await w.judge();
       expect(w.github.on()).toEqual([expect.objectContaining({ state: 'failure', description: expect.stringContaining('/approve-judge-change') })]);
+      // R20: what the owner is told to write carries sixteen characters of the head.
+      expect(report.summary).toContain(`/approve-judge-change ${head.slice(0, 16)}`);
     });
   }
 
   const attempts: [string, PullRequestComment | ((head: string) => PullRequestComment), string][] = [
-    ['another account', (h) => byOwner(`/approve-judge-change ${h.slice(0, 7)}`, { author: 'otra' }), 'failure'],
-    ['an edited comment', (h) => byOwner(`/approve-judge-change ${h.slice(0, 7)}`, { edited: true }), 'failure'],
-    ['a comment through an app', (h) => byOwner(`/approve-judge-change ${h.slice(0, 7)}`, { performedViaApp: true }), 'failure'],
-    ['a bot', (h) => byOwner(`/approve-judge-change ${h.slice(0, 7)}`, { authorType: 'Bot' }), 'failure'],
-    ['an older version', byOwner('/approve-judge-change 0000000'), 'failure'],
-    ['a code in a quote', (h) => byOwner(`> /approve-judge-change ${h.slice(0, 7)}`), 'failure'],
-    ['the owner, for this head', (h) => byOwner(`/approve-judge-change ${h.slice(0, 7)}`), 'success'],
+    ['another account', (h) => byOwner(`/approve-judge-change ${h.slice(0, 16)}`, { author: 'otra' }), 'failure'],
+    ['an edited comment', (h) => byOwner(`/approve-judge-change ${h.slice(0, 16)}`, { edited: true }), 'failure'],
+    ['a comment through an app', (h) => byOwner(`/approve-judge-change ${h.slice(0, 16)}`, { performedViaApp: true }), 'failure'],
+    ['a bot', (h) => byOwner(`/approve-judge-change ${h.slice(0, 16)}`, { authorType: 'Bot' }), 'failure'],
+    ['an older version', byOwner('/approve-judge-change 0000000000000000'), 'failure'],
+    // R20: fifteen characters of the right head are not enough; sixteen are.
+    ['fifteen characters of this head', (h) => byOwner(`/approve-judge-change ${h.slice(0, 15)}`), 'failure'],
+    ['a code in a quote', (h) => byOwner(`> /approve-judge-change ${h.slice(0, 16)}`), 'failure'],
+    ['the owner, for this head', (h) => byOwner(`/approve-judge-change ${h.slice(0, 16)}`), 'success'],
   ];
   for (const [who, comment, state] of attempts) {
     it(`attestation from ${who} → ${state}`, async () => {
