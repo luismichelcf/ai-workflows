@@ -1131,8 +1131,23 @@ export function createGhSandboxPort(repository: string): SandboxPort {
       const tree = o.tree === undefined ? treeOfCommit(o.expectedHead) : treeOfCommit(o.tree);
       const created = JSON.parse(runGh(['api', '-X', 'POST', `repos/${repo}/git/commits`, '--input', '-'],
         JSON.stringify({ message: o.message, tree, parents: [o.expectedHead] }))) as { sha: string };
-      const updated = tryGh(['api', '-X', 'PATCH', `repos/${repo}/git/refs/heads/main`, '-f', `sha=${created.sha}`, '-F', 'force=false']);
-      if (!updated.ok) return 'conflict';
+      // The ruleset of main only lets the merge queue move it. As the old judge test did, it is
+      // switched off only for this one move and put back exactly as it was, whatever happens (R22:
+      // the owner's session administers the rehearsal). A run that dies in between leaves it off:
+      // the restoration then finds a ruleset this run did not write and stops, naming it.
+      const ruleset = JSON.parse(runGh(['api', `repos/${repo}/rulesets/${rulesetId()}`])) as Record<string, unknown>;
+      const enforced = ruleset['enforcement'] !== 'disabled';
+      if (enforced) api('PUT', `repos/${repo}/rulesets/${rulesetId()}`, { ...pickRuleset(ruleset), enforcement: 'disabled' });
+      let updated: ReturnType<typeof tryGh>;
+      try {
+        updated = tryGh(['api', '-X', 'PATCH', `repos/${repo}/git/refs/heads/main`, '-f', `sha=${created.sha}`, '-F', 'force=false']);
+      } finally {
+        if (enforced) api('PUT', `repos/${repo}/rulesets/${rulesetId()}`, pickRuleset(ruleset));
+      }
+      if (!updated.ok) {
+        if (refSha('heads/main') !== o.expectedHead) return 'conflict';
+        throw new Error(`no se pudo mover main: ${updated.error}`);
+      }
       return { sha: created.sha, tree };
     },
     async variable() {
