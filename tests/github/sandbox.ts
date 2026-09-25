@@ -1128,7 +1128,11 @@ export function createGhSandboxPort(repository: string): SandboxPort {
     async commitToMain(o) {
       const head = refSha('heads/main');
       if (head !== o.expectedHead) return 'conflict';
-      const tree = o.tree === undefined ? treeOfCommit(o.expectedHead) : treeOfCommit(o.tree);
+      // `tree` is a tree when the restoration puts the snapshot back, and the commit `writeCommit`
+      // made when files are written: both are accepted, each read as what it is.
+      const tree = o.tree === undefined
+        ? treeOfCommit(o.expectedHead)
+        : tryGh(['api', `repos/${repo}/git/trees/${o.tree}`]).ok ? o.tree : treeOfCommit(o.tree);
       const created = JSON.parse(runGh(['api', '-X', 'POST', `repos/${repo}/git/commits`, '--input', '-'],
         JSON.stringify({ message: o.message, tree, parents: [o.expectedHead] }))) as { sha: string };
       // The ruleset of main only lets the merge queue move it. As the old judge test did, it is

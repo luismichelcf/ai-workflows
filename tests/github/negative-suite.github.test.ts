@@ -303,6 +303,13 @@ const checkDone = (sha: string, name: string) =>
 function stagesOf(status: Status): Record<string, { outcome: string; reason: string }> {
   const id = /\/actions\/runs\/(\d+)/.exec(status.target_url ?? '')?.[1];
   if (id === undefined) throw new Error(`the status has no run: ${JSON.stringify(status)}`);
+  // The judge publishes its verdict before its run ends, and GitHub only gives the log of an ended
+  // run: wait for it (seen in the first real run).
+  const deadline = Date.now() + 10 * MINUTE;
+  while (ghJson<{ status: string }>('run', 'view', id, '--repo', REPO, '--json', 'status').status !== 'completed') {
+    if (Date.now() > deadline) throw new Error(`the judge run ${id} did not end`);
+    execFileSync(process.execPath, ['-e', 'setTimeout(() => {}, 10000)']);
+  }
   const text = gh('run', 'view', id, '--repo', REPO, '--log');
   const stages: Record<string, { outcome: string; reason: string }> = {};
   for (const match of text.matchAll(/^.*?- ([\w-]+): (passed|rejected|waiting|technical|skipped|informative)(?: — (.*))?$/gm)) {
@@ -485,11 +492,25 @@ async function tryToMerge(piece: Piece): Promise<void> {
   }
 }
 
+/**
+ * The attempt did not merge. Then the merge the attempt armed is disarmed: otherwise the positive
+ * control, which makes the same pull request green on purpose, would let GitHub merge it (seen in
+ * the first real run, where two positive controls merged).
+ */
 async function stillOpen(piece: Piece): Promise<void> {
   await sleep(60_000);
   const state = prState(piece.pr);
   expect(state.state, `PR #${piece.pr} must not merge`).toBe('OPEN');
   expect(state.mergedAt).toBeNull();
+  try {
+    await asAgent('pr', 'merge', String(piece.pr), '--repo', REPO, '--disable-auto');
+  } catch (error) {
+    // Not armed (GitHub refused it at once): nothing to disarm. Anything else is a failure.
+    const text = String((error as { stderr?: string }).stderr ?? error);
+    if (!/not enabled|auto.?merge is not|no auto/i.test(text)) throw error;
+  }
+  const after = ghJson<{ autoMergeRequest: unknown }>('pr', 'view', String(piece.pr), '--repo', REPO, '--json', 'autoMergeRequest');
+  expect(after.autoMergeRequest, `the merge armed on #${piece.pr} must be disarmed`).toBeNull();
 }
 
 // ---------------------------------------------------------------------------------------------
