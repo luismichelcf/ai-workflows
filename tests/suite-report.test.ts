@@ -176,6 +176,13 @@ describe('what the report may not carry', () => {
     'a foreign link': { evidence: ['https://example.com/pull/1'] },
     'a link to another repository': { evidence: ['https://github.com/socialabs-margin/Socialabs/pull/1'] },
     'a link that is not https': { evidence: [`http://github.com/${REPO}/pull/1`] },
+    'a link that climbs out of the repository': { evidence: [`https://github.com/${REPO}/../../otra/cosa/pull/1`] },
+    'a link that climbs out with an encoded dot': { evidence: [`https://github.com/${REPO}/%2e%2e/%2E%2E/otra/pull/1`] },
+    'a link with credentials': { evidence: [`https://github.com/${REPO}@evil.example.com/pull/1`] },
+    'a UNC path': { attempt: 'se escribió \\\\servidor\\compartida\\x' },
+    'a Git Bash path': { attempt: 'se escribió /c/GitHub/ai-workflows/x' },
+    'a /tmp path': { attempt: 'se escribió /tmp/aiw-negative-x/y' },
+    'a JWT': { attempt: 'eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiI1MDY2Nzg3In0.c2lnbmF0dXJh' },
   };
   for (const [name, change] of Object.entries(leaks)) {
     it(`refuses ${name}`, () => {

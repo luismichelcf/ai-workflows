@@ -118,6 +118,7 @@ export function fakeGitHub(options: { crashAfter?: string } = {}) {
       return { sha, tree };
     },
     async variable() {
+      if (failing.has('variable')) throw new Error('gh: HTTP 502 al leer la variable');
       return state.variable;
     },
     async setVariable(value) {
@@ -132,6 +133,7 @@ export function fakeGitHub(options: { crashAfter?: string } = {}) {
       crash('putRuleset');
     },
     async workflowEnabled(path) {
+      if (failing.has('workflow')) throw new Error('gh: HTTP 502 al leer el workflow');
       return state.workflows.get(path) ?? false;
     },
     async setWorkflowEnabled(path, on) {
@@ -139,6 +141,7 @@ export function fakeGitHub(options: { crashAfter?: string } = {}) {
       crash(`setWorkflowEnabled:${path}:${on}`);
     },
     async inventory() {
+      if (failing.has('inventory')) throw new Error('gh: HTTP 502 al listar');
       return {
         branches: [...state.branches].sort(),
         openPullRequests: [...state.prs].filter(([, pr]) => pr.open).map(([n]) => n).sort(),
@@ -180,11 +183,14 @@ export function fakeGitHub(options: { crashAfter?: string } = {}) {
       if (d?.state !== 'inactive') throw new Error(`deployment ${id} is still active`);
       state.deployments.delete(id);
     },
+    // Like `gh`: closing a merged or closed pull request, or deleting a branch that is gone, fails.
     async closePullRequest(n) {
       const pr = state.prs.get(n);
-      if (pr) pr.open = false;
+      if (pr === undefined || !pr.open) throw new Error(`gh: pull request #${n} is not open`);
+      pr.open = false;
     },
     async deleteBranch(name) {
+      if (!state.branches.has(name)) throw new Error('gh: Reference does not exist (HTTP 422)');
       state.branches.delete(name);
     },
     async findPullRequests(marker) {
@@ -204,23 +210,32 @@ export function fakeGitHub(options: { crashAfter?: string } = {}) {
       state.mainHead = sha;
     },
   };
-  /** A pull request of the run merged by the queue. */
-  const mergeByQueue = (pr: number) => {
+  /**
+   * A pull request of the run merged by the queue, as GitHub does it: with `squash` the commit is
+   * the pull request title with `(#N)` and the history says nothing else; the branch is deleted.
+   */
+  const mergeByQueue = (pr: number, options: { squash?: boolean } = {}) => {
     const sha = next();
     const tree = next();
     state.trees.set(sha, tree);
-    state.mainLog.push({ sha, tree, by: 'merge', pr });
+    state.mainLog.push(options.squash ? { sha, tree, by: 'merge', message: `Suite negativa · pieza (#${pr})` } : { sha, tree, by: 'merge', pr });
     state.mainHead = sha;
     const entry = state.prs.get(pr);
     if (entry) {
       entry.open = false;
       entry.merged = true;
     }
+    const branch = branchOf.get(pr);
+    if (branch !== undefined) state.branches.delete(branch);
   };
+  const branchOf = new Map<number, string>();
   const openPr = (n: number, branch: string, marker: string) => {
     state.branches.add(branch);
+    branchOf.set(n, branch);
     state.prs.set(n, { head: next(), open: true, merged: false, marker });
   };
-  return { port, state, calls, outsider, mergeByQueue, openPr, firstTree };
+  /** Reads of these resources fail until removed, like a GitHub that answers 502. */
+  const failing = new Set<'variable' | 'workflow' | 'inventory'>();
+  return { port, state, calls, outsider, mergeByQueue, openPr, firstTree, failing };
 }
 

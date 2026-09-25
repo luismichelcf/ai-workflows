@@ -157,7 +157,7 @@ describe('§1.3 rule 0 knows the orders the recipe declares', () => {
 
   it('an approval-comment stage without a command gives the block default', () => {
     const text = lines(...BASE.map((row) => (row.includes('with: { command: /aprueba }') ? '      with: {}' : row)));
-    expect(ownerOrdersOf(recipeOf(text))).toEqual(['/visto-bueno', '/approve-judge-change']);
+    expect(ownerOrdersOf(recipeOf(text))).toEqual(['/approve', '/approve-judge-change']);
   });
 
   const refused: Record<string, HookInput> = {
