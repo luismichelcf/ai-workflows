@@ -29,13 +29,23 @@ it('runs the GitHub suite and writes its report', () => {
   });
   const testsPassed = suite.status === 0;
 
-  const read = existsSync(records) ? readCaseRecords(records) : [];
-  const run = read.find((record) => record.id === 'LIMPIEZA')?.run ?? read[0]?.run ?? 'sin-corrida';
   const engineSha = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: ROOT, encoding: 'utf8' }).stdout.trim();
   const date = new Date().toISOString().slice(0, 10);
-  const report = renderSuiteReport(read, { run, date, engineSha, repository: REPOSITORY, testsPassed });
   mkdirSync(join(ROOT, 'docs', 'reports'), { recursive: true });
   const file = join(ROOT, 'docs', 'reports', `suite-negativa-${date}.md`);
-  writeFileSync(file, `${report.text}\n`, 'utf8');
-  process.stdout.write(`\ninforme: docs/reports/suite-negativa-${date}.md (${report.complete ? 'completo' : 'no completo'})\n`);
+  // Always a report, never silence (§3.1): a record file that cannot be read, or a record that the
+  // report refuses, still leaves a report that says so in its first line.
+  let text: string;
+  let complete = false;
+  try {
+    const read = existsSync(records) ? readCaseRecords(records) : [];
+    const run = read.find((record) => record.id === 'LIMPIEZA')?.run ?? read[0]?.run ?? 'sin-corrida';
+    const report = renderSuiteReport(read, { run, date, engineSha, repository: REPOSITORY, testsPassed });
+    text = report.text;
+    complete = report.complete;
+  } catch (error) {
+    text = `# Falló: el registro de la corrida no se pudo convertir en informe (${error instanceof Error ? error.message : String(error)}).\n`;
+  }
+  writeFileSync(file, `${text}\n`, 'utf8');
+  process.stdout.write(`\ninforme: docs/reports/suite-negativa-${date}.md (${complete ? 'completo' : 'no completo'})\n`);
 }, 8 * HOUR);
