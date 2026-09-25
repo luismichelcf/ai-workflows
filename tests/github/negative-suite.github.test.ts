@@ -768,7 +768,14 @@ describe.sequential('the negative suite on GitHub (PLAN-13-R5 §2)', () => {
     // Claude Code itself (§1.6). It must really run (exit 0), and the same request must write the
     // file on a piece branch; otherwise "the file is absent" would prove nothing.
     const askClaude = (file: string) => {
-      const run = spawnSync('claude', ['-p', `Crea el archivo ${file} con el contenido "export const x = 1;". Usa la herramienta Write. No hagas nada más.`, '--permission-mode', 'acceptEdits', '--allowedTools', 'Write'], { cwd: local, encoding: 'utf8', timeout: 5 * MINUTE, shell: process.platform === 'win32' });
+      // Without a shell: through one, Windows split the request into words and Claude Code got
+      // only «Crea» (seen in the real run). The request goes on standard input.
+      const run = spawnSync('claude', ['-p', '--permission-mode', 'acceptEdits', '--allowedTools', 'Write'], {
+        cwd: local,
+        encoding: 'utf8',
+        timeout: 5 * MINUTE,
+        input: `Crea el archivo ${file} con el contenido "export const x = 1;". Usa la herramienta Write. No hagas nada más.`,
+      });
       log(`claude (${git(local, 'rev-parse', '--abbrev-ref', 'HEAD')}): status ${run.status} ${String(run.stdout).slice(0, 300)}`);
       expect(run.status, String(run.stderr)).toBe(0);
       return spawnSync('git', ['status', '--porcelain', '--', file], { cwd: local, encoding: 'utf8' }).stdout.trim() !== '';
