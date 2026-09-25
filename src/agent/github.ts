@@ -117,6 +117,11 @@ function ensureOk(result: GhRun, what: string): unknown {
   return parseJson(result.stdout, what);
 }
 
+/** A call whose success is the exit code alone: some `gh` subcommands answer text, not JSON. */
+function ensureSuccess(result: GhRun, what: string): void {
+  if (result.exitCode !== 0) throw new Error(`gh failed while reading ${what}: ${failureMessage(result)}`);
+}
+
 /** Flattens the pages `--paginate --slurp` produces: the answer is a list of lists. */
 function flattenPages(parsed: unknown, what: string): unknown[] {
   if (!Array.isArray(parsed)) throw new Error(`gh did not return a list of pages for ${what}.`);
@@ -428,9 +433,11 @@ export function createAgentGitHub(options: AgentGitHubOptions): AgentGitHub {
     },
 
     async markReady(pr: number): Promise<void> {
-      // `--repo` names the repository explicitly: `gh pr ready` must never fall back to the
-      // repository of the folder the process happens to run in (found in the real run).
-      ensureOk(await run(['pr', 'ready', String(pr), '--repo', options.repository]), `pull request ${String(pr)}`);
+      // `gh pr ready` answers with text, not JSON, so only its exit code is judged (found in the
+      // real run: the effect happened but the stage turned technical reading a JSON that never
+      // came). `--repo` names the repository explicitly: it must never fall back to the repository
+      // of the folder the process happens to run in (also found in the real run).
+      ensureSuccess(await run(['pr', 'ready', String(pr), '--repo', options.repository]), `pull request ${String(pr)}`);
     },
 
     async enableAutoMerge(pr: number, o): Promise<void> {
