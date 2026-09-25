@@ -528,8 +528,7 @@ const CN07_RECIPE = [
   '    gate:',
   '      uses: ai-workflows/github-merge@1',
   '',
-].join('
-');
+].join('\n');
 
 describe('CN-07 writing code without an active piece', () => {
   ran('CN-07');
@@ -542,9 +541,7 @@ describe('CN-07 writing code without an active piece', () => {
   afterEach(removeRepositories);
 
   async function installed(branch: string): Promise<string> {
-    const root = repository({ '.ai-workflows/pipeline.yml': CN07_RECIPE, 'src/a.mjs': 'export const a = 1;
-', 'docs/nota.md': 'nota
-' });
+    const root = repository({ '.ai-workflows/pipeline.yml': CN07_RECIPE, 'src/a.mjs': 'export const a = 1;\n', 'docs/nota.md': 'nota\n' });
     git(root, 'switch', '-q', '-C', branch);
     engine.install(root);
     const result = await installHooks({ root, apply: true });
@@ -560,15 +557,13 @@ describe('CN-07 writing code without an active piece', () => {
     const handler = settings.hooks.PreToolUse.flatMap((group) => group.hooks).find((item) => item.command === 'node');
     if (handler === undefined) throw new Error('no node hook in the settings');
     const args = handler.args.map((arg) => arg.replaceAll('${CLAUDE_PROJECT_DIR}', root));
-    const stdin = JSON.stringify({ tool_name: 'Write', tool_input: { file_path: join(root, file), content: 'x
-' }, cwd: root, hook_event_name: 'PreToolUse' });
+    const stdin = JSON.stringify({ tool_name: 'Write', tool_input: { file_path: join(root, file), content: 'x\n' }, cwd: root, hook_event_name: 'PreToolUse' });
     const output = spawnSync(process.execPath, args, { cwd: root, input: stdin, encoding: 'utf8' });
     return { status: output.status, stdout: output.stdout };
   }
 
   const tryCommit = (root: string, file: string) => {
-    write(root, file, 'nuevo
-');
+    write(root, file, 'nuevo\n');
     git(root, 'add', file);
     return spawnSync('git', ['commit', '-q', '-m', 'intento'], { cwd: root, encoding: 'utf8' });
   };
