@@ -20,6 +20,14 @@ export interface JudgePullRequest {
   readonly headRepo: string;
 }
 
+/** One open pull request of the repository (PLAN-13-R5 §2.6), as `openPullRequests` lists it. */
+export interface OpenPullRequest {
+  readonly number: number;
+  readonly headRef: string;
+  readonly headSha: string;
+  readonly baseRef: string;
+}
+
 /** One entry of the merge queue, in the shape the judge compares against a group. */
 export interface MergeQueueEntry {
   readonly position: number;
@@ -71,6 +79,12 @@ export interface JudgeGitHub {
   branchHead(branch: string): Promise<string>;
   pullRequest(n: number): Promise<JudgePullRequest>;
   openPullRequestsWithHead(sha: string): Promise<number[]>;
+  /**
+   * Every open pull request of the repository, with the live head and base of each (PLAN-13-R5
+   * §2.6). The list is paginated in full; a page that cannot be confirmed throws, as every other
+   * list of the port does.
+   */
+  openPullRequests(): Promise<OpenPullRequest[]>;
   /** Throws when the queue list cannot be confirmed. An empty queue is `[]`. */
   mergeQueue(branch: string): Promise<MergeQueueEntry[]>;
   comments(n: number): Promise<PullRequestComment[]>;
@@ -319,6 +333,33 @@ export function createJudgeGitHub(options: JudgeGitHubOptions): JudgeGitHub {
         numbers.push(number);
       }
       return numbers;
+    },
+
+    async openPullRequests(): Promise<OpenPullRequest[]> {
+      const parsed = ensureOk(
+        await run(['api', `${base}/pulls?state=open&per_page=100`, '--paginate', '--slurp']),
+        'the open pull requests',
+      );
+      const result: OpenPullRequest[] = [];
+      for (const item of flattenPages(parsed, 'the open pull requests')) {
+        const number = isRecord(item) ? item['number'] : undefined;
+        const head = recordField(item, 'head');
+        const headSha = textField(head, 'sha');
+        const headRef = textField(head, 'ref');
+        const baseRef = textField(recordField(item, 'base'), 'ref');
+        if (
+          typeof number !== 'number'
+          || headSha === undefined
+          || headRef === undefined
+          || baseRef === undefined
+        ) {
+          throw new Error(
+            'gh returned an open pull request without its number or its head and base references.',
+          );
+        }
+        result.push({ number, headRef, headSha, baseRef });
+      }
+      return result;
     },
 
     async mergeQueue(branch: string): Promise<MergeQueueEntry[]> {
