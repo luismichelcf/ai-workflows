@@ -102,9 +102,14 @@ interpreta la consola. Cada intento de leerla como la lee la consola dejó una f
 sueltas, `bash -c "…"`). La regla **sobreaproxima** sobre el texto entero, normalizado (sin
 continuaciones de línea, comillas, barras invertidas ni acentos graves): una orden que nombra `gh`,
 una revisión y algo con forma de aprobar, en cualquier parte, se rechaza; con receta rota, una orden
-que nombra `gh` y algo que escribe en GitHub, también. Puede rechazar una cadena inocente (el motivo
-pide separar las órdenes); nunca deja pasar una de estas por cómo se escribió, y responde en tiempo
-lineal. Una orden de más de 65 536 caracteres se rechaza sin leerla. **Es ayuda de nivel A y se
+que nombra `gh` y algo que publica texto en GitHub, también. Puede rechazar una cadena inocente (el
+motivo pide separar las órdenes) y responde en tiempo lineal; una orden de más de 65 536 caracteres
+se rechaza sin leerla. Cubre a quien escribe la orden **de forma directa**, en una o varias líneas,
+con comillas, redirecciones, sustituciones o `bash -c`; **no** a quien la disfraza a propósito
+(expansiones que parten una palabra, comodines, concatenación de PowerShell, codificaciones pasadas a
+otra consola, archivos de órdenes, alias de `gh`, otros programas como `node -e` o `curl`). Con receta
+rota, la lista es «lo que publica texto» (comentarios, revisiones, PRs e issues, `api` con escritura),
+no toda escritura de `gh` (`workflow run`, `secret set`, `repo …` pasan). **Es ayuda de nivel A y se
 declara así:** hay otras formas de aprobar (el navegador, otro
 programa, una orden disfrazada). El cierre real es el paso de instalación de R21 (la sesión del
 dueño fuera de la PC de los agentes); `doctor` ya avisa si la encuentra. La suite comprueba que

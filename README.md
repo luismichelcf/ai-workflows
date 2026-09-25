@@ -307,8 +307,14 @@ request whose paths cannot be read, or an internal error is a refusal, never a p
 false branch name get past them; the judge is the layer that holds (a pull request whose branch
 names no piece, or a piece without its evidence, is refused). If `node` itself is missing, the
 hook runs past its 30 seconds, or the process dies by a signal (out of memory), Claude Code lets
-the tool through. With a broken recipe the shell rule stops comments, reviews and `gh api` writes;
-other `gh` commands that write (`pr create`, `pr merge`, `pr edit`) are not judged there. Claude Code runs project hooks
+the tool through. The shell rule does not parse the shell: it refuses, on the whole normalized
+text, a command that names `gh`, a review and anything shaped like an approval (and, with a broken
+recipe, a command that names `gh` and anything that publishes text on GitHub). It may refuse an
+innocent chain (run the commands separately) and it stops a command written directly, in any number
+of lines, with quotes, redirections, substitutions or `bash -c`; it does not stop one disguised on
+purpose (an expansion that splits a word, globs, PowerShell concatenation, an encoded command piped
+to a shell, a script file, a `gh` alias, another program such as `node -e` or `curl`). A shell
+command over 64 KB is refused unread. Claude Code runs project hooks
 only in a folder it trusts. Codex and OpenCode are not covered yet: their builders are covered by
 the git hooks and the judge.
 

@@ -93,6 +93,31 @@ describe('with a broken recipe, writing on GitHub from the shell is refused howe
   });
 });
 
+describe('round 6: the GraphQL twin of the REST body file, the obvious disguises, and reading approvals', () => {
+  for (const command of [
+    'gh api graphql -F query=@q.graphql',
+    'gh api graphql --input q.json',
+    'gh pr re$()view 1 --approve',
+    'gh pr review 1 --approv$()e',
+    'g$()h pr review 1 --approve',
+    'gh pr re${x}view 1 --approve',
+    'cmd /c gh pr review 1 --appro^ve',
+    'cmd /c g^h pr review 1 --approve',
+  ]) {
+    it(`refuses ${JSON.stringify(command)}`, () => {
+      expect(decideToolUse(bash(command), withPiece).allow).toBe(false);
+    });
+  }
+
+  it('reading the reviews filtered by APPROVED is a read, not an approval', () => {
+    expect(decideToolUse(bash('gh api repos/o/r/pulls/5/reviews --jq \'.[] | select(.state=="APPROVED")\''), withPiece).allow).toBe(true);
+  });
+
+  it('git HEAD^ is not disturbed by removing the cmd escape', () => {
+    expect(decideToolUse(bash('git diff HEAD^ -- src && gh pr view 5'), withPiece).allow).toBe(true);
+  });
+});
+
 describe('what the over-approximation accepts and what it costs', () => {
   it('ordinary commands that do not approve pass', () => {
     for (const command of [
