@@ -13,7 +13,7 @@ import type { LockContext } from './editor.js';
 /** The order the judge's own change always knows, even when the recipe names no approval stage. */
 export const JUDGE_CHANGE_ORDER = '/approve-judge-change';
 /** The block default when an approval-comment stage names no command (`approval-comment@1`). */
-const DEFAULT_APPROVAL_COMMAND = '/visto-bueno';
+const DEFAULT_APPROVAL_COMMAND = '/approve';
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
   return typeof value === 'object' && value !== null ? (value as Record<string, unknown>) : undefined;

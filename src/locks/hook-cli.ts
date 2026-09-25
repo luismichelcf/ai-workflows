@@ -6,14 +6,16 @@
 // themselves stay in editor.ts and git.ts, which are pure.
 
 import { execFile } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { dirname, isAbsolute, join, resolve } from 'node:path';
+import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 
 import { childEnvironment } from '../git-env.js';
 import { parseRecipe } from '../recipe/parse.js';
 import type { Recipe } from '../recipe/types.js';
 import { lockContextFor } from './context.js';
+import { isUnder, readAbsolute } from './paths.js';
 import {
+  decideGitFolder,
   decideToolUse,
   isCoveredWriteTool,
   orderRefusal,
@@ -48,6 +50,8 @@ export interface RunHookOptions {
   readonly cwd: string;
   readonly stdin: string;
   readonly argv?: readonly string[];
+  /** The git executable, by default `git`. A caller may point at one that does not answer. */
+  readonly gitPath?: string;
 }
 
 export interface HookResult {
@@ -72,17 +76,23 @@ const GIT_BIN_ARGS: readonly string[] = ['node', 'node_modules/ai-workflows/dist
 
 /**
  * The fixed line the Claude hook runs with `node -e`. It takes the project folder as its first
- * argument, imports the compiled engine from `<project>/node_modules/ai-workflows/dist/bin.js`
- * (converted to a file URL so the same line works on Windows) and, if the engine is missing or
- * throws while loading, writes the reason to stderr and exits 2 — which Claude Code reads as a
- * block. A path never appears in any written file: the folder arrives as an argument.
+ * argument (falling back to `CLAUDE_PROJECT_DIR` when it is absent), imports the compiled engine
+ * from `<project>/node_modules/ai-workflows/dist/bin.js` (converted to a file URL so the same line
+ * works on Windows) and, if the engine is missing or throws while loading, writes the reason to
+ * stderr and exits 2 — which Claude Code reads as a block. Every exit other than 0 or 2 becomes 2,
+ * so an older engine that answers with an error can never let the tool through. A path never
+ * appears in any written file: the folder arrives as an argument.
  */
 export const HOOK_LOADER =
-  "const u=require('url'),p=require('path'),d=process.argv[1];" +
+  "try{" +
+  "var u=require('url'),p=require('path'),d=process.argv[1]||process.env.CLAUDE_PROJECT_DIR;" +
   "process.env.AI_WORKFLOWS_PROJECT_DIR=d;" +
+  "process.on('exit',function(c){if(c!==0&&c!==2)process.exit(2);});" +
   "import(u.pathToFileURL(p.join(d,'node_modules','ai-workflows','dist','bin.js')).href)" +
   ".catch(function(e){process.stderr.write('ai-workflows: no se pudo cargar el motor: '" +
-  "+(e&&e.message?e.message:e)+'\\n');process.exit(2);});";
+  "+(e&&e.message?e.message:e)+'\\n');process.exit(2);});" +
+  "}catch(e){process.stderr.write('ai-workflows: no se pudo cargar el motor: '" +
+  "+(e&&e.message?e.message:e)+'\\n');process.exit(2);}";
 
 interface GitResult {
   readonly ok: boolean;
@@ -90,10 +100,10 @@ interface GitResult {
   readonly stderr: string;
 }
 
-function runGit(cwd: string, args: readonly string[]): Promise<GitResult> {
+function runGit(cwd: string, args: readonly string[], gitPath = 'git'): Promise<GitResult> {
   return new Promise((done) => {
     execFile(
-      'git',
+      gitPath,
       [...args],
       {
         cwd,
@@ -122,23 +132,62 @@ interface WorkCopy {
   readonly root: string;
   /** The common git directory, folded for comparison: two worktrees share it, another repo does not. */
   readonly commonKey: string;
+  /** The common git directory, as git reports it. */
+  readonly commonDir: string;
+  /** This working copy's own git directory (`--absolute-git-dir`). */
+  readonly gitDir: string;
   readonly branch: string | undefined;
 }
 
-/** The working copy that contains `dir`, or `undefined` when `dir` is in no repository. */
-async function workCopyAt(dir: string): Promise<WorkCopy | undefined> {
-  const top = await runGit(dir, ['rev-parse', '--show-toplevel']);
+/** The working copy that contains `dir`, or `undefined` when `dir` is in no work tree. */
+async function workCopyAt(dir: string, gitPath = 'git'): Promise<WorkCopy | undefined> {
+  const top = await runGit(dir, ['rev-parse', '--show-toplevel'], gitPath);
   if (!top.ok || top.stdout.trim().length === 0) return undefined;
-  const common = await runGit(dir, ['rev-parse', '--path-format=absolute', '--git-common-dir']);
+  const common = await runGit(dir, ['rev-parse', '--path-format=absolute', '--git-common-dir'], gitPath);
   if (!common.ok || common.stdout.trim().length === 0) return undefined;
+  const gitDir = await runGit(dir, ['rev-parse', '--absolute-git-dir'], gitPath);
+  if (!gitDir.ok || gitDir.stdout.trim().length === 0) return undefined;
 
   const root = top.stdout.trim();
-  const branch = await runGit(root, ['symbolic-ref', '--short', '-q', 'HEAD']);
+  const branch = await runGit(root, ['symbolic-ref', '--short', '-q', 'HEAD'], gitPath);
   return {
     root,
     commonKey: fold(resolve(common.stdout.trim())),
+    commonDir: resolve(common.stdout.trim()),
+    gitDir: resolve(gitDir.stdout.trim()),
     branch: branch.ok && branch.stdout.trim().length > 0 ? branch.stdout.trim() : undefined,
   };
+}
+
+/**
+ * The working copy that owns a path inside the repository's own git area (PLAN-13-R5 §1.2), or
+ * `undefined` when the path is not in this repository's git area. Git refuses `--show-toplevel`
+ * inside `.git`, so those paths would otherwise read as "outside any repository" and let an agent
+ * rewrite the configuration or switch the hooks off. A linked worktree keeps the path of its own
+ * work tree in `<common>/worktrees/<name>/gitdir`, so the ruling copy is that one, not the session.
+ */
+async function workCopyOwningGitPath(
+  target: string,
+  watched: WorkCopy,
+  gitPath: string,
+): Promise<WorkCopy | undefined> {
+  const targetAbs = readAbsolute(target);
+  const common = readAbsolute(watched.commonDir);
+  if (!targetAbs.ok || !common.ok || !isUnder(targetAbs.path, common.path)) return undefined;
+
+  const rel = relative(watched.commonDir, targetAbs.path.display).split(/[\\/]+/);
+  if (rel[0] === 'worktrees' && rel[1] !== undefined && rel[1].length > 0) {
+    try {
+      const pointer = readFileSync(join(watched.commonDir, 'worktrees', rel[1], 'gitdir'), 'utf8').trim();
+      if (pointer.length > 0) {
+        const owner = await workCopyAt(dirname(resolve(pointer)), gitPath);
+        if (owner !== undefined) return owner;
+      }
+    } catch {
+      // No readable pointer: fall through to the main working copy, which shares the same repo.
+    }
+  }
+  return await workCopyAt(dirname(watched.commonDir), gitPath);
 }
 
 interface RecipeReading {
@@ -169,7 +218,7 @@ function readRecipe(root: string): RecipeReading | { readonly ok: false; readonl
   return { ok: true, recipe: parsed.recipe };
 }
 
-async function contextForCopy(copy: WorkCopy): Promise<LockContext> {
+function contextForCopy(copy: WorkCopy): LockContext {
   const read = readRecipe(copy.root);
   return lockContextFor({
     root: copy.root,
@@ -200,7 +249,17 @@ function editorOutput(decision: LockDecision): HookResult {
   return { stdout: out.stdout, stderr: '', exitCode: out.exitCode };
 }
 
+/** The real path of an existing folder, or the same spelling when it cannot be resolved. */
+function realPathOf(value: string): string {
+  try {
+    return realpathSync(value);
+  } catch {
+    return value;
+  }
+}
+
 async function runEditor(options: RunHookOptions): Promise<HookResult> {
+  const gitPath = options.gitPath ?? 'git';
   const parsed = parseHookInput(options.stdin);
   if ('error' in parsed) {
     return editorOutput({
@@ -209,7 +268,7 @@ async function runEditor(options: RunHookOptions): Promise<HookResult> {
     });
   }
 
-  const watched = await workCopyAt(options.projectDir);
+  const watched = await workCopyAt(options.projectDir, gitPath);
   if (watched === undefined) {
     return editorOutput({
       allow: false,
@@ -219,7 +278,7 @@ async function runEditor(options: RunHookOptions): Promise<HookResult> {
     });
   }
 
-  const sessionContext = await contextForCopy(watched);
+  const sessionContext = contextForCopy(watched);
 
   // Rule 0 once on the whole request: writing an order is refused wherever the target folder is.
   const order = orderRefusal(parsed, sessionContext);
@@ -228,7 +287,9 @@ async function runEditor(options: RunHookOptions): Promise<HookResult> {
   if (!isCoveredWriteTool(parsed.toolName)) return { stdout: '', stderr: '', exitCode: 0 };
 
   const targets = writeTargets(parsed.toolName, parsed.toolInput);
-  if (targets === undefined) {
+  // A writing tool whose paths cannot be read is refused, exactly like rule 5: an empty patch is
+  // not "nothing to judge" but a request the lock could not read.
+  if (targets === undefined || targets.length === 0) {
     return editorOutput({
       allow: false,
       reason:
@@ -236,23 +297,37 @@ async function runEditor(options: RunHookOptions): Promise<HookResult> {
         'formato de tool_input.',
     });
   }
-  if (targets.length === 0) return { stdout: '', stderr: '', exitCode: 0 };
 
   for (const target of targets) {
     const absolute = resolveTarget(target, parsed.cwd);
-    const copy = await workCopyAt(nearestExistingDir(absolute));
-    // Not in any repository, or in another one: not this lock's business (rule 6).
-    if (copy === undefined || copy.commonKey !== watched.commonKey) continue;
+    // The nearest existing folder is resolved through any link first: a shortcut into the project
+    // is judged by where it leads, not by the name it was reached through.
+    const nearest = nearestExistingDir(absolute);
+    const realNearest = realPathOf(nearest);
+    const rest = relative(nearest, absolute);
+    const judged = rest.length === 0 ? realNearest : join(realNearest, rest);
 
-    const context = await contextForCopy(copy);
+    const copy = await workCopyAt(realNearest, gitPath);
+    if (copy === undefined) {
+      // Not in a work tree: it may still be the repository's own git area, which git refuses to
+      // call a work tree. That is this lock's business, judged with the copy that owns it.
+      const owner = await workCopyOwningGitPath(judged, watched, gitPath);
+      if (owner === undefined) continue;
+      const decision = decideGitFolder(contextForCopy(owner));
+      if (!decision.allow) return editorOutput(decision);
+      continue;
+    }
+    // In another repository: not this lock's business (rule 6).
+    if (copy.commonKey !== watched.commonKey) continue;
+
     // The folder rules are decided with the copy that holds the path; only the path matters here,
     // because rule 0 already ran on the whole request above.
     const single: HookInput = {
       toolName: 'Write',
-      toolInput: { file_path: target, content: '' },
+      toolInput: { file_path: judged, content: '' },
       cwd: parsed.cwd,
     };
-    const decision = decideToolUse(single, context);
+    const decision = decideToolUse(single, contextForCopy(copy));
     if (!decision.allow) return editorOutput(decision);
   }
 
@@ -260,7 +335,8 @@ async function runEditor(options: RunHookOptions): Promise<HookResult> {
 }
 
 async function runPreCommit(options: RunHookOptions): Promise<HookResult> {
-  const copy = await workCopyAt(options.cwd);
+  const gitPath = options.gitPath ?? 'git';
+  const copy = await workCopyAt(options.cwd, gitPath);
   if (copy === undefined) {
     return {
       stdout: '',
@@ -269,19 +345,20 @@ async function runPreCommit(options: RunHookOptions): Promise<HookResult> {
     };
   }
 
-  const staged = await runGit(copy.root, STAGED_PATHS_GIT_ARGS);
+  const staged = await runGit(copy.root, STAGED_PATHS_GIT_ARGS, gitPath);
   if (!staged.ok) {
     return { stdout: '', stderr: `No pude leer lo preparado: ${staged.stderr.trim()}`, exitCode: 1 };
   }
 
-  const context = await contextForCopy(copy);
+  const context = contextForCopy(copy);
   const decision = decidePreCommit({ stagedPaths: parseStagedPaths(staged.stdout), context });
   if (decision.allow) return { stdout: '', stderr: '', exitCode: 0 };
   return { stdout: '', stderr: decision.reason, exitCode: 1 };
 }
 
 async function runPrePush(options: RunHookOptions): Promise<HookResult> {
-  const copy = await workCopyAt(options.cwd);
+  const gitPath = options.gitPath ?? 'git';
+  const copy = await workCopyAt(options.cwd, gitPath);
   if (copy === undefined) {
     return {
       stdout: '',
@@ -291,7 +368,7 @@ async function runPrePush(options: RunHookOptions): Promise<HookResult> {
   }
 
   // Without the network: the default branch is what `origin/HEAD` already says.
-  const head = await runGit(copy.root, ['symbolic-ref', '-q', '--short', 'refs/remotes/origin/HEAD']);
+  const head = await runGit(copy.root, ['symbolic-ref', '-q', '--short', 'refs/remotes/origin/HEAD'], gitPath);
   if (!head.ok || head.stdout.trim().length === 0) {
     return {
       stdout: '',

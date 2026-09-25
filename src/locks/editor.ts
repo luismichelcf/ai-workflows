@@ -96,16 +96,25 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
 export const SHELL_TOOLS = new Set(['Bash', 'PowerShell', 'Monitor']);
 /** Without a recipe the lock knows only the v0.3.0 order, so old callers keep working. */
 const DEFAULT_OWNER_ORDERS: readonly string[] = ['/visto-bueno'];
+/** The `gh` binary, plain or `.exe`, reached directly or through a quoted path (PLAN-13-R5 §1.3). */
+const GH_BIN = String.raw`(?:^|[\s"'\\/])gh(?:\.exe)?["']?`;
 /** The terminal forms a person uses to approve a pull request (PLAN-13-R5 §1.3). */
-const PULL_REQUEST_REVIEW = /\bgh\s+pr\s+review\b/;
+const PULL_REQUEST_REVIEW = new RegExp(`${GH_BIN}\\s+pr\\s+review\\b`, 'i');
 const REVIEW_APPROVE_FLAG = /(^|\s)(--approve|-a)(\s|$)/;
 const API_PULL_REVIEWS = /pulls\/\d+\/reviews/;
+/** A body sent to the reviews endpoint: its content cannot be read here, so it is refused. */
+const API_REVIEWS_INPUT = /(^|\s)--input(\s|$)/;
+const API_REVIEWS_APPROVE = /approve/i;
+/** The GraphQL mutation that approves a pull request. */
+const GRAPHQL_ADD_REVIEW = /addPullRequestReview\b/i;
 /** Publishing to GitHub from the shell, the strict rule of a broken recipe (§1.4). */
-const GH_PR_COMMENT = /\bgh\s+pr\s+comment\b/;
-const GH_ISSUE_COMMENT = /\bgh\s+issue\s+comment\b/;
-const GH_API = /\bgh\s+api\b/;
-const API_METHOD = /(?:-x|--method)\s+(\S+)/i;
-const API_SENDS_FIELDS = /(^|\s)(-f|--field|--input)(\s|$)/;
+const GH_PR_COMMENT = new RegExp(`${GH_BIN}\\s+pr\\s+comment\\b`, 'i');
+const GH_ISSUE_COMMENT = new RegExp(`${GH_BIN}\\s+issue\\s+comment\\b`, 'i');
+const GH_API = new RegExp(`${GH_BIN}\\s+api\\b`, 'i');
+/** Any spelling of the method flag: `-X GET`, `-XPOST`, `--method=POST`, `--method PATCH`. */
+const API_METHOD = /(?:-x|--method)\s*=?\s*(\S+)/i;
+/** Any spelling of a field flag, attached or not: `-f body=`, `-fbody=`, `-F=body=`, `--raw-field`. */
+const API_SENDS_FIELDS = /(^|\s)(-f|-F)(\S*)(?=\s|$)|(^|\s)(--field|--raw-field|--input)(=|\s|$)/i;
 /** A line the server reads as any order: `/word value`, the shape of every approval. */
 const ORDER_SHAPED_LINE = /^\/(\S+)\s+(\S.*)$/;
 
@@ -149,7 +158,11 @@ function writesOrderShapedLine(text: string, stripPlus: boolean): boolean {
 /** True when a shell command asks GitHub to approve a pull request. */
 function approvesPullRequest(command: string): boolean {
   if (PULL_REQUEST_REVIEW.test(command) && REVIEW_APPROVE_FLAG.test(command)) return true;
-  return GH_API.test(command) && API_PULL_REVIEWS.test(command) && /approve/i.test(command);
+  if (!GH_API.test(command)) return false;
+  if (API_PULL_REVIEWS.test(command) && (API_REVIEWS_INPUT.test(command) || API_REVIEWS_APPROVE.test(command))) {
+    return true;
+  }
+  return GRAPHQL_ADD_REVIEW.test(command) && API_REVIEWS_APPROVE.test(command);
 }
 
 /** True when a shell command publishes something on GitHub (broken-recipe mode). */
@@ -268,6 +281,21 @@ function ownerRuleRefusal(toolName: string, toolInput: unknown, context: LockCon
   return texts.some(({ text, stripPlus }) => writesOwnerOrderLine(text, stripPlus, orders))
     ? order
     : undefined;
+}
+
+/**
+ * PLAN-13-R5 §1.2: a path inside the git area of a working copy. Git refuses to call that a work
+ * tree, so the path rules cannot read it; the copy's own context decides. A broken recipe refuses
+ * it, a piece or `/libre` allows it, and without a piece it is refused like code would be.
+ */
+export function decideGitFolder(context: LockContext): LockDecision {
+  if (context.brokenRecipe !== undefined) return { allow: false, reason: brokenRecipeReason(context) };
+  if (context.activePiece || context.libre) return { allow: true };
+  return {
+    allow: false,
+    reason:
+      'La carpeta interna de git no se escribe sin una pieza activa: abre una o usa /libre para prototipos.',
+  };
 }
 
 /** What to say in broken-recipe mode: the problem, and the only door that stays open. */

@@ -68,7 +68,9 @@ const EXPLAIN_WORDS: Record<Language, ExplainWords> = {
     declaredKind: (line, file) =>
       `Su tipo de cambio lo declara la línea «${line}» de «${file}».`,
     noPiece: (papers) =>
-      `Sin una pieza activa solo se puede escribir en: ${papers.join(', ')}`,
+      papers.length === 0
+        ? 'Sin una pieza activa no se puede escribir en ninguna carpeta'
+        : `Sin una pieza activa solo se puede escribir en: ${papers.join(', ')}`,
     github: {
       recompute: '   En GitHub: se vuelve a comprobar antes de fusionar.',
       'require-check':
@@ -123,7 +125,9 @@ const EXPLAIN_WORDS: Record<Language, ExplainWords> = {
     declaredKind: (line, file) =>
       `Its kind of change is declared by the line "${line}" of "${file}".`,
     noPiece: (papers) =>
-      `Without an active piece, the only folders you may write to are: ${papers.join(', ')}`,
+      papers.length === 0
+        ? 'Without an active piece, no folder may be written to'
+        : `Without an active piece, the only folders you may write to are: ${papers.join(', ')}`,
     github: {
       recompute: '   On GitHub: checked again before joining the main line.',
       'require-check':
@@ -222,7 +226,7 @@ export function explainRecipe(recipe: Recipe): string {
     if (declared !== undefined) lines.push(words.declaredKind(declared.line, declared.file));
   }
 
-  if (recipe.hooks !== undefined && recipe.hooks.papers.length > 0) {
+  if (recipe.hooks !== undefined) {
     lines.push('', words.noPiece(recipe.hooks.papers));
   }
 

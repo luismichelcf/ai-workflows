@@ -29,6 +29,7 @@ import { compileRecipe, runProviderInGroup } from '../recipe/compile.js';
 import { recordCleanUpdate, verifyCleanUpdate } from '../recipe/validity.js';
 import { diskProjectFiles, type ChangeDeclared } from '../recipe/facts.js';
 import { pieceOfBranch, readDeclaredKind } from '../judge/pieces.js';
+import { HOOK_LOADER } from '../locks/hook-cli.js';
 import type { Recipe } from '../recipe/types.js';
 import type { ProviderRunner } from '../blocks/definition.js';
 import {
@@ -1189,31 +1190,47 @@ async function commandDoctor(deps: AgentCliDeps): Promise<CommandOutput> {
     );
   }
 
+  // Our entry is recognized by its exact command AND arguments: another hook that also runs
+  // `node` (or one that kept our command with foreign arguments) is never mistaken for ours.
+  const isOurEditorHook = (handler: { command?: unknown; args?: unknown }): boolean => {
+    if (handler.command !== 'node' || !Array.isArray(handler.args)) return false;
+    const args = handler.args.map((argument) => String(argument));
+    return args.length === 5
+      && args[0] === '-e'
+      && args[1] === HOOK_LOADER
+      && args[2] === '${CLAUDE_PROJECT_DIR}'
+      && args[3] === 'hook'
+      && args[4] === 'editor';
+  };
+
   let settingsHook = false;
+  let settingsUnreadable = false;
   try {
     const settings = JSON.parse(readFileSync(join(root, '.claude', 'settings.json'), 'utf8')) as {
       hooks?: { PreToolUse?: { hooks?: { command?: unknown; args?: unknown }[] }[] };
     };
     const groups = settings.hooks?.PreToolUse ?? [];
-    settingsHook = groups.some((group) =>
-      (group.hooks ?? []).some(
-        (handler) =>
-          handler.command === 'node' &&
-          Array.isArray(handler.args) &&
-          handler.args.includes('hook'),
-      ),
-    );
+    settingsHook = groups.some((group) => (group.hooks ?? []).some(isOurEditorHook));
   } catch {
-    settingsHook = false;
+    // A file that cannot be read is said as such, never as a missing hook: they are different
+    // problems and the owner fixes them differently.
+    settingsUnreadable = true;
   }
   const hooksPath = (await runGit(root, ['config', '--local', '--get', 'core.hooksPath'])).stdout.trim();
+  if (settingsUnreadable) {
+    lines.push(
+      es
+        ? 'No se pudo leer .claude/settings.json: revisa que sea un archivo JSON válido.'
+        : '.claude/settings.json could not be read: check that it is valid JSON.',
+    );
+  }
   if (settingsHook && hooksPath === '.ai-workflows/githooks') {
-    lines.push(es ? 'Ganchos del editor y de git: instalados.' : 'Editor and git hooks: installed.');
+    lines.push(es ? 'El gancho del editor y los de git: instalados.' : 'The editor hook and the git hooks: installed.');
   } else {
     lines.push(
       es
-        ? 'Ganchos del editor o de git: faltan. Ejecuta: ai-workflows hooks install --apply'
-        : 'Editor or git hooks: missing. Run: ai-workflows hooks install --apply',
+        ? 'El gancho del editor o los de git: faltan. Ejecuta: ai-workflows hooks install --apply'
+        : 'The editor hook or the git hooks: missing. Run: ai-workflows hooks install --apply',
     );
   }
 
