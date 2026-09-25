@@ -97,12 +97,11 @@ export const SHELL_TOOLS = new Set(['Bash', 'PowerShell', 'Monitor']);
 /** Without a recipe the lock knows only the v0.3.0 order, so old callers keep working. */
 const DEFAULT_OWNER_ORDERS: readonly string[] = ['/visto-bueno'];
 /**
- * The `gh` binary as a whole word, plain or `.exe`, reached directly or through a quoted path. `\b`
- * also sees it glued to a shell separator (`;gh`, `&&gh`, `|gh`, `(gh`, `$(gh`, a backquote), while
- * a word that merely ends in `gh` (`high`) has no boundary before it and is not the binary
- * (PLAN-13-R5 §1.3). What follows must be a shell delimiter, so `ghpr` is not read as the binary.
+ * PLAN-13-R5 §1.3 (round 4): a console order past this size is refused before any other reading, so
+ * the hook never spends its 30 s budget on a command too big to finish and Claude Code never lets it
+ * through by timeout. Fail closed: writing the reason is cheaper than reading the order.
  */
-const GH_BIN = /\bgh(?:\.exe)?["']?(?=[\s;&|`)$])/gi;
+const MAX_COMMAND_LENGTH = 65_536;
 /** The general options gh accepts with the next word as their value (`-R`, `--repo`, `--hostname`). */
 const GH_VALUE_GLOBALS = new Set(['-r', '--repo', '--hostname']);
 /** The reviews endpoint of a pull request, wherever in a `gh api` path it appears. */
@@ -113,18 +112,90 @@ const GRAPHQL_ADD_REVIEW = /(?:add|submit)PullRequestReview\b/i;
 const API_FIELD_FLAGS = new Set(['--field', '--raw-field', '--input']);
 /** A short flag group gh reads letter by letter (`-ab` is `-a -b`); a group with `a` approves. */
 const SHORT_FLAG_GROUP = /^-[A-Za-z]+$/;
+/**
+ * The tokens a shell reads as an order of its own, whatever glues them to the neighbouring word
+ * (`--approve;echo`, `-a&&`, `x=$(gh ...)`). A gh invocation ends here, so the next command's words
+ * can never be read as its flags (PLAN-13-R5 §1.3, round 4).
+ */
+const SHELL_SEPARATORS = new Set([';', '&&', '||', '&', '|', '<', '>', '(', ')', '$(', '`']);
+
+function isSeparator(token: string): boolean {
+  return SHELL_SEPARATORS.has(token);
+}
 
 /**
- * The words of one part of a shell command, stripped of the punctuation a shell glues to them
- * (`(gh ... )`, a trailing backquote). Only the words naming a flag or a path matter here, so the
- * tokenizer stays linear and does not try to be a shell: it splits on whitespace and trims the
- * surrounding `()`, quotes and separators (PLAN-13-R5 §1.3, round 3: no nested patterns).
+ * True when a token names the `gh` binary: the bare word, its `.exe`, or a path that ends in it
+ * (`/gh`, `\gh`, `/gh.exe`, `\gh.exe`). `high` ends in `gh` but not in a path to it, and `ghpr`
+ * does not end in it, so neither is the binary (PLAN-13-R5 §1.3).
  */
-function ghWords(rest: string): string[] {
-  return rest
-    .split(/\s+/)
-    .filter((word) => word.length > 0)
-    .map((word) => word.replace(/^[('"`$]+/, '').replace(/[)'"`;|&]+$/, ''));
+function isGhBinary(token: string): boolean {
+  const lower = token.toLowerCase();
+  if (lower === 'gh' || lower === 'gh.exe') return true;
+  return /[\\/]gh(?:\.exe)?$/.test(lower);
+}
+
+/**
+ * One linear pass over the command: split it into words on whitespace and into separator tokens on
+ * the console's order separators, even when glued to a word. Quotes group a word that contains
+ * spaces (a quoted path to `gh.exe`) and are removed. Backslash line continuations are dropped.
+ * No pattern backtracks here, so the cost is proportional to the command's length.
+ */
+function tokenizeShell(command: string): string[] {
+  const tokens: string[] = [];
+  let current = '';
+  let quote: string | undefined;
+  const flush = (): void => {
+    if (current.length > 0) {
+      tokens.push(current);
+      current = '';
+    }
+  };
+  for (let at = 0; at < command.length; at += 1) {
+    const ch = command[at];
+    if (ch === undefined) break;
+    if (quote !== undefined) {
+      if (ch === quote) {
+        quote = undefined;
+        continue;
+      }
+      current += ch;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      continue;
+    }
+    if (ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r') {
+      flush();
+      continue;
+    }
+    if (ch === '$' && command[at + 1] === '(') {
+      flush();
+      tokens.push('$(');
+      at += 1;
+      continue;
+    }
+    if (ch === '&' && command[at + 1] === '&') {
+      flush();
+      tokens.push('&&');
+      at += 1;
+      continue;
+    }
+    if (ch === '|' && command[at + 1] === '|') {
+      flush();
+      tokens.push('||');
+      at += 1;
+      continue;
+    }
+    if (ch === ';' || ch === '&' || ch === '|' || ch === '<' || ch === '>' || ch === '(' || ch === ')' || ch === '`') {
+      flush();
+      tokens.push(ch);
+      continue;
+    }
+    current += ch;
+  }
+  flush();
+  return tokens.filter((token) => token !== '\\');
 }
 
 interface GhInvocation {
@@ -136,36 +207,64 @@ interface GhInvocation {
 }
 
 /**
- * Every `gh` invocation of a command, parsed linearly: find the binary, split the rest into words,
- * and walk past the general options to the command. No pattern nests inside another, so the cost is
- * proportional to the command's length even with dozens of repeated options (PLAN-13-R5 §1.3).
+ * Walks past the general options gh accepts before its command and before its subcommand: `-R` /
+ * `--repo` / `--hostname` take the next word as their value unless they already carry it
+ * (`--repo=o/r`, `--hostname=x`); any other leading flag stands alone (PLAN-13-R5 §1.3, round 4).
+ */
+function skipGeneralOptions(words: readonly string[], at: number): number {
+  let cursor = at;
+  while (cursor < words.length) {
+    const word = (words[cursor] ?? '').toLowerCase();
+    if (!word.startsWith('-')) break;
+    const takesNext = GH_VALUE_GLOBALS.has(word) && !word.includes('=');
+    cursor += takesNext ? 2 : 1;
+  }
+  return cursor;
+}
+
+/**
+ * Every `gh` invocation of a command, parsed in one linear pass over the tokens: a token naming the
+ * binary opens an invocation, and the next separator closes it, so flags never leak from one
+ * command to the next. No pattern nests inside another (PLAN-13-R5 §1.3, round 4).
  */
 function ghInvocations(command: string): GhInvocation[] {
+  const tokens = tokenizeShell(command);
   const found: GhInvocation[] = [];
-  for (const match of command.matchAll(GH_BIN)) {
-    const words = ghWords(command.slice((match.index ?? 0) + match[0].length));
-    let at = 0;
-    // `-R`, `--repo` and `--hostname` take the next word as their value unless they already carry
-    // it (`--repo=o/r`, `-R=x`); every other leading word starting with `-` is a flag by itself.
-    while (at < words.length && (words[at] ?? '').startsWith('-')) {
-      const word = words[at] ?? '';
-      const takesNext = GH_VALUE_GLOBALS.has(word.toLowerCase()) && !word.includes('=');
-      at += takesNext ? 2 : 1;
+  let at = 0;
+  while (at < tokens.length) {
+    if (!isGhBinary(tokens[at] ?? '')) {
+      at += 1;
+      continue;
     }
-    const first = words[at]?.toLowerCase();
-    const second = words[at + 1]?.toLowerCase();
+    let end = at + 1;
+    while (end < tokens.length && !isSeparator(tokens[end] ?? '')) end += 1;
+    const words = tokens.slice(at + 1, end);
+    let cursor = skipGeneralOptions(words, 0);
+    const first = words[cursor]?.toLowerCase();
+    cursor += 1;
+    cursor = skipGeneralOptions(words, cursor);
+    const second = words[cursor]?.toLowerCase();
     found.push({
       words,
       ...(first === undefined ? {} : { command: first }),
       ...(second === undefined ? {} : { subcommand: second }),
     });
+    at = end;
   }
   return found;
 }
 
-/** True when a `gh pr review` word approves: `--approve`, `-a`, or a glued group that contains `a`. */
+/**
+ * True when a `gh pr review` word approves: `--approve`, `--approve=<any>`, `-a`, `-a=<any>`, or a
+ * short group gh reads letter by letter that contains `a` (`-ab`, `-ba`) (PLAN-13-R5 §1.3).
+ */
 function approvesReview(words: readonly string[]): boolean {
-  return words.some((word) => word === '--approve' || (SHORT_FLAG_GROUP.test(word) && word.includes('a')));
+  return words.some((word) => {
+    const lower = word.toLowerCase();
+    if (lower === '--approve' || lower.startsWith('--approve=')) return true;
+    if (lower.startsWith('-a=')) return true;
+    return SHORT_FLAG_GROUP.test(word) && lower.includes('a');
+  });
 }
 
 /** The method of a `gh api` call, as gh reads it: the LAST `-X`/`--method` of the command. */
@@ -243,14 +342,17 @@ function writesOrderShapedLine(text: string, stripPlus: boolean): boolean {
 
 /** True when a shell command asks GitHub to approve a pull request. */
 function approvesPullRequest(command: string): boolean {
+  // The plain-text searches look at the whole command; do them once, never per invocation.
+  const approvesText = /approve/i.test(command);
+  const graphqlReview = GRAPHQL_ADD_REVIEW.test(command);
   for (const invocation of ghInvocations(command)) {
     if (invocation.command === 'pr' && invocation.subcommand === 'review' && approvesReview(invocation.words)) {
       return true;
     }
     if (invocation.command === 'api') {
       const hasReviewsPath = invocation.words.some((word) => PULL_REVIEWS_PATH.test(word));
-      if (hasReviewsPath && (apiSendsFields(invocation.words) || /approve/i.test(command))) return true;
-      if (GRAPHQL_ADD_REVIEW.test(command) && /approve/i.test(command)) return true;
+      if (hasReviewsPath && (apiSendsFields(invocation.words) || approvesText)) return true;
+      if (graphqlReview && approvesText) return true;
     }
   }
   return false;
@@ -321,6 +423,20 @@ function fileSignOffTexts(toolName: string, toolInput: unknown): SignOffText[] |
 }
 
 /**
+ * PLAN-13-R5 §1.3 (round 4): refuse a console order past the size limit before reading it, so the
+ * hook fails closed instead of running past its time and being let through by the CLI.
+ */
+function tooLongCommand(command: string): LockDecision | undefined {
+  if (command.length <= MAX_COMMAND_LENGTH) return undefined;
+  return {
+    allow: false,
+    reason:
+      `La orden de consola es demasiado larga para revisarla (${command.length} caracteres, el tope ` +
+      `es ${MAX_COMMAND_LENGTH}). Me niego en vez de dejarla pasar a ciegas.`,
+  };
+}
+
+/**
  * Rule 0 of the editor hook: no tool call writes one of the owner's approval orders itself, and no
  * shell approves a pull request. The orders come from the recipe (`context.ownerOrders`); without
  * them the v0.3.0 behaviour is kept exactly. Returns `undefined` when the call may continue.
@@ -352,6 +468,9 @@ function ownerRuleRefusal(toolName: string, toolInput: unknown, context: LockCon
           'No pude leer el comando de esta herramienta: el candado se niega a adivinar si iba a escribir una orden del dueño. Revisa el formato de tool_input.',
       };
     }
+    // Too big to read within the hook's time: refuse before any other analysis, never slowly.
+    const tooLong = tooLongCommand(command);
+    if (tooLong !== undefined) return tooLong;
     // Shell text can fill a placeholder in before GitHub sees it, so any appearance is refused.
     const lower = command.toLowerCase();
     if (orders.some((entry) => lower.includes(entry.toLowerCase()))) return order;
@@ -416,6 +535,8 @@ function brokenOrderRefusal(input: HookInput, context: LockContext): LockDecisio
     if (typeof command !== 'string') {
       return { allow: false, reason: brokenRecipeReason(context) };
     }
+    const tooLong = tooLongCommand(command);
+    if (tooLong !== undefined) return tooLong;
     return publishesToGitHub(command) ? { allow: false, reason: brokenRecipeReason(context) } : undefined;
   }
 
