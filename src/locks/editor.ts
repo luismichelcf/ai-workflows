@@ -102,204 +102,71 @@ const DEFAULT_OWNER_ORDERS: readonly string[] = ['/visto-bueno'];
  * through by timeout. Fail closed: writing the reason is cheaper than reading the order.
  */
 const MAX_COMMAND_LENGTH = 65_536;
-/** The general options gh accepts with the next word as their value (`-R`, `--repo`, `--hostname`). */
-const GH_VALUE_GLOBALS = new Set(['-r', '--repo', '--hostname']);
-/** The reviews endpoint of a pull request, wherever in a `gh api` path it appears. */
-const PULL_REVIEWS_PATH = /pulls\/\d+\/reviews/i;
-/** The GraphQL mutations that add or submit a pull request review. */
-const GRAPHQL_ADD_REVIEW = /(?:add|submit)PullRequestReview\b/i;
-/** A body sent by a `gh api` call: the field flags, attached or not (`--raw-field`, `--input`). */
-const API_FIELD_FLAGS = new Set(['--field', '--raw-field', '--input']);
+/**
+ * PLAN-13-R5 §1.3 (round 5): the console is not parsed any more. Every attempt to read an order the
+ * way the shell reads it left a new way through (a line break, a redirection in the middle, a
+ * command substitution, PowerShell's line continuation, a stray quote, `bash -c "…"`). The rule
+ * OVER-APPROXIMATES on the whole text instead: a command that names `gh` and carries an
+ * approval-shaped flag, anywhere, is refused. It may refuse an innocent chain (the reason asks to
+ * run the orders separately); it never lets one of these through because of how it was written, and
+ * it answers in linear time.
+ */
+
+/**
+ * The command with the console's quoting and line continuations removed, so the whole-text searches
+ * see one flat line. `\` + end of line and backtick + end of line join the two lines first; then the
+ * remaining `\`, backtick, `'` and `"` are dropped. No pattern backtracks: the cost is linear.
+ */
+function normalizedCommand(command: string): string {
+  return command
+    .replace(/\\\r?\n/g, '')
+    .replace(/`\r?\n/g, '')
+    .replace(/['"`\\]/g, '');
+}
+
+/** The word `gh`, or `gh.exe` wherever it appears; `high` and `ghpr` are not it (PLAN-13-R5 §1.3). */
+const NAMES_GH = /\bgh\b|gh\.exe/i;
+/** The word `review` of `gh pr review`; `/reviews` does not count here (it has its own rule). */
+const WORD_REVIEW = /\breview\b/i;
+/** `--approve`, with or without a value (`--approve=true`). */
+const LONG_APPROVE = /--approve(?:=|\b)/i;
 /** A short flag group gh reads letter by letter (`-ab` is `-a -b`); a group with `a` approves. */
-const SHORT_FLAG_GROUP = /^-[A-Za-z]+$/;
-/**
- * The tokens a shell reads as an order of its own, whatever glues them to the neighbouring word
- * (`--approve;echo`, `-a&&`, `x=$(gh ...)`). A gh invocation ends here, so the next command's words
- * can never be read as its flags (PLAN-13-R5 §1.3, round 4).
- */
-const SHELL_SEPARATORS = new Set([';', '&&', '||', '&', '|', '<', '>', '(', ')', '$(', '`']);
-
-function isSeparator(token: string): boolean {
-  return SHELL_SEPARATORS.has(token);
-}
-
-/**
- * True when a token names the `gh` binary: the bare word, its `.exe`, or a path that ends in it
- * (`/gh`, `\gh`, `/gh.exe`, `\gh.exe`). `high` ends in `gh` but not in a path to it, and `ghpr`
- * does not end in it, so neither is the binary (PLAN-13-R5 §1.3).
- */
-function isGhBinary(token: string): boolean {
-  const lower = token.toLowerCase();
-  if (lower === 'gh' || lower === 'gh.exe') return true;
-  return /[\\/]gh(?:\.exe)?$/.test(lower);
-}
+const SHORT_APPROVE = /(?<![A-Za-z0-9_-])-[A-Za-z]*a[A-Za-z]*/;
+/** The reviews endpoint of a pull request, wherever in a `gh api` path it appears. */
+const REVIEWS_PATH = /\/reviews\b/i;
+/** A body sent to the reviews endpoint (`--input`), the second shape the reviews rule refuses. */
+const INPUT_FLAG = /--input(?:=|\b)/i;
+/** The GraphQL mutations that add or submit a pull request review. */
+const GRAPHQL_APPROVE = /(?:add|submit)PullRequestReview\b/i;
+/** The word APPROVE, whatever its case, as the reviews and GraphQL rules read it. */
+const WORD_APPROVE = /approve/i;
+/** The gh subcommands that write on GitHub; broken-recipe mode refuses any of them (§1.4). */
+const WRITE_WORDS = /\b(?:comment|review|create|merge|edit|close|delete|reopen|ready)\b/i;
+/** The word `api` of `gh api`, the other subcommand that can write. */
+const WORD_API = /\bapi\b/i;
+/** A `gh api` field flag, attached or not (`-f body=`, `-fbody=`, `-F=body=`). */
+const SHORT_FIELD = /(?<![A-Za-z0-9_-])-[fF]/;
+/** The long field flags of `gh api` (`--field`, `--raw-field`, `--input`), attached or not. */
+const LONG_FIELD = /--(?:field|raw-field|input)(?:=|\b)/i;
 
 /**
- * One linear pass over the command: split it into words on whitespace and into separator tokens on
- * the console's order separators, even when glued to a word. Quotes group a word that contains
- * spaces (a quoted path to `gh.exe`) and are removed. Backslash line continuations are dropped.
- * No pattern backtracks here, so the cost is proportional to the command's length.
+ * True when a `gh api` call names a method other than GET. The alternatives (`--method` and a short
+ * `-x`/`-X`) do not overlap and each captures its value, so the scan stays linear (PLAN-13-R5 §1.3).
  */
-function tokenizeShell(command: string): string[] {
-  const tokens: string[] = [];
-  let current = '';
-  let quote: string | undefined;
-  const flush = (): void => {
-    if (current.length > 0) {
-      tokens.push(current);
-      current = '';
-    }
-  };
-  for (let at = 0; at < command.length; at += 1) {
-    const ch = command[at];
-    if (ch === undefined) break;
-    if (quote !== undefined) {
-      if (ch === quote) {
-        quote = undefined;
-        continue;
-      }
-      current += ch;
-      continue;
-    }
-    if (ch === '"' || ch === "'") {
-      quote = ch;
-      continue;
-    }
-    if (ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r') {
-      flush();
-      continue;
-    }
-    if (ch === '$' && command[at + 1] === '(') {
-      flush();
-      tokens.push('$(');
-      at += 1;
-      continue;
-    }
-    if (ch === '&' && command[at + 1] === '&') {
-      flush();
-      tokens.push('&&');
-      at += 1;
-      continue;
-    }
-    if (ch === '|' && command[at + 1] === '|') {
-      flush();
-      tokens.push('||');
-      at += 1;
-      continue;
-    }
-    if (ch === ';' || ch === '&' || ch === '|' || ch === '<' || ch === '>' || ch === '(' || ch === ')' || ch === '`') {
-      flush();
-      tokens.push(ch);
-      continue;
-    }
-    current += ch;
+function apiWritesMethod(text: string): boolean {
+  const pattern = /--method(?:[\s=]+)(\S+)|(?<![A-Za-z0-9_-])-[xX](?:[\s=]*)(\S+)/g;
+  for (const match of text.matchAll(pattern)) {
+    const value = match[1] ?? match[2];
+    if (value !== undefined && value.toUpperCase() !== 'GET') return true;
   }
-  flush();
-  return tokens.filter((token) => token !== '\\');
+  return false;
 }
 
-interface GhInvocation {
-  /** The command group gh reads first (`pr`, `api`, `issue`), lowercased. */
-  readonly command?: string;
-  readonly subcommand?: string;
-  /** Every word after the binary, the general options included. */
-  readonly words: readonly string[];
+/** True when a `gh api` call carries a write: a field flag or a method other than GET. */
+function apiWrites(text: string): boolean {
+  return SHORT_FIELD.test(text) || LONG_FIELD.test(text) || apiWritesMethod(text);
 }
 
-/**
- * Walks past the general options gh accepts before its command and before its subcommand: `-R` /
- * `--repo` / `--hostname` take the next word as their value unless they already carry it
- * (`--repo=o/r`, `--hostname=x`); any other leading flag stands alone (PLAN-13-R5 §1.3, round 4).
- */
-function skipGeneralOptions(words: readonly string[], at: number): number {
-  let cursor = at;
-  while (cursor < words.length) {
-    const word = (words[cursor] ?? '').toLowerCase();
-    if (!word.startsWith('-')) break;
-    const takesNext = GH_VALUE_GLOBALS.has(word) && !word.includes('=');
-    cursor += takesNext ? 2 : 1;
-  }
-  return cursor;
-}
-
-/**
- * Every `gh` invocation of a command, parsed in one linear pass over the tokens: a token naming the
- * binary opens an invocation, and the next separator closes it, so flags never leak from one
- * command to the next. No pattern nests inside another (PLAN-13-R5 §1.3, round 4).
- */
-function ghInvocations(command: string): GhInvocation[] {
-  const tokens = tokenizeShell(command);
-  const found: GhInvocation[] = [];
-  let at = 0;
-  while (at < tokens.length) {
-    if (!isGhBinary(tokens[at] ?? '')) {
-      at += 1;
-      continue;
-    }
-    let end = at + 1;
-    while (end < tokens.length && !isSeparator(tokens[end] ?? '')) end += 1;
-    const words = tokens.slice(at + 1, end);
-    let cursor = skipGeneralOptions(words, 0);
-    const first = words[cursor]?.toLowerCase();
-    cursor += 1;
-    cursor = skipGeneralOptions(words, cursor);
-    const second = words[cursor]?.toLowerCase();
-    found.push({
-      words,
-      ...(first === undefined ? {} : { command: first }),
-      ...(second === undefined ? {} : { subcommand: second }),
-    });
-    at = end;
-  }
-  return found;
-}
-
-/**
- * True when a `gh pr review` word approves: `--approve`, `--approve=<any>`, `-a`, `-a=<any>`, or a
- * short group gh reads letter by letter that contains `a` (`-ab`, `-ba`) (PLAN-13-R5 §1.3).
- */
-function approvesReview(words: readonly string[]): boolean {
-  return words.some((word) => {
-    const lower = word.toLowerCase();
-    if (lower === '--approve' || lower.startsWith('--approve=')) return true;
-    if (lower.startsWith('-a=')) return true;
-    return SHORT_FLAG_GROUP.test(word) && lower.includes('a');
-  });
-}
-
-/** The method of a `gh api` call, as gh reads it: the LAST `-X`/`--method` of the command. */
-function lastApiMethod(words: readonly string[]): string | undefined {
-  let method: string | undefined;
-  for (let at = 0; at < words.length; at += 1) {
-    const word = words[at] ?? '';
-    const lower = word.toLowerCase();
-    if (lower === '-x' || lower === '--method') {
-      method = words[at + 1];
-      at += 1;
-    } else if (lower.startsWith('-x') && word.length > 2) {
-      method = word.slice(2);
-    } else if (lower.startsWith('--method=')) {
-      method = word.slice('--method='.length);
-    }
-  }
-  return method;
-}
-
-/** True when a `gh api` call sends a body: a field flag, attached or not (`-fbody=`, `-F=body=`). */
-function apiSendsFields(words: readonly string[]): boolean {
-  return words.some((word) => {
-    const lower = word.toLowerCase();
-    if (lower.startsWith('-f') && !lower.startsWith('--')) return true;
-    if (
-      lower.startsWith('--field=') ||
-      lower.startsWith('--raw-field=') ||
-      lower.startsWith('--input=')
-    ) {
-      return true;
-    }
-    return API_FIELD_FLAGS.has(lower);
-  });
-}
 /** A line the server reads as any order: `/word value`, the shape of every approval. */
 const ORDER_SHAPED_LINE = /^\/(\S+)\s+(\S.*)$/;
 
@@ -340,41 +207,29 @@ function writesOrderShapedLine(text: string, stripPlus: boolean): boolean {
   });
 }
 
-/** True when a shell command asks GitHub to approve a pull request. */
+/**
+ * True when a shell command asks GitHub to approve a pull request, read as an over-approximation on
+ * the whole normalized text (PLAN-13-R5 §1.3, round 5): it names `gh` and any of the three shapes
+ * of an approval is present.
+ */
 function approvesPullRequest(command: string): boolean {
-  // The plain-text searches look at the whole command; do them once, never per invocation.
-  const approvesText = /approve/i.test(command);
-  const graphqlReview = GRAPHQL_ADD_REVIEW.test(command);
-  for (const invocation of ghInvocations(command)) {
-    if (invocation.command === 'pr' && invocation.subcommand === 'review' && approvesReview(invocation.words)) {
-      return true;
-    }
-    if (invocation.command === 'api') {
-      const hasReviewsPath = invocation.words.some((word) => PULL_REVIEWS_PATH.test(word));
-      if (hasReviewsPath && (apiSendsFields(invocation.words) || approvesText)) return true;
-      if (graphqlReview && approvesText) return true;
-    }
+  const text = normalizedCommand(command);
+  if (!NAMES_GH.test(text)) return false;
+  // A review stage with an approval-shaped flag, wherever the flag lives.
+  if (WORD_REVIEW.test(text) && (LONG_APPROVE.test(text) || SHORT_APPROVE.test(text))) return true;
+  // A body sent to the reviews endpoint, or a review mutation naming APPROVE.
+  if (REVIEWS_PATH.test(text) && (WORD_APPROVE.test(text) || INPUT_FLAG.test(text) || text.includes('@'))) {
+    return true;
   }
-  return false;
+  return GRAPHQL_APPROVE.test(text) && WORD_APPROVE.test(text);
 }
 
-/** True when a shell command publishes something on GitHub (broken-recipe mode). */
+/** True when a shell command publishes something on GitHub (broken-recipe mode, §1.4). */
 function publishesToGitHub(command: string): boolean {
-  for (const invocation of ghInvocations(command)) {
-    if (
-      invocation.command === 'pr' &&
-      (invocation.subcommand === 'comment' || invocation.subcommand === 'review')
-    ) {
-      return true;
-    }
-    if (invocation.command === 'issue' && invocation.subcommand === 'comment') return true;
-    if (invocation.command === 'api') {
-      const method = lastApiMethod(invocation.words);
-      if (method !== undefined && method.toUpperCase() !== 'GET') return true;
-      if (apiSendsFields(invocation.words)) return true;
-    }
-  }
-  return false;
+  const text = normalizedCommand(command);
+  if (!NAMES_GH.test(text)) return false;
+  if (WRITE_WORDS.test(text)) return true;
+  return WORD_API.test(text) && apiWrites(text);
 }
 
 /**
@@ -478,8 +333,9 @@ function ownerRuleRefusal(toolName: string, toolInput: unknown, context: LockCon
       return {
         allow: false,
         reason:
-          'Aprobar un pull request solo lo hace el dueño. Un agente no puede publicar la aprobación ' +
-          'del dueño con su cuenta: pídeselo a él.',
+          'Aprobar un pull request solo lo hace el dueño. Esta orden aprobaría un PR con la cuenta ' +
+          'del dueño: un agente no puede publicarla, pídeselo a él. Si encadenaste varias órdenes, ' +
+          'córrelas por separado.',
       };
     }
     return undefined;
