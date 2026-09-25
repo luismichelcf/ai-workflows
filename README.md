@@ -42,7 +42,8 @@ Slices 1 to 4 are done: `engine`, `gates`, `providers` and `locks`. A piece's pr
 memory (`createMemoryStore`) or on GitHub (`createGitStore` over `createGitHubStatePort`), so a run
 survives its session and another terminal sees it.
 
-Version 1 (in progress, [PLAN-13](docs/plans/PLAN-13.md)) moves a project's process into a short
+Version 1 (in progress, [PLAN-13](docs/plans/PLAN-13.md); its slice 5 tries every attempt to get
+around the process on real GitHub, see below) moves a project's process into a short
 recipe, `.ai-workflows/pipeline.yml`, that the owner can read without programming:
 
 ```sh
@@ -149,12 +150,32 @@ the web or merge from another machine. The judge is a status check on GitHub tha
 stage before merging, with the recipe of the main branch, on the pull request and in the merge
 queue. Design: [PLAN-13-R3](docs/plans/PLAN-13-R3.md).
 
-**Install.** Copy `templates/ai-workflows.yml` and `templates/ai-workflows-red-test.yml` into
-`.github/workflows/`, replace `<ENGINE_SHA>` with the full commit SHA of the engine version you
-use (never a tag: the judge refuses to run unpinned), adjust the install steps of the red-test
-workflow to your project, and add to `workflow_run.workflows` of the judge the workflows that
-produce the checks your recipe requires. Then turn it on with the repository variable and, after
-that, require the `ai-workflows` status in the branch ruleset.
+**Install.** Copy `templates/ai-workflows.yml`, `templates/ai-workflows-red-test.yml` and
+`templates/ai-workflows-review-signal.yml` into `.github/workflows/`, replace `<ENGINE_SHA>` with
+the full commit SHA of the engine version you use (never a tag: the judge refuses to run unpinned),
+adjust the install steps of the red-test workflow to your project, and add to
+`workflow_run.workflows` of the judge the workflows that produce the checks your recipe requires.
+Then turn it on with the repository variable and, after that, require the `ai-workflows` status in
+the branch ruleset.
+
+**What wakes it again.** Besides the pull request's own events, two things judge a pull request
+again without anyone asking ([PLAN-13-R5](docs/plans/PLAN-13-R5.md) §2.6):
+
+- *The owner's "Approve".* A `pull_request_review` would run the pull request's own YAML, so it is
+  not a judge trigger. The review signal workflow listens to it instead, with no permissions and no
+  steps that read the pull request, and the judge follows it through `workflow_run` (whose YAML is
+  always the main branch's). The judge checks the signal's repository, path and event, takes the
+  pull request number from it only as a hint, re-reads the pull request and judges its live head.
+  A pull request can rewrite the signal and that version runs, but it gains nothing a pull request
+  of the same repository does not already have: at worst the judge is not woken (the pull request
+  keeps waiting) or a status is imitated (the accepted limit R13, reported as a trace). The signal
+  is one of the judge's own files: a pull request that changes it needs `/approve-judge-change`.
+  From a fork GitHub gives no pull request number: the next event or `workflow_dispatch` judges it.
+- *A builder or verdict event on the piece's issue.* A new comment carrying the event mark, or any
+  edit or deletion of a comment on an issue, makes the judge read the recipe of the main branch and
+  judge every open pull request into the main branch whose branch names that piece, each on its own
+  head, with the same guarantees before publishing as any other run. Editing any issue comment
+  therefore costs a short run; one that finds no piece ends without publishing.
 
 **Where a stage is checked.** Every pre-merge stage says it with `server:`, within what its block
 allows, and `validate` enforces it:
@@ -249,6 +270,46 @@ once, and only if it is still true when it would go out.
 If a pull request of the agents in the piece's branch lost its mark, the engine stops rather than
 open a second one: continue the piece in a new branch that still names it (`feat/13-algo-2`).
 
+## The hooks: help while the agent writes
+
+The recipe declares which folders may be written without an active piece:
+
+```yaml
+hooks:
+  papers: ["docs"]     # needs pieces:, like the judge
+```
+
+```sh
+ai-workflows hooks install           # shows what it would write
+ai-workflows hooks install --apply   # writes it
+```
+
+`--apply` adds a `PreToolUse` hook to `.claude/settings.json` (keeping everything else in the
+file) and git hooks in `.ai-workflows/githooks/`, and points the repository's local
+`core.hooksPath` there; it refuses a `core.hooksPath` of another tool, an invalid recipe or one
+without `pieces:`, and writes no path of the machine. The Claude hook runs in direct form (`node`
+with arguments, no shell), through a one-line loader that loads
+`node_modules/ai-workflows/dist/bin.js`; if the engine is missing, broken or answers anything but
+an answer, the loader exits 2 and Claude Code blocks the tool. `doctor` says whether the hooks are
+installed.
+
+What they decide ([PLAN-13-R5](docs/plans/PLAN-13-R5.md) §1): every file is judged with the
+working copy that holds it (its branch and its recipe), not the folder the session started in. A
+branch that names a piece may write anything; an excluded branch is free to write and never merges;
+any other branch, or a detached head, only the paper folders; the repository's own git folder
+counts as the project. With a recipe that cannot be read only `.ai-workflows/` may change, and
+nothing may publish on GitHub from the shell. Always, in any branch: no command or file may carry
+an order only the owner writes (the `approval-comment` commands of the recipe and
+`/approve-judge-change`), and no command may approve a pull request. A git that does not answer, a
+request whose paths cannot be read, or an internal error is a refusal, never a pass.
+
+**Limits.** The hooks are help, level A: `--no-verify`, the shell, MCP tools, another machine or a
+false branch name get past them; the judge is the layer that holds (a pull request whose branch
+names no piece, or a piece without its evidence, is refused). If `node` itself is missing, or the
+hook runs past its 30 seconds, Claude Code lets the tool through. Claude Code runs project hooks
+only in a folder it trusts. Codex and OpenCode are not covered yet: their builders are covered by
+the git hooks and the judge.
+
 ## Where progress lives on GitHub
 
 ```ts
@@ -276,6 +337,29 @@ await runCommand(argv, { config, store, describeChange, leaseMs: 15 * 60_000 });
   piece renews every 5 minutes, about 36 content-creating requests an hour, well under GitHub's
   limit of 500 an hour for ten pieces at once.
 
+## The negative suite on GitHub
+
+The attempts to get around the process (CN-01…CN-13, the server cases SV-01…SV-09, RC-06, RC-09)
+are tried against a real test repository with the agents' app, the real merge queue and the judge
+pinned to the commit under test ([PLAN-13-R5](docs/plans/PLAN-13-R5.md) §2). They need
+credentials, a person for the "Approve" button and Actions minutes, so the public CI never runs
+them:
+
+```sh
+pnpm test:github            # the four files under tests/github/, one after another
+pnpm test:github:report     # the same, then the report in docs/reports/suite-negativa-<date>.md
+pnpm test:github:recover    # reconciles and releases the lock of an abandoned run
+```
+
+with `AI_WORKFLOWS_GITHUB_TEST_REPO`, `AI_WORKFLOWS_APP_ID`, `AI_WORKFLOWS_APP_KEY_FILE` and
+`AI_WORKFLOWS_AGENT_ACCOUNT`. Every change to the test repository goes through one harness
+(`tests/github/sandbox.ts`): one lock per run whose commit carries the snapshot and the journal,
+the intention written before each change, a restoration that puts back only what the run itself
+wrote last and never someone else's change, and a final check that keeps the lock when anything is
+left. The report says «Completo» only when every case of the fixed manifest ran in that run, every
+attempt was stopped, every positive control passed and the clean-up was verified; it names what
+the owner did by hand and what the suite wrote with the owner's account (PLAN-13 R22).
+
 ## What it does not promise
 
 - Nothing stops a repository administrator from changing or disabling the rules.
@@ -291,4 +375,6 @@ await runCommand(argv, { config, store, describeChange, leaseMs: 15 * 60_000 });
   A rate limit is reported as a failure; the store does not wait for `Retry-After`.
 - Every write adds a commit to its ref, and journals and effect tables are rewritten whole.
 - The editor hooks are help, not a guarantee: they do not see MCP tools, and a determined agent
-  can still reach the same result by other means. The server check is the mandatory layer.
+  can still reach the same result by other means. The server check is the mandatory layer. The
+  hook settings (`.claude/settings.json`) and the engine version in `package.json` are not files
+  of the judge: a pull request can change them without the owner's attestation.

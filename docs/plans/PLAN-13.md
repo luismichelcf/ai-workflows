@@ -646,6 +646,12 @@ Rebanadas 1 → 2 → 3 → 4 en orden; 5 puede empezar tras 3; 6 tras 4 y 5; 7 
   - Resueltos en la rebanada 4 ([PLAN-13-R4](PLAN-13-R4.md)): `required: false` y `retry`; el
     binario conectado a la receta; tipo declarado y constructores leídos de la rama, el plan y el
     issue; veredictos publicados como eventos; salida saneada; R20 y R21.
+  - Resueltos en la rebanada 5 ([PLAN-13-R5](PLAN-13-R5.md)): CN-07 (ganchos del editor y de git
+    conectados a la receta); la cola de más de 5 PRs se ensaya en GitHub real (COLA-6); el juez
+    despierta con el botón «Approve» y con los eventos del issue; R22.
+  - **De la rebanada 5, a proponer al dueño:** ganchos para Codex (`.codex/hooks.json`) y OpenCode;
+    que el juez trate como archivos propios `.claude/settings.json` y la versión del motor de
+    `package.json` (hoy un PR puede quitar el gancho del editor sin la atestación del dueño).
   - **De la rebanada 4, sin bloquear:** CN-07 (ganchos del editor conectados a la receta) pasa a la
     rebanada 5; `cleanup` no libera zonas (nadie las reserva aún); sin `agent-account`, un aviso al
     dueño puede repetirse tras una caída (la conciliación solo reconoce comentarios de la

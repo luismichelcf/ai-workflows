@@ -90,8 +90,9 @@ frena el juez: una pieza falsa no tiene plan, eventos ni aprobación (la suite l
 ### 1.3 La regla 0 conectada a la receta
 
 Hoy la regla 0 solo conoce `/visto-bueno`. Pasa a leer de la receta **las órdenes que escribe el
-dueño**: cada `with.command` de las etapas `approval-comment` (por omisión del bloque,
-`/visto-bueno`) y, siempre, `/approve-judge-change` (R20).
+dueño**: cada `with.command` de las etapas `approval-comment` (sin `with.command`, la orden por
+omisión del bloque, `/approve`; corregido en la parvada, §10) y, siempre, `/approve-judge-change`
+(R20).
 
 Para la aprobación con botón (R21), la misma familia de regla en herramientas de terminal: se
 rechaza `gh pr review` con `--approve`/`-a` y `gh api` hacia `…/pulls/<n>/reviews` que lleve
@@ -706,3 +707,24 @@ que tampoco se fusiona; la frase de §2.6 ya no promete que no se fusiona (§2.4
 SV-04s dice que la atestación depende de la ruta tocada, y el informe describe los checks
 observados sin afirmar lo que GitHub haría. Aprobación del diseño; la implementación se verifica
 aparte (puerta del orquestador, parvada y recorrido real).
+
+## 9. Desviaciones durante la construcción
+
+Decididas por el orquestador al verificar cada parte; ninguna cambia lo que decidió el dueño.
+
+- **Construcción en encargos paralelos**, cada uno en su carpeta: A (ganchos), B (disparadores del
+  juez), C (informe), D y D2 (arnés), y tras la parvada E (motor) y F (arnés e informe). Cada uno
+  integrado solo después de correr la puerta el orquestador.
+- **El arnés tiene su propia prueba contra un GitHub falso** (`tests/sandbox*.test.ts`), escrita por
+  el orquestador y construida por DeepSeek como el resto del código; el falso se endureció tras la
+  parvada para portarse como el real (cerrar un PR fusionado o borrar una rama ausente falla, el
+  *squash* deja «título (#N)», una lectura puede fallar).
+- **`runHook` acepta la ruta del ejecutable de git** (`gitPath`) para probar un git que no responde.
+- **Al correr el arnés contra GitHub real** aparecieron tres fallos del puerto real, arreglados antes
+  de la parvada: las referencias se leían con un «refs/» de más, `force` viajaba como texto, y la
+  lista de repositorios de la aplicación se pide con el token de la propia aplicación (la sesión del
+  dueño no puede listarla). Tras eso, RC-09 real pasó 4/4 y el repositorio de ensayo quedó limpio.
+- **El pegado de textos por la consola rompía los `\n` escritos** en varias pruebas; se corrigió con
+  el editor y las pruebas nuevas se escriben sin pasar por la consola.
+- **La prueba del primer paso de `action.yml`** corre ese mismo guion con un `gh` falso; donde la PC
+  no tiene `jq`, la prueba trae un sustituto mínimo (en GitHub el ejecutor sí lo tiene).
