@@ -1,4 +1,4 @@
-import { isAbsolute } from 'node:path';
+import { isAbsolute, posix } from 'node:path';
 
 import { validGlob } from './glob.js';
 import { validateCommandLine } from './command-line.js';
@@ -418,13 +418,13 @@ function validateHooks(root: YamlNode, issues: LocatedIssue[]): void {
   for (const item of listNodes(yamlField(hooks, 'papers'))) {
     const entry = yamlWord(item);
     const forward = entry.replace(/\\/g, '/');
-    const normalized = forward.replace(/\/+$/, '');
+    // Read as the lock reads it (`readPapers`): `docs/..` is the root itself, never a paper folder.
+    const normalized = forward === '' ? '' : posix.normalize(forward).replace(/\/+$/, '');
     const leaves =
       normalized === '' ||
       normalized === '.' ||
       normalized === '..' ||
-      normalized.startsWith('../') ||
-      normalized.includes('/../');
+      normalized.startsWith('../');
     if (isAbsolute(forward) || /^[A-Za-z]:/.test(forward) || forward.startsWith('/') || leaves) {
       add(
         issues,
