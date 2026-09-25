@@ -163,18 +163,30 @@ function lastEntry(
   return undefined;
 }
 
+function messageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 function trackedPullRequests(state: SandboxState): { number: number; branch: string }[] {
-  const tracked: { number: number; branch: string }[] = [];
+  const tracked = new Map<number, { number: number; branch: string }>();
   for (const entry of state.journal) {
     if (entry.resource !== 'pull-request' || !entry.done || typeof entry.after !== 'number') continue;
-    tracked.push({ number: entry.after, branch: entry.path ?? '' });
+    const branch = entry.path ?? tracked.get(entry.after)?.branch ?? '';
+    tracked.set(entry.after, { number: entry.after, branch });
   }
-  return tracked;
+  return [...tracked.values()];
 }
 
 function isMerged(state: SandboxState, number: number): boolean {
   return state.journal.some(
     (entry) => entry.resource === 'pull-request' && entry.after === number && entry.op === 'merged',
+  );
+}
+
+/** A pull request the run registered: opened by the queue or recorded as merged by it. */
+function isRunPullRequest(state: SandboxState, number: number): boolean {
+  return state.journal.some(
+    (entry) => entry.resource === 'pull-request' && entry.after === number && (entry.op === 'merged' || entry.op === 'tracked'),
   );
 }
 
@@ -186,7 +198,9 @@ async function readLock(port: SandboxPort, sha: string): Promise<SandboxState> {
 }
 
 async function persistLock(port: SandboxPort, state: SandboxState, previous: string): Promise<string> {
-  const commit = await port.writeCommit({ 'lock.json': JSON.stringify(state, null, 2) });
+  // The new commit descends from the previous lock commit: GitHub accepts a `force=false` update
+  // only when the reference moves forward in line, so the comparison is atomic.
+  const commit = await port.writeCommit({ 'lock.json': JSON.stringify(state, null, 2) }, previous);
   const result = await port.updateRef(LOCK_REF, commit, previous);
   if (result === 'conflict') throw new Error('el candado de la suite fue movido por otra corrida');
   return commit;
@@ -288,16 +302,32 @@ async function performReconcile(port: SandboxPort, state: SandboxState): Promise
   return problems;
 }
 
+/** The pull request of a `main` commit: the port's field, or `(#N)` at the end of its first line. */
+function pullRequestOfCommit(commit: { message: string; pr?: number }): number | undefined {
+  if (commit.pr !== undefined) return commit.pr;
+  const firstLine = (commit.message.split(/\r?\n/)[0] ?? '').trim();
+  const match = /\(#(\d+)\)$/.exec(firstLine);
+  return match === null ? undefined : Number(match[1]);
+}
+
 async function restoreMain(port: SandboxPort, state: SandboxState): Promise<string[]> {
   const problems: string[] = [];
   const snapshot = state.snapshot;
-  const current = await port.main();
-  const history = await port.mainHistory(snapshot.main.head);
+  let current: { head: string; tree: string };
+  let history: { sha: string; message: string; pr?: number }[];
+  try {
+    current = await port.main();
+    history = await port.mainHistory(snapshot.main.head);
+  } catch (error) {
+    problems.push(`main: no se pudo leer su historia: ${messageOf(error)}`);
+    return problems;
+  }
   let changed = false;
   for (const commit of history) {
-    if (commit.pr !== undefined) {
-      if (isMerged(state, commit.pr)) changed = true;
-      else problems.push(`main: la fusión del pull request ${commit.pr} no la registró esta corrida`);
+    const pr = pullRequestOfCommit(commit);
+    if (pr !== undefined) {
+      if (isRunPullRequest(state, pr)) changed = true;
+      else problems.push(`main: la fusión del pull request ${pr} no la registró esta corrida`);
       continue;
     }
     if (commit.message.includes(state.run)) changed = true;
@@ -356,7 +386,55 @@ async function restoreWrite(
     await write();
   } catch (error) {
     if (await confirm()) return;
-    problems.push(`${label}: ${error instanceof Error ? error.message : String(error)}`);
+    problems.push(`${label}: ${messageOf(error)}`);
+  }
+}
+
+/** A restoration step that must not stop the others: its failure is collected and reported at the end. */
+async function attempt(problems: string[], label: string, task: () => Promise<void>): Promise<void> {
+  try {
+    await task();
+  } catch (error) {
+    problems.push(`${label}: ${messageOf(error)}`);
+  }
+}
+
+/**
+ * Closing a pull request fails when it is no longer open (GitHub already merged or somebody closed
+ * it). Re-read its state: not open means it is already as wanted; still open is a real problem.
+ */
+async function closePullRequestIfOpen(port: SandboxPort, problems: string[], number: number): Promise<void> {
+  try {
+    await port.closePullRequest(number);
+  } catch (error) {
+    let open: boolean;
+    try {
+      open = (await port.inventory()).openPullRequests.includes(number);
+    } catch (readError) {
+      problems.push(`pull request ${number}: ${messageOf(error)}; tampoco se pudo releer su estado (${messageOf(readError)})`);
+      return;
+    }
+    if (open) problems.push(`pull request ${number}: ${messageOf(error)}`);
+  }
+}
+
+/** Deleting a branch fails when GitHub already deleted it; absent means it is already as wanted. */
+async function deleteBranchIfPresent(port: SandboxPort, problems: string[], name: string): Promise<void> {
+  if (name.length === 0) return;
+  try {
+    await port.deleteBranch(name);
+  } catch (error) {
+    const current = await port.getRef(`refs/heads/${name}`);
+    if (current !== undefined) problems.push(`rama ${name}: ${messageOf(error)}`);
+  }
+}
+
+/** The final verification must fail with its reason, never abort the restoration with an exception. */
+async function verifySafely(port: SandboxPort, state: SandboxState, problems: string[]): Promise<void> {
+  try {
+    problems.push(...(await verifyAgainstSnapshot(port, state)));
+  } catch (error) {
+    problems.push(`la verificación final no pudo terminar: ${messageOf(error)}`);
   }
 }
 
@@ -370,38 +448,63 @@ async function performRestore(port: SandboxPort, state: SandboxState): Promise<s
 
   const variableEntry = lastEntry(state, 'variable');
   if (variableEntry !== undefined) {
-    const remote = await port.variable();
-    if (sameValue(remote, variableEntry.after)) {
-      await restoreWrite(
-        problems,
-        'variable AI_WORKFLOWS_MODE',
-        () => port.setVariable(snapshot.variable),
-        async () => sameValue(await port.variable(), snapshot.variable),
-      );
-    } else if (!sameValue(remote, snapshot.variable)) {
-      problems.push(`variable AI_WORKFLOWS_MODE: la foto tenía ${show(snapshot.variable)}, la corrida escribió ${show(variableEntry.after)} y ahora vale ${show(remote)}`);
+    let remote: string | undefined;
+    let read = true;
+    try {
+      remote = await port.variable();
+    } catch (error) {
+      read = false;
+      problems.push(`variable AI_WORKFLOWS_MODE: no se pudo leer su estado: ${messageOf(error)}`);
+    }
+    if (read) {
+      if (sameValue(remote, variableEntry.after)) {
+        await restoreWrite(
+          problems,
+          'variable AI_WORKFLOWS_MODE',
+          () => port.setVariable(snapshot.variable),
+          async () => sameValue(await port.variable(), snapshot.variable),
+        );
+      } else if (!sameValue(remote, snapshot.variable)) {
+        problems.push(`variable AI_WORKFLOWS_MODE: la foto tenía ${show(snapshot.variable)}, la corrida escribió ${show(variableEntry.after)} y ahora vale ${show(remote)}`);
+      }
     }
   }
 
   const rulesetEntry = lastEntry(state, 'ruleset');
   if (rulesetEntry !== undefined) {
-    const remote = pickRuleset(await port.ruleset());
-    if (sameValue(remote, pickRuleset(rulesetEntry.after))) {
-      await restoreWrite(
-        problems,
-        'ruleset',
-        () => port.putRuleset(pickRuleset(snapshot.ruleset)),
-        async () => sameValue(pickRuleset(await port.ruleset()), pickRuleset(snapshot.ruleset)),
-      );
-    } else if (!sameValue(remote, pickRuleset(snapshot.ruleset))) {
-      problems.push('ruleset: la corrida lo cambió y ahora no coincide con lo último que escribió');
+    let remote: Record<string, unknown> | undefined;
+    let read = true;
+    try {
+      remote = pickRuleset(await port.ruleset());
+    } catch (error) {
+      read = false;
+      problems.push(`ruleset: no se pudo leer su estado: ${messageOf(error)}`);
+    }
+    if (read && remote !== undefined) {
+      if (sameValue(remote, pickRuleset(rulesetEntry.after))) {
+        await restoreWrite(
+          problems,
+          'ruleset',
+          () => port.putRuleset(pickRuleset(snapshot.ruleset)),
+          async () => sameValue(pickRuleset(await port.ruleset()), pickRuleset(snapshot.ruleset)),
+        );
+      } else if (!sameValue(remote, pickRuleset(snapshot.ruleset))) {
+        problems.push('ruleset: la corrida lo cambió y ahora no coincide con lo último que escribió');
+      }
     }
   }
 
   for (const path of Object.keys(snapshot.workflows)) {
     const entry = lastEntry(state, 'workflow', (candidate) => candidate.path === path);
     if (entry === undefined) continue;
-    const remote = await port.workflowEnabled(path);
+    let remote: boolean;
+    try {
+      remote = await port.workflowEnabled(path);
+    } catch (error) {
+      // A state that cannot be read is not "off": the workflow is left untouched.
+      problems.push(`workflow ${path}: no se pudo leer su estado: ${messageOf(error)}`);
+      continue;
+    }
     if (remote === entry.after) {
       await restoreWrite(
         problems,
@@ -415,50 +518,64 @@ async function performRestore(port: SandboxPort, state: SandboxState): Promise<s
   problems.push(...(await restoreMain(port, state)));
 
   for (const entry of state.journal) {
-    if (entry.resource === 'issue' && entry.done && typeof entry.after === 'number') await port.closeIssue(entry.after);
+    if (entry.resource === 'issue' && entry.done && typeof entry.after === 'number') {
+      const number = entry.after;
+      await attempt(problems, `issue ${number}`, () => port.closeIssue(number));
+    }
   }
 
   for (const entry of state.journal) {
     if (entry.resource === 'deployment' && entry.done && typeof entry.after === 'number') {
-      await port.deactivateDeployment(entry.after);
-      await port.deleteDeployment(entry.after);
+      const id = entry.after;
+      await attempt(problems, `despliegue ${id}`, async () => {
+        await port.deactivateDeployment(id);
+        await port.deleteDeployment(id);
+      });
     }
   }
 
   for (const entry of state.journal) {
     if (entry.resource !== 'branch' || !entry.done || entry.path === undefined) continue;
-    const current = await port.getRef(`refs/heads/${entry.path}`);
-    if (current === entry.after) await port.deleteBranch(entry.path);
-    else if (current !== undefined) problems.push(`rama ${entry.path}: no coincide con lo último que escribió la corrida`);
+    const name = entry.path;
+    await attempt(problems, `rama ${name}`, async () => {
+      const current = await port.getRef(`refs/heads/${name}`);
+      if (current === entry.after) await port.deleteBranch(name);
+      else if (current !== undefined) problems.push(`rama ${name}: no coincide con lo último que escribió la corrida`);
+    });
   }
 
   for (const tracked of trackedPullRequests(state)) {
-    await port.closePullRequest(tracked.number);
-    await port.deleteBranch(tracked.branch);
+    if (!isMerged(state, tracked.number)) await closePullRequestIfOpen(port, problems, tracked.number);
+    await deleteBranchIfPresent(port, problems, tracked.branch);
   }
 
   for (const entry of state.journal) {
     if (entry.resource !== 'state-ref' || !entry.done || entry.path === undefined) continue;
-    const current = await port.getRef(entry.path);
-    if (typeof entry.after === 'string' && current === entry.after) {
-      const deleted = await port.deleteRef(entry.path, entry.after);
-      if (deleted === 'conflict') problems.push(`referencia de estado ${entry.path}: no se pudo borrar`);
-    } else if (current !== undefined) {
-      problems.push(`referencia de estado ${entry.path}: no coincide con lo último que escribió la corrida`);
-    }
+    const path = entry.path;
+    await attempt(problems, `referencia de estado ${path}`, async () => {
+      const current = await port.getRef(path);
+      if (typeof entry.after === 'string' && current === entry.after) {
+        const deleted = await port.deleteRef(path, entry.after);
+        if (deleted === 'conflict') problems.push(`referencia de estado ${path}: no se pudo borrar`);
+      } else if (current !== undefined) {
+        problems.push(`referencia de estado ${path}: no coincide con lo último que escribió la corrida`);
+      }
+    });
   }
 
   for (const entry of state.journal) {
     if (entry.resource !== 'issue' || !entry.done || typeof entry.after !== 'number') continue;
     const ref = `refs/ai-workflows/pieces/${entry.after}`;
-    const current = await port.getRef(ref);
-    if (current !== undefined) {
-      const deleted = await port.deleteRef(ref, current);
-      if (deleted === 'conflict') problems.push(`referencia de estado ${ref}: no se pudo borrar`);
-    }
+    await attempt(problems, `referencia de estado ${ref}`, async () => {
+      const current = await port.getRef(ref);
+      if (current !== undefined) {
+        const deleted = await port.deleteRef(ref, current);
+        if (deleted === 'conflict') problems.push(`referencia de estado ${ref}: no se pudo borrar`);
+      }
+    });
   }
 
-  problems.push(...(await verifyAgainstSnapshot(port, state)));
+  await verifySafely(port, state, problems);
   return problems;
 }
 
@@ -873,6 +990,11 @@ function tryGh(args: readonly string[]): { ok: true; out: string } | { ok: false
   }
 }
 
+/** Only a 404 means "it is not there"; every other `gh` error must be thrown, never read as absence. */
+function isNotFound(error: string): boolean {
+  return /\b404\b|not\s*found/i.test(error);
+}
+
 function workflowFile(path: string): string {
   return path.split('/').at(-1) ?? path;
 }
@@ -897,9 +1019,13 @@ export function createGhSandboxPort(repository: string): SandboxPort {
   const refPath = (name: string): string => name.replace(/^refs\//, '');
   const refSha = (name: string): string | undefined => {
     const result = tryGh(['api', `repos/${repo}/git/ref/${refPath(name)}`]);
-    if (!result.ok) return undefined;
-    const parsed = JSON.parse(result.out) as { object?: { sha?: string } };
-    return parsed.object?.sha;
+    if (result.ok) {
+      const parsed = JSON.parse(result.out) as { object?: { sha?: string } };
+      return parsed.object?.sha;
+    }
+    // Only a 404 is an absence: any other read error is thrown, never taken for "there is none".
+    if (isNotFound(result.error)) return undefined;
+    throw new Error(`no se pudo leer la referencia ${name}: ${result.error}`);
   };
   return {
     async permissions() {
@@ -923,12 +1049,14 @@ export function createGhSandboxPort(repository: string): SandboxPort {
     async createRef(name, sha) {
       const result = tryGh(['api', '-X', 'POST', `repos/${repo}/git/refs`, '-f', `ref=${name}`, '-f', `sha=${sha}`]);
       if (result.ok) return 'created';
-      if (/already exists|Reference already exists|422/i.test(result.error)) return 'exists';
+      // Only "already exists" is `exists`; any other 422 (a bad name, a missing object) is thrown.
+      if (/already exists/i.test(result.error)) return 'exists';
       throw new Error(`no se pudo crear la referencia ${name}: ${result.error}`);
     },
     async updateRef(name, sha, expected) {
       if (refSha(name) !== expected) return 'conflict';
-      const result = tryGh(['api', '-X', 'PATCH', `repos/${repo}/git/refs/${refPath(name)}`, '-f', `sha=${sha}`, '-F', 'force=true']);
+      // The new commit descends from `expected`, so `force=false` accepts only that forward move.
+      const result = tryGh(['api', '-X', 'PATCH', `repos/${repo}/git/refs/${refPath(name)}`, '-f', `sha=${sha}`, '-F', 'force=false']);
       return result.ok ? 'updated' : 'conflict';
     },
     async deleteRef(name, expected) {
@@ -967,16 +1095,26 @@ export function createGhSandboxPort(repository: string): SandboxPort {
       return { head, tree: treeOfCommit(head) };
     },
     async mainHistory(since) {
-      const commits = JSON.parse(runGh(['api', `repos/${repo}/commits?sha=main&per_page=100`])) as {
+      const commits = paginate(`repos/${repo}/commits?sha=main`) as {
         sha: string;
         commit: { message: string };
       }[];
       const index = commits.findIndex((commit) => commit.sha === since);
       if (index < 0) throw new Error(`${since} no está en main`);
-      return commits.slice(0, index).reverse().map((commit) => {
-        const pr = /Merge pull request #(\d+)/.exec(commit.commit.message)?.[1];
-        return { sha: commit.sha, message: commit.commit.message, ...(pr === undefined ? {} : { pr: Number(pr) }) };
-      });
+      const history: { sha: string; message: string; pr?: number }[] = [];
+      for (const commit of commits.slice(0, index).reverse()) {
+        const merge = /Merge pull request #(\d+)/.exec(commit.commit.message);
+        let pr = merge === null ? undefined : Number(merge[1]);
+        // A squash merge says nothing about its pull request in the message: ask GitHub.
+        if (pr === undefined) {
+          const pulls = tryGh(['api', `repos/${repo}/commits/${commit.sha}/pulls`]);
+          if (pulls.ok && pulls.out !== '' && pulls.out !== '[]') {
+            pr = (JSON.parse(pulls.out) as { number: number }[])[0]?.number;
+          }
+        }
+        history.push({ sha: commit.sha, message: commit.commit.message, ...(pr === undefined ? {} : { pr }) });
+      }
+      return history;
     },
     async commitToMain(o) {
       const head = refSha('heads/main');
@@ -990,8 +1128,10 @@ export function createGhSandboxPort(repository: string): SandboxPort {
     },
     async variable() {
       const result = tryGh(['api', `repos/${repo}/actions/variables/AI_WORKFLOWS_MODE`]);
-      if (!result.ok) return undefined;
-      return (JSON.parse(result.out) as { value?: string }).value;
+      if (result.ok) return (JSON.parse(result.out) as { value?: string }).value;
+      // Absent means it was never set, but only a 404 says that; any other error is thrown.
+      if (isNotFound(result.error)) return undefined;
+      throw new Error(`no se pudo leer la variable AI_WORKFLOWS_MODE: ${result.error}`);
     },
     async setVariable(value) {
       if (value === undefined) {
@@ -1008,17 +1148,20 @@ export function createGhSandboxPort(repository: string): SandboxPort {
     },
     async workflowEnabled(path) {
       const result = tryGh(['api', `repos/${repo}/actions/workflows/${workflowFile(path)}`]);
-      if (!result.ok) return false;
-      return (JSON.parse(result.out) as { state?: string }).state === 'active';
+      if (result.ok) return (JSON.parse(result.out) as { state?: string }).state === 'active';
+      if (isNotFound(result.error)) return false;
+      throw new Error(`no se pudo leer el workflow ${path}: ${result.error}`);
     },
     async setWorkflowEnabled(path, on) {
       runGh(['workflow', on ? 'enable' : 'disable', workflowFile(path), '--repo', repo]);
     },
     async inventory() {
       const branches = paginate(`repos/${repo}/branches?per_page=100`) as { name: string }[];
-      const openPullRequests = JSON.parse(runGh(['pr', 'list', '--repo', repo, '--state', 'open', '--json', 'number'])) as { number: number }[];
-      const openIssues = JSON.parse(runGh(['issue', 'list', '--repo', repo, '--state', 'open', '--json', 'number'])) as { number: number }[];
+      const openPullRequests = JSON.parse(runGh(['pr', 'list', '--repo', repo, '--state', 'open', '--limit', '1000', '--json', 'number'])) as { number: number }[];
+      const openIssues = JSON.parse(runGh(['issue', 'list', '--repo', repo, '--state', 'open', '--limit', '1000', '--json', 'number'])) as { number: number }[];
       const refs = tryGh(['api', '--paginate', '--slurp', `repos/${repo}/git/matching-refs/ai-workflows`]);
+      // A read that fails is never an empty list: only a 404 (there are no refs) is absence.
+      if (!refs.ok && !isNotFound(refs.error)) throw new Error(`no se pudieron listar las referencias de estado: ${refs.error}`);
       const stateRefs = refs.ok && refs.out !== '' ? ((JSON.parse(refs.out) as { ref: string }[][]).flat()).map((entry) => entry.ref) : [];
       const deployments = paginate(`repos/${repo}/deployments?per_page=100`) as { id: number }[];
       const states: { id: number; state: string }[] = [];
@@ -1039,7 +1182,7 @@ export function createGhSandboxPort(repository: string): SandboxPort {
       return Number(url.split('/').pop());
     },
     async findIssues(marker) {
-      const out = runGh(['issue', 'list', '--repo', repo, '--state', 'all', '--search', `${marker} in:title`, '--json', 'number', '--jq', '.[].number']);
+      const out = runGh(['issue', 'list', '--repo', repo, '--state', 'all', '--limit', '1000', '--search', `${marker} in:title`, '--json', 'number', '--jq', '.[].number']);
       return out === '' ? [] : out.split('\n').map(Number);
     },
     async closeIssue(n) {
@@ -1074,7 +1217,7 @@ export function createGhSandboxPort(repository: string): SandboxPort {
       runGh(['api', '-X', 'DELETE', `repos/${repo}/git/refs/heads/${name}`]);
     },
     async findPullRequests(marker) {
-      const out = runGh(['pr', 'list', '--repo', repo, '--state', 'all', '--search', marker, '--json', 'number', '--jq', '.[].number']);
+      const out = runGh(['pr', 'list', '--repo', repo, '--state', 'all', '--limit', '1000', '--search', marker, '--json', 'number', '--jq', '.[].number']);
       return out === '' ? [] : out.split('\n').map(Number);
     },
   };

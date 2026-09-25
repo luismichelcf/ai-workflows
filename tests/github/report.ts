@@ -251,7 +251,15 @@ const PATH_PATTERNS: readonly RegExp[] = [
   /(^|[^A-Za-z0-9])[A-Za-z]:[\\/]/,
   /\/Users\//,
   /\/home\//,
+  // A UNC path (`\\server\share`) starts with two backslashes.
+  /\\\\/,
+  // A Git Bash path (`/c/...`) has one letter between two slashes.
+  /(^|[^A-Za-z0-9])\/[A-Za-z]\//,
+  /(^|[^A-Za-z0-9])\/tmp\//,
 ];
+
+// Three base64url parts separated by dots, headed by `eyJ`: the shape of a JWT.
+const JWT_PATTERN = /eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/;
 
 function systemTemp(): string {
   return tmpdir().replace(/\\/g, '/').toLowerCase();
@@ -265,6 +273,7 @@ function findLeak(value: string): string | undefined {
   if (/gh[pousr]_[A-Za-z0-9]{8,}/.test(value)) return 'un token de GitHub';
   if (/github_pat_[A-Za-z0-9_]{20,}/.test(value)) return 'un token de GitHub';
   if (/-----BEGIN [A-Z ]*PRIVATE KEY-----/.test(value)) return 'una llave privada';
+  if (JWT_PATTERN.test(value)) return 'algo con forma de token';
   return undefined;
 }
 
@@ -299,6 +308,9 @@ function auditRecord(record: CaseRecord, repository: string): void {
   const prefix = evidencePrefix(repository);
   for (const link of record.evidence) {
     auditText(record.id, 'evidence', link);
+    if (/\.\./.test(link) || /%2e/i.test(link) || /@/.test(link)) {
+      throw new Error(`Caso ${record.id}: la evidencia "${link}" lleva una ruta que sale del repositorio de ensayo.`);
+    }
     if (!link.startsWith(prefix)) {
       throw new Error(`Caso ${record.id}: la evidencia "${link}" no es del repositorio de ensayo.`);
     }
@@ -423,11 +435,29 @@ export function renderSuiteReport(records: readonly CaseRecord[], meta: SuiteRep
 
   lines.push(`Corrida: ${meta.run}`);
   lines.push(`Fecha: ${meta.date}`);
+  lines.push(`Motor: ${meta.engineSha}`);
+  lines.push(`Repositorio: ${meta.repository}`);
   lines.push(`Pruebas de la corrida: ${meta.testsPassed ? 'en verde' : 'no en verde'}`);
 
+  const attempted = SUITE_MANIFEST.filter((entry) => firstById.has(entry.id)).length;
+  const stopped = SUITE_MANIFEST.filter((entry) => {
+    const record = firstById.get(entry.id);
+    if (record === undefined) return false;
+    if (entry.kind === 'limit') return record.negative === 'limite';
+    if (entry.kind === 'negative') return record.negative === 'frenado';
+    return false;
+  }).length;
+  const pending = unique(problems.flatMap((problem) => problem.ids));
+  lines.push(`Intentos: ${attempted} de ${SUITE_MANIFEST.length} casos del manifiesto.`);
+  lines.push(`Frenados: ${stopped} intentos quedaron frenados.`);
+  lines.push(`Falta: ${pending.length === 0 ? 'nada' : pending.join(', ')}.`);
+
   lines.push('', '## Qué hizo el dueño y qué se hizo con su cuenta', '');
-  const buttonCases = SUITE_MANIFEST.filter((entry) => entry.owner?.button === true).map((entry) => entry.id);
-  const orderCases = SUITE_MANIFEST.filter((entry) => entry.owner?.orders !== undefined);
+  // The section says what the records really carry, not only what the manifest expects.
+  const buttonCases = SUITE_MANIFEST.filter((entry) => firstById.get(entry.id)?.owner?.button === true).map((entry) => entry.id);
+  const orderCases = SUITE_MANIFEST.map((entry) => ({ entry, record: firstById.get(entry.id) }))
+    .filter((item) => (item.record?.owner?.ordersBySuite?.length ?? 0) > 0)
+    .map((item) => ({ id: item.entry.id, orders: item.record?.owner?.ordersBySuite ?? [] }));
   lines.push(
     buttonCases.length > 0
       ? `El dueño pulsó «Approve» en persona en: ${buttonCases.join(', ')}.`
@@ -435,7 +465,7 @@ export function renderSuiteReport(records: readonly CaseRecord[], meta: SuiteRep
   );
   lines.push(
     orderCases.length > 0
-      ? `La suite escribió órdenes del dueño con su cuenta (R22): ${orderCases.map((entry) => `${entry.id} (${(entry.owner?.orders ?? []).join(', ')})`).join(', ')}.`
+      ? `La suite escribió órdenes del dueño con su cuenta (R22): ${orderCases.map((item) => `${item.id} (${item.orders.join(', ')})`).join(', ')}.`
       : 'La suite no escribió órdenes del dueño con su cuenta.',
   );
   lines.push('La preparación y la restauración del ensayo también usaron la cuenta del dueño (R22).');
