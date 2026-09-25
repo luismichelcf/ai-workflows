@@ -742,3 +742,44 @@ Decididas por el orquestador al verificar cada parte; ninguna cambia lo que deci
   el editor y las pruebas nuevas se escriben sin pasar por la consola.
 - **La prueba del primer paso de `action.yml`** corre ese mismo guion con un `gh` falso; donde la PC
   no tiene `jq`, la prueba trae un sustituto mínimo (en GitHub el ejecutor sí lo tiene).
+
+## 10. Revisión de la parvada
+
+**Ronda 1** (cuatro revisores Claude en sesiones frescas: correctitud, seguridad, contrato del motor,
+pruebas con 66 mutantes). Bloqueantes, todos con su prueba roja y corregidos (encargos E y F):
+1. `action.yml` cortaba los dos disparadores nuevos antes del juez: la señal de revisión
+   (`workflow_run` de `pull_request_review`) y los comentarios del issue de la pieza.
+2. El gancho dejaba escribir dentro de `.git/` (git no responde ahí como copia de trabajo) y tomaba un
+   git que falla por «fuera del proyecto».
+3. El juicio desde el issue no tenía las garantías de PLAN-13-R3 §3.8 y terminaba callado ante
+   lecturas fallidas.
+4. Con receta rota pasaban `gh api -F/--raw-field/-XPOST`; aprobar por `gh.exe`, GraphQL o archivo.
+5. El cargador dejaba pasar una salida 1 del motor.
+6. La orden por omisión de `approval-comment` es `/approve`, no `/visto-bueno` (error del diseño).
+7. El arnés cerraba PRs ya fusionados, no reconocía el *squash* y tomaba una lectura fallida por
+   ausencia; el informe no filtraba UNC, `/c/`, `/tmp`, JWT ni `..`.
+8. En la suite real, dos controles leían el estado anterior y la prueba con Claude Code no comprobaba
+   que corriera ni tenía su positivo.
+
+**Ronda 2** (sobre el delta): `gh` pegado a separadores de la consola ya no se veía; el nombre corto
+8.3 y el flujo NTFS de `.git` saltaban el candado; el juicio desde el issue publicaba sin poder leer
+los estados. Corregidos (encargos G y H), con varios huecos menores (opciones entre `gh` y la orden,
+el último `-X`, `--input=`, `submitPullRequestReview`, un `.git` roto en una subcarpeta, PR abierto en
+la señal, fusión no anotada en el arnés, enlaces de comparación y cabecera del informe). El revisor
+de mutantes añadió pruebas para lo que ninguna vigilaba; destapó que la receta aceptaba `docs/..`.
+
+**Ronda 3**: el patrón de opciones de `gh` volvía atrás de forma exponencial (40 opciones: más de un
+minuto, y el gancho de 30 s deja pasar); con git traducido el gancho negaba todo lo de fuera.
+Corregidos (encargo I: lectura por palabras, git en idioma neutro).
+
+**Ronda 4**: la lectura por palabras no veía la aprobación pegada a un separador o con valor y tenía
+costo cuadrático. Corregido (encargo J: un recorrido, tope de 64 KB).
+
+**Ronda 5**: seis formas más de pasar entre líneas, redirecciones, sustituciones, comillas y
+`bash -c`. **Decisión del orquestador:** la regla deja de interpretar la consola y sobreaproxima
+sobre el texto normalizado (§1.3), con costo declarado (encargo K).
+
+**Ronda 6**: sin costo superlineal y con pocos falsos positivos; el gemelo GraphQL del cuerpo en
+archivo seguía abierto y la promesa «nunca por cómo se escribió» era falsa → cerrado (encargo L) y el
+texto dice ahora que cubre la orden escrita de forma directa, no la disfrazada a propósito (§1.3,
+README).
