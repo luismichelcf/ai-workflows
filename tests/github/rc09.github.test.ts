@@ -2,11 +2,14 @@ import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 
-import { afterAll, afterEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeAll, describe, expect, inject, it } from 'vitest';
 
 import { compileRecipe, createEngine, createMemoryStore, parseRecipe, type Recipe } from '../../src/index.js';
 
 import { emptyFolder, git, removeRepositories, write } from '../git-fixtures.js';
+
+import { recordCase } from './report.js';
+import { attachSandbox, createGhSandboxPort, type Sandbox } from './sandbox.js';
 
 // PLAN-13 RC-09 against GitHub itself (PLAN-13-R2 §7): a module block opens a real pull request
 // through runEffect. When the engine "dies" right after it is opened and before it is recorded,
@@ -16,8 +19,8 @@ import { emptyFolder, git, removeRepositories, write } from '../git-fixtures.js'
 // It needs credentials, so it never runs in the public CI. It runs only through
 // `pnpm test:github` with AI_WORKFLOWS_GITHUB_TEST_REPO=<owner>/<repo> pointing at the test
 // repository (socialabs-margin/ai-workflows-pruebas), and it FAILS — never skips — when asked
-// to run without that variable or without a logged-in `gh`. It closes every pull request and
-// deletes every branch it made, whatever happens.
+// to run without that variable or without a logged-in `gh`. Every pull request and branch it makes
+// is tracked by the harness of PLAN-13-R5 §2.2, which closes and deletes them at the end of the run.
 
 const REPO = process.env.AI_WORKFLOWS_GITHUB_TEST_REPO ?? '';
 const gh = (...args: string[]): string => execFileSync('gh', args, { encoding: 'utf8' }).trim();
@@ -30,27 +33,26 @@ function recipeOf(text: string): Recipe {
   return result.recipe;
 }
 
-const branches: string[] = [];
+let sandbox: Sandbox;
 
 const pullRequests = (branch: string): string[] =>
   gh('pr', 'list', '--repo', REPO, '--head', branch, '--state', 'all', '--json', 'number', '--jq', '.[].number')
-    .split('\n')
+    .split('
+')
     .filter(Boolean);
 
-afterAll(() => {
+/** Hands every pull request of the branch to the harness, so the run's restoration closes it. */
+async function track(branch: string): Promise<string[]> {
+  const numbers = pullRequests(branch);
+  for (const number of numbers) await sandbox.trackPullRequest(Number(number), branch);
+  return numbers;
+}
+
+beforeAll(async () => {
   if (REPO === '') return;
-  for (const branch of branches) {
-    try {
-      for (const number of pullRequests(branch)) gh('pr', 'close', number, '--repo', REPO, '--delete-branch');
-    } finally {
-      try {
-        gh('api', '-X', 'DELETE', `repos/${REPO}/git/refs/heads/${branch}`);
-      } catch {
-        // Already deleted by `pr close --delete-branch`: there is nothing left to remove.
-      }
-    }
-  }
-});
+  sandbox = await attachSandbox({ port: createGhSandboxPort(REPO), run: inject('sandboxRun') });
+  await sandbox.baseline();
+}, 10 * 60_000);
 
 afterEach(() => {
   removeRepositories();
@@ -88,7 +90,6 @@ const OPENER = (withReconcile: boolean) => [
 /** A fresh clone of the test repository on a new branch, with the opener block. */
 async function piece(withReconcile: boolean, crash: boolean) {
   const branch = `rc09-${randomUUID().slice(0, 8)}`;
-  branches.push(branch);
   const root = emptyFolder();
   git(root, 'clone', '-q', '--depth', '1', `https://github.com/${REPO}.git`, '.');
   git(root, 'config', 'user.email', 'test@example.com');
@@ -145,7 +146,9 @@ describe('RC-09 against GitHub', () => {
     expect(first, JSON.stringify(first)).toMatchObject({ status: { state: 'blocked:technical', reason: expect.stringMatching(/the engine died here/) } });
     const second = await engine.run('rc09');
     expect(second, JSON.stringify(second)).toMatchObject({ status: { state: 'done' } });
-    expect(pullRequests(branch)).toHaveLength(1);
+    const opened = await track(branch);
+    expect(opened).toHaveLength(1);
+    recordCase({ run: sandbox.run, id: 'RC-09', attempt: 'Un bloque del proyecto muere justo después de abrir un PR y antes de registrarlo', stoppedBy: ['motor'], negative: 'frenado', positive: 'pasó', evidence: opened.map((n) => `https://github.com/${REPO}/pull/${n}`) });
   }, 180_000);
 
   it('without reconcile, the piece stays blocked naming the effect, and no second pull request opens', async () => {
@@ -153,13 +156,13 @@ describe('RC-09 against GitHub', () => {
     await engine.run('rc09');
     const second = await engine.run('rc09');
     expect(second, JSON.stringify(second)).toMatchObject({ status: { state: 'blocked:technical', reason: expect.stringMatching(/"open-pr"/) } });
-    expect(pullRequests(branch)).toHaveLength(1);
+    expect(await track(branch)).toHaveLength(1);
   }, 180_000);
 
   it('positive: without an interruption exactly one pull request opens, and a resume opens none', async () => {
     const { branch, engine } = await piece(true, false);
     expect(await engine.run('rc09')).toMatchObject({ status: { state: 'done' } });
     expect(await engine.run('rc09')).toMatchObject({ status: { state: 'done' } });
-    expect(pullRequests(branch)).toHaveLength(1);
+    expect(await track(branch)).toHaveLength(1);
   }, 180_000);
 });

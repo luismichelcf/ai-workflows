@@ -4,7 +4,7 @@ import { appendFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, inject, it } from 'vitest';
 
 import {
   agentCredentialsFromEnv,
@@ -17,6 +17,9 @@ import {
 
 import { commit, git, write } from '../git-fixtures.js';
 
+import { recordCase, type CaseRecord } from './report.js';
+import { attachSandbox, createGhSandboxPort, type Sandbox } from './sandbox.js';
+
 // PLAN-13-R4 §10, the real run: a piece goes through the final stages in the test repository
 // (socialabs-margin/ai-workflows-pruebas) with the real GitHub App of the agents (R21), the real
 // merge queue and its required `candado-cola` status, real deployments (created by the test in
@@ -27,8 +30,9 @@ import { commit, git, write } from '../git-fixtures.js';
 // AI_WORKFLOWS_APP_KEY_FILE and AI_WORKFLOWS_AGENT_ACCOUNT set, and FAILS — never skips — without
 // them. The owner's approval is a MANUAL step outside this machine: the run prints the link and
 // waits up to 30 minutes for the owner to press "Approve" on the phone or the browser; the test
-// never approves with the owner's account. It closes every issue and pull request and deletes
-// every branch and folder it made.
+// never approves with the owner's account. Issues, pull requests, branches and deployments go
+// through the harness of PLAN-13-R5 §2.2, which starts this file from the snapshot and restores
+// everything at the end of the whole run; the folders it made are removed here.
 
 const REPO = process.env['AI_WORKFLOWS_GITHUB_TEST_REPO'] ?? '';
 const AGENT = process.env['AI_WORKFLOWS_AGENT_ACCOUNT'] ?? '';
@@ -56,7 +60,10 @@ async function waitFor<T>(label: string, probe: () => T | undefined, timeoutMs =
 }
 
 const OWNER = REPO === '' ? '' : gh('api', 'user', '--jq', '.login');
-const made = { issues: [] as number[], branches: [] as string[], folders: [] as string[] };
+const made = { folders: [] as string[] };
+let sandbox: Sandbox;
+const prUrl = (n: number) => `https://github.com/${REPO}/pull/${n}`;
+const record = (entry: Omit<CaseRecord, 'run'>) => recordCase({ run: sandbox.run, ...entry });
 
 function recipe(piece: number, stages: readonly string[]): string {
   return `${[
@@ -135,7 +142,6 @@ function workspace(piece: number, stages: readonly string[]) {
   git(main, 'config', 'user.name', 'e2e');
   git(main, 'config', 'commit.gpgsign', 'false');
   const branch = `feat/${piece}-e2e-${RUN}`;
-  made.branches.push(branch);
   const folder = join(parent, 'pieza');
   git(main, 'worktree', 'add', '-q', '-b', branch, folder, 'origin/main');
   // The recipe and the plan live next to the piece but never travel: the test repository's main
@@ -148,62 +154,34 @@ function workspace(piece: number, stages: readonly string[]) {
   return { main, folder, branch, head };
 }
 
-function newIssue(title: string): number {
-  const url = gh('issue', 'create', '--repo', REPO, '--title', title, '--body', 'Pieza de prueba del recorrido real de la rebanada 4. Se cierra sola.');
-  const number = Number(url.split('/').pop());
-  made.issues.push(number);
-  return number;
+async function newIssue(title: string): Promise<number> {
+  return sandbox.createIssue(title);
 }
 
-function createDeployment(sha: string, environment: string, url: string): void {
-  const body = JSON.stringify({ ref: sha, environment, auto_merge: false, required_contexts: [] });
-  const created = JSON.parse(execFileSync('gh', ['api', '-X', 'POST', `repos/${REPO}/deployments`, '--input', '-'], { input: body, encoding: 'utf8' })) as { id: number };
-  execFileSync('gh', ['api', '-X', 'POST', `repos/${REPO}/deployments/${created.id}/statuses`, '--input', '-'], {
-    input: JSON.stringify({ state: 'success', environment_url: url }),
-    encoding: 'utf8',
-  });
-  log(`deployment ${environment} ${created.id} for ${sha.slice(0, 7)} → ${url}`);
+async function createDeployment(sha: string, environment: string, url: string): Promise<void> {
+  const id = await sandbox.createDeployment({ sha, environment, url });
+  log(`deployment ${environment} ${id} for ${sha.slice(0, 7)} → ${url}`);
 }
 
 function deps(cwd: string, over: Partial<AgentCliDeps> = {}): AgentCliDeps {
   return { cwd, env: process.env as Record<string, string>, ...over };
 }
 
-beforeAll(() => {
+beforeAll(async () => {
   const missing = ['AI_WORKFLOWS_GITHUB_TEST_REPO', 'AI_WORKFLOWS_APP_ID', 'AI_WORKFLOWS_APP_KEY_FILE', 'AI_WORKFLOWS_AGENT_ACCOUNT']
     .filter((name) => (process.env[name] ?? '') === '');
   if (missing.length > 0) throw new Error(`the real run needs ${missing.join(', ')}; it never skips`);
-});
+  sandbox = await attachSandbox({ port: createGhSandboxPort(REPO), run: inject('sandboxRun') });
+  await sandbox.baseline();
+}, 10 * 60_000);
 
 afterAll(() => {
-  if (REPO === '') return;
-  for (const branch of made.branches) {
-    try {
-      for (const number of gh('pr', 'list', '--repo', REPO, '--head', branch, '--state', 'open', '--json', 'number', '--jq', '.[].number').split('\n').filter(Boolean)) {
-        gh('pr', 'close', number, '--repo', REPO);
-      }
-    } catch (error) {
-      log(`could not close the pull requests of ${branch}: ${String(error)}`);
-    }
-    try {
-      gh('api', '-X', 'DELETE', `repos/${REPO}/git/refs/heads/${branch}`);
-    } catch {
-      log(`branch ${branch} was already gone`);
-    }
-  }
-  for (const issue of made.issues) {
-    try {
-      gh('issue', 'close', String(issue), '--repo', REPO);
-    } catch (error) {
-      log(`could not close issue #${issue}: ${String(error)}`);
-    }
-  }
   for (const folder of made.folders) rmSync(folder, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 });
 
 describe('the final stages on GitHub, with the agents identity and the owner button', () => {
   it('a piece goes from the pull request to the merge queue, the checks after it and the cleanup', async () => {
-    const piece = newIssue(`e2e rebanada 4 · recorrido completo ${RUN}`);
+    const piece = await newIssue(`e2e rebanada 4 · recorrido completo ${RUN}`);
     const w = workspace(piece, FULL);
 
     // 1. The agents open the pull request and the piece waits for the owner.
@@ -215,6 +193,7 @@ describe('the final stages on GitHub, with the agents identity and the owner but
     );
     expect(pr).toBeDefined();
     if (pr === undefined) return;
+    await sandbox.trackPullRequest(pr.number, w.branch);
     expect(`${pr.author.login.replace(/^app\//, '')}${pr.author.is_bot && !pr.author.login.endsWith('[bot]') ? '[bot]' : ''}`).toBe(AGENT);
     const messages = ghJson<{ body: string; user: { login: string } }[]>('api', `repos/${REPO}/issues/${piece}/comments`);
     expect(messages.some((comment) => comment.user.login === AGENT && comment.body.includes('owner-message:approval'))).toBe(true);
@@ -225,6 +204,7 @@ describe('the final stages on GitHub, with the agents identity and the owner but
       runAgentCli(['run', String(piece)], deps(w.folder)),
     ]);
     expect([a, b].filter((output) => /otra sesión/.test(output.text))).toHaveLength(1);
+    record({ id: 'CN-12', attempt: 'Dos sesiones toman la misma pieza a la vez', stoppedBy: ['motor'], negative: 'frenado', positive: 'pasó', evidence: [prUrl(pr.number)] });
 
     // 3. MANUAL: the owner approves from outside this machine.
     process.stdout.write(`\n\n>>> DUEÑA: pulsa «Approve» en ${pr.url} (desde tu teléfono o navegador). Espero hasta 30 minutos.\n\n`);
@@ -234,17 +214,18 @@ describe('the final stages on GitHub, with the agents identity and the owner but
     }, 30 * MINUTE, 15_000);
 
     // 4. The preview of this exact version is ready (the test plays the hosting provider).
-    createDeployment(w.head, 'Preview', `https://p${piece}.example.com`);
+    await createDeployment(w.head, 'Preview', `https://p${piece}.example.com`);
 
     // 5. Approval, preview and merge pass; after the merge the production deployment is missing.
     const second = await runAgentCli(['run', String(piece)], deps(w.folder));
     log(second.text);
     const merged = ghJson<{ state: string; mergeCommit: { oid: string } | null }>('pr', 'view', String(pr.number), '--repo', REPO, '--json', 'state,mergeCommit');
     expect(merged.state).toBe('MERGED');
+    await sandbox.noteMerged(pr.number);
     expect(second.text).toMatch(/Lo publicado queda en verde|after/);
 
     // 6. Production of the merge commit is deployed; the checks after the merge pass and the cleanup ends it.
-    createDeployment(merged.mergeCommit?.oid ?? '', 'Production', `https://prod-${piece}.example.com`);
+    await createDeployment(merged.mergeCommit?.oid ?? '', 'Production', `https://prod-${piece}.example.com`);
     const third = await runAgentCli(['run', String(piece)], deps(w.folder));
     log(third.text);
     expect(third.ok).toBe(true);
@@ -257,10 +238,11 @@ describe('the final stages on GitHub, with the agents identity and the owner but
       }
     })();
     expect(branchGone).toBe(true);
+    record({ id: 'RECORRIDO', attempt: 'Una pieza completa, de la apertura del PR a la limpieza, con el botón del dueño', stoppedBy: [], negative: 'frenado', positive: 'no-aplica', result: 'pasó', evidence: [prUrl(pr.number)], owner: { button: true } });
   }, 90 * MINUTE);
 
   it('CN-13 for real: a crash right after the pull request is opened never opens a second one', async () => {
-    const piece = newIssue(`e2e rebanada 4 · caída tras abrir el PR ${RUN}`);
+    const piece = await newIssue(`e2e rebanada 4 · caída tras abrir el PR ${RUN}`);
     const w = workspace(piece, ONLY_APPROVAL);
     const credentials = agentCredentialsFromEnv(process.env, w.folder);
     if (!('appId' in credentials)) throw new Error(`credentials: ${JSON.stringify(credentials)}`);
@@ -285,6 +267,8 @@ describe('the final stages on GitHub, with the agents identity and the owner but
     log(second.text);
     expect(second.text).toMatch(/espera tu decisión|Approve/);
     const all = ghJson<{ number: number }[]>('pr', 'list', '--repo', REPO, '--head', w.branch, '--state', 'all', '--json', 'number');
+    for (const item of all) await sandbox.trackPullRequest(item.number, w.branch);
     expect(all).toHaveLength(1);
+    record({ id: 'CN-13', attempt: 'El motor muere justo después de abrir el PR y antes de registrarlo', stoppedBy: ['motor'], negative: 'frenado', positive: 'pasó', evidence: all.map((item) => prUrl(item.number)) });
   }, 20 * MINUTE);
 });
