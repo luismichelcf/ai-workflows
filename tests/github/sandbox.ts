@@ -183,13 +183,6 @@ function isMerged(state: SandboxState, number: number): boolean {
   );
 }
 
-/** A pull request the run registered: opened by the queue or recorded as merged by it. */
-function isRunPullRequest(state: SandboxState, number: number): boolean {
-  return state.journal.some(
-    (entry) => entry.resource === 'pull-request' && entry.after === number && (entry.op === 'merged' || entry.op === 'tracked'),
-  );
-}
-
 async function readLock(port: SandboxPort, sha: string): Promise<SandboxState> {
   const files = await port.readCommit(sha);
   const raw = files['lock.json'];
@@ -326,7 +319,9 @@ async function restoreMain(port: SandboxPort, state: SandboxState): Promise<stri
   for (const commit of history) {
     const pr = pullRequestOfCommit(commit);
     if (pr !== undefined) {
-      if (isRunPullRequest(state, pr)) changed = true;
+      // Only a merge the run itself noted with `noteMerged` counts as its own; a pull request it
+      // merely tracked, merged by GitHub without the run noticing, is reported, never accepted.
+      if (isMerged(state, pr)) changed = true;
       else problems.push(`main: la fusión del pull request ${pr} no la registró esta corrida`);
       continue;
     }
@@ -418,13 +413,22 @@ async function closePullRequestIfOpen(port: SandboxPort, problems: string[], num
   }
 }
 
-/** Deleting a branch fails when GitHub already deleted it; absent means it is already as wanted. */
+/**
+ * Deleting a branch fails when GitHub already deleted it; absent means it is already as wanted. If
+ * the re-read itself fails, both failures are collected so the rest of the restoration goes on.
+ */
 async function deleteBranchIfPresent(port: SandboxPort, problems: string[], name: string): Promise<void> {
   if (name.length === 0) return;
   try {
     await port.deleteBranch(name);
   } catch (error) {
-    const current = await port.getRef(`refs/heads/${name}`);
+    let current: string | undefined;
+    try {
+      current = await port.getRef(`refs/heads/${name}`);
+    } catch (readError) {
+      problems.push(`rama ${name}: ${messageOf(error)}; tampoco se pudo releer su estado (${messageOf(readError)})`);
+      return;
+    }
     if (current !== undefined) problems.push(`rama ${name}: ${messageOf(error)}`);
   }
 }
@@ -990,9 +994,11 @@ function tryGh(args: readonly string[]): { ok: true; out: string } | { ok: false
   }
 }
 
-/** Only a 404 means "it is not there"; every other `gh` error must be thrown, never read as absence. */
+/** Only a GitHub 404 means "it is not there"; every other `gh` error must be thrown, never read as absence. */
 function isNotFound(error: string): boolean {
-  return /\b404\b|not\s*found/i.test(error);
+  // Both `gh` shapes carry `HTTP 404` (`HTTP 404: Not Found` and `Not Found (HTTP 404)`); a mere
+  // "not found" in any other text is not an absence.
+  return /HTTP 404/.test(error);
 }
 
 function workflowFile(path: string): string {
@@ -1057,7 +1063,10 @@ export function createGhSandboxPort(repository: string): SandboxPort {
       if (refSha(name) !== expected) return 'conflict';
       // The new commit descends from `expected`, so `force=false` accepts only that forward move.
       const result = tryGh(['api', '-X', 'PATCH', `repos/${repo}/git/refs/${refPath(name)}`, '-f', `sha=${sha}`, '-F', 'force=false']);
-      return result.ok ? 'updated' : 'conflict';
+      if (result.ok) return 'updated';
+      // The reference still pointed at `expected`, so the failure is not ours to read as a race:
+      // throw with its reason instead of hiding it behind `conflict`.
+      throw new Error(`no se pudo mover la referencia ${name}: ${result.error}`);
     },
     async deleteRef(name, expected) {
       if (refSha(name) !== expected) return 'conflict';

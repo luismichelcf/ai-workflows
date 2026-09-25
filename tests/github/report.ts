@@ -282,6 +282,23 @@ function auditText(id: string, label: string, value: string): void {
   if (leak !== undefined) throw new Error(`Caso ${id}: "${label}" lleva ${leak}.`);
 }
 
+/**
+ * A path segment that is exactly `..` (or its percent-encoded form) climbs out of the repository;
+ * the three dots inside a name (`compare/abc...def`) are a legitimate link, not a climb.
+ */
+function climbsOutOfRepository(link: string): boolean {
+  for (const raw of link.split('/')) {
+    let segment = raw;
+    try {
+      segment = decodeURIComponent(raw);
+    } catch {
+      segment = raw;
+    }
+    if (segment === '..') return true;
+  }
+  return false;
+}
+
 function evidencePrefix(repository: string): string {
   return `https://github.com/${repository}/`;
 }
@@ -308,7 +325,7 @@ function auditRecord(record: CaseRecord, repository: string): void {
   const prefix = evidencePrefix(repository);
   for (const link of record.evidence) {
     auditText(record.id, 'evidence', link);
-    if (/\.\./.test(link) || /%2e/i.test(link) || /@/.test(link)) {
+    if (climbsOutOfRepository(link) || /@/.test(link)) {
       throw new Error(`Caso ${record.id}: la evidencia "${link}" lleva una ruta que sale del repositorio de ensayo.`);
     }
     if (!link.startsWith(prefix)) {
@@ -354,6 +371,12 @@ function unique(values: readonly string[]): string[] {
 }
 
 export function renderSuiteReport(records: readonly CaseRecord[], meta: SuiteReportMeta): SuiteReport {
+  // The header reaches the public report too: it goes through the same audit as every record.
+  auditText('la corrida', 'run', meta.run);
+  auditText('la corrida', 'date', meta.date);
+  auditText('la corrida', 'engineSha', meta.engineSha);
+  auditText('la corrida', 'repository', meta.repository);
+
   for (const record of records) auditRecord(record, meta.repository);
 
   const manifestById = new Map(SUITE_MANIFEST.map((entry) => [entry.id, entry]));
