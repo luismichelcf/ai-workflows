@@ -180,6 +180,22 @@ describe('a read that fails in the judgement from the issue is never a quiet gre
     expect(seen).toContain(other);
   });
 
+  // Round 3: the last re-read before publishing fails. Nothing may be published on a head that
+  // might have moved, but the run must not end quietly: it fails.
+  it('the last re-read before publishing fails: no verdict, and the run fails', async () => {
+    let reads = 0;
+    const t = setup({
+      pullRequest: async (n: number) => {
+        reads += 1;
+        if (reads > 1) throw new Error('HTTP 502 en la última relectura');
+        return { number: n, state: 'open', headSha: t.head, headRef: 'feat/13-boton', baseRef: 'main', headRepo: 'duena/proyecto' };
+      },
+    } as Partial<JudgeGitHub>);
+    await expect(t.judge()).rejects.toThrow(/502/);
+    expect(t.published.map((entry) => entry.state)).not.toContain('success');
+    expect(t.published.map((entry) => entry.state)).not.toContain('pending');
+  });
+
   it('an error status that cannot be published for one pull request does not stop the others', async () => {
     const other = 'd'.repeat(40);
     let first = true;
