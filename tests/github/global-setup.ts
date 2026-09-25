@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 
 import type { GlobalSetupContext } from 'vitest/node';
 
-import { createGhSandboxPort, createSandbox, type Sandbox } from './sandbox.js';
+import { createGhSandboxPort, createSandbox, finishSandbox, type Sandbox } from './sandbox.js';
 
 // PLAN-13-R5 §2.2: the whole GitHub suite shares one run. This setup takes the lock once, before
 // any file, and hands the run identifier to the files with `provide`; the teardown restores,
@@ -29,7 +29,12 @@ export default async function setup(context: GlobalSetupContext): Promise<() => 
   context.provide('sandboxRun', run);
   context.provide('sandboxRepository', REPOSITORY);
   return async () => {
-    const result = await sandbox.restore();
+    const reportFile = process.env['AI_WORKFLOWS_SUITE_REPORT'];
+    const result = await finishSandbox({
+      sandbox,
+      repository: REPOSITORY,
+      ...(reportFile === undefined ? {} : { reportFile }),
+    });
     if (!result.ok) {
       throw new Error(`la limpieza de la suite no quedó limpia; el candado sigue puesto:\n${result.problems.join('\n')}`);
     }

@@ -1,4 +1,7 @@
 import { execFileSync } from 'node:child_process';
+import { appendFileSync } from 'node:fs';
+
+import type { CaseRecord } from './report.js';
 
 // PLAN-13-R5 §2.2: the harness every real GitHub test goes through. One run, one lock, one
 // snapshot kept in GitHub. The lock (`refs/ai-workflows-suite/lock`) points, from its creation,
@@ -90,17 +93,25 @@ export interface SandboxPort {
 }
 
 export interface Sandbox {
+  /** The run this object belongs to; every attached object holds the same one. */
+  readonly run: string;
   acquire(): Promise<void>;
   restore(): Promise<{ ok: boolean; problems: string[] }>;
+  /** Puts the snapshot back without verifying and without releasing the lock, for the next file. */
+  baseline(): Promise<void>;
   setVariable(value: string): Promise<void>;
   addRequiredStatus(context: string): Promise<void>;
+  removeRequiredStatus(context: string): Promise<void>;
   setWorkflowEnabled(path: string, on: boolean): Promise<void>;
-  writeMainFiles(files: Record<string, string>, message: string): Promise<void>;
+  /** Writes files to `main` and returns the new head of `main`. */
+  writeMainFiles(files: Record<string, string>, message: string): Promise<string>;
   createIssue(title: string): Promise<number>;
   createBranch(name: string, sha: string): Promise<void>;
   createDeployment(o: { sha: string; environment: string; url: string }): Promise<number>;
-  trackPullRequest(number: number, branch: string): void;
-  noteMerged(number: number): void;
+  trackPullRequest(number: number, branch: string): Promise<void>;
+  noteMerged(number: number): Promise<void>;
+  /** Forges a piece-state ref: `journal.json` holds the object's JSON or the text as it comes. */
+  forgeStateRef(ref: string, content: Record<string, unknown> | string): Promise<string>;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -191,6 +202,20 @@ function addRequiredStatusTo(body: Record<string, unknown>, context: string): Re
     return { ...rule, parameters: { ...parameters, required_status_checks: checks } };
   });
   if (!found) next.push({ type: 'required_status_checks', parameters: { required_status_checks: [{ context }] } });
+  return { ...body, rules: next };
+}
+
+function removeRequiredStatusFrom(body: Record<string, unknown>, context: string): Record<string, unknown> {
+  const rules = Array.isArray(body['rules']) ? [...body['rules']] : [];
+  const next = rules.map((rule) => {
+    if (!isRecord(rule) || rule['type'] !== 'required_status_checks') return rule;
+    const parameters = isRecord(rule['parameters']) ? rule['parameters'] : {};
+    const checks = Array.isArray(parameters['required_status_checks']) ? [...parameters['required_status_checks']] : [];
+    return {
+      ...rule,
+      parameters: { ...parameters, required_status_checks: checks.filter((check) => !isRecord(check) || check['context'] !== context) },
+    };
+  });
   return { ...body, rules: next };
 }
 
@@ -410,7 +435,80 @@ async function performRestore(port: SandboxPort, state: SandboxState): Promise<s
     await port.deleteBranch(tracked.branch);
   }
 
+  for (const entry of state.journal) {
+    if (entry.resource !== 'state-ref' || !entry.done || entry.path === undefined) continue;
+    const current = await port.getRef(entry.path);
+    if (typeof entry.after === 'string' && current === entry.after) {
+      const deleted = await port.deleteRef(entry.path, entry.after);
+      if (deleted === 'conflict') problems.push(`referencia de estado ${entry.path}: no se pudo borrar`);
+    } else if (current !== undefined) {
+      problems.push(`referencia de estado ${entry.path}: no coincide con lo último que escribió la corrida`);
+    }
+  }
+
+  for (const entry of state.journal) {
+    if (entry.resource !== 'issue' || !entry.done || typeof entry.after !== 'number') continue;
+    const ref = `refs/ai-workflows/pieces/${entry.after}`;
+    const current = await port.getRef(ref);
+    if (current !== undefined) {
+      const deleted = await port.deleteRef(ref, current);
+      if (deleted === 'conflict') problems.push(`referencia de estado ${ref}: no se pudo borrar`);
+    }
+  }
+
   problems.push(...(await verifyAgainstSnapshot(port, state)));
+  return problems;
+}
+
+/**
+ * Puts back what this run wrote last (variable, ruleset, workflows, `main`) without verifying and
+ * without releasing the lock: each test file starts from the snapshot while the journal survives.
+ */
+async function performBaseline(port: SandboxPort, state: SandboxState): Promise<string[]> {
+  const problems: string[] = [];
+  const snapshot = state.snapshot;
+
+  const variableEntry = lastEntry(state, 'variable');
+  if (variableEntry !== undefined) {
+    const remote = await port.variable();
+    if (sameValue(remote, variableEntry.after) && !sameValue(remote, snapshot.variable)) {
+      await restoreWrite(
+        problems,
+        'variable AI_WORKFLOWS_MODE',
+        () => port.setVariable(snapshot.variable),
+        async () => sameValue(await port.variable(), snapshot.variable),
+      );
+    }
+  }
+
+  const rulesetEntry = lastEntry(state, 'ruleset');
+  if (rulesetEntry !== undefined) {
+    const remote = pickRuleset(await port.ruleset());
+    if (sameValue(remote, pickRuleset(rulesetEntry.after)) && !sameValue(remote, pickRuleset(snapshot.ruleset))) {
+      await restoreWrite(
+        problems,
+        'ruleset',
+        () => port.putRuleset(pickRuleset(snapshot.ruleset)),
+        async () => sameValue(pickRuleset(await port.ruleset()), pickRuleset(snapshot.ruleset)),
+      );
+    }
+  }
+
+  for (const path of Object.keys(snapshot.workflows)) {
+    const entry = lastEntry(state, 'workflow', (candidate) => candidate.path === path);
+    if (entry === undefined) continue;
+    const remote = await port.workflowEnabled(path);
+    if (remote === entry.after && remote !== snapshot.workflows[path]) {
+      await restoreWrite(
+        problems,
+        `workflow ${path}`,
+        () => port.setWorkflowEnabled(path, snapshot.workflows[path] === true),
+        async () => (await port.workflowEnabled(path)) === snapshot.workflows[path],
+      );
+    }
+  }
+
+  problems.push(...(await restoreMain(port, state)));
   return problems;
 }
 
@@ -427,8 +525,7 @@ function emptySnapshot(): SandboxSnapshot {
   };
 }
 
-export function createSandbox(options: { port: SandboxPort; run: string }): Sandbox {
-  const { port, run } = options;
+function makeSandbox(port: SandboxPort, run: string): { sandbox: Sandbox; adopt: (lockSha: string, state: SandboxState) => void } {
   let lockSha: string | undefined;
   let opCount = 0;
   let state: SandboxState = {
@@ -437,8 +534,36 @@ export function createSandbox(options: { port: SandboxPort; run: string }): Sand
     snapshot: emptySnapshot(),
     journal: [],
   };
+  let queue: Promise<unknown> = Promise.resolve();
+
+  // Every write waits its turn inside one object, so a file that does not await a journal write
+  // still sees it before the next one: track, merge and restore land in order on the lock.
+  const serialize = function <T>(task: () => Promise<T>): Promise<T> {
+    const result = queue.then(task, task);
+    queue = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  };
 
   const nextMarker = (kind: string): string => `${run}:${kind}:${(opCount += 1)}`;
+
+  // Reads the lock that is in GitHub before every write: another object of the run may have moved
+  // it, and its journal is the only truth. A lock of another run, or an unreadable one, stops here.
+  const refresh = async (): Promise<void> => {
+    const sha = await port.getRef(LOCK_REF);
+    if (sha === undefined) throw new Error('el candado de la suite no está puesto');
+    let remote: SandboxState;
+    try {
+      remote = await readLock(port, sha);
+    } catch {
+      throw new Error('el candado de la suite no se pudo leer: lo movió otra corrida');
+    }
+    if (remote.run !== run) throw new Error(`el candado de la suite es de la corrida ${remote.run}, no de ${run}`);
+    state = remote;
+    lockSha = sha;
+  };
 
   const persist = async (): Promise<void> => {
     if (lockSha === undefined) throw new Error('el candado de la suite todavía no se tomó');
@@ -462,7 +587,8 @@ export function createSandbox(options: { port: SandboxPort; run: string }): Sand
   const findTracked = (number: number): SandboxJournalEntry | undefined =>
     state.journal.find((entry) => entry.resource === 'pull-request' && entry.after === number && entry.op === 'tracked');
 
-  return {
+  const sandbox: Sandbox = {
+    run,
     async acquire(): Promise<void> {
       const permissions = await port.permissions();
       if (!permissions.admin || !permissions.appOnlyHere) {
@@ -502,83 +628,206 @@ export function createSandbox(options: { port: SandboxPort; run: string }): Sand
     },
 
     async restore(): Promise<{ ok: boolean; problems: string[] }> {
-      const problems = await performRestore(port, state);
-      if (problems.length > 0) return { ok: false, problems };
-      const deleted = await port.deleteRef(LOCK_REF, lockSha ?? '');
-      if (deleted === 'conflict') return { ok: false, problems: ['candado: se movió antes de soltarlo'] };
-      lockSha = undefined;
-      return { ok: true, problems: [] };
+      return serialize(async () => {
+        await refresh();
+        const problems = await performRestore(port, state);
+        if (problems.length > 0) return { ok: false, problems };
+        const deleted = await port.deleteRef(LOCK_REF, lockSha ?? '');
+        if (deleted === 'conflict') return { ok: false, problems: ['candado: se movió antes de soltarlo'] };
+        lockSha = undefined;
+        return { ok: true, problems: [] };
+      });
+    },
+
+    async baseline(): Promise<void> {
+      await serialize(async () => {
+        await refresh();
+        await performBaseline(port, state);
+      });
     },
 
     async setVariable(value: string): Promise<void> {
-      const before = (await port.variable()) ?? null;
-      const index = await addIntention({ op: 'set-variable', resource: 'variable', before, after: value });
-      await port.setVariable(value);
-      await markDone(index, value);
+      await serialize(async () => {
+        await refresh();
+        const before = (await port.variable()) ?? null;
+        const index = await addIntention({ op: 'set-variable', resource: 'variable', before, after: value });
+        await port.setVariable(value);
+        await markDone(index, value);
+      });
     },
 
     async addRequiredStatus(context: string): Promise<void> {
-      const before = await port.ruleset();
-      const next = addRequiredStatusTo(before, context);
-      const index = await addIntention({ op: 'add-required-status', resource: 'ruleset', before, after: pickRuleset(next) });
-      await port.putRuleset(pickRuleset(next));
-      await markDone(index);
+      await serialize(async () => {
+        await refresh();
+        const before = await port.ruleset();
+        const next = addRequiredStatusTo(before, context);
+        const index = await addIntention({ op: 'add-required-status', resource: 'ruleset', before, after: pickRuleset(next) });
+        await port.putRuleset(pickRuleset(next));
+        await markDone(index);
+      });
+    },
+
+    async removeRequiredStatus(context: string): Promise<void> {
+      await serialize(async () => {
+        await refresh();
+        const before = await port.ruleset();
+        const next = removeRequiredStatusFrom(before, context);
+        const index = await addIntention({ op: 'remove-required-status', resource: 'ruleset', before, after: pickRuleset(next) });
+        await port.putRuleset(pickRuleset(next));
+        await markDone(index);
+      });
     },
 
     async setWorkflowEnabled(path: string, on: boolean): Promise<void> {
-      const before = await port.workflowEnabled(path);
-      if (!(path in state.snapshot.workflows)) state.snapshot.workflows[path] = before;
-      const index = await addIntention({ op: 'set-workflow', resource: 'workflow', path, before, after: on });
-      await port.setWorkflowEnabled(path, on);
-      await markDone(index);
+      await serialize(async () => {
+        await refresh();
+        const before = await port.workflowEnabled(path);
+        if (!(path in state.snapshot.workflows)) state.snapshot.workflows[path] = before;
+        const index = await addIntention({ op: 'set-workflow', resource: 'workflow', path, before, after: on });
+        await port.setWorkflowEnabled(path, on);
+        await markDone(index);
+      });
     },
 
-    async writeMainFiles(files: Record<string, string>, message: string): Promise<void> {
-      const current = await port.main();
-      const marker = nextMarker('main');
-      const index = await addIntention({ op: 'write-main', resource: 'main', before: current.head, after: marker, marker });
-      const commit = await port.writeCommit(files, current.head);
-      const result = await port.commitToMain({ expectedHead: current.head, tree: commit, message: `${message} [${marker}]` });
-      if (result === 'conflict') throw new Error(`main se movió antes de escribir: ${message}`);
-      await markDone(index, result.sha);
+    async writeMainFiles(files: Record<string, string>, message: string): Promise<string> {
+      return serialize(async () => {
+        await refresh();
+        const current = await port.main();
+        const marker = nextMarker('main');
+        const index = await addIntention({ op: 'write-main', resource: 'main', before: current.head, after: marker, marker });
+        const commit = await port.writeCommit(files, current.head);
+        const result = await port.commitToMain({ expectedHead: current.head, tree: commit, message: `${message} [${marker}]` });
+        if (result === 'conflict') throw new Error(`main se movió antes de escribir: ${message}`);
+        await markDone(index, result.sha);
+        return result.sha;
+      });
     },
 
     async createIssue(title: string): Promise<number> {
-      const marker = nextMarker('issue');
-      const index = await addIntention({ op: 'create-issue', resource: 'issue', before: null, after: marker, marker });
-      const number = await port.createIssue(`[${marker}] ${title}`);
-      await markDone(index, number);
-      return number;
+      return serialize(async () => {
+        await refresh();
+        const marker = nextMarker('issue');
+        const index = await addIntention({ op: 'create-issue', resource: 'issue', before: null, after: marker, marker });
+        const number = await port.createIssue(`[${marker}] ${title}`);
+        await markDone(index, number);
+        return number;
+      });
     },
 
     async createBranch(name: string, sha: string): Promise<void> {
-      const index = await addIntention({ op: 'create-branch', resource: 'branch', path: name, before: null, after: sha });
-      const created = await port.createRef(`refs/heads/${name}`, sha);
-      if (created === 'exists') throw new Error(`la rama ${name} ya existía`);
-      await markDone(index);
+      await serialize(async () => {
+        await refresh();
+        const index = await addIntention({ op: 'create-branch', resource: 'branch', path: name, before: null, after: sha });
+        const created = await port.createRef(`refs/heads/${name}`, sha);
+        if (created === 'exists') throw new Error(`la rama ${name} ya existía`);
+        await markDone(index);
+      });
     },
 
     async createDeployment(o: { sha: string; environment: string; url: string }): Promise<number> {
-      const marker = nextMarker('deployment');
-      const index = await addIntention({ op: 'create-deployment', resource: 'deployment', before: null, after: marker, marker });
-      const id = await port.createDeployment({ ...o, payload: marker, autoInactive: false });
-      await markDone(index, id);
-      return id;
+      return serialize(async () => {
+        await refresh();
+        const marker = nextMarker('deployment');
+        const index = await addIntention({ op: 'create-deployment', resource: 'deployment', before: null, after: marker, marker });
+        const id = await port.createDeployment({ ...o, payload: marker, autoInactive: false });
+        await markDone(index, id);
+        return id;
+      });
     },
 
-    trackPullRequest(number: number, branch: string): void {
-      state.journal.push({ op: 'tracked', resource: 'pull-request', before: null, after: number, path: branch, done: true });
+    async trackPullRequest(number: number, branch: string): Promise<void> {
+      await serialize(async () => {
+        await refresh();
+        state.journal.push({ op: 'tracked', resource: 'pull-request', before: null, after: number, path: branch, done: true });
+        await persist();
+      });
     },
 
-    noteMerged(number: number): void {
-      const entry = findTracked(number);
-      if (entry === undefined) {
-        state.journal.push({ op: 'merged', resource: 'pull-request', before: null, after: number, done: true });
-        return;
-      }
-      state.journal.push({ op: 'merged', resource: 'pull-request', before: null, after: number, path: entry.path, done: true });
+    async noteMerged(number: number): Promise<void> {
+      await serialize(async () => {
+        await refresh();
+        const entry = findTracked(number);
+        state.journal.push({
+          op: 'merged',
+          resource: 'pull-request',
+          before: null,
+          after: number,
+          ...(entry?.path === undefined ? {} : { path: entry.path }),
+          done: true,
+        });
+        await persist();
+      });
+    },
+
+    async forgeStateRef(ref: string, content: Record<string, unknown> | string): Promise<string> {
+      return serialize(async () => {
+        await refresh();
+        const body = typeof content === 'string' ? content : JSON.stringify(content);
+        const sha = await port.writeCommit({ 'journal.json': body });
+        const index = await addIntention({ op: 'forge-state', resource: 'state-ref', before: null, after: sha, path: ref });
+        const created = await port.createRef(ref, sha);
+        if (created === 'exists') throw new Error(`la referencia ${ref} ya existía`);
+        await markDone(index);
+        return sha;
+      });
     },
   };
+
+  const adopt = (sha: string, adopted: SandboxState): void => {
+    lockSha = sha;
+    state = adopted;
+  };
+
+  return { sandbox, adopt };
+}
+
+export function createSandbox(options: { port: SandboxPort; run: string }): Sandbox {
+  const { port, run } = options;
+  return makeSandbox(port, run).sandbox;
+}
+
+/**
+ * Every test file works with its own object, in another scope, attached to the lock that the global
+ * setup left in GitHub. The run must be the one that holds the lock; otherwise it says both.
+ */
+export async function attachSandbox(options: { port: SandboxPort; run: string }): Promise<Sandbox> {
+  const { port, run } = options;
+  const sha = await port.getRef(LOCK_REF);
+  if (sha === undefined) throw new Error('no hay candado de la suite al que engancharse');
+  const state = await readLock(port, sha);
+  if (state.run !== run) throw new Error(`el candado es de la corrida ${state.run}, no de ${run}`);
+  const { sandbox, adopt } = makeSandbox(port, run);
+  adopt(sha, state);
+  return sandbox;
+}
+
+/**
+ * The teardown of the whole suite: restores, and records the LIMPIEZA case of the report when a
+ * report file is given. A dirty restoration leaves the lock in place and records it as failed.
+ */
+export async function finishSandbox(options: {
+  sandbox: Sandbox;
+  repository: string;
+  reportFile?: string;
+}): Promise<{ ok: boolean; problems: string[] }> {
+  const { sandbox, repository, reportFile } = options;
+  const result = await sandbox.restore();
+  if (reportFile !== undefined && reportFile.length > 0) {
+    const record: CaseRecord = {
+      run: sandbox.run,
+      id: 'LIMPIEZA',
+      attempt: result.ok
+        ? 'la suite repuso la foto del ensayo, la verificó y soltó el candado'
+        : 'la suite no pudo dejar el ensayo limpio: quedó algo fuera de la foto y el candado sigue puesto',
+      stoppedBy: [],
+      negative: 'frenado',
+      positive: 'no-aplica',
+      evidence: [`https://github.com/${repository}/actions`],
+      result: result.ok ? 'pasó' : 'falló',
+    };
+    appendFileSync(reportFile, `${JSON.stringify(record)}\n`, 'utf8');
+  }
+  return result;
 }
 
 /**
