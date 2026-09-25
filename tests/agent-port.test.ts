@@ -201,6 +201,21 @@ describe('branchActivity', () => {
   });
 });
 
+describe('every call names the repository (found in the real run: `gh pr ready` used the repository of the folder)', () => {
+  it('markReady never depends on the folder it runs in', async () => {
+    const { github, calls } = port([[/.*/, ok({ data: { markPullRequestReadyForReview: { pullRequest: { number: 7 } } }, node_id: 'PR_node7' })]]);
+    await github.markReady(7);
+    expect(calls.length).toBeGreaterThan(0);
+    for (const call of calls) {
+      const joined = call.args.join(' ');
+      const named = call.args[0] === 'api'
+        ? /repos\/duena\/proyecto|graphql/.test(joined)
+        : call.args.includes('--repo') && call.args[call.args.indexOf('--repo') + 1] === REPO;
+      expect(named, joined).toBe(true);
+    }
+  });
+});
+
 describe('writes', () => {
   it('creates a draft pull request with the body on stdin, never in the arguments', async () => {
     const body = 'Refs #13\n<!-- ai-workflows:op open-pr:feat/13-algo:aaaa -->';
