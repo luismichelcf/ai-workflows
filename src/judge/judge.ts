@@ -916,9 +916,9 @@ export async function runJudge(input: JudgeInput, deps: JudgeDeps): Promise<Judg
     if (!base.ok) {
       throw new Error(`La receta de la rama principal no se pudo leer: ${base.reason}`);
     }
-    let currentRecipe = base.recipe;
-    const spanish = isSpanish(currentRecipe.locale);
-    if (currentRecipe.pieces === undefined) {
+    const baseRecipe = base.recipe;
+    const spanish = isSpanish(baseRecipe.locale);
+    if (baseRecipe.pieces === undefined) {
       addNote(notes, pick(
         spanish,
         `La receta no declara piezas: el issue ${String(issueNumber)} no nombra ninguna`,
@@ -929,7 +929,7 @@ export async function runJudge(input: JudgeInput, deps: JudgeDeps): Promise<Judg
     const open = await github.openPullRequests();
     const matching = open.filter((pr) => {
       if (pr.baseRef !== principal) return false;
-      const piece = pieceOfBranch(currentRecipe, pr.headRef, pr.number);
+      const piece = pieceOfBranch(baseRecipe, pr.headRef, pr.number);
       return 'piece' in piece && piece.piece === String(issueNumber);
     });
     if (matching.length === 0) {
@@ -941,22 +941,38 @@ export async function runJudge(input: JudgeInput, deps: JudgeDeps): Promise<Judg
       return finish();
     }
 
-    // A publish that fails is said and never stops the other pull requests.
-    const safePublish = async (sha: string, state: string, description: string): Promise<void> => {
+    // A publish that fails is said and never stops the other pull requests, but a run that could
+    // not write a status ends as failed: the CLI exits 1 and the log keeps the motive.
+    const failures: string[] = [];
+    const safePublish = async (
+      sha: string,
+      state: string,
+      description: string,
+      locale: string,
+    ): Promise<boolean> => {
       try {
         await publish(sha, targetContext, state, description);
+        return true;
       } catch (error) {
-        addNote(notes, pick(
-          isSpanish(currentRecipe.locale),
+        const reason = pick(
+          isSpanish(locale),
           `No se pudo publicar el estado sobre ${sha}: ${reasonOf(error)}`,
           `The status could not be published on ${sha}: ${reasonOf(error)}`,
-        ));
+        );
+        addNote(notes, reason);
+        failures.push(reason);
+        return false;
       }
     };
 
     const judgedAll: JudgedPr[] = [];
     const unofficialAll: Unofficial[] = [];
     for (const candidate of matching) {
+      // The trusted commit and the recipe of that commit stay together, per pull request: a
+      // principal that moved while judging an earlier one never mixes a new recipe with an old SHA.
+      let currentTrusted = trusted;
+      let currentRecipe = baseRecipe;
+
       // (a) the live head and destination of this pull request, re-read before judging.
       let live: JudgePullRequest;
       try {
@@ -964,7 +980,7 @@ export async function runJudge(input: JudgeInput, deps: JudgeDeps): Promise<Judg
       } catch (error) {
         // The head is already known from the open list, so the error is published there and this
         // failure never touches the other pull requests.
-        await safePublish(candidate.headSha, 'error', reasonOf(error));
+        await safePublish(candidate.headSha, 'error', reasonOf(error), currentRecipe.locale);
         continue;
       }
       if (live.baseRef !== principal) {
@@ -994,13 +1010,12 @@ export async function runJudge(input: JudgeInput, deps: JudgeDeps): Promise<Judg
           },
         );
 
-      let currentTrusted = trusted;
       let judged: JudgedPr;
       try {
         judged = await judgeLive(currentRecipe, currentTrusted);
       } catch (error) {
         // An exception inside the engine is technical for this pull request only (SV-03c).
-        await safePublish(live.headSha, 'error', reasonOf(error));
+        await safePublish(live.headSha, 'error', reasonOf(error), currentRecipe.locale);
         continue;
       }
 
@@ -1035,7 +1050,7 @@ export async function runJudge(input: JudgeInput, deps: JudgeDeps): Promise<Judg
               isSpanish(currentRecipe.locale),
               'la rama principal cambió mientras se juzgaba',
               'the main branch changed while the run was judging',
-            ));
+            ), currentRecipe.locale);
             break;
           }
           currentTrusted = nowMain;
@@ -1053,7 +1068,7 @@ export async function runJudge(input: JudgeInput, deps: JudgeDeps): Promise<Judg
           try {
             judged = await judgeLive(currentRecipe, currentTrusted);
           } catch (error) {
-            await safePublish(live.headSha, 'error', reasonOf(error));
+            await safePublish(live.headSha, 'error', reasonOf(error), currentRecipe.locale);
             break;
           }
           continue;
@@ -1065,11 +1080,16 @@ export async function runJudge(input: JudgeInput, deps: JudgeDeps): Promise<Judg
         try {
           statuses = await github.statuses(live.headSha);
         } catch (error) {
+          // Without the statuses (c) cannot be decided: a verdict could overwrite a newer one.
+          // The head gets its error status, no verdict goes out, and the run is marked failed.
           addNote(notes, pick(
             isSpanish(currentRecipe.locale),
             `no se pudieron leer los estados de ${live.headSha}: ${reasonOf(error)}`,
             `the statuses of ${live.headSha} could not be read: ${reasonOf(error)}`,
           ));
+          failures.push(reasonOf(error));
+          await safePublish(live.headSha, 'error', reasonOf(error), currentRecipe.locale);
+          break;
         }
         const newest = statuses.find((status) => status.context === targetContext);
         if (newest !== undefined) {
@@ -1094,7 +1114,13 @@ export async function runJudge(input: JudgeInput, deps: JudgeDeps): Promise<Judg
           }
         }
 
-        await safePublish(live.headSha, stateOf(judged.verdict), describeVerdict([judged], currentRecipe.locale));
+        const written = await safePublish(
+          live.headSha,
+          stateOf(judged.verdict),
+          describeVerdict([judged], currentRecipe.locale),
+          currentRecipe.locale,
+        );
+        if (!written) break;
         done = true;
       }
       if (!done) continue;
@@ -1132,7 +1158,11 @@ export async function runJudge(input: JudgeInput, deps: JudgeDeps): Promise<Judg
       stages: piece.stages,
       ...(piece.note === undefined ? {} : { note: piece.note }),
     }));
-    return finish(judgedAll, unofficialAll, buildSummary(summaryPieces, unofficialAll, currentRecipe.locale, notes));
+    const summary = buildSummary(summaryPieces, unofficialAll, baseRecipe.locale, notes);
+    // The other pull requests were judged and each published its own status; but a run that could
+    // not write a verdict or read a head's status is failed, and it says so instead of pretending.
+    if (failures.length > 0) throw new Error(failures.join('; '));
+    return finish(judgedAll, unofficialAll, summary);
   };
 
   if (targets.ok === 'empty') {

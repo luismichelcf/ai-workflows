@@ -96,25 +96,38 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
 export const SHELL_TOOLS = new Set(['Bash', 'PowerShell', 'Monitor']);
 /** Without a recipe the lock knows only the v0.3.0 order, so old callers keep working. */
 const DEFAULT_OWNER_ORDERS: readonly string[] = ['/visto-bueno'];
-/** The `gh` binary, plain or `.exe`, reached directly or through a quoted path (PLAN-13-R5 §1.3). */
-const GH_BIN = String.raw`(?:^|[\s"'\\/])gh(?:\.exe)?["']?`;
+/**
+ * The `gh` binary as a whole word, plain or `.exe`, reached directly or through a quoted path. `\b`
+ * also sees it glued to a shell separator (`;gh`, `&&gh`, `|gh`, `(gh`, `$(gh`, a backquote), while
+ * a word that merely ends in `gh` (`high`) has no boundary before it and is not the binary
+ * (PLAN-13-R5 §1.3).
+ */
+const GH_BIN = String.raw`\bgh(?:\.exe)?["']?`;
+/** The general options gh accepts between the binary and its command (`-R`, `--repo`, `--hostname`). */
+const GH_GLOBAL =
+  String.raw`(?:\s+(?:-R|--repo|--hostname)(?:\s+|=)\S+|\s+--[A-Za-z][A-Za-z-]*(?:=\S+)?|\s+-[A-Za-z])*`;
+/** The binary plus its general options, ready to be followed by the command itself. */
+const GH_CMD = `${GH_BIN}${GH_GLOBAL}`;
 /** The terminal forms a person uses to approve a pull request (PLAN-13-R5 §1.3). */
-const PULL_REQUEST_REVIEW = new RegExp(`${GH_BIN}\\s+pr\\s+review\\b`, 'i');
-const REVIEW_APPROVE_FLAG = /(^|\s)(--approve|-a)(\s|$)/;
+const PULL_REQUEST_REVIEW = new RegExp(`${GH_CMD}\\s+pr\\s+review\\b`, 'i');
+const REVIEW_APPROVE_FLAG = /(^|\s)(--approve|-a)(?=\W|$)/;
 const API_PULL_REVIEWS = /pulls\/\d+\/reviews/;
 /** A body sent to the reviews endpoint: its content cannot be read here, so it is refused. */
-const API_REVIEWS_INPUT = /(^|\s)--input(\s|$)/;
+const API_REVIEWS_INPUT = /(^|\s)--input(=|\s|$)/;
 const API_REVIEWS_APPROVE = /approve/i;
-/** The GraphQL mutation that approves a pull request. */
-const GRAPHQL_ADD_REVIEW = /addPullRequestReview\b/i;
+/** The GraphQL mutations that add or submit a pull request review. */
+const GRAPHQL_ADD_REVIEW = /(?:add|submit)PullRequestReview\b/i;
 /** Publishing to GitHub from the shell, the strict rule of a broken recipe (§1.4). */
-const GH_PR_COMMENT = new RegExp(`${GH_BIN}\\s+pr\\s+comment\\b`, 'i');
-const GH_ISSUE_COMMENT = new RegExp(`${GH_BIN}\\s+issue\\s+comment\\b`, 'i');
-const GH_API = new RegExp(`${GH_BIN}\\s+api\\b`, 'i');
-/** Any spelling of the method flag: `-X GET`, `-XPOST`, `--method=POST`, `--method PATCH`. */
-const API_METHOD = /(?:-x|--method)\s*=?\s*(\S+)/i;
+const GH_PR_COMMENT = new RegExp(`${GH_CMD}\\s+pr\\s+comment\\b`, 'i');
+const GH_ISSUE_COMMENT = new RegExp(`${GH_CMD}\\s+issue\\s+comment\\b`, 'i');
+const GH_API = new RegExp(`${GH_CMD}\\s+api\\b`, 'i');
 /** Any spelling of a field flag, attached or not: `-f body=`, `-fbody=`, `-F=body=`, `--raw-field`. */
 const API_SENDS_FIELDS = /(^|\s)(-f|-F)(\S*)(?=\s|$)|(^|\s)(--field|--raw-field|--input)(=|\s|$)/i;
+/** The method of a `gh api` call, as gh reads it: the LAST `-X`/`--method` of the command. */
+function lastApiMethod(command: string): string | undefined {
+  const found = [...command.matchAll(/(?:-x|--method)\s*=?\s*(\S+)/gi)];
+  return found.length === 0 ? undefined : found[found.length - 1]?.[1];
+}
 /** A line the server reads as any order: `/word value`, the shape of every approval. */
 const ORDER_SHAPED_LINE = /^\/(\S+)\s+(\S.*)$/;
 
@@ -171,7 +184,7 @@ function publishesToGitHub(command: string): boolean {
     return true;
   }
   if (!GH_API.test(command)) return false;
-  const method = API_METHOD.exec(command)?.[1];
+  const method = lastApiMethod(command);
   if (method !== undefined && method.toUpperCase() !== 'GET') return true;
   return API_SENDS_FIELDS.test(command);
 }

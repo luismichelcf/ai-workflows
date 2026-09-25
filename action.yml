@@ -130,6 +130,13 @@ runs:
           fi
           local live
           live="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$n")"
+          # Un PR cerrado o fusionado no recibe veredicto nuevo: la señal de revisión solo sigue si
+          # el PR sigue abierto (PLAN-13-R5 §2.6). Una respuesta sin `state` no se supone abierta.
+          local live_state
+          live_state="$(printf '%s' "$live" | jq -r '.state // empty')"
+          if [ "$live_state" != 'open' ]; then
+            stop "el PR #$n ya no está abierto (estado: $live_state)"
+          fi
           local base
           base="$(printf '%s' "$live" | jq -r '.base.ref // empty')"
           if [ "$base" != "$default_branch" ]; then
@@ -205,6 +212,8 @@ runs:
               esac
               case "$mode" in
                 ''|off) stop "motor apagado" ;;
+                advisory|on) ;;
+                *) stop "AI_WORKFLOWS_MODE inválido: use off, advisory u on" ;;
               esac
               publish='false'
               sha=''

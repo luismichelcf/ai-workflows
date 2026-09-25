@@ -29,7 +29,9 @@ const FAKE_GH = [
   'printf "%s\\n" "$*" >> "$FAKE_LOG"',
   'case "$*" in',
   '  "api repos/o/r --jq .default_branch") echo main ;;',
-  `  "api repos/o/r/pulls/7") echo '{"base":{"ref":"main"},"head":{"sha":"${HEAD}"}}' ;;`,
+  `  "api repos/o/r/pulls/7") echo '{"state":"open","base":{"ref":"main"},"head":{"sha":"${HEAD}"}}' ;;`,
+  `  "api repos/o/r/pulls/9") echo '{"state":"closed","base":{"ref":"main"},"head":{"sha":"${HEAD}"}}' ;;`,
+  `  "api repos/o/r/pulls/10") echo '{"base":{"ref":"main"},"head":{"sha":"${HEAD}"}}' ;;`,
   '  "api repos/o/r/pulls/13") echo "gh: Not Found (HTTP 404)" >&2; exit 1 ;;',
   '  "api repos/o/r/statuses/"*) echo "{}" ;;',
   '  *) echo "fake gh: unexpected: $*" >&2; exit 1 ;;',
@@ -116,6 +118,8 @@ describe('the review signal gets through the first step of the action', () => {
     ['another repository', { repository: { full_name: 'otro/r' } }],
     ['another workflow path', { path: '.github/workflows/otra.yml@refs/heads/main' }],
     ['no pull request number (a fork)', { pull_requests: [] }],
+    ['a closed pull request', { pull_requests: [{ number: 9 }] }],
+    ['a pull request whose state GitHub does not say', { pull_requests: [{ number: 10 }] }],
   ] as const) {
     it(`a signal with ${name} stops quietly and publishes nothing`, () => {
       const run = decide('workflow_run', signal(over));

@@ -139,24 +139,53 @@ interface WorkCopy {
   readonly branch: string | undefined;
 }
 
-/** The working copy that contains `dir`, or `undefined` when `dir` is in no work tree. */
-async function workCopyAt(dir: string, gitPath = 'git'): Promise<WorkCopy | undefined> {
+/** What git answered about a folder: the working copy, no repository, or a failure with its motive. */
+type WorkCopyLookup =
+  | { readonly kind: 'copy'; readonly copy: WorkCopy }
+  | { readonly kind: 'outside' }
+  | { readonly kind: 'failed'; readonly reason: string };
+
+/** Git's own way of saying the path is in no work tree, in the languages it may answer in. */
+const NO_REPOSITORY = /not a git repository|must be run in a work tree|no es un repositorio de git/i;
+
+/**
+ * Looks for the working copy that contains `dir` (PLAN-13-R5 §1.2). Git failing because there is
+ * no repository is `outside`; git failing for any other reason is `failed` with its motive, so the
+ * caller refuses instead of reading the path as outside the project.
+ */
+async function lookupWorkCopyAt(dir: string, gitPath = 'git'): Promise<WorkCopyLookup> {
   const top = await runGit(dir, ['rev-parse', '--show-toplevel'], gitPath);
-  if (!top.ok || top.stdout.trim().length === 0) return undefined;
+  if (!top.ok || top.stdout.trim().length === 0) {
+    const reason = top.stderr.trim();
+    return NO_REPOSITORY.test(reason) ? { kind: 'outside' } : { kind: 'failed', reason: reason || 'git no respondió' };
+  }
   const common = await runGit(dir, ['rev-parse', '--path-format=absolute', '--git-common-dir'], gitPath);
-  if (!common.ok || common.stdout.trim().length === 0) return undefined;
+  if (!common.ok || common.stdout.trim().length === 0) {
+    return { kind: 'failed', reason: common.stderr.trim() || 'git no respondió' };
+  }
   const gitDir = await runGit(dir, ['rev-parse', '--absolute-git-dir'], gitPath);
-  if (!gitDir.ok || gitDir.stdout.trim().length === 0) return undefined;
+  if (!gitDir.ok || gitDir.stdout.trim().length === 0) {
+    return { kind: 'failed', reason: gitDir.stderr.trim() || 'git no respondió' };
+  }
 
   const root = top.stdout.trim();
   const branch = await runGit(root, ['symbolic-ref', '--short', '-q', 'HEAD'], gitPath);
   return {
-    root,
-    commonKey: fold(resolve(common.stdout.trim())),
-    commonDir: resolve(common.stdout.trim()),
-    gitDir: resolve(gitDir.stdout.trim()),
-    branch: branch.ok && branch.stdout.trim().length > 0 ? branch.stdout.trim() : undefined,
+    kind: 'copy',
+    copy: {
+      root,
+      commonKey: fold(resolve(common.stdout.trim())),
+      commonDir: resolve(common.stdout.trim()),
+      gitDir: resolve(gitDir.stdout.trim()),
+      branch: branch.ok && branch.stdout.trim().length > 0 ? branch.stdout.trim() : undefined,
+    },
   };
+}
+
+/** The working copy that contains `dir`, or `undefined` when `dir` is in no work tree. */
+async function workCopyAt(dir: string, gitPath = 'git'): Promise<WorkCopy | undefined> {
+  const found = await lookupWorkCopyAt(dir, gitPath);
+  return found.kind === 'copy' ? found.copy : undefined;
 }
 
 /**
@@ -252,7 +281,9 @@ function editorOutput(decision: LockDecision): HookResult {
 /** The real path of an existing folder, or the same spelling when it cannot be resolved. */
 function realPathOf(value: string): string {
   try {
-    return realpathSync(value);
+    // `native` asks the filesystem: on Windows it expands the short 8.3 name and the NTFS stream
+    // form, both of which reach inside a folder without spelling its real name (PLAN-13-R5 §1.2).
+    return realpathSync.native(value);
   } catch {
     return value;
   }
@@ -307,16 +338,43 @@ async function runEditor(options: RunHookOptions): Promise<HookResult> {
     const rest = relative(nearest, absolute);
     const judged = rest.length === 0 ? realNearest : join(realNearest, rest);
 
-    const copy = await workCopyAt(realNearest, gitPath);
-    if (copy === undefined) {
+    const found = await lookupWorkCopyAt(realNearest, gitPath);
+    if (found.kind === 'failed') {
+      // A git that fails for a reason other than "no repository" might be a real work tree the
+      // lock cannot read: refusing is the only honest answer (PLAN-13-R5 §1.2).
+      return editorOutput({
+        allow: false,
+        reason:
+          `Git no pudo decir a qué repositorio pertenece esta ruta (${found.reason}); el candado ` +
+          'se niega en vez de dejarla pasar a ciegas.',
+      });
+    }
+    if (found.kind === 'outside') {
       // Not in a work tree: it may still be the repository's own git area, which git refuses to
       // call a work tree. That is this lock's business, judged with the copy that owns it.
       const owner = await workCopyOwningGitPath(judged, watched, gitPath);
-      if (owner === undefined) continue;
-      const decision = decideGitFolder(contextForCopy(owner));
-      if (!decision.allow) return editorOutput(decision);
+      if (owner !== undefined) {
+        const decision = decideGitFolder(contextForCopy(owner));
+        if (!decision.allow) return editorOutput(decision);
+        continue;
+      }
+      // A path under the watched work tree whose git failed (a broken `.git` in a subfolder) is
+      // still the project's own code: it is judged with the watched context, never as outside.
+      const judgedPath = readAbsolute(judged);
+      const watchedRoot = readAbsolute(watched.root);
+      if (judgedPath.ok && watchedRoot.ok && isUnder(judgedPath.path, watchedRoot.path)) {
+        const single: HookInput = {
+          toolName: 'Write',
+          toolInput: { file_path: judged, content: '' },
+          cwd: parsed.cwd,
+        };
+        const decision = decideToolUse(single, sessionContext);
+        if (!decision.allow) return editorOutput(decision);
+      }
       continue;
     }
+
+    const copy = found.copy;
     // In another repository: not this lock's business (rule 6).
     if (copy.commonKey !== watched.commonKey) continue;
 
