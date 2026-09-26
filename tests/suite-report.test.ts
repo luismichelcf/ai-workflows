@@ -102,20 +102,28 @@ describe('what the owner did and what the suite did with the owner account (R22)
   it('names the cases whose branches and pull requests come from the owner account', () => {
     const text = renderSuiteReport(allGood(), META).text;
     const section = text.slice(text.indexOf('Qué hizo el dueño y qué se hizo con su cuenta'), text.indexOf('| Caso'));
-    const row = section.split('\n').find((line) => line.includes('En los casos del juez de la rebanada 3')) ?? '';
-    // Flock round 9: every act of the owner account there is named, not only pushes and PRs.
-    for (const act of ['sube las ramas', 'abre y edita los PRs', 'arma sus fusiones', 'lanza corridas del juez']) expect(row, act).toContain(act);
-    const judgeIds = SUITE_MANIFEST.filter((entry) => entry.file === 'judge').map((entry) => entry.id);
-    expect(judgeIds.length).toBeGreaterThan(0);
-    for (const id of judgeIds) expect(row, id).toContain(id);
-    for (const id of ['CN-01', 'CN-05b', 'SV-04s', 'RC-09', 'CN-12']) expect(row, id).not.toMatch(new RegExp(`\\b${id}\\b`));
+    const row = section.split('\n').find((line) => line.includes('actúan en GitHub con la cuenta del dueño')) ?? '';
+    // Flock rounds 9 and 10: every act of the owner account there is named; what only some cases
+    // do is said as "según el caso", never claimed for each one.
+    for (const act of ['suben sus ramas y abren sus PRs', 'según el caso', 'editan PRs', 'arman fusiones', 'lanzan o cancelan corridas del juez']) expect(row, act).toContain(act);
+    // The judge file of slice 3 and RC-09 act with the owner account.
+    const ownerIds = SUITE_MANIFEST.filter((entry) => entry.file === 'judge' || entry.file === 'rc09').map((entry) => entry.id);
+    expect(ownerIds).toContain('RC-09');
+    for (const id of ownerIds) expect(row, id).toContain(id);
+    for (const id of ['CN-01', 'CN-05b', 'SV-04s', 'CN-12']) expect(row, id).not.toMatch(new RegExp(`\\b${id}\\b`));
     expect(row).toContain('R22');
+  });
+
+  it('declares the other uses of the owner account during the run', () => {
+    const text = renderSuiteReport(allGood(), META).text;
+    const row = text.split('\n').find((line) => line.includes('La suite también usó la cuenta del dueño')) ?? '';
+    for (const act of ['preparar y restaurar el ensayo', 'crear los issues de las piezas', 'cambiar la variable del motor', 'prender y apagar flujos', 'crear despliegues de prueba', 'R22']) expect(row, act).toContain(act);
   });
 
   it('only the judge cases of this run are named there', () => {
     const records = allGood().filter((record) => record.id !== 'SV-01');
     const text = renderSuiteReport(records, META).text;
-    const row = text.split('\n').find((line) => line.includes('En los casos del juez de la rebanada 3')) ?? '';
+    const row = text.split('\n').find((line) => line.includes('actúan en GitHub con la cuenta del dueño')) ?? '';
     expect(row).toContain('SV-02');
     expect(row).not.toMatch(/\bSV-01\b/);
   });
