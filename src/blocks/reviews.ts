@@ -1,7 +1,7 @@
 import type { JsonValue } from '../contract.js';
 import type { ExecutionIdentity, Verdict } from '../identity.js';
 import { familyOf, requireDifferentBuilder, requireFreshVerdicts } from '../identity.js';
-import { selectVerdicts, type PieceEvent } from '../agent/events.js';
+import { selectVerdicts, type PieceEvent, type VerdictEvent } from '../agent/events.js';
 
 // PLAN-13-R4 §2.2 and §3.1: one decision for the independent review next to the agent and on
 // the server. It blends the events of the piece's issue into builders and a deciding verdict per
@@ -40,6 +40,19 @@ function missingAngleReason(angle: string, spanish: boolean): string {
   return spanish
     ? `Falta el veredicto del ángulo «${angle}».`
     : `The verdict of the angle "${angle}" is missing.`;
+}
+
+function olderVersionReason(
+  angle: string,
+  reviewed: string,
+  head: string,
+  spanish: boolean,
+): string {
+  const reviewedShort = reviewed.slice(0, 7);
+  const headShort = head.slice(0, 7);
+  return spanish
+    ? `El veredicto del ángulo «${angle}» es de la versión ${reviewedShort}, no de la actual ${headShort}.`
+    : `The verdict of the angle "${angle}" is of version ${reviewedShort}, not of the current ${headShort}.`;
 }
 
 function revisedReason(angle: string, spanish: boolean): string {
@@ -109,7 +122,21 @@ export async function decideIndependentReview(
 
   for (const angle of options.angles) {
     const event = selected.deciding.get(angle);
-    if (event === undefined) return { ok: false, reason: missingAngleReason(angle, spanish) };
+    if (event === undefined) {
+      // No readable verdict of the angle counted: every readable one was of another version than
+      // the head (`accepts` refused it), so name the newest by `at` and the head (PLAN-13-R5 §2,
+      // CN-03). Unreadable verdicts stay out of this, as they do everywhere else.
+      let newest: VerdictEvent | undefined;
+      for (const candidate of events) {
+        if (candidate.type !== 'verdict' || candidate.angle !== angle) continue;
+        if (options.unavailable?.has(candidate.sha) === true) continue;
+        if (newest === undefined || candidate.at >= newest.at) newest = candidate;
+      }
+      if (newest !== undefined) {
+        return { ok: false, reason: olderVersionReason(angle, newest.sha, options.head, spanish) };
+      }
+      return { ok: false, reason: missingAngleReason(angle, spanish) };
+    }
     if (!event.approved) return { ok: false, reason: revisedReason(angle, spanish) };
 
     const reviewer = identityOf(event.identity);
