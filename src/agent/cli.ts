@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 
@@ -29,6 +29,7 @@ import { compileRecipe, runProviderInGroup } from '../recipe/compile.js';
 import { recordCleanUpdate, verifyCleanUpdate } from '../recipe/validity.js';
 import { diskProjectFiles, type ChangeDeclared } from '../recipe/facts.js';
 import { pieceOfBranch, readDeclaredKind } from '../judge/pieces.js';
+import { HOOK_LOADER } from '../locks/hook-cli.js';
 import type { Recipe } from '../recipe/types.js';
 import type { ProviderRunner } from '../blocks/definition.js';
 import {
@@ -1175,6 +1176,63 @@ async function commandDoctor(deps: AgentCliDeps): Promise<CommandOutput> {
       ? es ? `git ${version.stdout.trim()}: correcto.` : `git ${version.stdout.trim()}: fine.`
       : es ? 'git es antiguo: hace falta 2.38 o más.' : 'git is too old: 2.38 or newer is needed.',
   );
+
+  // PLAN-13-R5 §1.5: a missing engine or a missing hook is said here, because the hook itself
+  // cannot start without the engine and would block the tools instead of explaining.
+  const engineBin = join(root, 'node_modules', 'ai-workflows', 'dist', 'bin.js');
+  if (existsSync(engineBin)) {
+    lines.push(es ? 'Motor instalado junto al proyecto.' : 'Engine installed next to the project.');
+  } else {
+    lines.push(
+      es
+        ? 'Falta node_modules/ai-workflows/dist/bin.js: los ganchos del editor bloquearán.'
+        : 'node_modules/ai-workflows/dist/bin.js is missing: the editor hooks will block.',
+    );
+  }
+
+  // Our entry is recognized by its exact command AND arguments: another hook that also runs
+  // `node` (or one that kept our command with foreign arguments) is never mistaken for ours.
+  const isOurEditorHook = (handler: { command?: unknown; args?: unknown }): boolean => {
+    if (handler.command !== 'node' || !Array.isArray(handler.args)) return false;
+    const args = handler.args.map((argument) => String(argument));
+    return args.length === 5
+      && args[0] === '-e'
+      && args[1] === HOOK_LOADER
+      && args[2] === '${CLAUDE_PROJECT_DIR}'
+      && args[3] === 'hook'
+      && args[4] === 'editor';
+  };
+
+  let settingsHook = false;
+  let settingsUnreadable = false;
+  try {
+    const settings = JSON.parse(readFileSync(join(root, '.claude', 'settings.json'), 'utf8')) as {
+      hooks?: { PreToolUse?: { hooks?: { command?: unknown; args?: unknown }[] }[] };
+    };
+    const groups = settings.hooks?.PreToolUse ?? [];
+    settingsHook = groups.some((group) => (group.hooks ?? []).some(isOurEditorHook));
+  } catch {
+    // A file that cannot be read is said as such, never as a missing hook: they are different
+    // problems and the owner fixes them differently.
+    settingsUnreadable = true;
+  }
+  const hooksPath = (await runGit(root, ['config', '--local', '--get', 'core.hooksPath'])).stdout.trim();
+  if (settingsUnreadable) {
+    lines.push(
+      es
+        ? 'No se pudo leer .claude/settings.json: revisa que sea un archivo JSON válido.'
+        : '.claude/settings.json could not be read: check that it is valid JSON.',
+    );
+  }
+  if (settingsHook && hooksPath === '.ai-workflows/githooks') {
+    lines.push(es ? 'El gancho del editor y los de git: instalados.' : 'The editor hook and the git hooks: installed.');
+  } else {
+    lines.push(
+      es
+        ? 'El gancho del editor o los de git: faltan. Ejecuta: ai-workflows hooks install --apply'
+        : 'The editor hook or the git hooks: missing. Run: ai-workflows hooks install --apply',
+    );
+  }
 
   if (!loaded.ok) {
     lines.push(es ? 'La receta no es válida:' : 'The recipe is not valid:');

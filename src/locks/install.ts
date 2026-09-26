@@ -7,6 +7,12 @@ export type HookClient = 'claude' | 'codex';
 export interface HookHandler {
   readonly type: 'command';
   readonly command: string;
+  /**
+   * PLAN-13-R5 §1.5: the direct form (no shell, same on every system) names the engine as the
+   * arguments of `node`. Our entry is recognized by `command` AND `args`, so a foreign hook that
+   * also runs `node` with other arguments is never mistaken for ours.
+   */
+  readonly args?: readonly string[];
   readonly timeout?: number;
 }
 
@@ -43,11 +49,6 @@ export function buildHooksConfig(client: HookClient, command: string): HooksFile
   };
 }
 
-/** The command that identifies our entry, so reinstalling can recognize it. */
-function firstCommand(file: HooksFile): string | undefined {
-  return file.hooks.PreToolUse[0]?.hooks[0]?.command;
-}
-
 /**
  * Whitespace carries no meaning in a shell command, so a formatter or a hand edit can change
  * the spacing without changing what runs. Normalizing lets a reinstall recognize our own
@@ -58,10 +59,32 @@ function normalizeCommand(command: unknown): string | undefined {
   return command.trim().replace(/\s+/g, ' ');
 }
 
-/** True when a handler is one of ours, matched by its command's normalized form. */
-function isOurHandler(handler: unknown, ourCommand: string | undefined): boolean {
-  if (!isRecord(handler)) return false;
-  return normalizeCommand(handler.command) === ourCommand;
+/**
+ * What identifies one handler: its normalized command and its arguments, in order. Two foreign
+ * hooks can both run `node`; only ours carries our exact arguments, so matching on the pair is
+ * what keeps a reinstall from swallowing somebody else's hook (§1.5).
+ */
+function handlerSignature(handler: unknown): string | undefined {
+  if (!isRecord(handler)) return undefined;
+  const command = normalizeCommand(handler.command);
+  if (command === undefined) return undefined;
+  const args = Array.isArray(handler.args) ? handler.args.map((arg) => String(arg)) : [];
+  return JSON.stringify([command, args]);
+}
+
+/** The signature of our own entry, taken from the first handler we install. */
+function entrySignature(file: HooksFile): string | undefined {
+  return handlerSignature(file.hooks.PreToolUse[0]?.hooks[0]);
+}
+
+/** True when a handler is one of ours, matched by command and arguments. */
+function isOurHandler(handler: unknown, signature: string | undefined): boolean {
+  return signature !== undefined && handlerSignature(handler) === signature;
+}
+
+/** A timeout the CLI can honor: a positive whole number; anything else is dropped. */
+function validTimeout(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isInteger(value) && value > 0 ? value : undefined;
 }
 
 /**
@@ -102,11 +125,17 @@ function readGroups(pre: readonly unknown[]): Array<Record<string, unknown>> {
 function copyOurGroups(groups: readonly HookGroup[], timeout: number | undefined): HookGroup[] {
   return groups.map((group) => ({
     matcher: group.matcher,
-    hooks: group.hooks.map((handler) =>
-      timeout === undefined
-        ? { type: handler.type, command: handler.command }
-        : { type: handler.type, command: handler.command, timeout },
-    ),
+    hooks: group.hooks.map((handler): HookHandler => {
+      // Our own arguments always come from our entry; the user only owns the timeout, and a
+      // timeout of our entry is kept when the user set none (§1.5).
+      const kept = timeout ?? validTimeout(handler.timeout);
+      return {
+        type: handler.type,
+        command: handler.command,
+        ...(handler.args === undefined ? {} : { args: [...handler.args] }),
+        ...(kept === undefined ? {} : { timeout: kept }),
+      };
+    }),
   }));
 }
 
@@ -150,7 +179,7 @@ export function mergeHooksConfig(existing: unknown, ours: HooksFile): Record<str
   }
   const currentGroups = readGroups(Array.isArray(preValue) ? preValue : []);
 
-  const ourCommand = normalizeCommand(firstCommand(ours));
+  const ourSignature = entrySignature(ours);
   const ourGroups = ours.hooks.PreToolUse;
 
   // Rule 1: look for a usable timeout the user set on one of our handlers before we rebuild
@@ -162,11 +191,9 @@ export function mergeHooksConfig(existing: unknown, ours: HooksFile): Record<str
     const handlers = Array.isArray(group.hooks) ? group.hooks : undefined;
     if (handlers === undefined) continue;
     for (const handler of handlers) {
-      if (!isOurHandler(handler, ourCommand) || !isRecord(handler)) continue;
-      if (typeof handler.timeout === 'number' && Number.isInteger(handler.timeout) && handler.timeout > 0) {
-        ourTimeout = handler.timeout;
-        break;
-      }
+      if (!isOurHandler(handler, ourSignature) || !isRecord(handler)) continue;
+      ourTimeout = validTimeout(handler.timeout);
+      if (ourTimeout !== undefined) break;
     }
     if (ourTimeout !== undefined) break;
   }
@@ -176,7 +203,7 @@ export function mergeHooksConfig(existing: unknown, ours: HooksFile): Record<str
 
   for (const group of currentGroups) {
     const handlers: readonly unknown[] | undefined = Array.isArray(group.hooks) ? group.hooks : undefined;
-    const holdsOurs = handlers !== undefined && handlers.some((handler) => isOurHandler(handler, ourCommand));
+    const holdsOurs = handlers !== undefined && handlers.some((handler) => isOurHandler(handler, ourSignature));
 
     // Rule 2: not ours (checked across every group, not just the first) stays exactly as it was.
     // `group` is already a deep copy, so pushing it shares nothing with the file we were given.
@@ -187,7 +214,7 @@ export function mergeHooksConfig(existing: unknown, ours: HooksFile): Record<str
 
     // Rule 2: pull our handler out of this group. Foreign handlers keep the group's own
     // matcher — we never widen it to ours — and an empty group disappears entirely.
-    const foreigners = handlers.filter((handler) => !isOurHandler(handler, ourCommand));
+    const foreigners = handlers.filter((handler) => !isOurHandler(handler, ourSignature));
 
     // Rule 2: every copy of ours collapses into this one, placed where the first copy was.
     // Placing it at the first occurrence, rather than appending, keeps a correct file in order.

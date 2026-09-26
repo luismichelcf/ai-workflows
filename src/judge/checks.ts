@@ -31,8 +31,15 @@ export interface CheckOutcome {
   readonly note?: string;
 }
 
-/** The pauses before each re-read of a queue that has not listed the group yet (PLAN-13-R3 §3.2). */
-export const MERGE_QUEUE_PAUSES_MS: readonly number[] = [2_000, 4_000, 8_000, 15_000, 30_000];
+/**
+ * The pauses before each re-read of a queue that has not listed the group yet (PLAN-13-R3 §3.2).
+ * They grow and then settle at one minute, so the whole wait reaches about five minutes (COLA-6:
+ * with six pull requests armed at once, GitHub listed some groups more than a minute after their
+ * event, and a shorter wait gave up and made GitHub take a piece out of the queue).
+ */
+export const MERGE_QUEUE_PAUSES_MS: readonly number[] = [
+  2_000, 4_000, 8_000, 15_000, 30_000, 60_000, 60_000, 60_000, 60_000,
+];
 
 export type MergeQueueWait =
   | { readonly ok: true; readonly entries: readonly MergeQueueEntry[] }
@@ -41,8 +48,8 @@ export type MergeQueueWait =
 
 /**
  * PLAN-13-R3 §3.2: a merge queue can list the group a moment after the event names it. The list is
- * read again, waiting, until the group appears — at most six reads with growing pauses — and only
- * then is its absence treated as a failure. An entry the queue is still assembling (its commits are
+ * read again, waiting, until the group appears — at most ten reads with growing pauses, up to about
+ * five minutes — and only then is its absence treated as a failure. An entry the queue is still assembling (its commits are
  * not there yet) counts as the group not appearing yet, so it is read again. Any other read that
  * throws is never retried: it stays technical at once, because it says nothing about the group.
  */

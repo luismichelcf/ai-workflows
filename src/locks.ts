@@ -21,4 +21,6 @@ export * from './locks/git.js';
 export * from './locks/install.js';
 export * from './locks/protections.js';
 export * from './locks/signoff.js';
+export * from './locks/context.js';
+export * from './locks/hook-cli.js';
 export type { CheckResult } from './gates.js';

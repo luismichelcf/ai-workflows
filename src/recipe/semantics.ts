@@ -1,4 +1,4 @@
-import { isAbsolute } from 'node:path';
+import { isAbsolute, posix } from 'node:path';
 
 import { validGlob } from './glob.js';
 import { validateCommandLine } from './command-line.js';
@@ -402,6 +402,39 @@ function validatePieces(root: YamlNode, issues: LocatedIssue[]): void {
   }
 }
 
+/**
+ * PLAN-13-R5 §1.1: `hooks:` declares the paper folders, and it needs `pieces:` — without a way to
+ * name a piece, the lock could never open and the section would quietly switch itself off. Each
+ * paper folder is read with the rules of `readPapers`: relative, non-empty and inside the project.
+ */
+function validateHooks(root: YamlNode, issues: LocatedIssue[]): void {
+  const hooks = yamlField(root, 'hooks');
+  if (hooks === null) return;
+
+  if (yamlField(root, 'pieces') === null) {
+    add(issues, keyNode(root, 'hooks'), 'hooks: needs pieces: in the recipe');
+  }
+
+  for (const item of listNodes(yamlField(hooks, 'papers'))) {
+    const entry = yamlWord(item);
+    const forward = entry.replace(/\\/g, '/');
+    // Read as the lock reads it (`readPapers`): `docs/..` is the root itself, never a paper folder.
+    const normalized = forward === '' ? '' : posix.normalize(forward).replace(/\/+$/, '');
+    const leaves =
+      normalized === '' ||
+      normalized === '.' ||
+      normalized === '..' ||
+      normalized.startsWith('../');
+    if (isAbsolute(forward) || /^[A-Za-z]:/.test(forward) || forward.startsWith('/') || leaves) {
+      add(
+        issues,
+        item,
+        `paper folder ${JSON.stringify(entry)} must be a relative folder inside the project`,
+      );
+    }
+  }
+}
+
 /** PLAN-13-R4 §6: the summary file must be a relative path with no escape. */
 function validateMessages(root: YamlNode, issues: LocatedIssue[]): void {
   const summary = yamlField(yamlField(root, 'messages'), 'summary');
@@ -593,6 +626,7 @@ export function validateSemantics(root: YamlNode): LocatedIssue[] {
 
   validateVocabulary(root, stages, declared, issues);
   validatePieces(root, issues);
+  validateHooks(root, issues);
   validateServerForms(root, stages, issues);
   validatePhases(stages, stagesNode, issues);
   validateStageRules(stages, issues);

@@ -130,6 +130,13 @@ runs:
           fi
           local live
           live="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$n")"
+          # Un PR cerrado o fusionado no recibe veredicto nuevo: la señal de revisión solo sigue si
+          # el PR sigue abierto (PLAN-13-R5 §2.6). Una respuesta sin `state` no se supone abierta.
+          local live_state
+          live_state="$(printf '%s' "$live" | jq -r '.state // empty')"
+          if [ "$live_state" != 'open' ]; then
+            stop "el PR #$n ya no está abierto (estado: $live_state)"
+          fi
           local base
           base="$(printf '%s' "$live" | jq -r '.base.ref // empty')"
           if [ "$base" != "$default_branch" ]; then
@@ -187,32 +194,79 @@ runs:
             sha="$(jq -r '.pull_request.head.sha // empty' "$GITHUB_EVENT_PATH")"
             ;;
           issue_comment)
-            read_live_pr "$(jq -r '.issue.number // empty' "$GITHUB_EVENT_PATH")"
+            issue_number="$(jq -r '.issue.number // empty' "$GITHUB_EVENT_PATH")"
+            if [ -z "$(jq -r '.issue.pull_request // empty' "$GITHUB_EVENT_PATH")" ]; then
+              # Comentario sobre el issue de una pieza, no sobre un PR. Aquí no se lee ningún PR:
+              # el juez publica por PR, así que este paso solo decide si la corrida sigue.
+              comment_action="$(jq -r '.action // empty' "$GITHUB_EVENT_PATH")"
+              comment_body="$(jq -r '.comment.body // empty' "$GITHUB_EVENT_PATH")"
+              case "$comment_action" in
+                created)
+                  case "$comment_body" in
+                    *'ai-workflows:event'*) ;;
+                    *) stop "un comentario nuevo sin la marca ai-workflows:event no dispara nada" ;;
+                  esac
+                  ;;
+                edited|deleted) ;;
+                *) stop "acción de comentario no juzgada: $comment_action" ;;
+              esac
+              case "$mode" in
+                ''|off) stop "motor apagado" ;;
+                advisory|on) ;;
+                *) stop "AI_WORKFLOWS_MODE inválido: use off, advisory u on" ;;
+              esac
+              publish='false'
+              sha=''
+              decided='true'
+              emit
+              exit 0
+            fi
+            read_live_pr "$issue_number"
             ;;
           workflow_dispatch)
             read_live_pr "$(jq -r '.inputs.pr // empty' "$GITHUB_EVENT_PATH")"
             ;;
           workflow_run)
-            sha="$(jq -r '.workflow_run.head_sha // empty' "$GITHUB_EVENT_PATH")"
-            if [ -z "$sha" ]; then
-              stop "no se pudo calcular el SHA a marcar ($GITHUB_EVENT_NAME)"
-            fi
-            # El SHA ya se conoce por el evento: se arma ANTES de leer los PRs de ese SHA, para que
-            # un fallo de la lectura deje el rojo honesto (lo publica el `trap`) sobre ese SHA,
-            # nunca un verde. La lectura va paginada y junta las páginas con `--slurp`.
-            armed='true'
             run_event="$(jq -r '.workflow_run.event // empty' "$GITHUB_EVENT_PATH")"
-            if [ "$run_event" = 'merge_group' ]; then
-              :
-            elif [ "$run_event" = 'pull_request' ]; then
-              match="$(gh api "repos/$GITHUB_REPOSITORY/commits/${sha}/pulls?per_page=100" --paginate --slurp \
-                | jq -r --arg head "$sha" --arg base "$default_branch" \
-                  '[.[][] | select(.state == "open" and .head.sha == $head and .base.ref == $base)] | length')"
-              if [ "$match" = '0' ]; then
-                stop "no hay un PR abierto con la cabeza $sha hacia $default_branch"
+            if [ "$run_event" = 'pull_request_review' ]; then
+              # La señal del botón «Approve» (PLAN-13-R5 §2.6): su repositorio, su ruta y su evento
+              # se comprueban; el número del PR es dato no confiable y se relee su cabeza viva.
+              run_repo="$(jq -r '.workflow_run.repository.full_name // empty' "$GITHUB_EVENT_PATH")"
+              if [ "$run_repo" != "$GITHUB_REPOSITORY" ]; then
+                stop "la señal de revisión viene de otro repositorio: $run_repo"
               fi
+              run_path="$(jq -r '.workflow_run.path // empty' "$GITHUB_EVENT_PATH")"
+              signal_path="${run_path%%@*}"
+              if [ "$signal_path" != '.github/workflows/ai-workflows-review-signal.yml' ]; then
+                stop "la ruta de la señal no es la del juez: $signal_path"
+              fi
+              signal_pr="$(jq -r '.workflow_run.pull_requests[0].number // empty' "$GITHUB_EVENT_PATH")"
+              if [ -z "$signal_pr" ]; then
+                stop "la señal de revisión no nombra ningún PR (¿un fork?)"
+              fi
+              read_live_pr "$signal_pr"
+              armed='true'
             else
-              stop "workflow_run de un evento no juzgado: $run_event"
+              sha="$(jq -r '.workflow_run.head_sha // empty' "$GITHUB_EVENT_PATH")"
+              if [ -z "$sha" ]; then
+                stop "no se pudo calcular el SHA a marcar ($GITHUB_EVENT_NAME)"
+              fi
+              # El SHA ya se conoce por el evento: se arma ANTES de leer los PRs de ese SHA, para
+              # que un fallo de la lectura deje el rojo honesto (lo publica el `trap`) sobre ese
+              # SHA, nunca un verde. La lectura va paginada y junta las páginas con `--slurp`.
+              armed='true'
+              if [ "$run_event" = 'merge_group' ]; then
+                :
+              elif [ "$run_event" = 'pull_request' ]; then
+                match="$(gh api "repos/$GITHUB_REPOSITORY/commits/${sha}/pulls?per_page=100" --paginate --slurp \
+                  | jq -r --arg head "$sha" --arg base "$default_branch" \
+                    '[.[][] | select(.state == "open" and .head.sha == $head and .base.ref == $base)] | length')"
+                if [ "$match" = '0' ]; then
+                  stop "no hay un PR abierto con la cabeza $sha hacia $default_branch"
+                fi
+              else
+                stop "workflow_run de un evento no juzgado: $run_event"
+              fi
             fi
             ;;
           merge_group)

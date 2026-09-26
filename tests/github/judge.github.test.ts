@@ -2,10 +2,13 @@ import { execFileSync } from 'node:child_process';
 import { randomInt } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { beforeAll, describe, expect, inject, it } from 'vitest';
 import { parse, stringify } from 'yaml';
 
-import { emptyFolder, git, removeRepositories, write } from '../git-fixtures.js';
+import { emptyFolder, git, write } from '../git-fixtures.js';
+
+import { recordCase, type CaseRecord } from './report.js';
+import { attachSandbox, createGhSandboxPort, type Sandbox } from './sandbox.js';
 
 // PLAN-13-R3 §7, the real run: the judge installed in the test repository
 // (socialabs-margin/ai-workflows-pruebas), pinned to the engine commit under test, judging real
@@ -13,10 +16,11 @@ import { emptyFolder, git, removeRepositories, write } from '../git-fixtures.js'
 //
 // It needs credentials and costs Actions minutes, so it never runs in the public CI. It runs only
 // through `pnpm test:github` with AI_WORKFLOWS_GITHUB_TEST_REPO set, and FAILS — never skips —
-// without it. The commit under test must already be on GitHub (push the branch first). It takes
-// the ruleset and the variables as it finds them, uses them during the run and restores them at
-// the end, closes every pull request and deletes every branch it made, and removes the judge from
-// the test repository's main when it is done.
+// without it. The commit under test must already be on GitHub (push the branch first). Every change
+// to the test repository goes through the harness of PLAN-13-R5 §2.2 (tests/github/sandbox.ts),
+// which starts this file from the snapshot, adds the judge's status to the required ones without
+// replacing them, and restores everything at the end of the whole run. The owner's orders of the
+// positive controls are written with the owner's account on this machine (R22).
 
 const REPO = process.env.AI_WORKFLOWS_GITHUB_TEST_REPO ?? '';
 const ENGINE_REPO = 'luismichelcf/ai-workflows';
@@ -45,6 +49,17 @@ async function waitFor<T>(label: string, probe: () => T | undefined, timeoutMs =
     if (Date.now() > deadline) throw new Error(`timed out waiting for ${label}`);
     await sleep(15_000);
   }
+}
+
+/**
+ * The log of a run. GitHub only gives the log of an ended run, and for a moment after it ends it
+ * can still answer "log not found" (seen in the real run, SV-07): wait for the end, then read it.
+ */
+function runLog(id: number | string): Promise<string> {
+  return waitFor(`the log of run ${String(id)}`, () => {
+    if (ghJson<{ status: string }>('run', 'view', String(id), '--repo', REPO, '--json', 'status').status !== 'completed') return undefined;
+    return gh('run', 'view', String(id), '--repo', REPO, '--log');
+  });
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -196,66 +211,15 @@ function remoteGit(root: string, ...args: string[]): string {
   throw last;
 }
 
-const branches: string[] = [];
+let sandbox: Sandbox;
 let clone = '';
 let mainAfterSetup = '';
-let rulesetBefore: Record<string, any> | undefined;
-let rulesetId = 0;
-let modeBefore: string | undefined;
 
-function setMode(mode: string | undefined): void {
-  if (mode === undefined) {
-    try {
-      gh('variable', 'delete', 'AI_WORKFLOWS_MODE', '--repo', REPO);
-    } catch {
-      // Not there: nothing to delete.
-    }
-    return;
-  }
-  gh('variable', 'set', 'AI_WORKFLOWS_MODE', '--repo', REPO, '--body', mode);
-}
-
-function putRuleset(body: Record<string, any>): void {
-  execFileSync('gh', ['api', '-X', 'PUT', `repos/${REPO}/rulesets/${rulesetId}`, '--input', '-'], {
-    input: JSON.stringify({ name: body['name'], target: body['target'], enforcement: body['enforcement'], conditions: body['conditions'], rules: body['rules'], bypass_actors: body['bypass_actors'] ?? [] }),
-    encoding: 'utf8',
-  });
-}
-
-/** The ruleset of the run: the queue as it was, and the judge's status as the required check. */
-function requireJudge(required: boolean): void {
-  if (rulesetBefore === undefined) throw new Error('no ruleset recorded');
-  const rules = (rulesetBefore['rules'] as Record<string, any>[]).map((rule) =>
-    rule['type'] === 'required_status_checks'
-      ? { ...rule, parameters: { ...rule['parameters'], required_status_checks: required ? [{ context: 'ai-workflows', integration_id: 15368 }] : [] } }
-      : rule,
-  ).filter((rule) => required || rule['type'] !== 'required_status_checks');
-  putRuleset({ ...rulesetBefore, enforcement: 'active', rules });
-}
-
-function pushToMain(files: Readonly<Record<string, string | null>>, message: string): string {
-  if (rulesetBefore === undefined) throw new Error('no ruleset recorded');
-  const current = ghJson<Record<string, any>>('api', `repos/${REPO}/rulesets/${rulesetId}`);
-  putRuleset({ ...current, enforcement: 'disabled' });
-  try {
-    remoteGit(clone, 'fetch', '-q', 'origin', 'main');
-    git(clone, 'switch', '-q', '-C', 'main', 'origin/main');
-    for (const [path, content] of Object.entries(files)) {
-      if (content === null) git(clone, 'rm', '-q', '--ignore-unmatch', path);
-      else write(clone, path, content);
-    }
-    git(clone, 'add', '-A');
-    git(clone, 'commit', '-q', '--allow-empty', '-m', message);
-    remoteGit(clone, 'push', '-q', 'origin', 'HEAD:main');
-    return git(clone, 'rev-parse', 'HEAD');
-  } finally {
-    putRuleset(current);
-  }
-}
+const prUrl = (n: number) => `https://github.com/${REPO}/pull/${n}`;
+const record = (entry: Omit<CaseRecord, 'run'>) => recordCase({ run: sandbox.run, ...entry });
 
 /** A branch from main with these files, pushed, and its PR. Returns the PR number and head. */
-function openPr(branch: string, files: Readonly<Record<string, string>>, base = 'main'): { number: number; head: string } {
-  branches.push(branch);
+async function openPr(branch: string, files: Readonly<Record<string, string>>, base = 'main'): Promise<{ number: number; head: string }> {
   remoteGit(clone, 'fetch', '-q', 'origin', 'main');
   git(clone, 'switch', '-q', '-C', branch, 'origin/main');
   for (const [path, content] of Object.entries(files)) write(clone, path, content);
@@ -264,6 +228,7 @@ function openPr(branch: string, files: Readonly<Record<string, string>>, base = 
   remoteGit(clone, 'push', '-q', '-f', 'origin', `HEAD:refs/heads/${branch}`);
   const url = gh('pr', 'create', '--repo', REPO, '--head', branch, '--base', base, '--title', `Prueba del juez ${branch}`, '--body', 'Prueba automática de ai-workflows (rebanada 3); se cierra sola.');
   const number = Number(url.split('/').at(-1));
+  await sandbox.trackPullRequest(number, branch);
   return { number, head: git(clone, 'rev-parse', 'HEAD') };
 }
 
@@ -274,75 +239,33 @@ const planOf = (id: string, kind: string) => lines(`# Plan ${id}`, '', '## En tr
 describe.sequential('the judge on GitHub (PLAN-13-R3 §7)', () => {
   let engineSha = '';
 
-  beforeAll(() => {
+  beforeAll(async () => {
     if (REPO === '') return;
     engineSha = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
-    const rulesets = ghJson<{ id: number; target: string }[]>('api', `repos/${REPO}/rulesets`);
-    rulesetId = rulesets.find((ruleset) => ruleset.target === 'branch')?.id ?? 0;
-    rulesetBefore = ghJson<Record<string, any>>('api', `repos/${REPO}/rulesets/${rulesetId}`);
-    try {
-      modeBefore = gh('variable', 'get', 'AI_WORKFLOWS_MODE', '--repo', REPO);
-    } catch {
-      modeBefore = undefined;
-    }
+    sandbox = await attachSandbox({ port: createGhSandboxPort(REPO), run: inject('sandboxRun') });
+    await sandbox.baseline();
     clone = emptyFolder();
     remoteGit(clone, 'clone', '-q', `https://github.com/${REPO}.git`, '.');
     git(clone, 'config', 'user.email', 'test@example.com');
     git(clone, 'config', 'user.name', 'ai-workflows test');
-    log(`engine ${engineSha}, run ${RUN_ID}, owner ${OWNER}, ruleset ${rulesetId}`);
+    log(`engine ${engineSha}, run ${sandbox.run}, owner ${OWNER}`);
   }, 5 * MINUTE);
-
-  afterAll(() => {
-    if (REPO === '') return;
-    const problems: string[] = [];
-    const attempt = (label: string, fn: () => void) => {
-      try {
-        fn();
-      } catch (error) {
-        problems.push(`${label}: ${error instanceof Error ? error.message : String(error)}`);
-      }
-    };
-    for (const branch of branches) {
-      attempt(`close ${branch}`, () => {
-        const numbers = gh('pr', 'list', '--repo', REPO, '--head', branch, '--state', 'open', '--json', 'number', '--jq', '.[].number').split('\n').filter(Boolean);
-        for (const number of numbers) gh('pr', 'close', number, '--repo', REPO);
-      });
-      attempt(`delete ${branch}`, () => {
-        try {
-          gh('api', '-X', 'DELETE', `repos/${REPO}/git/refs/heads/${branch}`);
-        } catch (error) {
-          // The queue deletes the branch of a merged PR: already gone is done.
-          if (!/Reference does not exist|HTTP 422|Not Found/.test(String((error as { stderr?: string }).stderr ?? error))) throw error;
-        }
-      });
-    }
-    attempt('remove the judge from main', () => {
-      pushToMain({ [WORKFLOW]: null, [RED_WORKFLOW]: null, [NO_STATUS_WORKFLOW]: null, '.ai-workflows/pipeline.yml': null }, 'prueba del juez: se retira');
-    });
-    attempt('restore the ruleset', () => {
-      if (rulesetBefore !== undefined) putRuleset(rulesetBefore);
-    });
-    attempt('restore the variable', () => setMode(modeBefore));
-    removeRepositories();
-    if (problems.length > 0) throw new Error(`cleanup left work to do by hand:\n${problems.join('\n')}`);
-  }, 15 * MINUTE);
 
   it('is asked to run with a test repository, a logged-in gh and the engine commit on GitHub', () => {
     expect(REPO, 'set AI_WORKFLOWS_GITHUB_TEST_REPO=<owner>/<repo>').toMatch(/^[\w.-]+\/[\w.-]+$/);
     expect(() => gh('auth', 'status')).not.toThrow();
     expect(() => gh('api', `repos/${ENGINE_REPO}/commits/${engineSha}`), 'push the branch under test first').not.toThrow();
-    expect(rulesetId).toBeGreaterThan(0);
   });
 
-  it('installs the judge on main, pinned to the engine under test, with the switch on', () => {
-    mainAfterSetup = pushToMain({
+  it('installs the judge on main, pinned to the engine under test, with the switch on', async () => {
+    mainAfterSetup = await sandbox.writeMainFiles({
       ...judgeWorkflows(engineSha),
       '.ai-workflows/pipeline.yml': RECIPE(),
       'runner.mjs': runnerSource(),
       'src/bonus.mjs': BONUS(800),
     }, `prueba del juez ${RUN_ID}: se instala`);
-    setMode('on');
-    requireJudge(true);
+    await sandbox.setVariable('on');
+    await sandbox.addRequiredStatus('ai-workflows');
     log(`main ${mainAfterSetup}`);
   });
 
@@ -350,9 +273,10 @@ describe.sequential('the judge on GitHub (PLAN-13-R3 §7)', () => {
   let good = { number: 0, head: '' };
   let visible = { number: 0, head: '' };
   let passing = { number: 0, head: '' };
+  let recipeChange = 0;
 
   it('SV-01, SV-06, SV-09: a red test that is really red on main and green on the head makes the judge pass', async () => {
-    good = openPr(`feat/${piece(1)}-bono`, {
+    good = await openPr(`feat/${piece(1)}-bono`, {
       'src/bonus.mjs': BONUS(1000),
       [`tests/bonus-${RUN_ID}.test.mjs`]: BONUS_TEST,
     });
@@ -366,13 +290,14 @@ describe.sequential('the judge on GitHub (PLAN-13-R3 §7)', () => {
 
     // SV-09: the privileged job checked out main, never the pull request.
     const judgeRun = await waitFor('the finished judge run on the PR', () => runs(WORKFLOW).find((run) => run.event === 'pull_request_target' && run.headSha === good.head && run.status === 'completed'));
-    const judgeLog = gh('run', 'view', String(judgeRun?.databaseId), '--repo', REPO, '--log');
+    const judgeLog = await runLog(String(judgeRun?.databaseId));
     expect(judgeLog).not.toMatch(/refs\/pull\//);
     expect(judgeLog).not.toContain(`HEAD is now at ${good.head.slice(0, 7)}`);
+    record({ id: 'SV-01', attempt: 'Pasar la etapa pesada sin su check verde en esta versión', stoppedBy: ['juez'], negative: 'frenado', positive: 'pasó', evidence: [prUrl(good.number)] });
   }, 20 * MINUTE);
 
   it('SV-06: a test that already passes on main is not red, and the judge rejects naming the stage', async () => {
-    passing = openPr(`feat/${piece(2)}-verde`, {
+    passing = await openPr(`feat/${piece(2)}-verde`, {
       [`tests/verde-${RUN_ID}.test.mjs`]: lines(
         'import assert from "node:assert/strict";',
         'import { bonus } from "../src/bonus.mjs";',
@@ -381,7 +306,7 @@ describe.sequential('the judge on GitHub (PLAN-13-R3 §7)', () => {
       'src/otro.mjs': 'export const otro = 1;\n',
     });
     // SV-08: a journal forged by hand in the state refs changes nothing.
-    gh('api', '-X', 'POST', `repos/${REPO}/git/refs`, '-f', `ref=refs/ai-workflows/pieces/${piece(2)}`, '-f', `sha=${passing.head}`);
+    await sandbox.forgeStateRef(`refs/ai-workflows/pieces/${piece(2)}`, { stage: 'red-test', outcome: 'passed', note: 'marcado a mano' });
     const red = await waitFor('red-test check', () => {
       const run = checkRun(passing.head, 'ai-workflows/red-test');
       return run?.status === 'completed' ? run : undefined;
@@ -389,17 +314,18 @@ describe.sequential('the judge on GitHub (PLAN-13-R3 §7)', () => {
     expect(red.conclusion).toBe('failure');
     const status = await settled(passing.head, 'ai-workflows', ['failure']);
     expect(status.description).toContain('red-test');
-    gh('api', '-X', 'DELETE', `repos/${REPO}/git/refs/ai-workflows/pieces/${piece(2)}`);
+    record({ id: 'SV-06', attempt: 'Una prueba «roja» que ya pasa sin el cambio', stoppedBy: ['juez'], negative: 'frenado', positive: 'pasó', evidence: [prUrl(passing.number), prUrl(good.number)] });
   }, 20 * MINUTE);
 
   it('CN-08: a free branch is never merged', async () => {
-    const free = openPr(`libre/prueba-${RUN_ID}`, { 'docs/libre.md': 'libre\n' });
+    const free = await openPr(`libre/prueba-${RUN_ID}`, { 'docs/libre.md': 'libre\n' });
     const status = await settled(free.head, 'ai-workflows', ['failure']);
     expect(status.description).toMatch(/pieza/);
+    record({ id: 'CN-08', attempt: 'Fusionar desde una carpeta libre, sin pieza', stoppedBy: ['juez'], negative: 'frenado', positive: 'pasó', evidence: [prUrl(free.number)] });
   }, 15 * MINUTE);
 
   it('RC-06 and SV-04: a PR that changes the recipe is judged with the recipe of main and needs the owner', async () => {
-    const recipePr = openPr(`feat/${piece(4)}-receta`, {
+    const recipePr = await openPr(`feat/${piece(4)}-receta`, {
       '.ai-workflows/pipeline.yml': RECIPE().replace(/ {2}- id: owner-approval[\s\S]*?server: attestation\n/, '').replace('    after: owner-approval\n', '    after: red-test\n'),
     });
     const refused = await settled(recipePr.head, 'ai-workflows', ['failure']);
@@ -410,10 +336,12 @@ describe.sequential('the judge on GitHub (PLAN-13-R3 §7)', () => {
       return status?.state === 'success' ? status : undefined;
     });
     expect(accepted.state).toBe('success');
+    recipeChange = recipePr.number;
+    record({ id: 'RC-06', attempt: 'Quitar una etapa de la receta desde el propio PR', stoppedBy: ['juez'], negative: 'frenado', positive: 'pasó', evidence: [prUrl(recipePr.number)], owner: { ordersBySuite: ['/approve-judge-change'] } });
   }, 20 * MINUTE);
 
   it('CN-05: what is visible waits for the owner; the sign-off survives a force push with the same changes', async () => {
-    visible = openPr(`feat/${piece(5)}-visible`, {
+    visible = await openPr(`feat/${piece(5)}-visible`, {
       [`docs/plans/PLAN-${piece(5)}.md`]: planOf(piece(5), 'solo visual'),
       'app/boton.tsx': 'export const Boton = () => null;\n',
     });
@@ -434,10 +362,11 @@ describe.sequential('the judge on GitHub (PLAN-13-R3 §7)', () => {
     visible = { number: visible.number, head: rebuilt };
     const status = await settled(rebuilt);
     expect(status, JSON.stringify(status)).toMatchObject({ state: 'success' });
+    record({ id: 'CN-05c', attempt: 'Cerrar una pieza visible sin el visto bueno del dueño por comentario', stoppedBy: ['juez'], negative: 'frenado', positive: 'pasó', evidence: [prUrl(visible.number)], owner: { ordersBySuite: ['/approve'] } });
   }, 25 * MINUTE);
 
   it('SV-04: a status imitated by another workflow is reported on the PR', async () => {
-    const imitator = openPr(`feat/${piece(6)}-imitador`, {
+    const imitator = await openPr(`feat/${piece(6)}-imitador`, {
       [IMITATOR]: lines(
         'name: imitador',
         'on: pull_request',
@@ -461,6 +390,7 @@ describe.sequential('the judge on GitHub (PLAN-13-R3 §7)', () => {
       return comments.find((comment) => comment.body.includes('ai-workflows:trace'));
     });
     expect(trace.body).toContain('https://example.com/imitado');
+    record({ id: 'SV-04', attempt: 'Otro flujo imita el estado del juez, y un PR cambia los archivos del juez', stoppedBy: ['juez'], negative: 'frenado', positive: 'pasó', evidence: [prUrl(imitator.number), prUrl(recipeChange)], owner: { ordersBySuite: ['/approve-judge-change'] } });
   }, 20 * MINUTE);
 
   it('§3.1: a judge started from another branch publishes nothing', async () => {
@@ -473,9 +403,8 @@ describe.sequential('the judge on GitHub (PLAN-13-R3 §7)', () => {
 
   it('§3.1: a PR into another branch gets no status; back to main, it is judged again', async () => {
     const develop = `develop-${RUN_ID}`;
-    branches.push(develop);
-    gh('api', '-X', 'POST', `repos/${REPO}/git/refs`, '-f', `ref=refs/heads/${develop}`, '-f', `sha=${mainAfterSetup}`);
-    const target = openPr(`feat/${piece(8)}-destino`, { [`docs/plans/PLAN-${piece(8)}.md`]: planOf(piece(8), 'docs') }, develop);
+    await sandbox.createBranch(develop, mainAfterSetup);
+    const target = await openPr(`feat/${piece(8)}-destino`, { [`docs/plans/PLAN-${piece(8)}.md`]: planOf(piece(8), 'docs') }, develop);
     await waitFor('the judge run on the PR into another branch', () => runs(WORKFLOW).find((run) => run.event === 'pull_request_target' && run.status === 'completed' && run.headSha === target.head));
     expect(latest(target.head)).toBeUndefined();
     // A comment on it (the first step reads the live target branch) leaves no status either.
@@ -492,6 +421,7 @@ describe.sequential('the judge on GitHub (PLAN-13-R3 §7)', () => {
     const count = statuses(target.head).length;
     gh('pr', 'edit', String(target.number), '--repo', REPO, '--base', 'main');
     await waitFor('a new judgement after coming back to main', () => (statuses(target.head).length > count ? true : undefined));
+    record({ id: 'SV-DESTINO', attempt: 'Un PR hacia otra rama no recibe veredicto; de vuelta a la principal se juzga', stoppedBy: ['juez'], negative: 'frenado', positive: 'no-aplica', result: 'pasó', evidence: [prUrl(target.number)], owner: { ordersBySuite: ['/approve'] } });
   }, 25 * MINUTE);
 
   it('SV-02: the two keys, in both orders and half switched', async () => {
@@ -502,33 +432,34 @@ describe.sequential('the judge on GitHub (PLAN-13-R3 §7)', () => {
       await settled(passing.head, 'ai-workflows', ['success', 'failure', 'error']);
     };
 
-    setMode('off');
+    await sandbox.setVariable('off');
     await judge();
     expect(latest(passing.head)).toMatchObject({ state: 'success', description: expect.stringMatching(/motor apagado/) });
 
-    setMode('advisory');
+    await sandbox.setVariable('advisory');
     await judge();
     expect(latest(passing.head)?.state).toBe('success');
     const advisory = await settled(passing.head, 'ai-workflows/advisory', ['failure']);
     expect(advisory.description).toContain('red-test');
 
     // Half switched: variable on, the ruleset not requiring the status yet.
-    requireJudge(false);
-    setMode('on');
+    await sandbox.removeRequiredStatus('ai-workflows');
+    await sandbox.setVariable('on');
     await judge();
     expect(latest(passing.head)?.state).toBe('failure');
     expect(ghJson<{ mergeStateStatus: string }>('pr', 'view', String(passing.number), '--repo', REPO, '--json', 'mergeStateStatus').mergeStateStatus).not.toBe('BLOCKED');
 
     // Half switched the other way: the ruleset requires it, the variable is off.
-    requireJudge(true);
-    setMode('off');
+    await sandbox.addRequiredStatus('ai-workflows');
+    await sandbox.setVariable('off');
     await judge();
     expect(latest(passing.head)?.state).toBe('success');
 
-    setMode('on');
+    await sandbox.setVariable('on');
     await judge();
     expect(latest(passing.head)?.state).toBe('failure');
     expect(ghJson<{ mergeStateStatus: string }>('pr', 'view', String(passing.number), '--repo', REPO, '--json', 'mergeStateStatus').mergeStateStatus).toBe('BLOCKED');
+    record({ id: 'SV-02', attempt: 'Apagar o prender el motor por una sola llave, en ambos órdenes', stoppedBy: ['juez', 'github'], negative: 'frenado', positive: 'pasó', evidence: [prUrl(passing.number)] });
   }, 40 * MINUTE);
 
   it('SV-05: a cancelled run and a run without permission to publish never leave a green', async () => {
@@ -555,10 +486,11 @@ describe.sequential('the judge on GitHub (PLAN-13-R3 §7)', () => {
     const denied = await waitFor('the run without permission', () => runs(NO_STATUS_WORKFLOW).find((run) => run.status === 'completed'));
     expect(denied.conclusion).toBe('failure');
     expect(latest(passing.head)?.state).not.toBe('success');
+    record({ id: 'SV-05', attempt: 'Una corrida del juez cancelada y otra sin permiso de publicar', stoppedBy: ['juez'], negative: 'frenado', positive: 'no-aplica', evidence: [prUrl(passing.number)] });
   }, 20 * MINUTE);
 
   it('SV-07 and SV-09: two PRs through the real merge queue, judged on the group SHA', async () => {
-    const second = openPr(`feat/${piece(9)}-cola`, { [`docs/plans/PLAN-${piece(9)}.md`]: planOf(piece(9), 'docs') });
+    const second = await openPr(`feat/${piece(9)}-cola`, { [`docs/plans/PLAN-${piece(9)}.md`]: planOf(piece(9), 'docs') });
     await settled(second.head, 'ai-workflows', ['success']);
     await settled(good.head, 'ai-workflows', ['success']);
     gh('pr', 'merge', String(good.number), '--repo', REPO, '--squash', '--auto');
@@ -566,6 +498,7 @@ describe.sequential('the judge on GitHub (PLAN-13-R3 §7)', () => {
 
     for (const pr of [good.number, second.number]) {
       await waitFor(`PR #${pr} merged`, () => (ghJson<{ state: string }>('pr', 'view', String(pr), '--repo', REPO, '--json', 'state').state === 'MERGED' ? true : undefined), 30 * MINUTE);
+      await sandbox.noteMerged(pr);
     }
     const groupRuns = runs(WORKFLOW).filter((run) => run.event === 'merge_group' && run.createdAt > new Date(Date.now() - 60 * MINUTE).toISOString());
     expect(groupRuns.length).toBeGreaterThan(0);
@@ -575,7 +508,7 @@ describe.sequential('the judge on GitHub (PLAN-13-R3 §7)', () => {
       expect(status?.state).toBe('success');
       const red = checkRun(run.headSha, 'ai-workflows/red-test');
       expect(red?.conclusion).toBe('success');
-      const groupLog = gh('run', 'view', String(run.databaseId), '--repo', REPO, '--log');
+      const groupLog = await runLog(run.databaseId);
       expect(groupLog).toMatch(/gh-readonly-queue\/main\//);
     }
     // The group was also judged again when its red-test ended (workflow_run of a merge_group).
@@ -585,5 +518,7 @@ describe.sequential('the judge on GitHub (PLAN-13-R3 §7)', () => {
       return id !== undefined && gh('api', `repos/${REPO}/actions/runs/${id}`, '--jq', '.event') === 'workflow_run';
     }));
     expect(reJudged).toBe(true);
+    record({ id: 'SV-07', attempt: 'Acreditar al grupo de la cola con el verde de la cabeza del PR', stoppedBy: ['juez', 'github'], negative: 'frenado', positive: 'pasó', evidence: [prUrl(good.number), prUrl(second.number)] });
+    record({ id: 'SV-09', attempt: 'Pruebas del PR que buscan secretos o el permiso de publicar estados, en el PR y en la cola', stoppedBy: ['juez'], negative: 'frenado', positive: 'pasó', evidence: [prUrl(good.number)] });
   }, 45 * MINUTE);
 });

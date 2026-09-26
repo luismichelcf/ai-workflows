@@ -36,6 +36,17 @@ function patternToRegExp(pattern: string): RegExp {
 }
 
 /**
+ * R19: the exclusion pattern a branch matches, or `undefined` when none does. One implementation
+ * for the judge and for the locks, so both answer the same question the same way (PLAN-13-R5 §1.2).
+ */
+export function excludedBy(recipe: Recipe, branch: string): string | undefined {
+  for (const pattern of recipe.pieces?.excludeBranches ?? []) {
+    if (patternToRegExp(pattern).test(branch)) return pattern;
+  }
+  return undefined;
+}
+
+/**
  * R19: the piece a branch declares, or the reason it declares none. Without `pieces:` the piece
  * of a change is the pull request number.
  */
@@ -48,14 +59,13 @@ export function pieceOfBranch(
   if (pieces === undefined) return { piece: String(prNumber) };
   const spanish = languageOf(recipe.locale) === 'es';
 
-  for (const pattern of pieces.excludeBranches) {
-    if (patternToRegExp(pattern).test(branch)) {
-      return {
-        none: spanish
-          ? `la rama "${branch}" está excluida por "${pattern}" y no nombra ninguna pieza`
-          : `the branch "${branch}" is excluded by "${pattern}" and names no piece`,
-      };
-    }
+  const excluded = excludedBy(recipe, branch);
+  if (excluded !== undefined) {
+    return {
+      none: spanish
+        ? `la rama "${branch}" está excluida por "${excluded}" y no nombra ninguna pieza`
+        : `the branch "${branch}" is excluded by "${excluded}" and names no piece`,
+    };
   }
 
   for (const pattern of pieces.branch) {

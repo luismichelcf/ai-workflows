@@ -195,6 +195,10 @@ del servidor: `git ls-tree -r -z --full-tree <head>` y `git cat-file blob <head>
   muestre el grupo (observado en GitHub): si el grupo no aparece todavía, o alguna entrada aún no
   trae sus commits, se lee hasta 6 veces en total (pausas de 2, 4, 8, 15 y 30 s) antes de
   rendirse; una lectura que falla por otra causa es técnica al momento. Lo mismo hace el job de la prueba roja (§5).
+  *Ajustado en la rebanada 5 (PLAN-13-R5 §9, hallado en la corrida real):* la espera llega a unos
+  cinco minutos (10 lecturas), y como GitHub arma como mucho cinco grupos a la vez, las entradas
+  **del final** que aún no traen ninguno de sus commits se dejan fuera de la lista; solo una entrada
+  a medio armar, o una sin armar antes de una armada, sigue siendo «todavía no lista».
 - En un grupo, cada PR se juzga con su cabeza (`pullRequest.headRefOid`) contra el commit
   confiable (§3.1), salvo `require-check`, que se lee sobre el **SHA del grupo** (un verde de la cabeza del
   PR no acredita al grupo). El grupo pasa solo si pasan todos sus PRs.

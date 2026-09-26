@@ -22,6 +22,18 @@ export interface LockContext {
   readonly libre?: boolean;
   /** Folders, relative to `cwd`, where papers may be written without a piece. */
   readonly paperPaths: readonly string[];
+  /**
+   * PLAN-13-R5 §1.3: the orders only the owner writes, read from the recipe's approval stages.
+   * Absent means the v0.3.0 behaviour: only `/visto-bueno` is known.
+   */
+  readonly ownerOrders?: readonly string[];
+  /** PLAN-13-R5 §1.3: refuse the terminal forms that approve a pull request. */
+  readonly forbidPullRequestApproval?: boolean;
+  /**
+   * PLAN-13-R5 §1.4: the recipe of this working copy could not be read or validated, with the
+   * problem at file:line:column. Only `.ai-workflows/` stays writable, and rule 0 is stricter.
+   */
+  readonly brokenRecipe?: string;
 }
 
 export type LockDecision = { readonly allow: true } | { readonly allow: false; readonly reason: string };
@@ -81,9 +93,92 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
 //
 // This is help, not a guarantee: an agent can still write a template holding `<sha>` in one step
 // and fill it in with the shell in another, never naming the order where this hook can read it.
-const SHELL_TOOLS = new Set(['Bash', 'PowerShell', 'Monitor']);
-const SHELL_SIGN_OFF = /\/visto-bueno/i;
-const FILE_SIGN_OFF_LINE = /^\/visto-bueno\s+(\S.*)$/i;
+export const SHELL_TOOLS = new Set(['Bash', 'PowerShell', 'Monitor']);
+/** Without a recipe the lock knows only the v0.3.0 order, so old callers keep working. */
+const DEFAULT_OWNER_ORDERS: readonly string[] = ['/visto-bueno'];
+/**
+ * PLAN-13-R5 §1.3 (round 4): a console order past this size is refused before any other reading, so
+ * the hook never spends its 30 s budget on a command too big to finish and Claude Code never lets it
+ * through by timeout. Fail closed: writing the reason is cheaper than reading the order.
+ */
+const MAX_COMMAND_LENGTH = 65_536;
+/**
+ * PLAN-13-R5 §1.3 (round 5): the console is not parsed any more. Every attempt to read an order the
+ * way the shell reads it left a new way through (a line break, a redirection in the middle, a
+ * command substitution, PowerShell's line continuation, a stray quote, `bash -c "…"`). The rule
+ * OVER-APPROXIMATES on the whole text instead: a command that names `gh` and carries an
+ * approval-shaped flag, anywhere, is refused. It may refuse an innocent chain (the reason asks to
+ * run the orders separately); it never lets one of these through because of how it was written, and
+ * it answers in linear time.
+ */
+
+/**
+ * The command with the console's quoting and line continuations removed, so the whole-text searches
+ * see one flat line. `\` + end of line and backtick + end of line join the two lines first; then the
+ * obvious disguises are dropped (`^`, cmd's escape; the literal `$()` and `${…}` up to the next
+ * `}`); finally the remaining `\`, backtick, `'` and `"` are dropped. No pattern backtracks: each
+ * replacement scans the text once, so the cost is linear.
+ */
+function normalizedCommand(command: string): string {
+  return command
+    .replace(/\\\r?\n/g, '')
+    .replace(/`\r?\n/g, '')
+    .replace(/\^/g, '')
+    .replace(/\$\(\)/g, '')
+    .replace(/\$\{[^}]*\}/g, '')
+    .replace(/['"`\\]/g, '');
+}
+
+/** The word `gh`, or `gh.exe` wherever it appears; `high` and `ghpr` are not it (PLAN-13-R5 §1.3). */
+const NAMES_GH = /\bgh\b|gh\.exe/i;
+/** The word `review` of `gh pr review`; `/reviews` does not count here (it has its own rule). */
+const WORD_REVIEW = /\breview\b/i;
+/** `--approve`, with or without a value (`--approve=true`). */
+const LONG_APPROVE = /--approve(?:=|\b)/i;
+/** A short flag group gh reads letter by letter (`-ab` is `-a -b`); a group with `a` approves. */
+const SHORT_APPROVE = /(?<![A-Za-z0-9_-])-[A-Za-z]*a[A-Za-z]*/;
+/** The reviews endpoint of a pull request, wherever in a `gh api` path it appears. */
+const REVIEWS_PATH = /\/reviews\b/i;
+/** A body sent to the reviews endpoint (`--input`), the second shape the reviews rule refuses. */
+const INPUT_FLAG = /--input(?:=|\b)/i;
+/** The GraphQL mutations that add or submit a pull request review. */
+const GRAPHQL_APPROVE = /(?:add|submit)PullRequestReview\b/i;
+/** The word `graphql`, so a body read from a file cannot hide the mutation (round 6). */
+const WORD_GRAPHQL = /\bgraphql\b/i;
+/**
+ * The word APPROVE, whatever its case, as the reviews and GraphQL rules read it. Not `APPROVED`:
+ * reading the reviews filtered by that state is a read, not an approval (round 6).
+ */
+const WORD_APPROVE = /approve(?!d)/i;
+/** The gh subcommands that write on GitHub; broken-recipe mode refuses any of them (§1.4). */
+const WRITE_WORDS = /\b(?:comment|review|create|merge|edit|close|delete|reopen|ready)\b/i;
+/** The word `api` of `gh api`, the other subcommand that can write. */
+const WORD_API = /\bapi\b/i;
+/** A `gh api` field flag, attached or not (`-f body=`, `-fbody=`, `-F=body=`). */
+const SHORT_FIELD = /(?<![A-Za-z0-9_-])-[fF]/;
+/** The long field flags of `gh api` (`--field`, `--raw-field`, `--input`), attached or not. */
+const LONG_FIELD = /--(?:field|raw-field|input)(?:=|\b)/i;
+
+/**
+ * True when a `gh api` call names a method other than GET. The alternatives (`--method` and a short
+ * `-x`/`-X`) do not overlap and each captures its value, so the scan stays linear (PLAN-13-R5 §1.3).
+ */
+function apiWritesMethod(text: string): boolean {
+  const pattern = /--method(?:[\s=]+)(\S+)|(?<![A-Za-z0-9_-])-[xX](?:[\s=]*)(\S+)/g;
+  for (const match of text.matchAll(pattern)) {
+    const value = match[1] ?? match[2];
+    if (value !== undefined && value.toUpperCase() !== 'GET') return true;
+  }
+  return false;
+}
+
+/** True when a `gh api` call carries a write: a field flag or a method other than GET. */
+function apiWrites(text: string): boolean {
+  return SHORT_FIELD.test(text) || LONG_FIELD.test(text) || apiWritesMethod(text);
+}
+
+/** A line the server reads as any order: `/word value`, the shape of every approval. */
+const ORDER_SHAPED_LINE = /^\/(\S+)\s+(\S.*)$/;
 
 interface SignOffText {
   readonly text: string;
@@ -91,18 +186,62 @@ interface SignOffText {
   readonly stripPlus: boolean;
 }
 
-/** True when one line, trimmed, is a line the server would read as the owner's order. */
-function isSignOffOrderLine(rawLine: string, stripPlus: boolean): boolean {
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/** True when one line, trimmed, is a line the server would read as one of the owner's orders. */
+function isOwnerOrderLine(rawLine: string, stripPlus: boolean, orders: readonly string[]): boolean {
   let line = rawLine.trim();
   if (stripPlus) line = line.replace(/^\+/, '').trim();
 
-  const value = FILE_SIGN_OFF_LINE.exec(line)?.[1];
-  return value !== undefined && !value.startsWith('<');
+  for (const order of orders) {
+    const value = new RegExp(`^${escapeRegExp(order)}\\s+(\\S.*)$`, 'i').exec(line)?.[1];
+    if (value !== undefined && !value.startsWith('<')) return true;
+  }
+  return false;
 }
 
-/** True when any line of the text the tool is about to write would be read as the order. */
-function writesSignOffLine(text: string, stripPlus: boolean): boolean {
-  return text.split(/\r?\n/).some((line) => isSignOffOrderLine(line, stripPlus));
+/** True when any line of the text the tool is about to write would be read as an order. */
+function writesOwnerOrderLine(text: string, stripPlus: boolean, orders: readonly string[]): boolean {
+  return text.split(/\r?\n/).some((line) => isOwnerOrderLine(line, stripPlus, orders));
+}
+
+/** True when any line has the shape of an order, whatever its word is (broken-recipe mode). */
+function writesOrderShapedLine(text: string, stripPlus: boolean): boolean {
+  return text.split(/\r?\n/).some((rawLine) => {
+    let line = rawLine.trim();
+    if (stripPlus) line = line.replace(/^\+/, '').trim();
+    const value = ORDER_SHAPED_LINE.exec(line)?.[2];
+    return value !== undefined && !value.startsWith('<');
+  });
+}
+
+/**
+ * True when a shell command asks GitHub to approve a pull request, read as an over-approximation on
+ * the whole normalized text (PLAN-13-R5 §1.3, round 5): it names `gh` and any of the three shapes
+ * of an approval is present.
+ */
+function approvesPullRequest(command: string): boolean {
+  const text = normalizedCommand(command);
+  if (!NAMES_GH.test(text)) return false;
+  // A review stage with an approval-shaped flag, wherever the flag lives.
+  if (WORD_REVIEW.test(text) && (LONG_APPROVE.test(text) || SHORT_APPROVE.test(text))) return true;
+  // A body sent to the reviews endpoint, or a review mutation naming APPROVE.
+  if (REVIEWS_PATH.test(text) && (WORD_APPROVE.test(text) || INPUT_FLAG.test(text) || text.includes('@'))) {
+    return true;
+  }
+  // The GraphQL twin: the mutation is hidden in a file named by `@` or `--input`.
+  if (WORD_GRAPHQL.test(text) && (text.includes('@') || INPUT_FLAG.test(text))) return true;
+  return GRAPHQL_APPROVE.test(text) && WORD_APPROVE.test(text);
+}
+
+/** True when a shell command publishes something on GitHub (broken-recipe mode, §1.4). */
+function publishesToGitHub(command: string): boolean {
+  const text = normalizedCommand(command);
+  if (!NAMES_GH.test(text)) return false;
+  if (WRITE_WORDS.test(text)) return true;
+  return WORD_API.test(text) && apiWrites(text);
 }
 
 /**
@@ -151,15 +290,31 @@ function fileSignOffTexts(toolName: string, toolInput: unknown): SignOffText[] |
 }
 
 /**
- * Rule 0 of the editor hook: refuse any tool call that would write the owner's sign-off itself.
- * Returns `undefined` when the call may continue to the folder rules.
+ * PLAN-13-R5 §1.3 (round 4): refuse a console order past the size limit before reading it, so the
+ * hook fails closed instead of running past its time and being let through by the CLI.
  */
-function signOffRefusal(toolName: string, toolInput: unknown): LockDecision | undefined {
+function tooLongCommand(command: string): LockDecision | undefined {
+  if (command.length <= MAX_COMMAND_LENGTH) return undefined;
+  return {
+    allow: false,
+    reason:
+      `La orden de consola es demasiado larga para revisarla (${command.length} caracteres, el tope ` +
+      `es ${MAX_COMMAND_LENGTH}). Me niego en vez de dejarla pasar a ciegas.`,
+  };
+}
+
+/**
+ * Rule 0 of the editor hook: no tool call writes one of the owner's approval orders itself, and no
+ * shell approves a pull request. The orders come from the recipe (`context.ownerOrders`); without
+ * them the v0.3.0 behaviour is kept exactly. Returns `undefined` when the call may continue.
+ */
+function ownerRuleRefusal(toolName: string, toolInput: unknown, context: LockContext): LockDecision | undefined {
+  const orders = context.ownerOrders ?? DEFAULT_OWNER_ORDERS;
   const order: LockDecision = {
     allow: false,
     reason:
-      'El visto bueno del dueño solo lo da él. No escribas tú `/visto-bueno <sha>` con su cuenta: ' +
-      'pídeselo al dueño y que sea él quien lo escriba en el PR.',
+      'La aprobación del dueño solo la da él. No escribas tú la orden de aprobación con su cuenta: ' +
+      'pídeselo al dueño y que sea él quien la escriba.',
   };
 
   if (SHELL_TOOLS.has(toolName)) {
@@ -177,11 +332,25 @@ function signOffRefusal(toolName: string, toolInput: unknown): LockDecision | un
       return {
         allow: false,
         reason:
-          'No pude leer el comando de esta herramienta: el candado se niega a adivinar si iba a escribir el visto bueno del dueño. Revisa el formato de tool_input.',
+          'No pude leer el comando de esta herramienta: el candado se niega a adivinar si iba a escribir una orden del dueño. Revisa el formato de tool_input.',
       };
     }
+    // Too big to read within the hook's time: refuse before any other analysis, never slowly.
+    const tooLong = tooLongCommand(command);
+    if (tooLong !== undefined) return tooLong;
     // Shell text can fill a placeholder in before GitHub sees it, so any appearance is refused.
-    return SHELL_SIGN_OFF.test(command) ? order : undefined;
+    const lower = command.toLowerCase();
+    if (orders.some((entry) => lower.includes(entry.toLowerCase()))) return order;
+    if (context.forbidPullRequestApproval === true && approvesPullRequest(command)) {
+      return {
+        allow: false,
+        reason:
+          'Aprobar un pull request solo lo hace el dueño. Esta orden aprobaría un PR con la cuenta ' +
+          'del dueño: un agente no puede publicarla, pídeselo a él. Si encadenaste varias órdenes, ' +
+          'córrelas por separado.',
+      };
+    }
+    return undefined;
   }
 
   const texts = fileSignOffTexts(toolName, toolInput);
@@ -190,15 +359,115 @@ function signOffRefusal(toolName: string, toolInput: unknown): LockDecision | un
     return {
       allow: false,
       reason:
-        'No pude leer lo que esta herramienta iba a escribir: el candado se niega a adivinar si era el visto bueno del dueño. Revisa el formato de tool_input.',
+        'No pude leer lo que esta herramienta iba a escribir: el candado se niega a adivinar si era ' +
+        'una orden del dueño. Revisa el formato de tool_input.',
     };
   }
 
-  return texts.some(({ text, stripPlus }) => writesSignOffLine(text, stripPlus)) ? order : undefined;
+  return texts.some(({ text, stripPlus }) => writesOwnerOrderLine(text, stripPlus, orders))
+    ? order
+    : undefined;
+}
+
+/**
+ * PLAN-13-R5 §1.2: a path inside the git area of a working copy. Git refuses to call that a work
+ * tree, so the path rules cannot read it; the copy's own context decides. A broken recipe refuses
+ * it, a piece or `/libre` allows it, and without a piece it is refused like code would be.
+ */
+export function decideGitFolder(context: LockContext): LockDecision {
+  if (context.brokenRecipe !== undefined) return { allow: false, reason: brokenRecipeReason(context) };
+  if (context.activePiece || context.libre) return { allow: true };
+  return {
+    allow: false,
+    reason:
+      'La carpeta interna de git no se escribe sin una pieza activa: abre una o usa /libre para prototipos.',
+  };
+}
+
+/** What to say in broken-recipe mode: the problem, and the only door that stays open. */
+function brokenRecipeReason(context: LockContext): string {
+  return (
+    `La receta no es válida (${context.brokenRecipe}). Hasta repararla solo se puede escribir dentro ` +
+    'de .ai-workflows/: el candado no deja pasar nada más por si acaso.'
+  );
+}
+
+/** Rule 0 in broken-recipe mode: publishing to GitHub and any order-shaped line are refused. */
+function brokenOrderRefusal(input: HookInput, context: LockContext): LockDecision | undefined {
+  if (SHELL_TOOLS.has(input.toolName)) {
+    const record = asRecord(input.toolInput);
+    const command = record?.command;
+    if (typeof command !== 'string' && input.toolName === 'Monitor' && asRecord(record?.ws)) {
+      return undefined;
+    }
+    if (typeof command !== 'string') {
+      return { allow: false, reason: brokenRecipeReason(context) };
+    }
+    const tooLong = tooLongCommand(command);
+    if (tooLong !== undefined) return tooLong;
+    return publishesToGitHub(command) ? { allow: false, reason: brokenRecipeReason(context) } : undefined;
+  }
+
+  if (!isCoveredWriteTool(input.toolName)) return undefined;
+  const texts = fileSignOffTexts(input.toolName, input.toolInput);
+  if (texts === undefined) return { allow: false, reason: brokenRecipeReason(context) };
+  return texts.some(({ text, stripPlus }) => writesOrderShapedLine(text, stripPlus))
+    ? { allow: false, reason: brokenRecipeReason(context) }
+    : undefined;
+}
+
+/**
+ * The owner rule alone, without the folder rules. `runHook` calls it once on the whole request so
+ * that writing an order is refused wherever the target folder lives, and `decideToolUse` uses it
+ * as the first rule of a whole decision.
+ */
+export function orderRefusal(input: HookInput, context: LockContext): LockDecision | undefined {
+  if (context.brokenRecipe !== undefined) return brokenOrderRefusal(input, context);
+  return ownerRuleRefusal(input.toolName, input.toolInput, context);
+}
+
+/** The whole decision under a broken recipe: repair folder only, and the stricter rule 0. */
+function decideBrokenToolUse(input: HookInput, context: LockContext): LockDecision {
+  const order = brokenOrderRefusal(input, context);
+  if (order !== undefined) return order;
+  if (SHELL_TOOLS.has(input.toolName)) return { allow: true };
+  if (!isCoveredWriteTool(input.toolName)) return { allow: true };
+
+  const root = readAbsolute(context.projectRoot);
+  if (!root.ok) {
+    return { allow: false, reason: brokenRecipeReason(context) };
+  }
+  const repair = readAbsolute(`${root.path.display}/.ai-workflows`);
+  if (!repair.ok) return { allow: false, reason: brokenRecipeReason(context) };
+
+  const targets = writeTargets(input.toolName, input.toolInput);
+  if (targets === undefined || targets.length === 0) {
+    // Under a broken recipe an unreadable write is refused, never passed by doubt.
+    return { allow: false, reason: brokenRecipeReason(context) };
+  }
+
+  const projectDrive = root.path.windows ? /^([A-Za-z]):/.exec(root.path.display)?.[1] : undefined;
+  const readings = targets.map((target) => readAgainst(target, input.cwd, projectDrive));
+  for (const reading of readings) {
+    if (!reading.ok) return { allow: false, reason: brokenRecipeReason(context) };
+  }
+
+  const inside = readings
+    .flatMap((reading) => (reading.ok ? [reading.path] : []))
+    .filter((target) => isUnder(target, root.path));
+  // Paths outside the project are not this lock's business, broken recipe or not.
+  if (inside.length === 0) return { allow: true };
+  if (inside.every((target) => isUnder(target, repair.path))) return { allow: true };
+  return { allow: false, reason: brokenRecipeReason(context) };
+}
+
+/** True when the tool is one of the writing surfaces this lock judges by its path. */
+export function isCoveredWriteTool(toolName: string): boolean {
+  return CLAUDE_FILE_TOOLS.has(toolName) || toolName === 'NotebookEdit' || toolName === 'apply_patch';
 }
 
 /** The paths a covered tool will write, or `undefined` when the request cannot be read. */
-function writeTargets(toolName: string, toolInput: unknown): string[] | undefined {
+export function writeTargets(toolName: string, toolInput: unknown): string[] | undefined {
   if (toolName === 'apply_patch') {
     const record = asRecord(toolInput);
     if (!record) return undefined;
@@ -230,9 +499,12 @@ function writeTargets(toolName: string, toolInput: unknown): string[] | undefine
  * with the shell in another, never naming the order where this hook can read it.
  */
 export function decideToolUse(input: HookInput, context: LockContext): LockDecision {
+  // A broken recipe replaces every rule: only the recipe can be repaired, and rule 0 is stricter.
+  if (context.brokenRecipe !== undefined) return decideBrokenToolUse(input, context);
+
   // Rule 0: no agent writes the owner's sign-off for him. Checked before every other rule, and
   // unaffected by a piece or a /libre folder, because those open writing, never the sign-off.
-  const signOff = signOffRefusal(input.toolName, input.toolInput);
+  const signOff = ownerRuleRefusal(input.toolName, input.toolInput, context);
   if (signOff) return signOff;
 
   // Shell tools are covered only by the sign-off rule above: their command is not a path this
@@ -240,10 +512,8 @@ export function decideToolUse(input: HookInput, context: LockContext): LockDecis
   // stage, not what they run.
   if (SHELL_TOOLS.has(input.toolName)) return { allow: true };
 
-  const isCovered =
-    CLAUDE_FILE_TOOLS.has(input.toolName) || input.toolName === 'NotebookEdit' || input.toolName === 'apply_patch';
   // Rule 1: everything the hook is not wired to passes untouched.
-  if (!isCovered) return { allow: true };
+  if (!isCoveredWriteTool(input.toolName)) return { allow: true };
 
   // Rule 2: the guarded folder is the configured project root, never the hook's cwd, which moves
   // with every `cd`. A root the lock cannot read as an absolute path cannot be guarded at all:
