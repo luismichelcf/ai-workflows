@@ -117,7 +117,8 @@ describe('what the owner did and what the suite did with the owner account (R22)
   it('declares the other uses of the owner account during the run', () => {
     const text = renderSuiteReport(allGood(), META).text;
     const row = text.split('\n').find((line) => line.includes('La suite también usó la cuenta del dueño')) ?? '';
-    for (const act of ['preparar y restaurar el ensayo', 'crear los issues de las piezas', 'cambiar la variable del motor', 'prender y apagar flujos', 'crear despliegues de prueba', 'R22']) expect(row, act).toContain(act);
+    // Flock round 11: the whole list of what the harness does with that account (tests/github/sandbox.ts).
+    for (const act of ['preparar y restaurar el ensayo', 'crear los issues y las ramas de las piezas', 'cambiar la variable del motor', 'prender y apagar flujos', 'quitar y reponer checks exigidos en la protección de main', 'escribir a mano registros del motor en las trampas que los falsifican', 'crear despliegues de prueba', 'R22']) expect(row, act).toContain(act);
   });
 
   it('only the judge cases of this run are named there', () => {
