@@ -60,9 +60,23 @@ describe('what the owner did and what the suite did with the owner account (R22)
       'SV-DESTINO': { orders: ['/approve'] },
       'RC-06': { orders: ['/approve-judge-change'] },
       'SV-04': { orders: ['/approve-judge-change'] },
-      'SV-04s': { orders: ['/approve-judge-change'], pushes: true },
+      'SV-04s': { orders: ['/approve-judge-change'], pushes: true, dispatches: true },
+      'SV-03a': { dispatches: true },
+      'SV-03d': { dispatches: true },
       RECORRIDO: { button: true },
     });
+  });
+
+  // Flock round 9: outside the judge file, some cases start runs of the judge by hand with the
+  // owner account (`gh workflow run`) instead of waiting for an event. The report names them.
+  it('names the cases that start runs of the judge by hand with the owner account', () => {
+    const text = renderSuiteReport(allGood(), META).text;
+    const row = text.split('\n').find((line) => line.includes('lanzó a mano corridas del juez')) ?? '';
+    for (const id of ['SV-03a', 'SV-03d', 'SV-04s']) expect(row, id).toContain(id);
+    for (const id of ['SV-03b', 'SV-03c', 'CN-01']) expect(row, id).not.toMatch(new RegExp(`\\b${id}\\b`));
+    expect(row).toContain('R22');
+    const without = renderSuiteReport(allGood().filter((record) => record.id !== 'SV-03d'), META).text;
+    expect(without.split('\n').find((line) => line.includes('lanzó a mano corridas del juez'))).not.toMatch(/SV-03d/);
   });
 
   // Found in the real run, part 5: GitHub refuses the agents' app a change to a workflow file, so
@@ -88,7 +102,9 @@ describe('what the owner did and what the suite did with the owner account (R22)
   it('names the cases whose branches and pull requests come from the owner account', () => {
     const text = renderSuiteReport(allGood(), META).text;
     const section = text.slice(text.indexOf('Qué hizo el dueño y qué se hizo con su cuenta'), text.indexOf('| Caso'));
-    const row = section.split('\n').find((line) => line.includes('abren con la cuenta del dueño')) ?? '';
+    const row = section.split('\n').find((line) => line.includes('En los casos del juez de la rebanada 3')) ?? '';
+    // Flock round 9: every act of the owner account there is named, not only pushes and PRs.
+    for (const act of ['sube las ramas', 'abre y edita los PRs', 'arma sus fusiones', 'lanza corridas del juez']) expect(row, act).toContain(act);
     const judgeIds = SUITE_MANIFEST.filter((entry) => entry.file === 'judge').map((entry) => entry.id);
     expect(judgeIds.length).toBeGreaterThan(0);
     for (const id of judgeIds) expect(row, id).toContain(id);
@@ -99,7 +115,7 @@ describe('what the owner did and what the suite did with the owner account (R22)
   it('only the judge cases of this run are named there', () => {
     const records = allGood().filter((record) => record.id !== 'SV-01');
     const text = renderSuiteReport(records, META).text;
-    const row = text.split('\n').find((line) => line.includes('abren con la cuenta del dueño')) ?? '';
+    const row = text.split('\n').find((line) => line.includes('En los casos del juez de la rebanada 3')) ?? '';
     expect(row).toContain('SV-02');
     expect(row).not.toMatch(/\bSV-01\b/);
   });
