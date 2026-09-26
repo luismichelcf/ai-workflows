@@ -389,7 +389,12 @@ export function createJudgeGitHub(options: JudgeGitHubOptions): JudgeGitHub {
         throw new Error(`gh did not report a list of merge queue entries for ${branch}.`);
       }
       const seen = new Set<number>();
-      const result: MergeQueueEntry[] = [];
+      const ordered: {
+        readonly position: number;
+        readonly prNumber: number;
+        readonly headSha: string | undefined;
+        readonly baseSha: string | undefined;
+      }[] = [];
       for (const node of nodes) {
         const position = isRecord(node) ? node['position'] : undefined;
         if (typeof position !== 'number' || !Number.isInteger(position) || position <= 0) {
@@ -403,18 +408,34 @@ export function createJudgeGitHub(options: JudgeGitHubOptions): JudgeGitHub {
         if (typeof prNumber !== 'number') {
           throw new Error(`A merge queue entry of ${branch} is missing its pull request.`);
         }
-        // The queue can list an entry before it has finished building it: an entry without its head
-        // or base commit is not a list that cannot be confirmed, but one that is not ready yet.
-        const headSha = textField(recordField(node, 'headCommit'), 'oid');
-        const baseSha = textField(recordField(node, 'baseCommit'), 'oid');
-        if (headSha === undefined || baseSha === undefined) {
-          throw new MergeQueueNotReady(
-            `A merge queue entry of ${branch} does not carry its head or base commit yet.`,
-          );
-        }
-        result.push({ position, headSha, baseSha, prNumber });
+        ordered.push({
+          position,
+          prNumber,
+          headSha: textField(recordField(node, 'headCommit'), 'oid'),
+          baseSha: textField(recordField(node, 'baseCommit'), 'oid'),
+        });
       }
-      result.sort((a, b) => a.position - b.position);
+      ordered.sort((a, b) => a.position - b.position);
+      const result: MergeQueueEntry[] = [];
+      for (const [index, entryNode] of ordered.entries()) {
+        const { position, prNumber, headSha, baseSha } = entryNode;
+        if (headSha !== undefined && baseSha !== undefined) {
+          result.push({ position, headSha, baseSha, prNumber });
+          continue;
+        }
+        // GitHub builds at most five entries at once, so the queue can list a trailing entry that
+        // carries neither of its two commits. Neither is a list that cannot be confirmed:
+        //   - an entry with neither commit and no built entry after it is left out;
+        //   - an entry with neither commit before a built one is not ready yet;
+        //   - an entry with only one of its two commits is not ready yet.
+        const builtAfter = ordered
+          .slice(index + 1)
+          .some((later) => later.headSha !== undefined && later.baseSha !== undefined);
+        if (headSha === undefined && baseSha === undefined && !builtAfter) continue;
+        throw new MergeQueueNotReady(
+          `A merge queue entry of ${branch} does not carry its head or base commit yet.`,
+        );
+      }
       return result;
     },
 
