@@ -33,7 +33,7 @@ function good(id: string, index: number): CaseRecord {
     ...(entry?.kind === 'check' ? { result: 'pasó' as const } : {}),
     ...(entry?.owner === undefined
       ? {}
-      : { owner: { ...(entry.owner.button ? { button: true as const } : {}), ...(entry.owner.orders ? { ordersBySuite: [...entry.owner.orders] } : {}) } }),
+      : { owner: { ...(entry.owner.button ? { button: true as const } : {}), ...(entry.owner.orders ? { ordersBySuite: [...entry.owner.orders] } : {}), ...(entry.owner.pushes ? { pushesBySuite: true as const } : {}) } }),
   };
 }
 
@@ -60,9 +60,39 @@ describe('what the owner did and what the suite did with the owner account (R22)
       'SV-DESTINO': { orders: ['/approve'] },
       'RC-06': { orders: ['/approve-judge-change'] },
       'SV-04': { orders: ['/approve-judge-change'] },
-      'SV-04s': { orders: ['/approve-judge-change'] },
+      'SV-04s': { orders: ['/approve-judge-change'], pushes: true },
       RECORRIDO: { button: true },
     });
+  });
+
+  // Found in the real run, part 5: GitHub refuses the agents' app a change to a workflow file, so
+  // for SV-04s the suite pushes that change with the owner's account (R22). The report says so.
+  it('says which changes the suite pushed with the owner account, citing R22', () => {
+    const text = renderSuiteReport(allGood(), META).text;
+    const section = text.slice(text.indexOf('Qué hizo el dueño y qué se hizo con su cuenta'), text.indexOf('| Caso'));
+    const pushes = section.split('\n').find((row) => row.includes('subió con la cuenta del dueño')) ?? '';
+    expect(pushes).toContain('SV-04s');
+    expect(pushes).toContain('R22');
+    expect(pushes).not.toContain('CN-01');
+  });
+
+  it('with no change pushed by the suite, the report says that too', () => {
+    const records = allGood().map((record) => (record.id === 'SV-04s' ? { ...record, owner: { ordersBySuite: ['/approve-judge-change'] } } : record));
+    const text = renderSuiteReport(records, META).text;
+    expect(text).toContain('La suite no subió cambios con la cuenta del dueño.');
+  });
+
+  it('a record may only carry pushesBySuite as true', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'aiw-report-push-'));
+    try {
+      const file = join(dir, 'push.jsonl');
+      writeFileSync(file, `${JSON.stringify({ ...good('SV-04s', 0), owner: { ordersBySuite: ['/approve-judge-change'], pushesBySuite: 'si' } })}\n`);
+      expect(() => readCaseRecords(file)).toThrow(/pushesBySuite/);
+      writeFileSync(file, `${JSON.stringify(good('SV-04s', 0))}\n`);
+      expect(readCaseRecords(file)[0]?.owner).toEqual({ ordersBySuite: ['/approve-judge-change'], pushesBySuite: true });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   const misattributed: Record<string, (records: CaseRecord[]) => CaseRecord[]> = {
@@ -71,6 +101,8 @@ describe('what the owner did and what the suite did with the owner account (R22)
     'the wrong order is named': (records) => records.map((record) => (record.id === 'CN-05c' ? { ...record, owner: { ordersBySuite: ['/visto-bueno'] } } : record)),
     'a button is claimed where there was none': (records) => records.map((record) => (record.id === 'CN-01' ? { ...record, owner: { button: true } } : record)),
     'an order written by the suite is shown as a button': (records) => records.map((record) => (record.id === 'SV-04' ? { ...record, owner: { button: true } } : record)),
+    'a push with the owner account is missing': (records) => records.map((record) => (record.id === 'SV-04s' ? { ...record, owner: { ordersBySuite: ['/approve-judge-change'] } } : record)),
+    'a push with the owner account is claimed where there was none': (records) => records.map((record) => (record.id === 'CN-01' ? { ...record, owner: { pushesBySuite: true } } : record)),
   };
   for (const [name, change] of Object.entries(misattributed)) {
     it(`${name} → not complete`, () => {
