@@ -163,8 +163,11 @@ describe('when the report may say complete', () => {
 
   it('lists the cases in manifest order, the thirteen first', () => {
     const shuffled = allGood().reverse();
-    const text = renderSuiteReport(shuffled, META).text;
-    const positions = ['CN-01', 'CN-02', 'CN-13', 'SV-01', 'LIMPIEZA'].map((id) => text.indexOf(id));
+    const full = renderSuiteReport(shuffled, META).text;
+    // Only the table: the owner section above it also names cases (flock round 8).
+    const text = full.slice(full.indexOf('| Caso'));
+    const positions = ['CN-01', 'CN-02', 'CN-13', 'SV-01', 'LIMPIEZA'].map((id) => text.indexOf(`| ${id} |`));
+    expect(positions.every((position) => position >= 0)).toBe(true);
     expect([...positions].sort((a, b) => a - b)).toEqual(positions);
   });
 

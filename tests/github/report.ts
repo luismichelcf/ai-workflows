@@ -506,8 +506,14 @@ export function renderSuiteReport(records: readonly CaseRecord[], meta: SuiteRep
   lines.push(
     pushCases.length > 0
       ? `La suite subió con la cuenta del dueño cambios que GitHub no deja subir a los agentes (R22): ${pushCases.join(', ')}.`
-      : 'La suite no subió cambios con la cuenta del dueño.',
+      : 'Ningún caso necesitó subir con la cuenta del dueño un cambio que GitHub no deja subir a los agentes.',
   );
+  const judgeCases = SUITE_MANIFEST.filter((entry) => entry.file === 'judge' && firstById.has(entry.id)).map((entry) => entry.id);
+  if (judgeCases.length > 0) {
+    lines.push(
+      `En los casos del juez de la rebanada 3, las ramas se suben y los PRs se abren con la cuenta del dueño, no con la aplicación de los agentes (R22): ${judgeCases.join(', ')}.`,
+    );
+  }
   lines.push('La preparación y la restauración del ensayo también usaron la cuenta del dueño (R22).');
 
   lines.push('', '| Caso | Qué se intentó | Quién lo frenó | Control positivo | Por qué sabemos que no pasó nada |');

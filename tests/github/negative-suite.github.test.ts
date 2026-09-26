@@ -97,17 +97,26 @@ async function asAgent(...args: string[]): Promise<string> {
  * command line, and the first real run printed the header in its log). A refusal of the remote
  * is final and not retried.
  */
+function gitAuth(token: string): { env: NodeJS.ProcessEnv; redact: (text: string) => string } {
+  const encoded = Buffer.from(`x-access-token:${token}`).toString('base64');
+  const header = `AUTHORIZATION: basic ${encoded}`;
+  // No tracing inherited from the machine: a trace would print the header on its own.
+  const inherited = Object.fromEntries(Object.entries(process.env).filter(([name]) => !/^GIT_TRACE|^GIT_CURL_VERBOSE$/.test(name)));
+  return {
+    env: { ...inherited, GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'http.https://github.com/.extraheader', GIT_CONFIG_VALUE_0: header },
+    redact: (text) => text.split(header).join('***').split(encoded).join('***').split(token).join('***'),
+  };
+}
+
 async function agentGit(root: string, ...args: string[]): Promise<string> {
-  const token = await agentToken();
-  const header = `AUTHORIZATION: basic ${Buffer.from(`x-access-token:${token}`).toString('base64')}`;
-  const env = { ...process.env, GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'http.https://github.com/.extraheader', GIT_CONFIG_VALUE_0: header };
+  const { env, redact } = gitAuth(await agentToken());
   let last = '';
   for (let attempt = 1; attempt <= 4; attempt += 1) {
     try {
       return execFileSync('git', args, { cwd: root, encoding: 'utf8', env, stdio: ['ignore', 'pipe', 'pipe'] }).trim();
     } catch (error) {
       const stderr = String((error as { stderr?: unknown }).stderr ?? '');
-      last = `git ${args.join(' ')} failed: ${stderr.split(token).join('***').split(header).join('***')}`;
+      last = `git ${args.join(' ')} failed: ${redact(stderr)}`;
       if (/remote rejected|\[rejected\]/.test(stderr)) break;
       await sleep(attempt * 3000);
     }
@@ -121,14 +130,12 @@ async function agentGit(root: string, ...args: string[]): Promise<string> {
  * workflow file needs the `workflows` permission, which the agents' app does not have.
  */
 async function ownerGit(root: string, ...args: string[]): Promise<string> {
-  const token = gh('auth', 'token');
-  const header = `AUTHORIZATION: basic ${Buffer.from(`x-access-token:${token}`).toString('base64')}`;
-  const env = { ...process.env, GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'http.https://github.com/.extraheader', GIT_CONFIG_VALUE_0: header };
+  const { env, redact } = gitAuth(gh('auth', 'token'));
   try {
     return execFileSync('git', args, { cwd: root, encoding: 'utf8', env, stdio: ['ignore', 'pipe', 'pipe'] }).trim();
   } catch (error) {
     const stderr = String((error as { stderr?: unknown }).stderr ?? '');
-    throw new Error(`git ${args.join(' ')} failed as the owner: ${stderr.split(token).join('***').split(header).join('***')}`);
+    throw new Error(`git ${args.join(' ')} failed as the owner: ${redact(stderr)}`);
   }
 }
 
@@ -521,9 +528,10 @@ async function judged(
       return settledStages.every((stage) => seen?.stages[stage] !== undefined && seen.stages[stage]?.outcome !== 'waiting') ? seen : undefined;
     });
   } catch (error) {
-    // Timed out on stages that never settled: hand back what the judge last said, so the test's
-    // own assertion reports it instead of a bare timeout.
-    if (seen !== undefined && settledStages.length > 0) return seen;
+    // Timed out on stages that stayed waiting: hand back what the judge last said, so the test's
+    // own assertion reports it instead of a bare timeout. A stage missing from the table is never
+    // handed back: `notPassing` would not see it (flock round 8).
+    if (seen !== undefined && settledStages.length > 0 && settledStages.every((stage) => seen?.stages[stage] !== undefined)) return seen;
     throw error;
   }
 }
@@ -760,6 +768,7 @@ describe.sequential('the negative suite on GitHub (PLAN-13-R5 §2)', () => {
     expect((await checkDone(piece.head, 'fronteras')).conclusion).toBe('success');
     const fixed = await judged(piece, ['pending', 'success', 'failure', 'error'], ['red-test', 'suite', 'boundaries']);
     expect(notPassing(fixed.stages)).toEqual(['approval']);
+    expect(fixed.stages['boundaries']?.outcome).toBe('passed');
     record({ id: 'CN-09', attempt: 'Cruzar la frontera: algo visible importa la base de datos', stoppedBy: ['juez'], negative: 'frenado', positive: 'pasó', evidence: [prUrl(piece.pr), runUrl(refused.status), runUrl(fixed.status)] });
   }, 40 * MINUTE);
 
@@ -973,10 +982,16 @@ describe.sequential('the negative suite on GitHub (PLAN-13-R5 §2)', () => {
     };
     const deps = (over: Partial<AgentCliDeps> = {}): AgentCliDeps => ({ cwd: folder, env: process.env as Record<string, string>, github: edges.github, remote: edges.remote, statePort: real, ...over });
 
-    const first = await runAgentCli(['run', String(piece.n)], deps({ statePort: cutting }));
-    log(first.text);
-    const opened = ghJson<{ number: number }[]>('pr', 'list', '--repo', REPO, '--head', piece.branch, '--state', 'all', '--json', 'number');
-    for (const item of opened) await sandbox.trackPullRequest(item.number, piece.branch);
+    // Whatever happens to the first run, every pull request the engine opened is handed to the
+    // harness, so the clean-up closes it (flock round 8).
+    let opened: { number: number }[] = [];
+    try {
+      const first = await runAgentCli(['run', String(piece.n)], deps({ statePort: cutting }));
+      log(first.text);
+    } finally {
+      opened = ghJson<{ number: number }[]>('pr', 'list', '--repo', REPO, '--head', piece.branch, '--state', 'all', '--json', 'number');
+      for (const item of opened) await sandbox.trackPullRequest(item.number, piece.branch);
+    }
     expect(opened).toHaveLength(1);
     piece.pr = opened[0]?.number ?? 0;
     expect(cut.done).toBe(true);

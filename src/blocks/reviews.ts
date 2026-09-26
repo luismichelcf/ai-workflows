@@ -123,16 +123,17 @@ export async function decideIndependentReview(
   for (const angle of options.angles) {
     const event = selected.deciding.get(angle);
     if (event === undefined) {
-      // No readable verdict of the angle counted: every readable one was of another version than
-      // the head (`accepts` refused it), so name the newest by `at` and the head (PLAN-13-R5 §2,
-      // CN-03). Unreadable verdicts stay out of this, as they do everywhere else.
+      // No readable verdict of the angle counted: `accepts` refused every readable one. When the
+      // newest by `at` is of another version than the head, name it and the head (PLAN-13-R5 §2,
+      // CN-03); a refused verdict of the head itself leaves the verdict simply missing. Unreadable
+      // verdicts stay out of this, as they do everywhere else.
       let newest: VerdictEvent | undefined;
       for (const candidate of events) {
         if (candidate.type !== 'verdict' || candidate.angle !== angle) continue;
         if (options.unavailable?.has(candidate.sha) === true) continue;
         if (newest === undefined || candidate.at >= newest.at) newest = candidate;
       }
-      if (newest !== undefined) {
+      if (newest !== undefined && newest.sha !== options.head) {
         return { ok: false, reason: olderVersionReason(angle, newest.sha, options.head, spanish) };
       }
       return { ok: false, reason: missingAngleReason(angle, spanish) };
