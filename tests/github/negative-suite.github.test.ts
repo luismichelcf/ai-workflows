@@ -973,7 +973,9 @@ describe.sequential('the negative suite on GitHub (PLAN-13-R5 §2)', () => {
       refs: (prefix) => real.refs(prefix),
       read: (commitSha, path) => real.read(commitSha, path),
       async commit(name, parent, changes, message) {
-        if (!cut.done && /confirm effect merge:[0-9a-f]{40}/.test(message)) {
+        // The store names the merge effect `merge:<pr>:<sha>` (src/blocks/github-merge.ts); the
+        // second real run looked for `merge:<sha>` and never cut.
+        if (!cut.done && /confirm effect merge:\d+:[0-9a-f]{40} /.test(message)) {
           cut.done = true;
           throw new Error('corte de red justo antes de registrar que la fusión quedó armada');
         }

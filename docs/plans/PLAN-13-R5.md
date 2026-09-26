@@ -361,7 +361,7 @@ su autor.
 Se corre `runAgentCli(['run', pieza])` en el proceso de la prueba con un `statePort` real envuelto
 (el mismo patrón de CN-13 en la rebanada 4). `enableAutoMerge` ocurre de verdad en GitHub; la
 envoltura deja pasar todas las escrituras del almacén **menos** la que pasaría el efecto
-`merge:<sha>` de `pending` a `confirmed`: esa **no llega a GitHub** y la envoltura lanza como un
+`merge:<pr>:<sha>` de `pending` a `confirmed`: esa **no llega a GitHub** y la envoltura lanza como un
 corte de red. Así el efecto externo (fusión armada) ocurrió y su registro queda `pending`. La prueba
 comprueba en el almacén de GitHub que el efecto está `pending` (no `confirmed`). Una **segunda
 corrida nueva** (otro `runId`, tras soltar o vencer la reserva) debe **conciliar** el efecto contra
@@ -773,6 +773,15 @@ Decididas por el orquestador al verificar cada parte; ninguna cambia lo que deci
   - un fallo de git de la suite imprimía en su registro local la cabecera con la llave temporal de
     los agentes (vence en una hora; no llegó al informe). La llave viaja ahora por el entorno y todo
     error la tacha.
+- **Tercera corrida real completa (26-sep):** 24 intentos frenados y CN-03, SV-03, SV-04s y CN-09 ya
+  pasan. Dos fallos más de la suite, no del motor:
+  - la bitácora del arnés viajaba en la línea de órdenes al guardarse; al crecer pasó el límite de
+    Windows y el arnés dejó de anotar, así que la limpieza no pudo restaurar sola. La recuperación se
+    negó a tocar lo no anotado (como debe); el orquestador comprobó que todo era de esa corrida, cerró
+    sus cuatro PRs, anotó la fusión de CN-06 y la recuperación dejó el ensayo limpio. La bitácora va
+    ahora en el cuerpo de la petición (probado en GitHub con 60 KB);
+  - CN-06 buscaba el efecto como `merge:<sha>` y el motor lo llama `merge:<pr>:<sha>`: el corte nunca
+    ocurrió. Corregido el patrón y §2.5.
 
 ## 10. Revisión de la parvada
 

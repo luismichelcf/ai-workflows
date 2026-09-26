@@ -1083,7 +1083,9 @@ export function createGhSandboxPort(repository: string): SandboxPort {
     },
     async writeCommit(files, parent) {
       const entries = Object.entries(files).map(([path, content]) => {
-        const blob = JSON.parse(runGh(['api', '-X', 'POST', `repos/${repo}/git/blobs`, '-f', `content=${content}`, '-f', 'encoding=utf-8'])) as { sha: string };
+        // The content goes in the body, never in the command line: the journal grows during a run
+        // and passed Windows' command-line limit in the third real run (ENAMETOOLONG).
+        const blob = JSON.parse(runGh(['api', '-X', 'POST', `repos/${repo}/git/blobs`, '--input', '-'], JSON.stringify({ content, encoding: 'utf-8' }))) as { sha: string };
         return { path, mode: '100644', type: 'blob', sha: blob.sha };
       });
       const tree: Record<string, unknown> = { tree: entries };
