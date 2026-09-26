@@ -829,3 +829,10 @@ la propia cabeza no se nombra como «otra versión»; pruebas del orden, de otro
 ilegible; la llave también se tacha en su forma codificada y sin trazas heredadas; CN-06 entrega al
 arnés el PR del motor aunque la primera corrida falle; la espera del veredicto nunca devuelve una tabla
 a la que le falta una etapa; notas en §1.3 y en la fila de SV-04s.
+
+**Rondas 9 y 10** (un revisor cada una, sobre el delta): el informe seguía callando usos de la cuenta
+del dueño (armar fusiones, lanzar o cancelar corridas del juez, editar PRs, RC-09 que sube y abre su
+PR con esa cuenta, crear issues, cambiar la variable, prender flujos, crear despliegues). En vez de
+seguir sumando casos sueltos, la sección del dueño dice ahora qué casos actúan con su cuenta y qué
+hacen «según el caso», qué casos lanzan el juez a mano y todos los demás usos durante la corrida
+(encargos R y S). CN-06 ya no se traga un fallo al entregar su PR al arnés.

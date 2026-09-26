@@ -985,18 +985,22 @@ describe.sequential('the negative suite on GitHub (PLAN-13-R5 §2)', () => {
     // Whatever happens to the first run, every pull request the engine opened is handed to the
     // harness, so the clean-up closes it (flock round 8).
     let opened: { number: number }[] = [];
+    let handOver: unknown;
     try {
       const first = await runAgentCli(['run', String(piece.n)], deps({ statePort: cutting }));
       log(first.text);
     } finally {
-      // A failure here is logged, never allowed to hide the error of the run itself.
+      // A failure here never hides the error of the run itself: it is logged, and thrown below
+      // when the run did not fail (flock round 9).
       try {
         opened = ghJson<{ number: number }[]>('pr', 'list', '--repo', REPO, '--head', piece.branch, '--state', 'all', '--json', 'number');
         for (const item of opened) await sandbox.trackPullRequest(item.number, piece.branch);
       } catch (error) {
+        handOver = error;
         log(`CN-06: could not hand the engine's pull request to the harness: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
+    if (handOver !== undefined) throw handOver;
     expect(opened).toHaveLength(1);
     piece.pr = opened[0]?.number ?? 0;
     expect(cut.done).toBe(true);

@@ -509,10 +509,10 @@ export function renderSuiteReport(records: readonly CaseRecord[], meta: SuiteRep
       ? `La suite subió con la cuenta del dueño cambios que GitHub no deja subir a los agentes (R22): ${pushCases.join(', ')}.`
       : 'Ningún caso necesitó subir con la cuenta del dueño un cambio que GitHub no deja subir a los agentes.',
   );
-  const judgeCases = SUITE_MANIFEST.filter((entry) => entry.file === 'judge' && firstById.has(entry.id)).map((entry) => entry.id);
+  const judgeCases = SUITE_MANIFEST.filter((entry) => (entry.file === 'judge' || entry.file === 'rc09') && firstById.has(entry.id)).map((entry) => entry.id);
   if (judgeCases.length > 0) {
     lines.push(
-      `En los casos del juez de la rebanada 3, la cuenta del dueño sube las ramas, abre y edita los PRs, arma sus fusiones y lanza corridas del juez, no la aplicación de los agentes (R22): ${judgeCases.join(', ')}.`,
+      `Estos casos actúan en GitHub con la cuenta del dueño, no con la aplicación de los agentes: suben sus ramas y abren sus PRs y, según el caso, editan PRs, arman fusiones, lanzan o cancelan corridas del juez (R22): ${judgeCases.join(', ')}.`,
     );
   }
   const dispatchCases = SUITE_MANIFEST.filter((entry) => entry.owner?.dispatches === true && firstById.has(entry.id)).map((entry) => entry.id);
@@ -521,7 +521,7 @@ export function renderSuiteReport(records: readonly CaseRecord[], meta: SuiteRep
       `La suite lanzó a mano corridas del juez con la cuenta del dueño, en vez de esperar un evento (R22): ${dispatchCases.join(', ')}.`,
     );
   }
-  lines.push('La preparación y la restauración del ensayo también usaron la cuenta del dueño (R22).');
+  lines.push('La suite también usó la cuenta del dueño para preparar y restaurar el ensayo, crear los issues de las piezas, cambiar la variable del motor, prender y apagar flujos y crear despliegues de prueba (R22).');
 
   lines.push('', '| Caso | Qué se intentó | Quién lo frenó | Control positivo | Por qué sabemos que no pasó nada |');
   lines.push('|---|---|---|---|---|');
