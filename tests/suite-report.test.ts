@@ -76,10 +76,32 @@ describe('what the owner did and what the suite did with the owner account (R22)
     expect(pushes).not.toContain('CN-01');
   });
 
-  it('with no change pushed by the suite, the report says that too', () => {
+  it('with no such change, it says so without denying the other uses of the owner account', () => {
     const records = allGood().map((record) => (record.id === 'SV-04s' ? { ...record, owner: { ordersBySuite: ['/approve-judge-change'] } } : record));
     const text = renderSuiteReport(records, META).text;
-    expect(text).toContain('La suite no subió cambios con la cuenta del dueño.');
+    expect(text).toContain('Ningún caso necesitó subir con la cuenta del dueño un cambio que GitHub no deja subir a los agentes.');
+    expect(text).not.toContain('La suite no subió cambios con la cuenta del dueño');
+  });
+
+  // Flock round 8: the cases of the judge file (slice 3) push their branches and open their pull
+  // requests with the owner account, not the agents' app. The report must say so, naming them.
+  it('names the cases whose branches and pull requests come from the owner account', () => {
+    const text = renderSuiteReport(allGood(), META).text;
+    const section = text.slice(text.indexOf('Qué hizo el dueño y qué se hizo con su cuenta'), text.indexOf('| Caso'));
+    const row = section.split('\n').find((line) => line.includes('abren con la cuenta del dueño')) ?? '';
+    const judgeIds = SUITE_MANIFEST.filter((entry) => entry.file === 'judge').map((entry) => entry.id);
+    expect(judgeIds.length).toBeGreaterThan(0);
+    for (const id of judgeIds) expect(row, id).toContain(id);
+    for (const id of ['CN-01', 'CN-05b', 'SV-04s', 'RC-09', 'CN-12']) expect(row, id).not.toMatch(new RegExp(`\\b${id}\\b`));
+    expect(row).toContain('R22');
+  });
+
+  it('only the judge cases of this run are named there', () => {
+    const records = allGood().filter((record) => record.id !== 'SV-01');
+    const text = renderSuiteReport(records, META).text;
+    const row = text.split('\n').find((line) => line.includes('abren con la cuenta del dueño')) ?? '';
+    expect(row).toContain('SV-02');
+    expect(row).not.toMatch(/\bSV-01\b/);
   });
 
   it('a record may only carry pushesBySuite as true', () => {
