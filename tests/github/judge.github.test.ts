@@ -51,6 +51,17 @@ async function waitFor<T>(label: string, probe: () => T | undefined, timeoutMs =
   }
 }
 
+/**
+ * The log of a run. GitHub only gives the log of an ended run, and for a moment after it ends it
+ * can still answer "log not found" (seen in the real run, SV-07): wait for the end, then read it.
+ */
+function runLog(id: number | string): Promise<string> {
+  return waitFor(`the log of run ${String(id)}`, () => {
+    if (ghJson<{ status: string }>('run', 'view', String(id), '--repo', REPO, '--json', 'status').status !== 'completed') return undefined;
+    return gh('run', 'view', String(id), '--repo', REPO, '--log');
+  });
+}
+
 // ---------------------------------------------------------------------------------------------
 // What the test repository holds while the run lasts
 
@@ -279,7 +290,7 @@ describe.sequential('the judge on GitHub (PLAN-13-R3 §7)', () => {
 
     // SV-09: the privileged job checked out main, never the pull request.
     const judgeRun = await waitFor('the finished judge run on the PR', () => runs(WORKFLOW).find((run) => run.event === 'pull_request_target' && run.headSha === good.head && run.status === 'completed'));
-    const judgeLog = gh('run', 'view', String(judgeRun?.databaseId), '--repo', REPO, '--log');
+    const judgeLog = await runLog(String(judgeRun?.databaseId));
     expect(judgeLog).not.toMatch(/refs\/pull\//);
     expect(judgeLog).not.toContain(`HEAD is now at ${good.head.slice(0, 7)}`);
     record({ id: 'SV-01', attempt: 'Pasar la etapa pesada sin su check verde en esta versión', stoppedBy: ['juez'], negative: 'frenado', positive: 'pasó', evidence: [prUrl(good.number)] });
@@ -497,7 +508,7 @@ describe.sequential('the judge on GitHub (PLAN-13-R3 §7)', () => {
       expect(status?.state).toBe('success');
       const red = checkRun(run.headSha, 'ai-workflows/red-test');
       expect(red?.conclusion).toBe('success');
-      const groupLog = gh('run', 'view', String(run.databaseId), '--repo', REPO, '--log');
+      const groupLog = await runLog(run.databaseId);
       expect(groupLog).toMatch(/gh-readonly-queue\/main\//);
     }
     // The group was also judged again when its red-test ended (workflow_run of a merge_group).

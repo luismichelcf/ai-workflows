@@ -15,6 +15,7 @@ export type SuiteCaseKind = 'negative' | 'limit' | 'check';
 export interface SuiteOwnerActs {
   readonly button?: true;
   readonly orders?: readonly string[];
+  readonly pushes?: true;
 }
 
 export interface SuiteManifestEntry {
@@ -54,7 +55,7 @@ export const SUITE_MANIFEST: readonly SuiteManifestEntry[] = [
   { id: 'SV-03c', file: 'negative-suite', kind: 'negative' },
   { id: 'SV-03d', file: 'negative-suite', kind: 'negative' },
   { id: 'SV-04', file: 'judge', kind: 'negative', owner: { orders: ['/approve-judge-change'] } },
-  { id: 'SV-04s', file: 'negative-suite', kind: 'negative', owner: { orders: ['/approve-judge-change'] } },
+  { id: 'SV-04s', file: 'negative-suite', kind: 'negative', owner: { orders: ['/approve-judge-change'], pushes: true } },
   { id: 'SV-05', file: 'judge', kind: 'negative' },
   { id: 'SV-06', file: 'judge', kind: 'negative' },
   { id: 'SV-07', file: 'judge', kind: 'negative' },
@@ -77,6 +78,7 @@ export type CheckResult = 'pasó' | 'falló';
 export interface OwnerActs {
   readonly button?: true;
   readonly ordersBySuite?: readonly string[];
+  readonly pushesBySuite?: true;
 }
 
 export interface CaseRecord {
@@ -150,7 +152,7 @@ function readOwner(value: unknown, where: string): OwnerActs {
   }
   const owner = value as Record<string, unknown>;
   for (const key of Object.keys(owner)) {
-    if (key !== 'button' && key !== 'ordersBySuite') {
+    if (key !== 'button' && key !== 'ordersBySuite' && key !== 'pushesBySuite') {
       throw new Error(`Registro ilegible en la ${where}: campo desconocido "owner.${key}".`);
     }
   }
@@ -163,9 +165,15 @@ function readOwner(value: unknown, where: string): OwnerActs {
   if ('ordersBySuite' in owner) {
     ordersBySuite = readStringList(owner.ordersBySuite, 'owner.ordersBySuite', where);
   }
+  let pushesBySuite: true | undefined;
+  if ('pushesBySuite' in owner) {
+    if (owner.pushesBySuite !== true) throw new Error(`Registro ilegible en la ${where}: "owner.pushesBySuite" no es verdadero.`);
+    pushesBySuite = true;
+  }
   return {
     ...(button === undefined ? {} : { button }),
     ...(ordersBySuite === undefined ? {} : { ordersBySuite }),
+    ...(pushesBySuite === undefined ? {} : { pushesBySuite }),
   };
 }
 
@@ -353,6 +361,9 @@ function sameOwner(expected: SuiteOwnerActs | undefined, actual: OwnerActs | und
   const expectedButton = expected?.button === true;
   const actualButton = actual?.button === true;
   if (expectedButton !== actualButton) return false;
+  const expectedPushes = expected?.pushes === true;
+  const actualPushes = actual?.pushesBySuite === true;
+  if (expectedPushes !== actualPushes) return false;
   return sameOrders(expected?.orders ?? [], actual?.ordersBySuite ?? []);
 }
 
@@ -490,6 +501,12 @@ export function renderSuiteReport(records: readonly CaseRecord[], meta: SuiteRep
     orderCases.length > 0
       ? `La suite escribió órdenes del dueño con su cuenta (R22): ${orderCases.map((item) => `${item.id} (${item.orders.join(', ')})`).join(', ')}.`
       : 'La suite no escribió órdenes del dueño con su cuenta.',
+  );
+  const pushCases = SUITE_MANIFEST.filter((entry) => firstById.get(entry.id)?.owner?.pushesBySuite === true).map((entry) => entry.id);
+  lines.push(
+    pushCases.length > 0
+      ? `La suite subió con la cuenta del dueño cambios que GitHub no deja subir a los agentes (R22): ${pushCases.join(', ')}.`
+      : 'La suite no subió cambios con la cuenta del dueño.',
   );
   lines.push('La preparación y la restauración del ensayo también usaron la cuenta del dueño (R22).');
 

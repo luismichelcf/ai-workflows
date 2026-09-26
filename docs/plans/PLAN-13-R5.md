@@ -756,6 +756,21 @@ Decididas por el orquestador al verificar cada parte; ninguna cambia lo que deci
     confirmó. Ahora las entradas **del final** aún sin armar se dejan fuera (encargo N) y la espera
     llega a unos cinco minutos (encargo M); una entrada a medio armar, o sin armar antes de una
     armada, sigue siendo «todavía no lista» (PLAN-13-R3 §3.2 anotado).
+- **Segunda corrida real completa (26-sep):** COLA-6 pasó (seis piezas fusionadas, cada grupo
+  juzgado) y 19 intentos quedaron frenados; destapó más fallos, cada uno arreglado:
+  - SV-04s: GitHub rechaza que la aplicación de los agentes cambie un flujo. El rechazo se registra
+    como primer candado y la cuenta del dueño sube el mismo cambio para ensayar el juez (R22 ampliada);
+    el informe lo declara en su sección del dueño;
+  - CN-03: el juez frenaba bien, pero decía «falta el veredicto» en vez de nombrar la versión revisada
+    y la actual, como promete §2 (encargo O);
+  - CN-06: el PR lo abría la suite sin la marca del motor, y el motor, con razón, no lo tomaba como
+    suyo; ahora el PR lo abre el propio motor;
+  - SV-03 y CN-09 leían el aviso «juzgando» o un check aún en curso como el veredicto final; la
+    suite espera el veredicto y los checks de las etapas que mira;
+  - GitHub puede tardar en dar el registro de una corrida ya terminada: se relee;
+  - un fallo de git de la suite imprimía en su registro local la cabecera con la llave temporal de
+    los agentes (vence en una hora; no llegó al informe). La llave viaja ahora por el entorno y todo
+    error la tacha.
 
 ## 10. Revisión de la parvada
 
