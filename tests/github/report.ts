@@ -521,7 +521,7 @@ export function renderSuiteReport(records: readonly CaseRecord[], meta: SuiteRep
       `La suite lanzó a mano corridas del juez con la cuenta del dueño, en vez de esperar un evento (R22): ${dispatchCases.join(', ')}.`,
     );
   }
-  lines.push('La suite también usó la cuenta del dueño para preparar y restaurar el ensayo, crear los issues de las piezas, cambiar la variable del motor, prender y apagar flujos y crear despliegues de prueba (R22).');
+  lines.push('La suite también usó la cuenta del dueño para preparar y restaurar el ensayo, crear los issues y las ramas de las piezas, cambiar la variable del motor, prender y apagar flujos, quitar y reponer checks exigidos en la protección de main, escribir a mano registros del motor en las trampas que los falsifican y crear despliegues de prueba (R22).');
 
   lines.push('', '| Caso | Qué se intentó | Quién lo frenó | Control positivo | Por qué sabemos que no pasó nada |');
   lines.push('|---|---|---|---|---|');

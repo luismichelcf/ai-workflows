@@ -835,4 +835,4 @@ del dueño (armar fusiones, lanzar o cancelar corridas del juez, editar PRs, RC-
 PR con esa cuenta, crear issues, cambiar la variable, prender flujos, crear despliegues). En vez de
 seguir sumando casos sueltos, la sección del dueño dice ahora qué casos actúan con su cuenta y qué
 hacen «según el caso», qué casos lanzan el juez a mano y todos los demás usos durante la corrida
-(encargos R y S). CN-06 ya no se traga un fallo al entregar su PR al arnés.
+(encargos R y S). CN-06 ya no se traga un fallo al entregar su PR al arnés. **Ronda 11:** faltaban los registros del motor escritos a mano (SV-03, SV-06, SV-08) y los checks exigidos que SV-02 quita y repone; la línea general nombra ahora todo lo que el arnés sabe hacer con esa cuenta (encargo T).
