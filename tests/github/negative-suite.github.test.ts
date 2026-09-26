@@ -989,8 +989,13 @@ describe.sequential('the negative suite on GitHub (PLAN-13-R5 §2)', () => {
       const first = await runAgentCli(['run', String(piece.n)], deps({ statePort: cutting }));
       log(first.text);
     } finally {
-      opened = ghJson<{ number: number }[]>('pr', 'list', '--repo', REPO, '--head', piece.branch, '--state', 'all', '--json', 'number');
-      for (const item of opened) await sandbox.trackPullRequest(item.number, piece.branch);
+      // A failure here is logged, never allowed to hide the error of the run itself.
+      try {
+        opened = ghJson<{ number: number }[]>('pr', 'list', '--repo', REPO, '--head', piece.branch, '--state', 'all', '--json', 'number');
+        for (const item of opened) await sandbox.trackPullRequest(item.number, piece.branch);
+      } catch (error) {
+        log(`CN-06: could not hand the engine's pull request to the harness: ${error instanceof Error ? error.message : String(error)}`);
+      }
     }
     expect(opened).toHaveLength(1);
     piece.pr = opened[0]?.number ?? 0;

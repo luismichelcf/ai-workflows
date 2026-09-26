@@ -16,6 +16,7 @@ export interface SuiteOwnerActs {
   readonly button?: true;
   readonly orders?: readonly string[];
   readonly pushes?: true;
+  readonly dispatches?: true;
 }
 
 export interface SuiteManifestEntry {
@@ -50,12 +51,12 @@ export const SUITE_MANIFEST: readonly SuiteManifestEntry[] = [
   { id: 'CN-13', file: 'final-stages', kind: 'negative' },
   { id: 'SV-01', file: 'judge', kind: 'negative' },
   { id: 'SV-02', file: 'judge', kind: 'negative' },
-  { id: 'SV-03a', file: 'negative-suite', kind: 'negative' },
+  { id: 'SV-03a', file: 'negative-suite', kind: 'negative', owner: { dispatches: true } },
   { id: 'SV-03b', file: 'negative-suite', kind: 'negative' },
   { id: 'SV-03c', file: 'negative-suite', kind: 'negative' },
-  { id: 'SV-03d', file: 'negative-suite', kind: 'negative' },
+  { id: 'SV-03d', file: 'negative-suite', kind: 'negative', owner: { dispatches: true } },
   { id: 'SV-04', file: 'judge', kind: 'negative', owner: { orders: ['/approve-judge-change'] } },
-  { id: 'SV-04s', file: 'negative-suite', kind: 'negative', owner: { orders: ['/approve-judge-change'], pushes: true } },
+  { id: 'SV-04s', file: 'negative-suite', kind: 'negative', owner: { orders: ['/approve-judge-change'], pushes: true, dispatches: true } },
   { id: 'SV-05', file: 'judge', kind: 'negative' },
   { id: 'SV-06', file: 'judge', kind: 'negative' },
   { id: 'SV-07', file: 'judge', kind: 'negative' },
@@ -511,7 +512,13 @@ export function renderSuiteReport(records: readonly CaseRecord[], meta: SuiteRep
   const judgeCases = SUITE_MANIFEST.filter((entry) => entry.file === 'judge' && firstById.has(entry.id)).map((entry) => entry.id);
   if (judgeCases.length > 0) {
     lines.push(
-      `En los casos del juez de la rebanada 3, las ramas se suben y los PRs se abren con la cuenta del dueño, no con la aplicación de los agentes (R22): ${judgeCases.join(', ')}.`,
+      `En los casos del juez de la rebanada 3, la cuenta del dueño sube las ramas, abre y edita los PRs, arma sus fusiones y lanza corridas del juez, no la aplicación de los agentes (R22): ${judgeCases.join(', ')}.`,
+    );
+  }
+  const dispatchCases = SUITE_MANIFEST.filter((entry) => entry.owner?.dispatches === true && firstById.has(entry.id)).map((entry) => entry.id);
+  if (dispatchCases.length > 0) {
+    lines.push(
+      `La suite lanzó a mano corridas del juez con la cuenta del dueño, en vez de esperar un evento (R22): ${dispatchCases.join(', ')}.`,
     );
   }
   lines.push('La preparación y la restauración del ensayo también usaron la cuenta del dueño (R22).');
