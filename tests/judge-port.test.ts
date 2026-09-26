@@ -317,6 +317,33 @@ describe('flock 5: waiting for the queue list to show the group', () => {
     expect(queue.map((item) => item.headSha)).toEqual(['g1', 'g2', 'g3', 'g4', 'g5']);
   });
 
+  it('"at the end" is by position, not by the order GitHub lists them; two waiting entries are both left out', async () => {
+    const waiting = (position: number, pr: number) => ({ position, headCommit: null, baseCommit: null, pullRequest: { number: pr } });
+    const gh = fakeGh([[/graphql/, queueAnswer([waiting(4, 12), entry(2, 'g2', 'g1', 8), waiting(3, 11), entry(1, 'g1', 'm0', 7)])]]);
+    const queue = await createJudgeGitHub({ repository: REPO, runner: gh.runner }).mergeQueue('main');
+    expect(queue).toEqual([
+      { position: 1, headSha: 'g1', baseSha: 'm0', prNumber: 7 },
+      { position: 2, headSha: 'g2', baseSha: 'g1', prNumber: 8 },
+    ]);
+  });
+
+  it('a queue where GitHub has built nothing yet is an empty list, so the wait reads it again', async () => {
+    const gh = fakeGh([[/graphql/, queueAnswer([
+      { position: 1, headCommit: null, baseCommit: null, pullRequest: { number: 7 } },
+      { position: 2, headCommit: null, baseCommit: null, pullRequest: { number: 8 } },
+    ])]]);
+    expect(await createJudgeGitHub({ repository: REPO, runner: gh.runner }).mergeQueue('main')).toEqual([]);
+  });
+
+  it('a waiting entry followed by a half-built one is still "not ready yet"', async () => {
+    const gh = fakeGh([[/graphql/, queueAnswer([
+      entry(1, 'g1', 'm0', 7),
+      { position: 2, headCommit: null, baseCommit: null, pullRequest: { number: 8 } },
+      { position: 3, headCommit: { oid: 'g3' }, baseCommit: null, pullRequest: { number: 9 } },
+    ])]]);
+    await expect(createJudgeGitHub({ repository: REPO, runner: gh.runner }).mergeQueue('main')).rejects.toBeInstanceOf(MergeQueueNotReady);
+  });
+
   it('an entry not built yet BEFORE a built one is still "not ready yet"', async () => {
     const gh = fakeGh([[/graphql/, queueAnswer([{ position: 1, headCommit: null, baseCommit: null, pullRequest: { number: 7 } }, entry(2, 'g2', 'g1', 8)])]]);
     await expect(createJudgeGitHub({ repository: REPO, runner: gh.runner }).mergeQueue('main')).rejects.toBeInstanceOf(MergeQueueNotReady);

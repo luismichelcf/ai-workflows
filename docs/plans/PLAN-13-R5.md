@@ -742,6 +742,20 @@ Decididas por el orquestador al verificar cada parte; ninguna cambia lo que deci
   el editor y las pruebas nuevas se escriben sin pasar por la consola.
 - **La prueba del primer paso de `action.yml`** corre ese mismo guion con un `gh` falso; donde la PC
   no tiene `jq`, la prueba trae un sustituto mínimo (en GitHub el ejecutor sí lo tiene).
+- **La corrida real completa destapó, tras la parvada, fallos que ninguna prueba local veía**, cada
+  uno arreglado con su prueba y revisado por su delta:
+  - el arnés apaga la protección de `main` solo mientras la mueve y la repone; distingue un commit de
+    un árbol preguntando primero por el commit;
+  - la suite desarma la fusión automática de cada intento (si no, un intento se fusionaba al ponerse
+    verde su control positivo) y espera a que termine la corrida del juez antes de leer su registro;
+  - Claude Code recibe la orden entera por la entrada, sin consola de por medio;
+  - un flujo que la corrida misma añadió se anota como apagado, no se intenta encender al restaurar;
+  - **cola de seis (COLA-6):** GitHub arma como mucho cinco grupos a la vez y la sexta entrada queda
+    listada sin sus commits; el motor tomaba toda la lista por «no lista», los grupos esperaban a sus
+    comprobaciones y estas a la sexta: se trababa. Un experimento en el repositorio de ensayo lo
+    confirmó. Ahora las entradas **del final** aún sin armar se dejan fuera (encargo N) y la espera
+    llega a unos cinco minutos (encargo M); una entrada a medio armar, o sin armar antes de una
+    armada, sigue siendo «todavía no lista» (PLAN-13-R3 §3.2 anotado).
 
 ## 10. Revisión de la parvada
 
@@ -783,3 +797,9 @@ sobre el texto normalizado (§1.3), con costo declarado (encargo K).
 archivo seguía abierto y la promesa «nunca por cómo se escribió» era falsa → cerrado (encargo L) y el
 texto dice ahora que cubre la orden escrita de forma directa, no la disfrazada a propósito (§1.3,
 README).
+
+**Ronda 7** (dos revisores, sobre el delta de la cola de seis): **sin bloqueantes**. Confirmaron que
+dejar fuera las entradas del final nunca cambia los PRs que se juzgan para un grupo (solo cuentan los
+que van hasta él) y que todo caso raro sigue fallando cerrado. Menores aplicados: pruebas para el
+orden en que GitHub lista las entradas, dos entradas sin armar al final, una cola sin nada armado y
+una sin armar seguida de una a medio armar; PLAN-13-R3 §3.2 anotado.
