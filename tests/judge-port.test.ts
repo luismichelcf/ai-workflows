@@ -305,7 +305,24 @@ describe('flock 5: waiting for the queue list to show the group', () => {
     expect(result).toEqual({ ok: true, entries: [entryOf('g1')] });
   });
 
-  it('the port says "not ready yet" for an entry whose head or base commit is still missing', async () => {
+  // COLA-6 on real GitHub (PLAN-13-R5): GitHub builds at most five entries at once; a sixth waits
+  // with neither head nor base commit until the first ones finish. Reading that as "the whole list
+  // is not ready" deadlocked the queue: the groups waited for their checks, and the checks waited
+  // for the sixth entry. Entries at the END that GitHub has not built yet are left out.
+  it('leaves out the trailing entries GitHub has not built yet, and returns the built ones', async () => {
+    const built = [entry(1, 'g1', 'm0', 7), entry(2, 'g2', 'g1', 8), entry(3, 'g3', 'g2', 9), entry(4, 'g4', 'g3', 10), entry(5, 'g5', 'g4', 11)];
+    const waiting = { position: 6, headCommit: null, baseCommit: null, pullRequest: { number: 12 } };
+    const gh = fakeGh([[/graphql/, queueAnswer([...built, waiting])]]);
+    const queue = await createJudgeGitHub({ repository: REPO, runner: gh.runner }).mergeQueue('main');
+    expect(queue.map((item) => item.headSha)).toEqual(['g1', 'g2', 'g3', 'g4', 'g5']);
+  });
+
+  it('an entry not built yet BEFORE a built one is still "not ready yet"', async () => {
+    const gh = fakeGh([[/graphql/, queueAnswer([{ position: 1, headCommit: null, baseCommit: null, pullRequest: { number: 7 } }, entry(2, 'g2', 'g1', 8)])]]);
+    await expect(createJudgeGitHub({ repository: REPO, runner: gh.runner }).mergeQueue('main')).rejects.toBeInstanceOf(MergeQueueNotReady);
+  });
+
+  it('the port says "not ready yet" for an entry that carries only one of its two commits', async () => {
     for (const node of [
       { position: 1, headCommit: null, baseCommit: { oid: 'm0' }, pullRequest: { number: 7 } },
       { position: 1, headCommit: { oid: 'g1' }, baseCommit: null, pullRequest: { number: 7 } },
