@@ -260,6 +260,23 @@ describe('a crash between an effect and its record (CN-13)', () => {
     expect((await store.getEffect(PIECE, op))?.state).toBe('confirmed');
   });
 
+  it('a merged pull request whose history cannot be read leaves the record in doubt as technical, never armed again', async () => {
+    const { root } = pieceRepository();
+    const github = new FakeGitHub();
+    github.failures.set('enableAutoMerge', { when: 'after' });
+    const store = createMemoryStore();
+
+    const first = await runFinal(root, github, MERGE_STAGES(), { store });
+    const pr = github.prs[0];
+    if (pr === undefined) throw new Error('fixture: no pull request');
+    github.merge(pr, MERGED_AT);
+    github.readErrors.set('pullRequestHistory', 5);
+    const second = await first.again();
+
+    expect(second.outcome).toMatchObject({ status: { state: 'blocked:technical', stage: 'merge' } });
+    expect(github.calls.enableAutoMerge).toBe(1);
+  });
+
   it('an unreadable history leaves the effect in doubt as technical, never repeated', async () => {
     const { root } = pieceRepository();
     const github = new FakeGitHub();
