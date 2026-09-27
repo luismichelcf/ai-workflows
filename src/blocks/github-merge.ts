@@ -72,7 +72,24 @@ function createGate(inputs: MergeInputs, deps: EngineBlockDeps): Gate {
     }
 
     let detail = pr.detail;
-    if (detail.state === 'MERGED') return merged(pr.number, sha, detail.mergeCommit ?? null);
+    const mergeOp = `merge:${pr.number}:${sha}`;
+    if (detail.state === 'MERGED') {
+      // GitHub merged the pull request before a resume could look at it. A merged pull request
+      // settles the record of arming the merge from its history (PLAN-13-R4 §3.0.1), so it is
+      // never left in doubt for ever; found by the real negative suite, part 5. The effect never
+      // arms anything again: the merge is already done, so actually running it is an error.
+      const recordedMerge = await deps.store.getEffect(context.piece, mergeOp);
+      if (recordedMerge !== undefined && recordedMerge.state !== 'confirmed') {
+        await context.runEffect(mergeOp, async () => {
+          throw new Error(
+            spanish
+              ? `La fusión del PR #${pr.number} ya está hecha: no se vuelve a armar.`
+              : `Pull request #${pr.number} is already merged: it is not armed again.`,
+          );
+        });
+      }
+      return merged(pr.number, sha, detail.mergeCommit ?? null);
+    }
 
     // An earlier attempt may have left the ready effect in doubt. It is settled even when GitHub
     // now shows the pull request ready, so a "ready" by someone else is never taken for the
@@ -100,7 +117,7 @@ function createGate(inputs: MergeInputs, deps: EngineBlockDeps): Gate {
       });
     }
 
-    await context.runEffect(`merge:${pr.number}:${sha}`, async () => {
+    await context.runEffect(mergeOp, async () => {
       await agent.github.enableAutoMerge(pr.number, { method: inputs.method, headSha: sha });
       return null;
     });

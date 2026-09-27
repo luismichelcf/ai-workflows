@@ -782,6 +782,19 @@ Decididas por el orquestador al verificar cada parte; ninguna cambia lo que deci
     ahora en el cuerpo de la petición (probado en GitHub con 60 KB);
   - CN-06 buscaba el efecto como `merge:<sha>` y el motor lo llama `merge:<pr>:<sha>`: el corte nunca
     ocurrió. Corregido el patrón y §2.5.
+- **Cuarta corrida real completa (26-sep):** 32 de 35 pruebas en verde, 28 intentos frenados, el
+  primer «Approve» del dueño registrado y el juez corriendo solo tras él. Tres hallazgos:
+  - **del motor (CN-06):** GitHub fusionó el PR dos minutos después del corte, antes de que la
+    reanudación lo mirara; el bloque de fusión vio `MERGED` y pasó, pero dejó su registro de «fusión
+    armada» en duda para siempre. La carrera que §2.5 daba por rara ocurrió en la práctica. Ahora un PR
+    fusionado con ese registro pendiente lo concilia antes con la historia del PR (encargo U);
+  - de la suite: SV-07 tomaba todos los grupos de la cola de la última hora y se coló uno de otro
+    caso, frenado con razón; ahora mira solo los grupos de sus dos PRs. El arnés marcaba como problema
+    la referencia falsificada de SV-03a que el motor tocó, aunque es de una pieza de la corrida; ahora
+    la retira (encargo U). La limpieza dejó el candado puesto; la recuperación la terminó tras anotar
+    la fusión de CN-06;
+  - el segundo aviso al dueño venía escrito «DUEÑA» y la vigilancia del orquestador buscaba «DUEÑO»:
+    el aviso llegó tarde y el recorrido final se quedó sin su «Approve».
 
 ## 10. Revisión de la parvada
 

@@ -185,6 +185,21 @@ function isMerged(state: SandboxState, number: number): boolean {
   );
 }
 
+/** The numbers of the pieces the run created: the issues it opened itself. */
+function piecesOfRun(state: SandboxState): Set<string> {
+  const pieces = new Set<string>();
+  for (const entry of state.journal) {
+    if (entry.resource === 'issue' && entry.done && typeof entry.after === 'number') pieces.add(String(entry.after));
+  }
+  return pieces;
+}
+
+/** Whether a state ref belongs to one of the run's own pieces (`refs/ai-workflows/pieces/<n>`). */
+function isRunPieceRef(path: string, pieces: ReadonlySet<string>): boolean {
+  const match = /^refs\/ai-workflows\/pieces\/(\d+)$/.exec(path);
+  return match !== null && pieces.has(match[1] ?? '');
+}
+
 async function readLock(port: SandboxPort, sha: string): Promise<SandboxState> {
   const files = await port.readCommit(sha);
   const raw = files['lock.json'];
@@ -555,6 +570,7 @@ async function performRestore(port: SandboxPort, state: SandboxState): Promise<s
     await deleteBranchIfPresent(port, problems, tracked.branch);
   }
 
+  const pieces = piecesOfRun(state);
   for (const entry of state.journal) {
     if (entry.resource !== 'state-ref' || !entry.done || entry.path === undefined) continue;
     const path = entry.path;
@@ -564,6 +580,10 @@ async function performRestore(port: SandboxPort, state: SandboxState): Promise<s
         const deleted = await port.deleteRef(path, entry.after);
         if (deleted === 'conflict') problems.push(`referencia de estado ${path}: no se pudo borrar`);
       } else if (current !== undefined) {
+        // A forged state ref of a piece the run itself created stays the run's own even when the
+        // engine moved it (SV-03a): the piece sweep below removes it, so it is not a problem. Any
+        // other moved ref is somebody else's change and is reported, never touched.
+        if (isRunPieceRef(path, pieces)) return;
         problems.push(`referencia de estado ${path}: no coincide con lo último que escribió la corrida`);
       }
     });
