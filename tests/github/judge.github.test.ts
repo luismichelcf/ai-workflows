@@ -184,11 +184,11 @@ function settled(sha: string, context = 'ai-workflows', states: string[] = ['suc
   });
 }
 
-interface Run { databaseId: number; status: string; conclusion: string; event: string; headSha: string; workflowName: string; createdAt: string }
+interface Run { databaseId: number; status: string; conclusion: string; event: string; headSha: string; headBranch: string; workflowName: string; createdAt: string }
 
 function runs(workflow: string): Run[] {
   return ghJson<Run[]>('run', 'list', '--repo', REPO, '--workflow', workflow.split('/').at(-1) ?? workflow, '--limit', '100',
-    '--json', 'databaseId,status,conclusion,event,headSha,workflowName,createdAt');
+    '--json', 'databaseId,status,conclusion,event,headSha,headBranch,workflowName,createdAt');
 }
 
 function checkRun(sha: string, name: string) {
@@ -500,7 +500,10 @@ describe.sequential('the judge on GitHub (PLAN-13-R3 §7)', () => {
       await waitFor(`PR #${pr} merged`, () => (ghJson<{ state: string }>('pr', 'view', String(pr), '--repo', REPO, '--json', 'state').state === 'MERGED' ? true : undefined), 30 * MINUTE);
       await sandbox.noteMerged(pr);
     }
-    const groupRuns = runs(WORKFLOW).filter((run) => run.event === 'merge_group' && run.createdAt > new Date(Date.now() - 60 * MINUTE).toISOString());
+    // Only the groups of these two pull requests: in the full suite the last hour also holds groups
+    // of other cases, some rightly refused (seen in the fourth real run: a piece without a piece).
+    const ours = new RegExp(`^gh-readonly-queue/main/pr-(${good.number}|${second.number})-`);
+    const groupRuns = runs(WORKFLOW).filter((run) => run.event === 'merge_group' && ours.test(run.headBranch) && run.createdAt > new Date(Date.now() - 60 * MINUTE).toISOString());
     expect(groupRuns.length).toBeGreaterThan(0);
     for (const run of groupRuns) {
       const status = latest(run.headSha);

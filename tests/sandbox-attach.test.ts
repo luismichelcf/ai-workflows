@@ -93,6 +93,42 @@ describe('what the suite needs from the harness', () => {
     expect(gh.state.refs.has('refs/ai-workflows/pieces/4243')).toBe(false);
   });
 
+  // Found in the real runs (SV-03a): the engine wrote to the forged state ref of a piece the run
+  // created, so it no longer matched the forged commit. That ref is the run's own all the same
+  // (its piece is), so the restoration removes it and reports no problem.
+  it('a forged state ref of a piece the run created is removed even if the engine moved it', async () => {
+    const gh = fakeGitHub();
+    const setup = createSandbox({ port: gh.port, run: RUN });
+    await setup.acquire();
+    const file = await attachSandbox({ port: gh.port, run: RUN });
+    const issue = await file.createIssue('pieza con almacén roto');
+    const ref = `refs/ai-workflows/pieces/${issue}`;
+    await file.forgeStateRef(ref, 'esto no es un diario');
+    const moved = await gh.port.writeCommit({ 'journal.json': '[]' });
+    gh.state.refs.set(ref, moved);
+
+    const result = await setup.restore();
+
+    expect(result).toEqual({ ok: true, problems: [] });
+    expect(gh.state.refs.has(ref)).toBe(false);
+  });
+
+  it('a forged state ref outside the pieces of the run that someone moved is still a problem, never removed', async () => {
+    const gh = fakeGitHub();
+    const setup = createSandbox({ port: gh.port, run: RUN });
+    await setup.acquire();
+    const file = await attachSandbox({ port: gh.port, run: RUN });
+    const ref = 'refs/ai-workflows/pieces/4250';
+    await file.forgeStateRef(ref, 'esto no es un diario');
+    const moved = await gh.port.writeCommit({ 'journal.json': '[]' });
+    gh.state.refs.set(ref, moved);
+
+    const result = await setup.restore();
+
+    expect(result.problems.join('\n')).toMatch(/4250/);
+    expect(gh.state.refs.get(ref)).toBe(moved);
+  });
+
   it('the engine state refs of the pieces the run created are removed at the end; others are not touched', async () => {
     const gh = fakeGitHub();
     gh.state.refs.set('refs/ai-workflows/pieces/1', 'a'.repeat(40));
