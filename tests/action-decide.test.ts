@@ -58,7 +58,7 @@ if (value === null || value === undefined || value === false) { if (!/\/\/ empty
 console.log(typeof value === "string" ? value : JSON.stringify(value));
 `;
 
-function decide(eventName: string, event: unknown, mode = 'on') {
+function decide(eventName: string, event: unknown, mode = 'on', workflowRef = 'o/r/.github/workflows/ai-workflows.yml@refs/heads/main') {
   const dir = mkdtempSync(join(tmpdir(), 'aiw-decide-'));
   dirs.push(dir);
   const bin = join(dir, 'bin');
@@ -84,7 +84,7 @@ function decide(eventName: string, event: unknown, mode = 'on') {
       GITHUB_EVENT_NAME: eventName,
       GITHUB_EVENT_PATH: posix(join(dir, 'event.json')),
       GITHUB_OUTPUT: posix(join(dir, 'output')),
-      GITHUB_WORKFLOW_REF: 'o/r/.github/workflows/ai-workflows.yml@refs/heads/main',
+      GITHUB_WORKFLOW_REF: workflowRef,
       GITHUB_REPOSITORY: 'o/r',
       GITHUB_SERVER_URL: 'https://github.com',
       GITHUB_RUN_ID: '1',
@@ -167,5 +167,43 @@ describe('a comment on the piece issue gets through the first step of the action
     const run = decide('issue_comment', { action: 'created', issue: { number: 7, pull_request: { url: 'x' } }, comment: { body: '/approve abc' } });
     expect(run.code, run.stderr).toBe(0);
     expect(run.outputs).toMatchObject({ continue: 'true', sha: HEAD });
+  });
+});
+
+// Found by the real negative suite, part 5 (SV-03): two checks of one merge group ended together,
+// so the judge ran twice on the group. The first run left «Todo en verde»; the second opened with
+// «juzgando» (pending) over it, and GitHub took the group out of the queue at that very moment
+// (branch_protection_failure). A group never changes, so there is no old green to withdraw: on a
+// merge group the judge publishes only its verdict, never the in-progress pending.
+describe('on a merge group the judge never publishes «juzgando»', () => {
+  const GROUP = 'c'.repeat(40);
+  const QUEUE_REF = 'o/r/.github/workflows/ai-workflows.yml@refs/heads/gh-readonly-queue/main/pr-7-abc';
+
+  it('a merge_group event continues without any status', () => {
+    const run = decide('merge_group', { merge_group: { head_sha: GROUP, head_ref: 'refs/heads/gh-readonly-queue/main/pr-7-abc' } }, 'on', QUEUE_REF);
+    expect(run.code, run.stderr).toBe(0);
+    expect(run.outputs).toMatchObject({ continue: 'true', publish: 'true', sha: GROUP });
+    expect(run.statuses).toEqual([]);
+  });
+
+  it('a workflow_run of a merge group continues without any status', () => {
+    const run = decide('workflow_run', { workflow_run: { event: 'merge_group', head_sha: GROUP, path: '.github/workflows/ai-workflows-red-test.yml@refs/heads/main', repository: { full_name: 'o/r' }, pull_requests: [] } });
+    expect(run.code, run.stderr).toBe(0);
+    expect(run.outputs).toMatchObject({ continue: 'true', publish: 'true', sha: GROUP });
+    expect(run.statuses).toEqual([]);
+  });
+
+  it('on a pull request head the in-progress pending stays', () => {
+    const run = decide('workflow_dispatch', { inputs: { pr: '7' } });
+    expect(run.code, run.stderr).toBe(0);
+    expect(run.statuses).toHaveLength(1);
+    expect(run.statuses[0]).toContain(`statuses/${HEAD}`);
+  });
+
+  it('with the engine off a merge group still gets its green (nothing else would pass it)', () => {
+    const run = decide('merge_group', { merge_group: { head_sha: GROUP, head_ref: 'refs/heads/gh-readonly-queue/main/pr-7-abc' } }, 'off', QUEUE_REF);
+    expect(run.code, run.stderr).toBe(0);
+    expect(run.statuses).toHaveLength(1);
+    expect(run.statuses[0]).toContain(`statuses/${GROUP}`);
   });
 });

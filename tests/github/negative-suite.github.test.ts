@@ -1,7 +1,7 @@
 import { execFileSync, spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, delimiter, dirname, join } from 'node:path';
 
 import { afterAll, beforeAll, describe, expect, inject, it } from 'vitest';
 import { parse, stringify } from 'yaml';
@@ -511,7 +511,7 @@ async function judged(
   states: string[] = ['success', 'failure', 'error'],
   settledStages: readonly string[] = [],
 ) {
-  let seen: { status: Status; stages: ReturnType<typeof stagesOf> } | undefined;
+  let seen: { status: Status; stages: ReturnType<typeof stagesOf>; since: number } | undefined;
   try {
     return await waitFor(`ai-workflows on ${piece.head.slice(0, 7)} in ${states.join('/')} after mark ${piece.mark}`, () => {
       const all = statuses(piece.head);
@@ -520,9 +520,15 @@ async function judged(
       const newest = all.find((entry) => entry.context === 'ai-workflows');
       const inProgress = newest?.state === 'pending' && newest.description === 'juzgando';
       if (!(all.length > piece.mark && newest !== undefined && !inProgress && states.includes(newest.state))) return undefined;
+      // A run cancelled by a newer one posts «el juez no pudo decidir» (error) on its way out, and
+      // the newer one then posts its own verdict (seen in the fifth real run, CN-05b). A verdict
+      // counts only once it has stayed the newest for a minute.
       if (seen?.status.target_url !== newest.target_url || seen.status.created_at !== newest.created_at) {
-        seen = { status: newest, stages: stagesOf(newest) };
+        seen = { status: newest, stages: {}, since: Date.now() };
+        return undefined;
       }
+      if (Date.now() - seen.since < MINUTE) return undefined;
+      if (Object.keys(seen.stages).length === 0) seen.stages = stagesOf(newest);
       // A stage whose check GitHub has not finished yet waits: the judge runs again when it ends
       // (seen in the real run, CN-09, where the red-test check was still running).
       return settledStages.every((stage) => seen?.stages[stage] !== undefined && seen.stages[stage]?.outcome !== 'waiting') ? seen : undefined;
@@ -1008,18 +1014,25 @@ describe.sequential('the negative suite on GitHub (PLAN-13-R5 §2)', () => {
     expect(cut.done).toBe(true);
     expect((await mergeEffect(piece.n)).state).toBe('pending');
 
-    const second = runAgentCli(['run', String(piece.n)], deps());
-    const settledEffect = await waitFor('the merge effect settled', async () => {
-      const effect = await mergeEffect(piece.n);
-      return effect.state === 'pending' ? undefined : effect;
-    }, 10 * MINUTE, 5_000);
+    // A new run resumes. If it stops on a technical failure (the fifth real run: GitHub answered
+    // «malformed request» to a lease renewal), it is run again, as the engine itself asks («vuelve
+    // a ejecutarla con run»), up to three times. What is required does not change.
+    let settledEffect = await mergeEffect(piece.n);
+    try {
+      for (let attempt = 1; attempt <= 3 && (settledEffect.state === 'pending' || settledEffect.state === 'uncertain'); attempt += 1) {
+        const outcome = await runAgentCli(['run', String(piece.n)], deps());
+        log(`CN-06 resume ${attempt}: ${outcome.text}`);
+        settledEffect = await mergeEffect(piece.n);
+      }
+    } finally {
+      // The merge is noted whatever the assertions say, so the clean-up never trips on it.
+      if (await waitFor(`PR #${piece.pr} merged`, () => (prState(piece.pr).state === 'MERGED' ? true : undefined), 30 * MINUTE).catch(() => false)) {
+        await sandbox.noteMerged(piece.pr);
+      }
+    }
     expect(settledEffect).toEqual({ state: 'confirmed', byReconciliation: true });
-    const outcome = await second;
-    log(outcome.text);
     const history = ghJson<{ timelineItems: { nodes: { __typename: string }[] } }>('api', 'graphql', '-f', `query=query { repository(owner: "${REPO.split('/')[0]}", name: "${REPO.split('/')[1]}") { pullRequest(number: ${piece.pr}) { timelineItems(first: 100, itemTypes: [AUTO_MERGE_ENABLED_EVENT]) { nodes { __typename } } } } }`, '--jq', '.data.repository.pullRequest');
     expect(history.timelineItems.nodes).toHaveLength(1);
-    await waitFor(`PR #${piece.pr} merged`, () => (prState(piece.pr).state === 'MERGED' ? true : undefined), 30 * MINUTE);
-    await sandbox.noteMerged(piece.pr);
     record({ id: 'CN-06', attempt: 'El motor se corta entre armar la fusión y registrarlo; otra corrida retoma', stoppedBy: ['motor'], negative: 'frenado', positive: 'pasó', evidence: [prUrl(piece.pr)] });
   }, 60 * MINUTE);
 
@@ -1063,9 +1076,26 @@ describe.sequential('the negative suite on GitHub (PLAN-13-R5 §2)', () => {
     expect(judgedAfter.status.state).toBe(judgedBefore.status.state);
 
     // SV-03b: the review provider is not installed. The agent's review of A is technical; no verdict.
-    const noProvider = await runAgentCli(['review', String(corrupted.n)], { cwd: agentFolder, env: { ...(process.env as Record<string, string>), PATH: '' } });
+    // A complete order, so the stop comes from the missing provider and not from the order itself:
+    // the fifth real run found this call without its options, refused as "Usage", and counted as
+    // stopped. Only the folders that hold the provider are taken out of PATH; git stays.
+    // The prompt lives outside the folder: a new file inside it would be refused as unsaved work.
+    const promptName = `${basename(agentFolder)}-revision.md`;
+    writeFileSync(join(dirname(agentFolder), promptName), 'Revisa la pieza.\n');
+    const withoutClaude = (process.env['PATH'] ?? '').split(delimiter)
+      .filter((dir) => dir !== '' && !['claude', 'claude.exe', 'claude.cmd'].some((name) => existsSync(join(dir, name))))
+      .join(delimiter);
+    const commentsBefore = ghJson<unknown[][]>('api', `repos/${REPO}/issues/${corrupted.n}/comments`, '--paginate', '--slurp').flat().length;
+    const noProvider = await runAgentCli(
+      ['review', String(corrupted.n), '--provider', 'claude', '--model', 'claude-opus', '--prompt', `../${promptName}`, '--angle', 'correctness'],
+      { cwd: agentFolder, env: { ...(process.env as Record<string, string>), PATH: withoutClaude, Path: withoutClaude } },
+    );
     log(noProvider.text);
     expect(noProvider.ok).toBe(false);
+    expect(noProvider.text).not.toMatch(/^Usage/);
+    // What the engine says when the provider cannot be started (tried on this machine).
+    expect(noProvider.text).toMatch(/could not start the process|no se pudo iniciar/i);
+    expect(ghJson<unknown[][]>('api', `repos/${REPO}/issues/${corrupted.n}/comments`, '--paginate', '--slurp').flat().length).toBe(commentsBefore);
 
     // Meanwhile B enters the queue and merges.
     await asAgent('pr', 'merge', String(papers.pr), '--repo', REPO, '--squash', '--auto');
