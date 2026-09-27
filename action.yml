@@ -38,7 +38,9 @@ runs:
     # a marcar y, según el modo, publica el verde de `off`/`advisory` o el `pending` de `on`. Todo
     # con `gh api` y variables de entorno. Con la procedencia fallida no publica nada y termina en
     # 0 después de dejar un `::error::` en el registro: la corrida queda sin veredicto, nunca en
-    # verde. Con `off` termina aquí y no se instala ni compila nada.
+    # verde. Con `off` termina aquí y no se instala ni compila nada. En un grupo de la cola
+    # (`merge_group`, o su `workflow_run`) el modo `on` no publica «juzgando»: un grupo no cambia y
+    # el pendiente de una segunda corrida sacaría el grupo de la cola (SV-03, parte 5).
     #
     # La cabeza y la rama destino del PR se releen por API para `issue_comment` y
     # `workflow_dispatch`; un PR hacia otra rama no se juzga. El número de PR de esos eventos debe
@@ -64,6 +66,7 @@ runs:
         status_context="$INPUT_CONTEXT"
         armed='false'
         decided='false'
+        queue_group='false'
 
         emit() {
           {
@@ -256,7 +259,8 @@ runs:
               # SHA, nunca un verde. La lectura va paginada y junta las páginas con `--slurp`.
               armed='true'
               if [ "$run_event" = 'merge_group' ]; then
-                :
+                # La cabeza del grupo de la cola: no se publica «juzgando» (ver el modo `on`).
+                queue_group='true'
               elif [ "$run_event" = 'pull_request' ]; then
                 match="$(gh api "repos/$GITHUB_REPOSITORY/commits/${sha}/pulls?per_page=100" --paginate --slurp \
                   | jq -r --arg head "$sha" --arg base "$default_branch" \
@@ -271,6 +275,7 @@ runs:
             ;;
           merge_group)
             sha="$(jq -r '.merge_group.head_sha // empty' "$GITHUB_EVENT_PATH")"
+            queue_group='true'
             ;;
           *)
             stop "evento no juzgado: $GITHUB_EVENT_NAME"
@@ -298,8 +303,15 @@ runs:
             status_context='ai-workflows/advisory'
             ;;
           on)
-            publish_status pending "$INPUT_CONTEXT" 'juzgando' \
-              || { echo "::error::no se pudo publicar el estado"; exit 1; }
+            # Hallado en la corrida real de la parte 5 (SV-03): en un grupo de la cola el paso no
+            # publica «juzgando». Si el juez corre dos veces sobre el mismo grupo, el pendiente de
+            # la segunda corrida caería sobre el verde de la primera y GitHub sacaría el grupo de
+            # la cola (branch_protection_failure). Un grupo nunca cambia, así que no hay verde
+            # viejo que retirar: aquí solo publica el veredicto el propio juez.
+            if [ "$queue_group" != 'true' ]; then
+              publish_status pending "$INPUT_CONTEXT" 'juzgando' \
+                || { echo "::error::no se pudo publicar el estado"; exit 1; }
+            fi
             status_context="$INPUT_CONTEXT"
             ;;
           *)

@@ -795,6 +795,19 @@ Decididas por el orquestador al verificar cada parte; ninguna cambia lo que deci
     la fusión de CN-06;
   - el segundo aviso al dueño venía escrito «DUEÑA» y la vigilancia del orquestador buscaba «DUEÑO»:
     el aviso llegó tarde y el recorrido final se quedó sin su «Approve».
+- **Quinta corrida real completa (27-sep):** 12 de 16 casos del archivo principal en verde. Hallazgos:
+  - **del motor (juez en la cola, SV-03):** dos checks de un mismo grupo terminaron juntos y el juez
+    corrió dos veces; la segunda corrida abrió con «juzgando» (pendiente) sobre el verde de la
+    primera y GitHub sacó el grupo de la cola. En un grupo el juez ya no publica «juzgando», solo su
+    veredicto (encargo V). Queda un riesgo menor, anotado en §12 de PLAN-13: una corrida del juez
+    cancelada a mitad de juicio en un grupo deja «no pudo decidir» y el grupo sale de la cola (falla
+    cerrado; la pieza se vuelve a encolar);
+  - de la suite: CN-05b leyó el «no pudo decidir» pasajero de una corrida cancelada; ahora un
+    veredicto cuenta solo si sigue siendo el último durante un minuto. SV-03b llamaba a `review` sin
+    sus opciones y contaba el «Usage» como freno: ahora la orden es completa y se exige el motivo del
+    proveedor ausente (probado en la PC). La segunda corrida de CN-06 se detuvo por un «malformed
+    request» de GitHub al renovar la reserva (el motor lo dejó técnico, como debe); la suite reanuda
+    hasta tres veces, como pide el propio motor, y anota siempre la fusión.
 
 ## 10. Revisión de la parvada
 

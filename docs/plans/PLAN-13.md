@@ -651,7 +651,9 @@ Rebanadas 1 → 2 → 3 → 4 en orden; 5 puede empezar tras 3; 6 tras 4 y 5; 7 
     despierta con el botón «Approve» y con los eventos del issue; R22.
   - **De la rebanada 5, a proponer al dueño:** ganchos para Codex (`.codex/hooks.json`) y OpenCode;
     que el juez trate como archivos propios `.claude/settings.json` y la versión del motor de
-    `package.json` (hoy un PR puede quitar el gancho del editor sin la atestación del dueño).
+    `package.json` (hoy un PR puede quitar el gancho del editor sin la atestación del dueño);
+    que una corrida del juez cancelada a mitad de juicio en un grupo de la cola no deje «no pudo
+    decidir» (hoy falla cerrado: el grupo sale de la cola y la pieza se vuelve a encolar).
   - **De la rebanada 4, sin bloquear:** CN-07 (ganchos del editor conectados a la receta) pasa a la
     rebanada 5; `cleanup` no libera zonas (nadie las reserva aún); sin `agent-account`, un aviso al
     dueño puede repetirse tras una caída (la conciliación solo reconoce comentarios de la
