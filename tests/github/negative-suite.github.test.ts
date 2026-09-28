@@ -1126,15 +1126,44 @@ describe.sequential('the negative suite on GitHub (PLAN-13-R5 §2)', () => {
     }
     for (const piece of pieces) await settled(piece.head, ['success']);
     for (const piece of pieces) await asAgent('pr', 'merge', String(piece.pr), '--repo', REPO, '--squash', '--auto');
-    for (const piece of pieces) {
-      await waitFor(`PR #${piece.pr} merged`, () => {
-        const state = prState(piece.pr).state;
-        if (state === 'CLOSED') throw new Error(`PR #${piece.pr} was closed without merging`);
-        return state === 'MERGED' ? true : undefined;
-      }, 60 * MINUTE, 30_000);
-      await sandbox.noteMerged(piece.pr);
+    // The rehearsal's own queue lock (`candado-cola`, a copy of the real project's, not the engine)
+    // downloads the engine; in the seventh real run GitHub answered that download with a 500 and the
+    // lock stayed red, so the piece never entered the queue. A lock that failed on a GitHub server
+    // error is re-run once, as a person would, and the report says so. Any other red stays red.
+    const reruns: number[] = [];
+    const rerunIfServerError = (piece: Piece): void => {
+      if (reruns.includes(piece.pr) || latest(piece.head, 'candado-cola')?.state !== 'failure') return;
+      const failed = ghJson<{ databaseId: number; conclusion: string }[]>('run', 'list', '--repo', REPO, '--commit', piece.head, '--workflow', 'Candado de la cola', '--json', 'databaseId,conclusion')
+        .find((run) => run.conclusion === 'failure');
+      if (failed === undefined) return;
+      const text = gh('run', 'view', String(failed.databaseId), '--repo', REPO, '--log');
+      if (!/returned error: 5\d\d/.test(text)) throw new Error(`the rehearsal queue lock of PR #${piece.pr} failed for a reason other than a GitHub server error`);
+      gh('run', 'rerun', String(failed.databaseId), '--repo', REPO, '--failed');
+      reruns.push(piece.pr);
+      log(`COLA-6: the rehearsal queue lock of PR #${piece.pr} failed on a GitHub server error; re-run once`);
+    };
+    const noted: number[] = [];
+    try {
+      for (const piece of pieces) {
+        await waitFor(`PR #${piece.pr} merged`, () => {
+          const state = prState(piece.pr).state;
+          if (state === 'CLOSED') throw new Error(`PR #${piece.pr} was closed without merging`);
+          if (state === 'MERGED') return true;
+          for (const other of pieces) rerunIfServerError(other);
+          return undefined;
+        }, 60 * MINUTE, 30_000);
+        await sandbox.noteMerged(piece.pr);
+        noted.push(piece.pr);
+      }
+    } finally {
+      // Whatever failed, every piece that did merge is noted, so the clean-up never trips on it
+      // (seen in the seventh real run: two merges after the stuck piece went unnoted).
+      for (const piece of pieces) {
+        if (!noted.includes(piece.pr) && prState(piece.pr).state === 'MERGED') await sandbox.noteMerged(piece.pr);
+      }
     }
-    record({ id: 'COLA-6', attempt: 'Seis piezas de papeles armadas a la vez en la cola', stoppedBy: [], negative: 'frenado', positive: 'no-aplica', result: 'pasó', evidence: pieces.map((piece) => prUrl(piece.pr)) });
+    const rerunNote = reruns.length === 0 ? '' : ` (GitHub falló con un error de servidor el candado propio del ensayo en ${reruns.map((pr) => `#${pr}`).join(', ')}; la suite lo relanzó una vez con la cuenta del dueño)`;
+    record({ id: 'COLA-6', attempt: `Seis piezas de papeles armadas a la vez en la cola${rerunNote}`, stoppedBy: [], negative: 'frenado', positive: 'no-aplica', result: 'pasó', evidence: pieces.map((piece) => prUrl(piece.pr)) });
   }, 90 * MINUTE);
 
   it('CN-05b positive: after the owner pressed Approve, the judge ran by itself and passed', async () => {

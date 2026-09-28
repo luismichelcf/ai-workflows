@@ -816,6 +816,13 @@ Decididas por el orquestador al verificar cada parte; ninguna cambia lo que deci
   `auto_inactive` iba en el despliegue y no en su estado, así que un despliegue de prueba apagaba los
   anteriores del ensayo (se repusieron y se probó en GitHub); una restauración repetida acepta un
   despliegue ya retirado; GitHub da el `payload` de un despliegue como texto o como objeto.
+- **Séptima corrida real (28-sep):** 33 de 35 en verde; por primera vez pasaron CN-05b (con el
+  botón del dueño), CN-06, SV-03 (con SV-03b frenado por el proveedor ausente) y todos los demás
+  casos del archivo principal. Los dos restantes: el recorrido final se quedó sin el «Approve» del
+  dueño a tiempo, y COLA-6 se trabó porque el candado propio del ensayo (copia del de Socialabs, no
+  el motor) recibió un error 500 de GitHub al descargar y quedó rojo. La suite ahora relanza una vez
+  ese candado cuando el fallo es un error de servidor de GitHub, y el informe lo dice; cualquier
+  otro rojo sigue rojo. COLA-6 anota ya todas sus fusiones aunque falle.
 
 ## 10. Revisión de la parvada
 
