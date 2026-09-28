@@ -207,6 +207,34 @@ async function readLock(port: SandboxPort, sha: string): Promise<SandboxState> {
   return JSON.parse(raw) as SandboxState;
 }
 
+// A read of the lock that comes back empty from GitHub once is tried again before giving up: in
+// the sixth real run one read failed and the harness blamed another run, hiding the real reason.
+const LOCK_READ_ATTEMPTS = 3;
+const LOCK_READ_PAUSE_MS = 1_000;
+
+function pause(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Reads the lock ref and the state it carries, retrying a few times with a short pause. A read that
+ * keeps failing says its real reason; it is never attributed to another run.
+ */
+async function readLockRef(port: SandboxPort): Promise<{ sha: string; state: SandboxState } | undefined> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < LOCK_READ_ATTEMPTS; attempt += 1) {
+    if (attempt > 0) await pause(LOCK_READ_PAUSE_MS);
+    try {
+      const sha = await port.getRef(LOCK_REF);
+      if (sha === undefined) return undefined;
+      return { sha, state: await readLock(port, sha) };
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw new Error(`el candado de la suite no se pudo leer: ${messageOf(lastError)}`);
+}
+
 async function persistLock(port: SandboxPort, state: SandboxState, previous: string): Promise<string> {
   // The new commit descends from the previous lock commit: GitHub accepts a `force=false` update
   // only when the reference moves forward in line, so the comparison is atomic.
@@ -549,6 +577,11 @@ async function performRestore(port: SandboxPort, state: SandboxState): Promise<s
     if (entry.resource === 'deployment' && entry.done && typeof entry.after === 'number') {
       const id = entry.after;
       await attempt(problems, `despliegue ${id}`, async () => {
+        // A restoration that already removed it and then stopped can be retried: a deployment that
+        // is no longer there counts as removed, without calling GitHub again (seen in the sixth
+        // real run, where the second removal failed on the missing deployment).
+        const found = await port.findDeployments(entry.marker ?? '');
+        if (!found.includes(id)) return;
         await port.deactivateDeployment(id);
         await port.deleteDeployment(id);
       });
@@ -697,17 +730,11 @@ function makeSandbox(port: SandboxPort, run: string): { sandbox: Sandbox; adopt:
   // Reads the lock that is in GitHub before every write: another object of the run may have moved
   // it, and its journal is the only truth. A lock of another run, or an unreadable one, stops here.
   const refresh = async (): Promise<void> => {
-    const sha = await port.getRef(LOCK_REF);
-    if (sha === undefined) throw new Error('el candado de la suite no está puesto');
-    let remote: SandboxState;
-    try {
-      remote = await readLock(port, sha);
-    } catch {
-      throw new Error('el candado de la suite no se pudo leer: lo movió otra corrida');
-    }
-    if (remote.run !== run) throw new Error(`el candado de la suite es de la corrida ${remote.run}, no de ${run}`);
-    state = remote;
-    lockSha = sha;
+    const found = await readLockRef(port);
+    if (found === undefined) throw new Error('el candado de la suite no está puesto');
+    if (found.state.run !== run) throw new Error(`el candado de la suite es de la corrida ${found.state.run}, no de ${run}`);
+    state = found.state;
+    lockSha = found.sha;
   };
 
   const persist = async (): Promise<void> => {
@@ -741,10 +768,9 @@ function makeSandbox(port: SandboxPort, run: string): { sandbox: Sandbox; adopt:
           `el repositorio de ensayo no admite la corrida: se necesita administración y la aplicación de los agentes instalada solo aquí (R22)`,
         );
       }
-      const existing = await port.getRef(LOCK_REF);
+      const existing = await readLockRef(port);
       if (existing !== undefined) {
-        const lock = await readLock(port, existing);
-        throw new Error(`el candado ya lo tiene la corrida ${lock.run} desde ${lock.startedAt}`);
+        throw new Error(`el candado ya lo tiene la corrida ${existing.state.run} desde ${existing.state.startedAt}`);
       }
       const main = await port.main();
       const variable = await port.variable();
@@ -765,8 +791,9 @@ function makeSandbox(port: SandboxPort, run: string): { sandbox: Sandbox; adopt:
       const commit = await port.writeCommit({ 'lock.json': JSON.stringify(state, null, 2) });
       const created = await port.createRef(LOCK_REF, commit);
       if (created === 'exists') {
-        const sha = (await port.getRef(LOCK_REF)) ?? commit;
-        const lock = await readLock(port, sha);
+        const found = await readLockRef(port);
+        if (found !== undefined) throw new Error(`el candado ya lo tiene la corrida ${found.state.run} desde ${found.state.startedAt}`);
+        const lock = await readLock(port, commit);
         throw new Error(`el candado ya lo tiene la corrida ${lock.run} desde ${lock.startedAt}`);
       }
       lockSha = commit;
@@ -943,12 +970,11 @@ export function createSandbox(options: { port: SandboxPort; run: string }): Sand
  */
 export async function attachSandbox(options: { port: SandboxPort; run: string }): Promise<Sandbox> {
   const { port, run } = options;
-  const sha = await port.getRef(LOCK_REF);
-  if (sha === undefined) throw new Error('no hay candado de la suite al que engancharse');
-  const state = await readLock(port, sha);
-  if (state.run !== run) throw new Error(`el candado es de la corrida ${state.run}, no de ${run}`);
+  const found = await readLockRef(port);
+  if (found === undefined) throw new Error('no hay candado de la suite al que engancharse');
+  if (found.state.run !== run) throw new Error(`el candado es de la corrida ${found.state.run}, no de ${run}`);
   const { sandbox, adopt } = makeSandbox(port, run);
-  adopt(sha, state);
+  adopt(found.sha, found.state);
   return sandbox;
 }
 
@@ -991,12 +1017,12 @@ export async function recoverSandbox(options: { port: SandboxPort }): Promise<{ 
   if (!permissions.admin || !permissions.appOnlyHere) {
     return { ok: false, problems: ['el repositorio de ensayo no admite la recuperación: se necesita administración y la aplicación de los agentes instalada solo aquí (R22)'] };
   }
-  const sha = await port.getRef(LOCK_REF);
-  if (sha === undefined) return { ok: true, problems: [], note: 'no hay candado de una corrida abandonada' };
-  const state = await readLock(port, sha);
+  const found = await readLockRef(port);
+  if (found === undefined) return { ok: true, problems: [], note: 'no hay candado de una corrida abandonada' };
+  const state = found.state;
   const conflicts = await performReconcile(port, state);
   if (conflicts.length > 0) return { ok: false, problems: conflicts };
-  const persisted = await persistLock(port, state, sha);
+  const persisted = await persistLock(port, state, found.sha);
   const problems = await performRestore(port, state);
   if (problems.length > 0) return { ok: false, problems };
   const deleted = await port.deleteRef(LOCK_REF, persisted);
