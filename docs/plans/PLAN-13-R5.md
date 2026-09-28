@@ -808,6 +808,14 @@ Decididas por el orquestador al verificar cada parte; ninguna cambia lo que deci
     proveedor ausente (probado en la PC). La segunda corrida de CN-06 se detuvo por un «malformed
     request» de GitHub al renovar la reserva (el motor lo dejó técnico, como debe); la suite reanuda
     hasta tres veces, como pide el propio motor, y anota siempre la fusión.
+- **Sexta corrida real (28-sep):** el recorrido final pasó entero con el «Approve» del dueño, y los
+  archivos del juez, de las etapas finales y de RC-09 pasaron completos. El archivo principal no
+  arrancó: una lectura del candado volvió vacía de GitHub y el arnés lo atribuyó a «otra corrida»,
+  escondiendo el motivo. Hallazgos del arnés, todos arreglados (encargo W y el orquestador en la
+  parte que habla con GitHub): la lectura del candado se reintenta y dice su motivo real;
+  `auto_inactive` iba en el despliegue y no en su estado, así que un despliegue de prueba apagaba los
+  anteriores del ensayo (se repusieron y se probó en GitHub); una restauración repetida acepta un
+  despliegue ya retirado; GitHub da el `payload` de un despliegue como texto o como objeto.
 
 ## 10. Revisión de la parvada
 

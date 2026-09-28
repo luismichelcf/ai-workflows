@@ -1309,8 +1309,11 @@ export function createGhSandboxPort(repository: string): SandboxPort {
       return deployment.id;
     },
     async findDeployments(marker) {
-      const deployments = paginate(`repos/${repo}/deployments?per_page=100`) as { id: number; payload?: string }[];
-      return deployments.filter((deployment) => (deployment.payload ?? '').includes(marker)).map((deployment) => deployment.id);
+      const deployments = paginate(`repos/${repo}/deployments?per_page=100`) as { id: number; payload?: unknown }[];
+      // GitHub gives the payload back as text or as an object (`{}` for deployments made without
+      // one, seen in the sixth real run): read it as text either way.
+      const payloadText = (payload: unknown): string => (typeof payload === 'string' ? payload : JSON.stringify(payload ?? ''));
+      return deployments.filter((deployment) => payloadText(deployment.payload).includes(marker)).map((deployment) => deployment.id);
     },
     async deactivateDeployment(id) {
       api('POST', `repos/${repo}/deployments/${id}/statuses`, { state: 'inactive' });
