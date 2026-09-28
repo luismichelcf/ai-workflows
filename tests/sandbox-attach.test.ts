@@ -76,6 +76,69 @@ describe('attaching to the run of the global setup', () => {
   });
 });
 
+// Found in the sixth real run: one read of the lock came back empty from GitHub («unexpected end
+// of JSON input»), and the harness said «lo movió otra corrida», hiding the real reason. A read
+// that fails is tried again; one that keeps failing says why.
+describe('reading the lock', () => {
+  it('a read of the lock that fails once is tried again', async () => {
+    const gh = fakeGitHub();
+    await createSandbox({ port: gh.port, run: RUN }).acquire();
+    let failures = 1;
+    const flaky = { ...gh.port, readCommit: async (sha: string) => {
+      if (failures > 0) {
+        failures -= 1;
+        throw new Error('unexpected end of JSON input');
+      }
+      return gh.port.readCommit(sha);
+    } };
+    const file = await attachSandbox({ port: flaky, run: RUN });
+    failures = 1;
+    await file.setVariable('on');
+    expect(gh.state.variable).toBe('on');
+  });
+
+  it('a read that keeps failing says the real reason, never «another run»', async () => {
+    const gh = fakeGitHub();
+    await createSandbox({ port: gh.port, run: RUN }).acquire();
+    const file = await attachSandbox({ port: gh.port, run: RUN });
+    const broken = { ...gh.port, readCommit: async () => { throw new Error('unexpected end of JSON input'); } };
+    const other = await attachSandbox({ port: gh.port, run: RUN });
+    void other;
+    Object.assign(gh.port, { readCommit: broken.readCommit });
+    const error = await file.setVariable('on').then(() => undefined, (caught: unknown) => caught);
+    expect(String(error)).toMatch(/unexpected end of JSON input/);
+    expect(String(error)).not.toMatch(/otra corrida/);
+  });
+});
+
+// Found in the sixth real run: the teardown removed a deployment of the run and then stopped on
+// something else; the recovery tried to remove it again and failed on the missing deployment.
+describe('restoring twice', () => {
+  it('a deployment of the run that is already gone counts as removed', async () => {
+    const gh = fakeGitHub();
+    const setup = createSandbox({ port: gh.port, run: RUN });
+    await setup.acquire();
+    const file = await attachSandbox({ port: gh.port, run: RUN });
+    const id = await file.createDeployment({ sha: gh.state.mainHead, environment: 'Preview', url: 'https://p.example.com' });
+    await gh.port.deactivateDeployment(id);
+    await gh.port.deleteDeployment(id);
+    let deleted = 0;
+    const strict = { ...gh.port, deactivateDeployment: async (target: number) => {
+      if (target === id) throw new Error(`HTTP 404: deployment ${target} not found`);
+      return gh.port.deactivateDeployment(target);
+    }, deleteDeployment: async (target: number) => {
+      deleted += 1;
+      if (target === id) throw new Error(`HTTP 404: deployment ${target} not found`);
+      return gh.port.deleteDeployment(target);
+    } };
+
+    const result = await createSandbox({ port: strict, run: RUN }).restore();
+
+    expect(result).toEqual({ ok: true, problems: [] });
+    expect(deleted).toBe(0);
+  });
+});
+
 describe('what the suite needs from the harness', () => {
   it('forgeStateRef writes a hand-made journal under refs/ai-workflows, returns its commit and the restoration removes it', async () => {
     const gh = fakeGitHub();

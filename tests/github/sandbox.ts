@@ -1276,7 +1276,10 @@ export function createGhSandboxPort(repository: string): SandboxPort {
         required_contexts: [],
       });
       const deployment = JSON.parse(created) as { id: number };
-      api('POST', `repos/${repo}/deployments/${deployment.id}/statuses`, { state: 'success', environment_url: o.url });
+      // `auto_inactive` belongs to the status, not to the deployment: GitHub ignores it on the
+      // deployment and, by default, a new successful status turns the older deployments of the
+      // environment inactive (seen in the sixth real run: the snapshot's deployments changed).
+      api('POST', `repos/${repo}/deployments/${deployment.id}/statuses`, { state: 'success', environment_url: o.url, auto_inactive: o.autoInactive });
       return deployment.id;
     },
     async findDeployments(marker) {
