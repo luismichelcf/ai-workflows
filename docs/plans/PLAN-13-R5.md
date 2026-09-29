@@ -904,3 +904,10 @@ PR con esa cuenta, crear issues, cambiar la variable, prender flujos, crear desp
 seguir sumando casos sueltos, la sección del dueño dice ahora qué casos actúan con su cuenta y qué
 hacen «según el caso», qué casos lanzan el juez a mano y todos los demás usos durante la corrida
 (encargos R y S). CN-06 ya no se traga un fallo al entregar su PR al arnés. **Ronda 11:** faltaban los registros del motor escritos a mano (SV-03, SV-06, SV-08) y los checks exigidos que SV-02 quita y repone; la línea general nombra ahora todo lo que el arnés sabe hacer con esa cuenta (encargo T).
+
+**Rondas 12 a 15** (un revisor por delta, tras cada corrida real: encargos U, V, W y X/Y): sin
+bloqueantes; menores aplicados con su prueba (un PR fusionado con historia ilegible queda técnico y
+nunca se vuelve a armar; COLA-6 relanza la corrida fallida más reciente y falla al instante; el
+informe muestra los registros anteriores que no cuentan). **Revisión final** (dos revisores, el
+informe juntado y el motor de toda la rebanada): **sin bloqueantes**; tres menores del motor quedan
+propuestos en PLAN-13 §12.
