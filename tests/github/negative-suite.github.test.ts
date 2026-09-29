@@ -1133,8 +1133,9 @@ describe.sequential('the negative suite on GitHub (PLAN-13-R5 §2)', () => {
     const reruns: number[] = [];
     const rerunIfServerError = (piece: Piece): void => {
       if (reruns.includes(piece.pr) || latest(piece.head, 'candado-cola')?.state !== 'failure') return;
-      const failed = ghJson<{ databaseId: number; conclusion: string }[]>('run', 'list', '--repo', REPO, '--commit', piece.head, '--workflow', 'Candado de la cola', '--json', 'databaseId,conclusion')
-        .find((run) => run.conclusion === 'failure');
+      const failed = ghJson<{ databaseId: number; conclusion: string; createdAt: string }[]>('run', 'list', '--repo', REPO, '--commit', piece.head, '--workflow', 'Candado de la cola', '--json', 'databaseId,conclusion,createdAt')
+        .filter((run) => run.conclusion === 'failure')
+        .sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
       if (failed === undefined) return;
       const text = gh('run', 'view', String(failed.databaseId), '--repo', REPO, '--log');
       if (!/returned error: 5\d\d/.test(text)) throw new Error(`the rehearsal queue lock of PR #${piece.pr} failed for a reason other than a GitHub server error`);
@@ -1145,13 +1146,25 @@ describe.sequential('the negative suite on GitHub (PLAN-13-R5 §2)', () => {
     const noted: number[] = [];
     try {
       for (const piece of pieces) {
+        // `waitFor` only logs what a probe throws; a closed pull request or a lock refused for a
+        // real reason must end the case at once, not after an hour (final review of part 5).
+        let fatal: unknown;
         await waitFor(`PR #${piece.pr} merged`, () => {
-          const state = prState(piece.pr).state;
-          if (state === 'CLOSED') throw new Error(`PR #${piece.pr} was closed without merging`);
-          if (state === 'MERGED') return true;
-          for (const other of pieces) rerunIfServerError(other);
-          return undefined;
+          try {
+            const state = prState(piece.pr).state;
+            if (state === 'CLOSED') throw new Error(`PR #${piece.pr} was closed without merging`);
+            if (state === 'MERGED') return true;
+            for (const other of pieces) rerunIfServerError(other);
+            return undefined;
+          } catch (error) {
+            if (error instanceof Error && /closed without merging|other than a GitHub server error/.test(error.message)) {
+              fatal = error;
+              return true;
+            }
+            throw error;
+          }
         }, 60 * MINUTE, 30_000);
+        if (fatal !== undefined) throw fatal;
         await sandbox.noteMerged(piece.pr);
         noted.push(piece.pr);
       }

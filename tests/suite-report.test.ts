@@ -388,3 +388,32 @@ describe('a report that joins two runs (R23)', () => {
     expect(renderSuiteReport(failedCleanup, metaWith(cases)).complete).toBe(false);
   });
 });
+
+// Final review of part 5: an earlier record of a case the earlier run does not give used to be
+// dropped silently. The report lists it with its result; a dropped record that did not pass keeps
+// the report from being complete (R23 joins cases the earlier run left without a passing record).
+describe('earlier records that do not count are shown (R23)', () => {
+  const EARLIER = 'r-5d5f';
+  const final = () => allGood().filter((record) => ['COLA-6', 'RECORRIDO', 'LIMPIEZA', 'CN-12'].includes(record.id));
+  const earlierOf = (over: Partial<CaseRecord> = {}) => allGood()
+    .filter((record) => !['COLA-6', 'RECORRIDO', 'LIMPIEZA'].includes(record.id))
+    .map((record) => ({ ...record, run: EARLIER, ...(record.id === 'CN-12' ? over : {}) }));
+  const meta = (cases: readonly string[]) => ({ ...META, runs: [{ run: EARLIER, engineSha: 'b'.repeat(40), testsPassed: false, cases }] });
+  const given = (records: readonly CaseRecord[]) => records.map((record) => record.id).filter((id) => id !== 'CN-12');
+
+  it('a case redone by the final run names the earlier record it replaces', () => {
+    const earlier = earlierOf();
+    const text = renderSuiteReport([...earlier, ...final()], meta(given(earlier))).text;
+    const row = text.split('\n').find((line) => line.includes('no cuenta')) ?? '';
+    expect(row).toContain(EARLIER);
+    expect(row).toMatch(/CN-12 \(frenado, control positivo: pasó\)/);
+    expect(renderSuiteReport([...earlier, ...final()], meta(given(earlier))).complete).toBe(true);
+  });
+
+  it('an earlier record that did not pass and was dropped keeps the report from being complete', () => {
+    const earlier = earlierOf({ positive: 'falló' });
+    const report = renderSuiteReport([...earlier, ...final()], meta(given(earlier)));
+    expect(report.complete).toBe(false);
+    expect(firstLine(report.text)).toMatch(/CN-12/);
+  });
+});
