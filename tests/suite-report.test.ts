@@ -315,3 +315,76 @@ describe('reading the records', () => {
     expect(() => readCaseRecords(file)).toThrow();
   });
 });
+
+// R23 (owner decision, 29-sep): the report may join a full run with a short run of the cases it
+// left without a record. The final (short) run is `meta.run`; each earlier run says which cases it
+// gives. It is declared in the heading and per run, with that run's own clean-up outcome.
+describe('a report that joins two runs (R23)', () => {
+  const EARLIER = 'r-5d5f';
+  const RETAKEN = ['COLA-6', 'RECORRIDO', 'LIMPIEZA'];
+  const joined = () => {
+    const all = allGood();
+    const earlier = all.filter((record) => !RETAKEN.includes(record.id)).map((record) => ({ ...record, run: EARLIER }));
+    const earlierCleanup: CaseRecord = { ...good('LIMPIEZA', 99), run: EARLIER, result: 'falló', attempt: 'la suite no pudo dejar el ensayo limpio' };
+    const final = all.filter((record) => RETAKEN.includes(record.id));
+    return { records: [...earlier, earlierCleanup, ...final], cases: earlier.map((record) => record.id) };
+  };
+  const metaWith = (cases: readonly string[], over: Partial<{ testsPassed: boolean }> = {}) => ({
+    ...META,
+    runs: [{ run: EARLIER, engineSha: 'b'.repeat(40), testsPassed: false, cases }],
+    ...over,
+  });
+
+  it('every case from one of the two runs, the final clean-up verified → complete, and it says so', () => {
+    const { records, cases } = joined();
+    const report = renderSuiteReport(records, metaWith(cases));
+    expect(report.complete).toBe(true);
+    const heading = firstLine(report.text);
+    expect(heading).toMatch(/Completo/);
+    expect(heading).toContain('R23');
+    expect(heading).toContain(EARLIER);
+    expect(heading).toContain(RUN);
+  });
+
+  it('names each earlier run, its engine, the cases it gives and its own clean-up outcome', () => {
+    const { records, cases } = joined();
+    const text = renderSuiteReport(records, metaWith(cases)).text;
+    const row = text.split('\n').find((line) => line.startsWith(`Corrida anterior: ${EARLIER}`)) ?? '';
+    expect(row).toContain('b'.repeat(40));
+    expect(row).toContain('CN-01');
+    expect(row).not.toMatch(/\bCOLA-6\b/);
+    expect(row).toMatch(/limpieza: falló/);
+    expect(row).toMatch(/pruebas: no en verde/);
+  });
+
+  it('a case given by both runs is repeated → not complete', () => {
+    const { records, cases } = joined();
+    expect(renderSuiteReport(records, metaWith([...cases, 'COLA-6'])).complete).toBe(false);
+  });
+
+  it('an earlier record of a case the run does not give does not count', () => {
+    const { records, cases } = joined();
+    const report = renderSuiteReport(records, metaWith(cases.filter((id) => id !== 'CN-01')));
+    expect(report.complete).toBe(false);
+    expect(firstLine(report.text)).toMatch(/CN-01/);
+  });
+
+  it('a case the earlier run says it gives but has no record → not complete', () => {
+    const { records, cases } = joined();
+    const report = renderSuiteReport(records.filter((record) => record.id !== 'CN-02'), metaWith(cases));
+    expect(report.complete).toBe(false);
+  });
+
+  it('a record from a run that is not declared → not complete', () => {
+    const { records, cases } = joined();
+    const stray = records.map((record) => (record.id === 'SV-01' ? { ...record, run: 'r-otra' } : record));
+    expect(renderSuiteReport(stray, metaWith(cases)).complete).toBe(false);
+  });
+
+  it('the final run must end in green, and its clean-up must pass', () => {
+    const { records, cases } = joined();
+    expect(renderSuiteReport(records, metaWith(cases, { testsPassed: false })).complete).toBe(false);
+    const failedCleanup = records.map((record) => (record.id === 'LIMPIEZA' && record.run === RUN ? { ...record, result: 'falló' as const } : record));
+    expect(renderSuiteReport(failedCleanup, metaWith(cases)).complete).toBe(false);
+  });
+});

@@ -520,6 +520,14 @@ esa sección no puede ser «Completo»; un caso con `ordersBySuite` vacío o con
 empieza con `/` invalida el registro. En cualquier otro caso la **primera línea** dice
 «Incompleto» o «Falló» y enumera por qué.
 
+**Dos corridas juntadas (R23, decisión del dueño del 29-sep).** El informe puede juntar una corrida
+completa anterior con una corrida corta final de los casos que aquella dejó sin registro. La corrida
+final es la del encabezado; cada corrida anterior declara su motor, sus pruebas y **qué casos
+aporta**. Un registro anterior de un caso que no aporta no cuenta; un caso aportado por las dos es
+repetido; un registro de una corrida no declarada es «de otra corrida». La limpieza que decide es la
+de la corrida final; la de cada corrida anterior se muestra con su resultado. La primera línea de un
+informe completo lo dice y cita R23. Nada se reconstruye a mano: sin registro, el caso falta.
+
 ### 3.3 Qué dice y qué no puede decir
 
 En español llano (lista prohibida por omisión): las tres líneas, una tabla por caso (qué se intentó,
