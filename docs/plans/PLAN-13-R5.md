@@ -830,7 +830,16 @@ Decididas por el orquestador al verificar cada parte; ninguna cambia lo que deci
   dueño a tiempo, y COLA-6 se trabó porque el candado propio del ensayo (copia del de Socialabs, no
   el motor) recibió un error 500 de GitHub al descargar y quedó rojo. La suite ahora relanza una vez
   ese candado cuando el fallo es un error de servidor de GitHub, y el informe lo dice; cualquier
-  otro rojo sigue rojo. COLA-6 anota ya todas sus fusiones aunque falle.
+  otro rojo sigue rojo. COLA-6 anota ya todas sus fusiones aunque falle. Su limpieza no cerró sola
+  (fusiones de COLA-6 sin anotar); el orquestador las anotó y la recuperación dejó el ensayo limpio.
+- **Corrida corta final (29-sep, R23):** solo el recorrido final, COLA-6 y la limpieza, con el
+  «Approve» del dueño: todo en verde y la limpieza cerró sola. El informe
+  `docs/reports/suite-negativa-2026-09-29.md` junta la séptima corrida con esta y dice «Completo»,
+  citando R23. La prueba del recorrido final registra también CN-12, así que la corrida corta lo
+  rehízo; el informe se volvió a generar con los mismos registros reales de las dos corridas, ahora
+  declarando CN-12 como aportado por la corta (sin eso lo contaba repetido). Límite anotado: la tarea
+  del informe deduce los casos a rehacer de sus nombres de prueba y no sabe que una prueba registra
+  dos casos.
 
 ## 10. Revisión de la parvada
 
