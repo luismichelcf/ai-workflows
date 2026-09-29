@@ -30,13 +30,14 @@ function envList(name: string): string[] {
 
 interface Join {
   readonly earlierRecords: readonly CaseRecord[];
-  readonly run: SuiteJoinedRun;
+  readonly run: Omit<SuiteJoinedRun, 'cases'>;
   readonly testPattern: string | undefined;
   readonly files: readonly string[];
 }
 
 // R23: with AI_WORKFLOWS_SUITE_JOIN, read the earlier run, work out which tests the final run must
-// redo and describe the earlier run for the report. Everything is checked before anything runs.
+// redo and describe the earlier run for the report. Everything is checked before anything runs. The
+// cases the earlier run gives are decided later, from what the final run really records.
 function prepareJoin(file: string): Join {
   const earlierRecords = readCaseRecords(file);
   const runIds = [...new Set(earlierRecords.map((record) => record.run))];
@@ -60,11 +61,9 @@ function prepareJoin(file: string): Join {
   if (engineSha.length === 0) {
     throw new Error('Falta AI_WORKFLOWS_SUITE_JOIN_ENGINE con el sha del motor de la corrida anterior.');
   }
-  const retaken = new Set(retake);
-  const cases = [...new Set(earlierRecords.map((record) => record.id))].filter((id) => id !== 'LIMPIEZA' && !retaken.has(id));
   return {
     earlierRecords,
-    run: { run: runId, engineSha, testsPassed: false, cases },
+    run: { run: runId, engineSha, testsPassed: false },
     testPattern: testFilters.length === 0 ? undefined : testFilters.join('|'),
     files: [...files],
   };
@@ -103,13 +102,19 @@ it('runs the GitHub suite and writes its report', () => {
     const finalRecords = existsSync(records) ? readCaseRecords(records) : [];
     const run = finalRecords.find((record) => record.id === 'LIMPIEZA')?.run ?? finalRecords[0]?.run ?? 'sin-corrida';
     const read = joinRun === undefined ? finalRecords : [...joinRun.earlierRecords, ...finalRecords];
+    // R23: the earlier run gives the cases whose records the final run did NOT produce: its own ids,
+    // minus the clean-up and minus every id the final run recorded. RETAKE only decides what runs.
+    const finalIds = new Set(finalRecords.map((record) => record.id));
+    const earlierCases = [...new Set(joinRun?.earlierRecords.map((record) => record.id) ?? [])].filter(
+      (id) => id !== 'LIMPIEZA' && !finalIds.has(id),
+    );
     const report = renderSuiteReport(read, {
       run,
       date,
       engineSha,
       repository: REPOSITORY,
       testsPassed,
-      ...(joinRun === undefined ? {} : { runs: [joinRun.run] }),
+      ...(joinRun === undefined ? {} : { runs: [{ ...joinRun.run, cases: earlierCases }] }),
     });
     text = report.text;
     complete = report.complete;

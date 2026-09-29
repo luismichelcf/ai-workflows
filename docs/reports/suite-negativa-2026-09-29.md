@@ -1,6 +1,7 @@
 # Completo: 36 casos en 2 corridas juntadas por decisión del dueño (R23): r-5d5ffe9a y r-dacf1fbf; cada intento frenado y cada control positivo en verde.
 Corrida: r-dacf1fbf
 Corrida anterior: r-5d5ffe9a (motor 1c093694435f2d02f4f2b82f2e8c2402c81c23bc; pruebas: no en verde; limpieza: falló) aporta: CN-01, CN-02, CN-03, CN-03e, CN-04, CN-05b, CN-05c, CN-06, CN-07, CN-08, CN-09, CN-10, CN-11a, CN-11b, CN-13, SV-01, SV-02, SV-03a, SV-03b, SV-03c, SV-03d, SV-04, SV-04s, SV-05, SV-06, SV-07, SV-08, SV-09, SV-DESTINO, RC-06, RC-09, PIEZA-COMPLETA.
+Registros de r-5d5ffe9a que no cuentan (los rehízo la corrida final o no se aportan): CN-12 (frenado, control positivo: pasó).
 Fecha: 2026-09-29
 Motor: a76bef71df6062bf1de45f2fdf69c3060d40eabf
 Repositorio: socialabs-margin/ai-workflows-pruebas

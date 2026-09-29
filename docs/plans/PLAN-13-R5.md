@@ -837,9 +837,10 @@ Decididas por el orquestador al verificar cada parte; ninguna cambia lo que deci
   `docs/reports/suite-negativa-2026-09-29.md` junta la séptima corrida con esta y dice «Completo»,
   citando R23. La prueba del recorrido final registra también CN-12, así que la corrida corta lo
   rehízo; el informe se volvió a generar con los mismos registros reales de las dos corridas, ahora
-  declarando CN-12 como aportado por la corta (sin eso lo contaba repetido). Límite anotado: la tarea
-  del informe deduce los casos a rehacer de sus nombres de prueba y no sabe que una prueba registra
-  dos casos.
+  declarando CN-12 como aportado por la corta (sin eso lo contaba repetido). Tras la revisión final,
+  la tarea toma los casos de la corrida anterior de lo que la final registró de verdad (la misma regla
+  usada para generar este informe), y el informe muestra los registros anteriores que no cuentan con
+  su resultado (CN-12: pasó); uno que no pasó impide «Completo».
 
 ## 10. Revisión de la parvada
 

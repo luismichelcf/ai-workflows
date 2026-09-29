@@ -400,6 +400,27 @@ function unique(values: readonly string[]): string[] {
   return [...new Set(values)];
 }
 
+// R23: a dropped earlier record "passed" under the same rules as a counted one: a negative attempt
+// stayed stopped (frenado, or limite for its declared limit), no positive control failed and a
+// control case reported "pasó".
+function droppedRecordPassed(entry: SuiteManifestEntry, record: CaseRecord): boolean {
+  if (entry.kind === 'limit') {
+    if (record.negative !== 'limite') return false;
+  } else if (entry.kind === 'negative') {
+    if (record.negative !== 'frenado') return false;
+  }
+  if (record.positive === 'falló') return false;
+  if (entry.kind === 'check' && record.result !== 'pasó') return false;
+  return true;
+}
+
+function droppedRecordText(entry: SuiteManifestEntry, record: CaseRecord): string {
+  const detail = entry.kind === 'check'
+    ? `resultado: ${escapeReportText(record.result ?? '')}`
+    : `control positivo: ${escapeReportText(record.positive)}`;
+  return `${escapeReportText(record.id)} (${escapeReportText(record.negative)}, ${detail})`;
+}
+
 export function renderSuiteReport(records: readonly CaseRecord[], meta: SuiteReportMeta): SuiteReport {
   // The header reaches the public report too: it goes through the same audit as every record.
   auditText('la corrida', 'run', meta.run);
@@ -427,6 +448,10 @@ export function renderSuiteReport(records: readonly CaseRecord[], meta: SuiteRep
   const recordsById = new Map<string, CaseRecord[]>();
   const extras: string[] = [];
   const undeclared: string[] = [];
+  // R23: a record of an earlier run whose case that run does not give is dropped from the count,
+  // but it is not silent: it is listed per run and, if it did not pass, it keeps the report from
+  // being complete. The clean-up is shown in its own run's line and never lands here.
+  const droppedByRun = new Map<string, CaseRecord[]>();
 
   for (const record of records) {
     if (!manifestById.has(record.id)) {
@@ -439,7 +464,13 @@ export function renderSuiteReport(records: readonly CaseRecord[], meta: SuiteRep
         undeclared.push(record.id);
         continue;
       }
-      if (record.id === 'LIMPIEZA' || !earlier.cases.includes(record.id)) continue;
+      if (record.id === 'LIMPIEZA') continue;
+      if (!earlier.cases.includes(record.id)) {
+        const dropped = droppedByRun.get(record.run) ?? [];
+        dropped.push(record);
+        droppedByRun.set(record.run, dropped);
+        continue;
+      }
     }
     const seen = recordsById.get(record.id) ?? [];
     seen.push(record);
@@ -510,6 +541,12 @@ export function renderSuiteReport(records: readonly CaseRecord[], meta: SuiteRep
   if (partials.length > 0) problems.push({ reason: 'casos parciales', ids: partials });
   if (ownerMismatch.length > 0) problems.push({ reason: 'actos del dueño que no coinciden con el manifiesto', ids: ownerMismatch });
 
+  const dropped = [...droppedByRun.values()].flat();
+  const droppedNotPassed = SUITE_MANIFEST.filter((entry) =>
+    dropped.some((record) => record.id === entry.id && !droppedRecordPassed(entry, record)),
+  ).map((entry) => entry.id);
+  if (droppedNotPassed.length > 0) problems.push({ reason: 'registros anteriores que no pasaron', ids: droppedNotPassed });
+
   const complete = meta.testsPassed && problems.length === 0;
 
   const lines: string[] = [];
@@ -538,6 +575,18 @@ export function renderSuiteReport(records: readonly CaseRecord[], meta: SuiteRep
     lines.push(
       `Corrida anterior: ${run.run} (motor ${run.engineSha}; pruebas: ${run.testsPassed ? 'en verde' : 'no en verde'}; limpieza: ${cleanupText}) aporta: ${cases.length === 0 ? 'nada' : cases.join(', ')}.`,
     );
+    const droppedRecords = droppedByRun.get(run.run) ?? [];
+    if (droppedRecords.length > 0) {
+      const items: string[] = [];
+      for (const entry of SUITE_MANIFEST) {
+        for (const record of droppedRecords) {
+          if (record.id === entry.id) items.push(droppedRecordText(entry, record));
+        }
+      }
+      lines.push(
+        `Registros de ${run.run} que no cuentan (los rehízo la corrida final o no se aportan): ${items.join(', ')}.`,
+      );
+    }
   }
   lines.push(`Fecha: ${meta.date}`);
   lines.push(`Motor: ${meta.engineSha}`);
