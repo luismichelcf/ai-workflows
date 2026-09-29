@@ -10,9 +10,31 @@ export interface PreCommitInput {
   readonly context: LockContext;
 }
 
+function brokenRecipeReason(context: LockContext): string {
+  return (
+    `La receta no es válida (${context.brokenRecipe}). Hasta repararla solo se puede guardar dentro ` +
+    'de .ai-workflows/: el candado no deja pasar nada más por si acaso.'
+  );
+}
+
 export function decidePreCommit(input: PreCommitInput): LockDecision {
   // An empty commit is not this lock's business: nothing is being added to the tree.
   if (input.stagedPaths.length === 0) return { allow: true };
+
+  // A broken recipe is repaired only from its own folder, in git as in the editor hook (§1.4).
+  if (input.context.brokenRecipe !== undefined) {
+    const root = readAbsolute(input.context.projectRoot);
+    const repair = root.ok ? readAbsolute(`${root.path.display}/.ai-workflows`) : undefined;
+    if (!root.ok || repair === undefined || !repair.ok) {
+      return { allow: false, reason: brokenRecipeReason(input.context) };
+    }
+    const offenders = input.stagedPaths.filter((stagedPath) => {
+      const reading = readAgainst(stagedPath, root.path.display);
+      return !reading.ok || !isUnder(reading.path, repair.path);
+    });
+    if (offenders.length === 0) return { allow: true };
+    return { allow: false, reason: brokenRecipeReason(input.context) };
+  }
 
   // The guarded folder is the configured project root, never the folder git happens to run in.
   // A root the lock cannot read is refused, like in the editor hook.

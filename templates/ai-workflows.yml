@@ -30,8 +30,13 @@ on:
   # Se dispara al terminar los workflows que producen checks exigidos. Agrega aquí los tuyos: el de
   # `ai-workflows/red-test` va de ejemplo. Un check de una app externa no vuelve a disparar el juez;
   # para eso queda `workflow_dispatch` o el siguiente evento del PR.
+  #
+  # `ai-workflows review signal` es el workflow mínimo que escucha las revisiones del PR (el botón
+  # «Approve»): como `pull_request_review` correría el YAML del commit de mezcla del PR, el juez no
+  # lo usa y sigue esa señal por `workflow_run`, que corre siempre con el YAML de la rama principal.
+  # La señal no se cree: solo aporta el número del PR, que el juez relee por la API.
   workflow_run:
-    workflows: ["ai-workflows red-test"]
+    workflows: ["ai-workflows red-test", "ai-workflows review signal"]
     types: [completed]
   workflow_dispatch:
     inputs:
@@ -46,12 +51,17 @@ jobs:
   # El id es `judge`, nunca `ai-workflows`: ver arriba.
   judge:
     name: Juez de ai-workflows
-    # En un comentario solo se juzga si es de un PR y trae una orden (`/…`), o si el comentario se
-    # editó o borró (el visto bueno pudo retirarse). En un issue suelto no hay nada que juzgar.
+    # En un comentario de un PR solo se juzga si trae una orden (`/…`), o si el comentario se editó
+    # o borró (el visto bueno pudo retirarse). En un issue que NO es un PR, se juzga si la acción no
+    # es `created` (editar o borrar un veredicto debe reevaluar) o si el comentario nuevo lleva la
+    # marca `ai-workflows:event`; un comentario nuevo sin la marca no dispara nada; así, la pieza del
+    # issue (su número) se rejuzga cuando aparece un evento de constructor o de veredicto.
     if: >-
       github.event_name != 'issue_comment'
       || (github.event.issue.pull_request
         && (contains(github.event.comment.body, '/') || github.event.action != 'created'))
+      || (!github.event.issue.pull_request
+        && (contains(github.event.comment.body, 'ai-workflows:event') || github.event.action != 'created'))
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -80,6 +90,8 @@ jobs:
           task: judge
           mode: ${{ vars.AI_WORKFLOWS_MODE }}
           token: ${{ github.token }}
-          # El workflow del job sin privilegios también es archivo del juez: un PR que lo toque sin
+          # Los workflows sin privilegios que también son archivos del juez: un PR que toque uno sin
           # atestación del dueño se rechaza.
-          also-protect: .github/workflows/ai-workflows-red-test.yml
+          also-protect: >-
+            .github/workflows/ai-workflows-red-test.yml,
+            .github/workflows/ai-workflows-review-signal.yml

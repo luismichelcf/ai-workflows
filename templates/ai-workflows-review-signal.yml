@@ -1,0 +1,35 @@
+# La señal de revisión de ai-workflows (PLAN-13-R5 §2.6). Existe solo para terminar: su único
+# trabajo es que GitHub registre una corrida del evento `pull_request_review` para que el juez,
+# que la escucha por `workflow_run`, vuelva a mirar el pull request cuando el dueño pulsa
+# «Approve» (o cuando una revisión se descarta). No da ningún poder nuevo: no trae el repositorio al
+# disco, no lee el pull request, no usa secretos ni el token de la aplicación y no lleva ninguna
+# expresión de plantilla que pudiera venir del contenido del PR. El juez nunca confía en esta
+# corrida: relee el pull request por su cuenta y lo juzga con la receta de la rama principal.
+#
+# POR QUÉ UN WORKFLOW APARTE. Un `pull_request_review` correría el YAML del commit de mezcla del
+# pull request, no el de la rama principal; con esta señal mínima, el juez sigue corriendo siempre
+# su propio YAML (el de la rama principal), que es lo único en lo que confía.
+#
+# PROTECCIÓN. El juez incluye este archivo en `also-protect`: un pull request que lo modifique sin
+# la atestación del dueño se rechaza. Aun así, un pull request del mismo repositorio puede alterar
+# esta señal y esa versión corre; no obtiene poder que no tuviera ya (puede añadir cualquier
+# workflow con `pull_request`) y el juez no se fía de la señal: solo usa su número de PR como pista
+# y relee todo. Sus dos efectos posibles son esperar (del lado seguro) o imitar un estado del juez,
+# que el rastro reporta (R13).
+
+name: ai-workflows review signal
+
+on:
+  pull_request_review:
+    types: [submitted, dismissed]
+
+permissions: {}
+
+jobs:
+  signal:
+    name: Señal de revisión (inocua)
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    steps:
+      - name: Terminar sin hacer nada
+        run: echo "ai-workflows review signal"

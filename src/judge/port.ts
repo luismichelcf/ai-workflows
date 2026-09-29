@@ -20,6 +20,14 @@ export interface JudgePullRequest {
   readonly headRepo: string;
 }
 
+/** One open pull request of the repository (PLAN-13-R5 §2.6), as `openPullRequests` lists it. */
+export interface OpenPullRequest {
+  readonly number: number;
+  readonly headRef: string;
+  readonly headSha: string;
+  readonly baseRef: string;
+}
+
 /** One entry of the merge queue, in the shape the judge compares against a group. */
 export interface MergeQueueEntry {
   readonly position: number;
@@ -71,6 +79,12 @@ export interface JudgeGitHub {
   branchHead(branch: string): Promise<string>;
   pullRequest(n: number): Promise<JudgePullRequest>;
   openPullRequestsWithHead(sha: string): Promise<number[]>;
+  /**
+   * Every open pull request of the repository, with the live head and base of each (PLAN-13-R5
+   * §2.6). The list is paginated in full; a page that cannot be confirmed throws, as every other
+   * list of the port does.
+   */
+  openPullRequests(): Promise<OpenPullRequest[]>;
   /** Throws when the queue list cannot be confirmed. An empty queue is `[]`. */
   mergeQueue(branch: string): Promise<MergeQueueEntry[]>;
   comments(n: number): Promise<PullRequestComment[]>;
@@ -321,6 +335,33 @@ export function createJudgeGitHub(options: JudgeGitHubOptions): JudgeGitHub {
       return numbers;
     },
 
+    async openPullRequests(): Promise<OpenPullRequest[]> {
+      const parsed = ensureOk(
+        await run(['api', `${base}/pulls?state=open&per_page=100`, '--paginate', '--slurp']),
+        'the open pull requests',
+      );
+      const result: OpenPullRequest[] = [];
+      for (const item of flattenPages(parsed, 'the open pull requests')) {
+        const number = isRecord(item) ? item['number'] : undefined;
+        const head = recordField(item, 'head');
+        const headSha = textField(head, 'sha');
+        const headRef = textField(head, 'ref');
+        const baseRef = textField(recordField(item, 'base'), 'ref');
+        if (
+          typeof number !== 'number'
+          || headSha === undefined
+          || headRef === undefined
+          || baseRef === undefined
+        ) {
+          throw new Error(
+            'gh returned an open pull request without its number or its head and base references.',
+          );
+        }
+        result.push({ number, headRef, headSha, baseRef });
+      }
+      return result;
+    },
+
     async mergeQueue(branch: string): Promise<MergeQueueEntry[]> {
       const parsed = await graphql(
         MERGE_QUEUE_QUERY,
@@ -348,7 +389,12 @@ export function createJudgeGitHub(options: JudgeGitHubOptions): JudgeGitHub {
         throw new Error(`gh did not report a list of merge queue entries for ${branch}.`);
       }
       const seen = new Set<number>();
-      const result: MergeQueueEntry[] = [];
+      const ordered: {
+        readonly position: number;
+        readonly prNumber: number;
+        readonly headSha: string | undefined;
+        readonly baseSha: string | undefined;
+      }[] = [];
       for (const node of nodes) {
         const position = isRecord(node) ? node['position'] : undefined;
         if (typeof position !== 'number' || !Number.isInteger(position) || position <= 0) {
@@ -362,18 +408,34 @@ export function createJudgeGitHub(options: JudgeGitHubOptions): JudgeGitHub {
         if (typeof prNumber !== 'number') {
           throw new Error(`A merge queue entry of ${branch} is missing its pull request.`);
         }
-        // The queue can list an entry before it has finished building it: an entry without its head
-        // or base commit is not a list that cannot be confirmed, but one that is not ready yet.
-        const headSha = textField(recordField(node, 'headCommit'), 'oid');
-        const baseSha = textField(recordField(node, 'baseCommit'), 'oid');
-        if (headSha === undefined || baseSha === undefined) {
-          throw new MergeQueueNotReady(
-            `A merge queue entry of ${branch} does not carry its head or base commit yet.`,
-          );
-        }
-        result.push({ position, headSha, baseSha, prNumber });
+        ordered.push({
+          position,
+          prNumber,
+          headSha: textField(recordField(node, 'headCommit'), 'oid'),
+          baseSha: textField(recordField(node, 'baseCommit'), 'oid'),
+        });
       }
-      result.sort((a, b) => a.position - b.position);
+      ordered.sort((a, b) => a.position - b.position);
+      const result: MergeQueueEntry[] = [];
+      for (const [index, entryNode] of ordered.entries()) {
+        const { position, prNumber, headSha, baseSha } = entryNode;
+        if (headSha !== undefined && baseSha !== undefined) {
+          result.push({ position, headSha, baseSha, prNumber });
+          continue;
+        }
+        // GitHub builds at most five entries at once, so the queue can list a trailing entry that
+        // carries neither of its two commits. Neither is a list that cannot be confirmed:
+        //   - an entry with neither commit and no built entry after it is left out;
+        //   - an entry with neither commit before a built one is not ready yet;
+        //   - an entry with only one of its two commits is not ready yet.
+        const builtAfter = ordered
+          .slice(index + 1)
+          .some((later) => later.headSha !== undefined && later.baseSha !== undefined);
+        if (headSha === undefined && baseSha === undefined && !builtAfter) continue;
+        throw new MergeQueueNotReady(
+          `A merge queue entry of ${branch} does not carry its head or base commit yet.`,
+        );
+      }
       return result;
     },
 

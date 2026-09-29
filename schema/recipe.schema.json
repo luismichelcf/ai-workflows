@@ -224,6 +224,22 @@
         }
       }
     },
+    "hooks": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "PLAN-13-R5 §1.1: the folders the locks may write without an active piece.",
+      "properties": {
+        "papers": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "description": "Folders, relative to the project root, writable without an active piece."
+        }
+      }
+    },
     "stages": {
       "type": "array",
       "minItems": 1,

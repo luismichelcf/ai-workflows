@@ -63,6 +63,16 @@ export interface RecipeMessages {
   readonly bannedWords: readonly string[];
 }
 
+/**
+ * PLAN-13-R5 §1.1: the folders the locks let be written without an active piece. The locks read
+ * them from the recipe, never from `kinds.from-paths`: a change kind and a folder writable without
+ * a piece are different things.
+ */
+export interface RecipeHooks {
+  /** Folders, relative to the project root, writable without an active piece. Empty by default. */
+  readonly papers: readonly string[];
+}
+
 /** R19: how a branch names its piece, and where the piece declares its kind. */
 export interface RecipePieces {
   /** Branch patterns; `{piece}` appears exactly once in each. */
@@ -85,6 +95,8 @@ export interface Recipe {
   readonly messages?: RecipeMessages;
   /** R19: optional; without it the piece of a change is the pull request number. */
   readonly pieces?: RecipePieces;
+  /** PLAN-13-R5 §1.1: the folders the editor and git locks may write without a piece. */
+  readonly hooks?: RecipeHooks;
   /** Named file classes retain declaration order for condition messages. */
   readonly classify: Readonly<Record<string, readonly string[]>>;
   readonly kinds?: {

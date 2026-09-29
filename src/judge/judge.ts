@@ -36,7 +36,7 @@ import {
   type Unofficial,
 } from './checks.js';
 import { pieceOfBranch, readDeclaredKind } from './pieces.js';
-import type { JudgeGitHub } from './port.js';
+import type { CommitStatus, JudgeGitHub, JudgePullRequest } from './port.js';
 import { buildSummary, escapeReportText, type SummaryPiece } from './summary.js';
 
 // ---------------------------------------------------------------------------------------------
@@ -155,6 +155,12 @@ function pick(spanish: boolean, es: string, en: string): string {
 
 const FULL_SHA = /^[0-9a-f]{40}$/i;
 
+/** PLAN-13-R5 §2.6: the mark a builder or verdict event carries in a comment on the piece issue. */
+const EVENT_MARK = 'ai-workflows:event';
+
+/** PLAN-13-R5 §2.6: the path of the minimal workflow that signals a review of a pull request. */
+const REVIEW_SIGNAL_PATH = '.github/workflows/ai-workflows-review-signal.yml';
+
 // ---------------------------------------------------------------------------------------------
 // Targets of §3.2
 
@@ -167,7 +173,13 @@ interface Target {
 type Targets =
   | { readonly ok: true; readonly sha: string; readonly targets: readonly Target[] }
   | { readonly ok: 'empty'; readonly note: string }
-  | { readonly ok: 'technical'; readonly sha: string; readonly reason: string };
+  | { readonly ok: 'technical'; readonly sha: string; readonly reason: string }
+  /**
+   * PLAN-13-R5 §2.6: a comment on an issue that is not a pull request. Nothing is looked up yet:
+   * which pull requests belong to the piece can only be known after the recipe of the base is read,
+   * so the judge carries just the piece (the issue number, R19) and resolves the rest later.
+   */
+  | { readonly ok: 'issue'; readonly piece: number };
 
 async function mergeGroupTargets(
   github: JudgeGitHub,
@@ -232,19 +244,36 @@ async function resolveTargets(
     }
     case 'issue_comment': {
       const issue = field(event, 'issue');
-      if (field(issue, 'pull_request') === undefined) {
-        return { ok: 'empty', note: 'el comentario no es de un pull request' };
+      if (field(issue, 'pull_request') !== undefined) {
+        const number = num(issue, 'number');
+        if (number === undefined) {
+          return { ok: 'technical', sha: '', reason: 'el comentario no nombra el pull request' };
+        }
+        try {
+          const pr = await github.pullRequest(number);
+          return { ok: true, sha: pr.headSha, targets: [{ pr: number, head: pr.headSha }] };
+        } catch (error) {
+          return { ok: 'technical', sha: '', reason: reasonOf(error) };
+        }
       }
-      const number = num(issue, 'number');
-      if (number === undefined) {
-        return { ok: 'technical', sha: '', reason: 'el comentario no nombra el pull request' };
+      // PLAN-13-R5 §2.6: a comment on an issue that is not a pull request. The piece is the issue
+      // number (R19), but the pull requests of the piece are only known once the base recipe is
+      // read, so nothing is looked up here. A new comment only wakes the judge when it carries the
+      // event mark; editing or deleting any comment always does, because that may have removed the
+      // mark (or the verdict) that was there.
+      const issueNumber = num(issue, 'number');
+      if (issueNumber === undefined) {
+        return { ok: 'empty', note: 'el comentario no nombra el issue' };
       }
-      try {
-        const pr = await github.pullRequest(number);
-        return { ok: true, sha: pr.headSha, targets: [{ pr: number, head: pr.headSha }] };
-      } catch (error) {
-        return { ok: 'technical', sha: '', reason: reasonOf(error) };
+      const action = text(event, 'action');
+      const body = text(field(event, 'comment'), 'body') ?? '';
+      if (action === 'created' && !body.includes(EVENT_MARK)) {
+        return {
+          ok: 'empty',
+          note: 'el comentario nuevo del issue no lleva la marca ai-workflows:event',
+        };
       }
+      return { ok: 'issue', piece: issueNumber };
     }
     case 'workflow_dispatch': {
       const raw = field(field(event, 'inputs'), 'pr');
@@ -263,6 +292,35 @@ async function resolveTargets(
     case 'workflow_run': {
       const run = field(event, 'workflow_run');
       const triggered = text(run, 'event');
+      if (triggered === 'pull_request_review') {
+        // PLAN-13-R5 §2.6: the signal only says that a review of some pull request moved; it is
+        // never trusted. Its own repository, workflow path and event must match, and the pull
+        // request number it carries is treated as a hint: the pull request is re-read and judged
+        // on its live head. `head_sha` is the merge commit of the event, never the head to judge.
+        const repo = text(field(run, 'repository'), 'full_name');
+        const rawPath = text(run, 'path');
+        // GitHub may report the path with a ref suffix; only the path is compared.
+        const path = rawPath === undefined ? undefined : rawPath.split('@')[0];
+        if (repo !== input.repository || path !== REVIEW_SIGNAL_PATH) {
+          return {
+            ok: 'empty',
+            note: 'la señal de revisión no es de este repositorio o de este workflow',
+          };
+        }
+        const pulls = field(run, 'pull_requests');
+        const first = Array.isArray(pulls) ? pulls[0] : undefined;
+        const number = num(first, 'number');
+        if (number === undefined) {
+          // A pull request from a fork leaves the list empty: nothing to judge, with the note.
+          return { ok: 'empty', note: 'la señal de revisión no trae número de pull request' };
+        }
+        try {
+          const pr = await github.pullRequest(number);
+          return { ok: true, sha: pr.headSha, targets: [{ pr: number, head: pr.headSha }] };
+        } catch (error) {
+          return { ok: 'technical', sha: '', reason: reasonOf(error) };
+        }
+      }
       const head = text(run, 'head_sha');
       if (head === undefined) {
         return { ok: 'technical', sha: '', reason: 'workflow_run sin head_sha' };
@@ -765,7 +823,7 @@ export async function runJudge(input: JudgeInput, deps: JudgeDeps): Promise<Judg
   }
 
   const targets = await resolveTargets(input, github, principal, sleep);
-  const judgedSha = targets.ok === 'empty' ? '' : targets.sha;
+  const judgedSha = targets.ok === 'empty' || targets.ok === 'issue' ? '' : targets.sha;
   const infos = new Map<number, PrInfo>();
   const targetList: Target[] = [];
 
@@ -822,6 +880,296 @@ export async function runJudge(input: JudgeInput, deps: JudgeDeps): Promise<Judg
     return finish(judged, collected.unofficial, buildSummary(summary, collected.unofficial, locale, notes));
   };
 
+  /** The recipe of the trusted commit of the main branch, or why it could not be read. */
+  const readRecipeAt = async (sha: string): Promise<{ ok: true; recipe: Recipe } | { ok: false; reason: string }> => {
+    let content: string | undefined;
+    try {
+      content = await gitProjectFiles(input.root, sha).read('.ai-workflows/pipeline.yml');
+    } catch (error) {
+      return { ok: false, reason: reasonOf(error) };
+    }
+    if (content === undefined) {
+      return { ok: false, reason: 'no existe .ai-workflows/pipeline.yml en la rama principal' };
+    }
+    const checked = await checkRecipe(content, '.ai-workflows/pipeline.yml', { root: input.root });
+    if (!checked.ok) {
+      const first = checked.errors[0];
+      return { ok: false, reason: first === undefined ? 'la receta no es válida' : `${first.line}:${first.column} ${first.message}` };
+    }
+    return { ok: true, recipe: checked.recipe };
+  };
+
+  /**
+   * PLAN-13-R5 §2.6: a builder or verdict event arrived as a comment on the piece's issue. The
+   * recipe of the base names the pieces, so only here can the issue number be matched against the
+   * branches: every open pull request into the principal whose branch names that piece is judged on
+   * its own live head, with its own status, trace and summary. The failure of one never touches the
+   * others. Without the recipe declaring pieces there is nothing to judge, with the note. If the
+   * open pull requests cannot be read, no status can be published (there is no SHA to attach it to):
+   * the run ends with the motive in the notes.
+   */
+  const judgeIssuePiece = async (issueNumber: number): Promise<JudgeReport> => {
+    const trusted = await github.branchHead(principal);
+    await deps.fetchObjects([trusted]);
+    await checkout(input.root, trusted);
+    const base = await readRecipeAt(trusted);
+    if (!base.ok) {
+      throw new Error(`La receta de la rama principal no se pudo leer: ${base.reason}`);
+    }
+    const baseRecipe = base.recipe;
+    const spanish = isSpanish(baseRecipe.locale);
+    if (baseRecipe.pieces === undefined) {
+      addNote(notes, pick(
+        spanish,
+        `La receta no declara piezas: el issue ${String(issueNumber)} no nombra ninguna`,
+        `The recipe declares no pieces: issue ${String(issueNumber)} names none`,
+      ));
+      return finish();
+    }
+    const open = await github.openPullRequests();
+    const matching = open.filter((pr) => {
+      if (pr.baseRef !== principal) return false;
+      const piece = pieceOfBranch(baseRecipe, pr.headRef, pr.number);
+      return 'piece' in piece && piece.piece === String(issueNumber);
+    });
+    if (matching.length === 0) {
+      addNote(notes, pick(
+        spanish,
+        `La pieza ${String(issueNumber)} no tiene pull requests abiertos hacia ${principal}`,
+        `Piece ${String(issueNumber)} has no open pull requests into ${principal}`,
+      ));
+      return finish();
+    }
+
+    // A publish that fails is said and never stops the other pull requests, but a run that could
+    // not write a status ends as failed: the CLI exits 1 and the log keeps the motive.
+    const failures: string[] = [];
+    const safePublish = async (
+      sha: string,
+      state: string,
+      description: string,
+      locale: string,
+    ): Promise<boolean> => {
+      try {
+        await publish(sha, targetContext, state, description);
+        return true;
+      } catch (error) {
+        const reason = pick(
+          isSpanish(locale),
+          `No se pudo publicar el estado sobre ${sha}: ${reasonOf(error)}`,
+          `The status could not be published on ${sha}: ${reasonOf(error)}`,
+        );
+        addNote(notes, reason);
+        failures.push(reason);
+        return false;
+      }
+    };
+
+    const judgedAll: JudgedPr[] = [];
+    const unofficialAll: Unofficial[] = [];
+    for (const candidate of matching) {
+      // The trusted commit and the recipe of that commit stay together, per pull request: a
+      // principal that moved while judging an earlier one never mixes a new recipe with an old SHA.
+      let currentTrusted = trusted;
+      let currentRecipe = baseRecipe;
+
+      // (a) the live head and destination of this pull request, re-read before judging.
+      let live: JudgePullRequest;
+      try {
+        live = await github.pullRequest(candidate.number);
+      } catch (error) {
+        // The head is already known from the open list, so the error is published there and this
+        // failure never touches the other pull requests.
+        await safePublish(candidate.headSha, 'error', reasonOf(error), currentRecipe.locale);
+        continue;
+      }
+      if (live.baseRef !== principal) {
+        addNote(notes, pick(
+          isSpanish(currentRecipe.locale),
+          `la rama destino del PR #${String(candidate.number)} es "${live.baseRef}", no la principal: no se juzga`,
+          `the target branch of pull request #${String(candidate.number)} is "${live.baseRef}", not the principal: nothing is judged`,
+        ));
+        continue;
+      }
+
+      const judgeLive = (recipe: Recipe, at: string): Promise<JudgedPr> =>
+        judgeOne(
+          recipe,
+          at,
+          { pr: candidate.number, head: live.headSha },
+          { headRef: live.headRef, baseRef: live.baseRef },
+          {
+            recipe,
+            judgedSha: live.headSha,
+            root: input.root,
+            github,
+            fetchObjects: deps.fetchObjects,
+            judgePath,
+            alsoProtect: input.alsoProtect,
+            notes,
+          },
+        );
+
+      let judged: JudgedPr;
+      try {
+        judged = await judgeLive(currentRecipe, currentTrusted);
+      } catch (error) {
+        // An exception inside the engine is technical for this pull request only (SV-03c).
+        await safePublish(live.headSha, 'error', reasonOf(error), currentRecipe.locale);
+        continue;
+      }
+
+      let done = false;
+      for (let attempt = 0; !done; attempt += 1) {
+        // (a) the head and destination, one last time before writing.
+        let before: JudgePullRequest;
+        try {
+          before = await github.pullRequest(candidate.number);
+        } catch (error) {
+          // The head cannot be confirmed before writing, so nothing is published on it; and, like
+          // the other unreadable reads, the run ends failed once the remaining pull requests were
+          // judged (PLAN-13-R5 §2.6, round 3), in the recipe's language.
+          const reason = pick(
+            isSpanish(currentRecipe.locale),
+            `no se pudo releer el PR #${String(candidate.number)} antes de publicar: ${reasonOf(error)}`,
+            `pull request #${String(candidate.number)} could not be re-read before publishing: ${reasonOf(error)}`,
+          );
+          addNote(notes, reason);
+          failures.push(reason);
+          break;
+        }
+        if (before.headSha !== live.headSha || before.baseRef !== principal) {
+          addNote(notes, pick(
+            isSpanish(currentRecipe.locale),
+            `la cabeza o la rama destino del PR #${String(candidate.number)} cambió antes de publicar; no se publica veredicto`,
+            `the head or the target branch of pull request #${String(candidate.number)} moved before publishing; no verdict is published`,
+          ));
+          break;
+        }
+
+        // (b) a principal that moved while judging is judged again from the new principal, once.
+        const nowMain = await github.branchHead(principal);
+        if (nowMain !== currentTrusted) {
+          if (attempt >= 1) {
+            await safePublish(live.headSha, 'error', pick(
+              isSpanish(currentRecipe.locale),
+              'la rama principal cambió mientras se juzgaba',
+              'the main branch changed while the run was judging',
+            ), currentRecipe.locale);
+            break;
+          }
+          currentTrusted = nowMain;
+          await deps.fetchObjects([currentTrusted]);
+          await checkout(input.root, currentTrusted);
+          const read = await readRecipeAt(currentTrusted);
+          if (!read.ok) {
+            throw new Error(pick(
+              isSpanish(currentRecipe.locale),
+              `La receta de la rama principal no se pudo leer: ${read.reason}`,
+              `The recipe of the main branch could not be read: ${read.reason}`,
+            ));
+          }
+          currentRecipe = read.recipe;
+          try {
+            judged = await judgeLive(currentRecipe, currentTrusted);
+          } catch (error) {
+            await safePublish(live.headSha, 'error', reasonOf(error), currentRecipe.locale);
+            break;
+          }
+          continue;
+        }
+
+        // (c) abstain only when the newest state of this context is an official run that started
+        // after this one. An older one, or a foreign state, never silences the verdict.
+        let statuses: readonly CommitStatus[] = [];
+        try {
+          statuses = await github.statuses(live.headSha);
+        } catch (error) {
+          // Without the statuses (c) cannot be decided: a verdict could overwrite a newer one.
+          // The head gets its error status, no verdict goes out, and the run is marked failed.
+          addNote(notes, pick(
+            isSpanish(currentRecipe.locale),
+            `no se pudieron leer los estados de ${live.headSha}: ${reasonOf(error)}`,
+            `the statuses of ${live.headSha} could not be read: ${reasonOf(error)}`,
+          ));
+          failures.push(reasonOf(error));
+          await safePublish(live.headSha, 'error', reasonOf(error), currentRecipe.locale);
+          break;
+        }
+        const newest = statuses.find((status) => status.context === targetContext);
+        if (newest !== undefined) {
+          let official: number | undefined;
+          try {
+            official = await officialRunId(github, newest, input.repository, judgePath, principal, input.serverUrl);
+          } catch (error) {
+            addNote(notes, pick(
+              isSpanish(currentRecipe.locale),
+              `no se pudo comprobar el estado más reciente de ${targetContext}: ${reasonOf(error)}`,
+              `the newest status of ${targetContext} could not be checked: ${reasonOf(error)}`,
+            ));
+            official = undefined;
+          }
+          if (official !== undefined && official > input.runId) {
+            addNote(notes, pick(
+              isSpanish(currentRecipe.locale),
+              `otra corrida oficial del juez publicó después (${official}); esta no publica`,
+              `another official judge run published later (${official}); this one stays quiet`,
+            ));
+            break;
+          }
+        }
+
+        const written = await safePublish(
+          live.headSha,
+          stateOf(judged.verdict),
+          describeVerdict([judged], currentRecipe.locale),
+          currentRecipe.locale,
+        );
+        if (!written) break;
+        done = true;
+      }
+      if (!done) continue;
+
+      const collected = await collectUnofficial(
+        github,
+        live.headSha,
+        input.repository,
+        judgePath,
+        principal,
+        input.serverUrl,
+        traceContexts,
+        currentRecipe.locale,
+      );
+      for (const note of collected.notes) addNote(notes, note);
+      for (const entry of collected.unofficial) unofficialAll.push(entry);
+      if (collected.unofficial.length > 0) {
+        try {
+          await github.upsertTraceComment(candidate.number, traceComment(collected.unofficial, currentRecipe.locale));
+        } catch (error) {
+          addNote(notes, pick(
+            isSpanish(currentRecipe.locale),
+            `No se pudo escribir el rastro en el PR #${String(candidate.number)}: ${reasonOf(error)}`,
+            `The trace could not be written on pull request #${String(candidate.number)}: ${reasonOf(error)}`,
+          ));
+        }
+      }
+      judgedAll.push(judged);
+    }
+
+    const summaryPieces: SummaryPiece[] = judgedAll.map((piece) => ({
+      pr: piece.pr,
+      ...(piece.piece === undefined ? {} : { piece: piece.piece }),
+      verdict: piece.verdict,
+      stages: piece.stages,
+      ...(piece.note === undefined ? {} : { note: piece.note }),
+    }));
+    const summary = buildSummary(summaryPieces, unofficialAll, baseRecipe.locale, notes);
+    // The other pull requests were judged and each published its own status; but a run that could
+    // not write a verdict or read a head's status is failed, and it says so instead of pretending.
+    if (failures.length > 0) throw new Error(failures.join('; '));
+    return finish(judgedAll, unofficialAll, summary);
+  };
+
   if (targets.ok === 'empty') {
     addNote(notes, targets.note);
     return finish();
@@ -829,6 +1177,9 @@ export async function runJudge(input: JudgeInput, deps: JudgeDeps): Promise<Judg
   if (targets.ok === 'technical') {
     await publish(targets.sha, targetContext, 'error', targets.reason);
     return conclude([], 'es');
+  }
+  if (targets.ok === 'issue') {
+    return judgeIssuePiece(targets.piece);
   }
 
   // §3.1 rama destino: before publishing anything, not even an error. A pull request whose base
@@ -871,24 +1222,6 @@ export async function runJudge(input: JudgeInput, deps: JudgeDeps): Promise<Judg
     await publish(targets.sha, targetContext, 'error', reasonOf(error));
     return conclude([], 'es');
   }
-
-  const readRecipeAt = async (sha: string): Promise<{ ok: true; recipe: Recipe } | { ok: false; reason: string }> => {
-    let content: string | undefined;
-    try {
-      content = await gitProjectFiles(input.root, sha).read('.ai-workflows/pipeline.yml');
-    } catch (error) {
-      return { ok: false, reason: reasonOf(error) };
-    }
-    if (content === undefined) {
-      return { ok: false, reason: 'no existe .ai-workflows/pipeline.yml en la rama principal' };
-    }
-    const checked = await checkRecipe(content, '.ai-workflows/pipeline.yml', { root: input.root });
-    if (!checked.ok) {
-      const first = checked.errors[0];
-      return { ok: false, reason: first === undefined ? 'la receta no es válida' : `${first.line}:${first.column} ${first.message}` };
-    }
-    return { ok: true, recipe: checked.recipe };
-  };
 
   let read = await readRecipeAt(trusted);
   if (!read.ok) {
