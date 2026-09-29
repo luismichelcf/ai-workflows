@@ -26,6 +26,11 @@ export interface SuiteManifestEntry {
   readonly kind: SuiteCaseKind;
   /** The owner acts EXPECTED in the case; the record must match them exactly. */
   readonly owner?: SuiteOwnerActs;
+  /**
+   * A slice of the test name that runs this case. It exists only for the cases a short final run
+   * may redo on its own (R23), so the task can point vitest at exactly those tests.
+   */
+  readonly test?: string;
 }
 
 // §3.1 and the encargo: fixed order, thirteen negatives first, then the server cases, the recipe
@@ -65,8 +70,8 @@ export const SUITE_MANIFEST: readonly SuiteManifestEntry[] = [
   { id: 'SV-DESTINO', file: 'judge', kind: 'check', owner: { orders: ['/approve'] } },
   { id: 'RC-06', file: 'judge', kind: 'negative', owner: { orders: ['/approve-judge-change'] } },
   { id: 'RC-09', file: 'rc09', kind: 'negative' },
-  { id: 'COLA-6', file: 'negative-suite', kind: 'check' },
-  { id: 'RECORRIDO', file: 'final-stages', kind: 'check', owner: { button: true } },
+  { id: 'COLA-6', file: 'negative-suite', kind: 'check', test: 'COLA-6' },
+  { id: 'RECORRIDO', file: 'final-stages', kind: 'check', owner: { button: true }, test: 'a piece goes from the pull request to the merge queue' },
   { id: 'PIEZA-COMPLETA', file: 'negative-suite', kind: 'check' },
   { id: 'LIMPIEZA', file: 'negative-suite', kind: 'check' },
 ];
@@ -95,12 +100,25 @@ export interface CaseRecord {
   readonly owner?: OwnerActs;
 }
 
+/**
+ * R23: an earlier run this report joins with the final one. `cases` is what that run gives; `run`
+ * is the final run of the header, never one of these.
+ */
+export interface SuiteJoinedRun {
+  readonly run: string;
+  readonly engineSha: string;
+  readonly testsPassed: boolean;
+  readonly cases: readonly string[];
+}
+
 export interface SuiteReportMeta {
   readonly run: string;
   readonly date: string;
   readonly engineSha: string;
   readonly repository: string;
   readonly testsPassed: boolean;
+  /** The earlier runs joined with the final one, newest knowledge in the manifest order. */
+  readonly runs?: readonly SuiteJoinedRun[];
 }
 
 export interface SuiteReport {
@@ -389,23 +407,62 @@ export function renderSuiteReport(records: readonly CaseRecord[], meta: SuiteRep
   auditText('la corrida', 'engineSha', meta.engineSha);
   auditText('la corrida', 'repository', meta.repository);
 
+  const joinedRuns = meta.runs ?? [];
+  for (const run of joinedRuns) {
+    auditText('la corrida', 'run', run.run);
+    auditText('la corrida', 'engineSha', run.engineSha);
+    for (const id of run.cases) auditText('la corrida', 'cases', id);
+  }
+
   for (const record of records) auditRecord(record, meta.repository);
 
   const manifestById = new Map(SUITE_MANIFEST.map((entry) => [entry.id, entry]));
+  const earlierRuns = new Map(joinedRuns.map((run) => [run.run, run]));
+
+  // R23: a record counts if it is from the final run, or from a declared earlier run that gives the
+  // case (`cases`). A record of an earlier run whose case it does not give does not count: it is
+  // neither repeated nor "from another run", and the case is missing if nobody else gives it. The
+  // clean-up of an earlier run is never a case (the final one decides), though it is shown.
   const firstById = new Map<string, CaseRecord>();
+  const recordsById = new Map<string, CaseRecord[]>();
   const extras: string[] = [];
-  const duplicates: string[] = [];
+  const undeclared: string[] = [];
+
   for (const record of records) {
     if (!manifestById.has(record.id)) {
       extras.push(record.id);
       continue;
     }
-    if (firstById.has(record.id)) {
-      duplicates.push(record.id);
-      continue;
+    if (record.run !== meta.run) {
+      const earlier = earlierRuns.get(record.run);
+      if (earlier === undefined) {
+        undeclared.push(record.id);
+        continue;
+      }
+      if (record.id === 'LIMPIEZA' || !earlier.cases.includes(record.id)) continue;
     }
-    firstById.set(record.id, record);
+    const seen = recordsById.get(record.id) ?? [];
+    seen.push(record);
+    recordsById.set(record.id, seen);
+    if (!firstById.has(record.id)) firstById.set(record.id, record);
   }
+
+  // A case is repeated if two runs give it — the final one (by its record) and an earlier one (by
+  // its declaration) — or if one run gives it twice.
+  const declaringRuns = new Map<string, Set<string>>();
+  const declare = (id: string, run: string): void => {
+    const runs = declaringRuns.get(id) ?? new Set<string>();
+    runs.add(run);
+    declaringRuns.set(id, runs);
+  };
+  for (const run of joinedRuns) for (const id of run.cases) if (manifestById.has(id)) declare(id, run.run);
+  for (const record of records) if (record.run === meta.run && manifestById.has(record.id)) declare(record.id, meta.run);
+
+  const repeated = SUITE_MANIFEST.filter((entry) => {
+    const list = recordsById.get(entry.id) ?? [];
+    const runs = new Set(list.map((record) => record.run));
+    return runs.size !== list.length || (declaringRuns.get(entry.id)?.size ?? 0) > 1;
+  }).map((entry) => entry.id);
 
   const problems: Problem[] = [];
 
@@ -413,10 +470,8 @@ export function renderSuiteReport(records: readonly CaseRecord[], meta: SuiteRep
   if (missing.length > 0) problems.push({ reason: 'faltan casos del manifiesto', ids: missing });
 
   if (extras.length > 0) problems.push({ reason: 'hay casos que no están en el manifiesto', ids: unique(extras) });
-  if (duplicates.length > 0) problems.push({ reason: 'hay casos repetidos', ids: unique(duplicates) });
-
-  const otherRun = unique(records.filter((record) => record.run !== meta.run).map((record) => record.id));
-  if (otherRun.length > 0) problems.push({ reason: `hay casos de otra corrida`, ids: otherRun });
+  if (repeated.length > 0) problems.push({ reason: 'hay casos repetidos', ids: repeated });
+  if (undeclared.length > 0) problems.push({ reason: `hay casos de otra corrida`, ids: unique(undeclared) });
 
   const notStopped: string[] = [];
   const positivesFailed: string[] = [];
@@ -459,7 +514,14 @@ export function renderSuiteReport(records: readonly CaseRecord[], meta: SuiteRep
 
   const lines: string[] = [];
   if (complete) {
-    lines.push(`# Completo: ${SUITE_MANIFEST.length} casos, todos en la corrida ${meta.run}, cada intento frenado y cada control positivo en verde.`);
+    if (joinedRuns.length > 0) {
+      const names = [...joinedRuns.map((run) => run.run), meta.run].join(', ').replace(/, ([^,]*)$/, ' y $1');
+      lines.push(
+        `# Completo: ${SUITE_MANIFEST.length} casos en ${joinedRuns.length + 1} corridas juntadas por decisión del dueño (R23): ${names}; cada intento frenado y cada control positivo en verde.`,
+      );
+    } else {
+      lines.push(`# Completo: ${SUITE_MANIFEST.length} casos, todos en la corrida ${meta.run}, cada intento frenado y cada control positivo en verde.`);
+    }
   } else {
     const reasons: string[] = [];
     if (!meta.testsPassed) reasons.push('las pruebas de la corrida no terminaron en verde');
@@ -469,6 +531,14 @@ export function renderSuiteReport(records: readonly CaseRecord[], meta: SuiteRep
   }
 
   lines.push(`Corrida: ${meta.run}`);
+  for (const run of joinedRuns) {
+    const cleanup = records.find((record) => record.run === run.run && record.id === 'LIMPIEZA');
+    const cleanupText = cleanup?.result === 'pasó' ? 'pasó' : cleanup?.result === 'falló' ? 'falló' : 'sin registro';
+    const cases = SUITE_MANIFEST.map((entry) => entry.id).filter((id) => run.cases.includes(id));
+    lines.push(
+      `Corrida anterior: ${run.run} (motor ${run.engineSha}; pruebas: ${run.testsPassed ? 'en verde' : 'no en verde'}; limpieza: ${cleanupText}) aporta: ${cases.length === 0 ? 'nada' : cases.join(', ')}.`,
+    );
+  }
   lines.push(`Fecha: ${meta.date}`);
   lines.push(`Motor: ${meta.engineSha}`);
   lines.push(`Repositorio: ${meta.repository}`);
