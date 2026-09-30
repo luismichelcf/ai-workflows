@@ -40,10 +40,10 @@ function noneOf(items: readonly string[]): string {
   return `none of ${quoted(items, false).join(', ')}`;
 }
 
-/** A list joined with commas and a final ` o ` (`or` in English), for the branches of §1.1. */
-function orList(items: readonly string[]): string {
+/** A list joined with commas and a final conjunction, for the branches of §1.1 (§15: `or` in English). */
+function orList(items: readonly string[], conjunction: string): string {
   if (items.length <= 1) return items[0] ?? '';
-  return `${items.slice(0, -1).join(', ')} o ${items[items.length - 1]}`;
+  return `${items.slice(0, -1).join(', ')} ${conjunction} ${items[items.length - 1]}`;
 }
 
 const EXPLAIN_WORDS: Record<Language, ExplainWords> = {
@@ -81,7 +81,7 @@ const EXPLAIN_WORDS: Record<Language, ExplainWords> = {
       papers.length === 0
         ? 'Sin una pieza activa no se puede escribir en ninguna carpeta'
         : `Sin una pieza activa solo se puede escribir en: ${papers.join(', ')}`,
-    branchesInto: (names) => `Las piezas entran ${orList(names.map((name) => `a ${name}`))}.`,
+    branchesInto: (names) => `Las piezas entran ${orList(names.map((name) => `a ${name}`), 'o')}.`,
     branchesPromotion: (from, to) =>
       `Un paso de ${from} a ${to} no es una pieza: solo se revisa que no toque los archivos del motor.`,
     github: {
@@ -141,7 +141,7 @@ const EXPLAIN_WORDS: Record<Language, ExplainWords> = {
       papers.length === 0
         ? 'Without an active piece, no folder may be written to'
         : `Without an active piece, the only folders you may write to are: ${papers.join(', ')}`,
-    branchesInto: (names) => `Pieces enter ${orList(names)}.`,
+    branchesInto: (names) => `Pieces enter ${orList(names, 'or')}.`,
     branchesPromotion: (from, to) =>
       `A pass from ${from} to ${to} is not a piece: only that it does not touch the engine's files is checked.`,
     github: {
