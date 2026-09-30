@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { advanceMain, commit, git, removeRepositories, repository, write } from './git-fixtures.js';
+import { advanceMain, commit, emptyFolder, git, removeRepositories, repository, write } from './git-fixtures.js';
 
 // PLAN-13-R6 §9.1, §9.3 and §9.4 test 6: the seal script, on a real temporary git repository.
 //
@@ -20,6 +20,11 @@ import { advanceMain, commit, git, removeRepositories, repository, write } from 
 //   Success: exit 0 and ./engine.json = {"version": "<version>", "sha": "<40 hex of HEAD>"}.
 //   Refusal: exit code other than 0, no engine.json, and a line on stderr that starts with
 //   `seal refused: ` and says why.
+//
+// PLAN-13-R6 §15 P4 (after the flock): <ref> must be a fully qualified branch ref, `refs/heads/…`
+// or `refs/remotes/…`. Anything else (`main`, `origin/main`, `refs/tags/main`) is refused with a
+// line that names both accepted forms, because git resolves a bare name to a tag first. The
+// existing cases above pass `refs/heads/main` for that reason (they passed a bare `main` before).
 
 const REPO = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const SEAL_SCRIPT = join(REPO, 'scripts', 'seal.mjs');
@@ -68,7 +73,7 @@ describe('R6 §9.4 test 6: the seal script', () => {
     git(root, 'tag', 'v1.0.0', reviewed);
     git(root, 'switch', '-q', '--detach', 'v1.0.0');
 
-    const result = seal(root, '--tag', 'v1.0.0', '--main', 'main');
+    const result = seal(root, '--tag', 'v1.0.0', '--main', 'refs/heads/main');
 
     expect(result.code, result.stderr).toBe(0);
     expect(engineJson(root)).toEqual({ version: '1.0.0', sha: reviewed });
@@ -81,7 +86,7 @@ describe('R6 §9.4 test 6: the seal script', () => {
     git(root, 'tag', 'v1.0.0', reviewed);
     git(root, 'switch', '-q', '--detach', 'v1.0.0');
 
-    const result = seal(root, '--tag', 'v1.0.0', '--main', 'main');
+    const result = seal(root, '--tag', 'v1.0.0', '--main', 'refs/heads/main');
 
     expect(result.code, result.stderr).toBe(0);
     expect(engineJson(root)).toEqual({ version: '1.0.0', sha: reviewed });
@@ -91,7 +96,7 @@ describe('R6 §9.4 test 6: the seal script', () => {
     const { root, reviewed } = releaseRepository();
     git(root, 'switch', '-q', '--detach', reviewed);
 
-    const result = seal(root, '--main', 'main');
+    const result = seal(root, '--main', 'refs/heads/main');
 
     expect(result.code, result.stderr).toBe(0);
     expect(engineJson(root)).toEqual({ version: '1.0.0', sha: reviewed });
@@ -102,7 +107,7 @@ describe('R6 §9.4 test 6: the seal script', () => {
     git(root, 'tag', 'v1.0.1', reviewed);
     git(root, 'switch', '-q', '--detach', 'v1.0.1');
 
-    const result = seal(root, '--tag', 'v1.0.1', '--main', 'main');
+    const result = seal(root, '--tag', 'v1.0.1', '--main', 'refs/heads/main');
 
     expectRefused(root, result);
     expect(result.stderr).toContain('v1.0.1');
@@ -113,7 +118,7 @@ describe('R6 §9.4 test 6: the seal script', () => {
     git(root, 'tag', 'v1.0.0', reviewed);
     // HEAD is the merge commit on main, not the reviewed commit.
 
-    expectRefused(root, seal(root, '--tag', 'v1.0.0', '--main', 'main'));
+    expectRefused(root, seal(root, '--tag', 'v1.0.0', '--main', 'refs/heads/main'));
   });
 
   it('refuses a commit that is not an ancestor of main (never merged)', () => {
@@ -121,7 +126,7 @@ describe('R6 §9.4 test 6: the seal script', () => {
     git(root, 'tag', 'v1.0.0', reviewed);
     git(root, 'switch', '-q', '--detach', 'v1.0.0');
 
-    expectRefused(root, seal(root, '--tag', 'v1.0.0', '--main', 'main'));
+    expectRefused(root, seal(root, '--tag', 'v1.0.0', '--main', 'refs/heads/main'));
   });
 
   it('refuses when the branch was behind main: the merge tree differs from the reviewed tree', () => {
@@ -129,7 +134,7 @@ describe('R6 §9.4 test 6: the seal script', () => {
     git(root, 'tag', 'v1.0.0', reviewed);
     git(root, 'switch', '-q', '--detach', 'v1.0.0');
 
-    expectRefused(root, seal(root, '--tag', 'v1.0.0', '--main', 'main'));
+    expectRefused(root, seal(root, '--tag', 'v1.0.0', '--main', 'refs/heads/main'));
   });
 
   it('refuses a squash merge: the reviewed commit is not an ancestor of main', () => {
@@ -140,13 +145,87 @@ describe('R6 §9.4 test 6: the seal script', () => {
     git(root, 'tag', 'v1.0.0', reviewed);
     git(root, 'switch', '-q', '--detach', 'v1.0.0');
 
-    expectRefused(root, seal(root, '--tag', 'v1.0.0', '--main', 'main'));
+    expectRefused(root, seal(root, '--tag', 'v1.0.0', '--main', 'refs/heads/main'));
   });
 
   it('the dry-run refuses too when HEAD is not an ancestor of main', () => {
     const { root, reviewed } = releaseRepository({ merge: false });
     git(root, 'switch', '-q', '--detach', reviewed);
 
-    expectRefused(root, seal(root, '--main', 'main'));
+    expectRefused(root, seal(root, '--main', 'refs/heads/main'));
+  });
+});
+
+/**
+ * What `actions/checkout` leaves on a tag push with `fetch-depth: 0`: the branches only as
+ * `refs/remotes/origin/*`, the tags, no local branch, and HEAD detached at the tag.
+ */
+function checkoutOfTag(origin: string, tag: string): string {
+  const clone = emptyFolder();
+  git(clone, 'init', '-q');
+  git(clone, 'config', 'core.autocrlf', 'false');
+  git(clone, 'remote', 'add', 'origin', origin);
+  git(clone, 'fetch', '-q', '--no-tags', '--prune', 'origin', '+refs/heads/*:refs/remotes/origin/*', '+refs/tags/*:refs/tags/*');
+  git(clone, 'checkout', '-q', '--force', `refs/tags/${tag}`);
+  return clone;
+}
+
+describe('R6 §15 P4: the seal on the checkout of a tag push, and only a fully qualified main', () => {
+  it('a clone made like actions/checkout on a tag push seals with --main refs/remotes/origin/main', () => {
+    const { root, reviewed } = releaseRepository();
+    git(root, 'tag', 'v1.0.0', reviewed);
+    const clone = checkoutOfTag(root, 'v1.0.0');
+    expect(git(clone, 'for-each-ref', '--format=%(refname)', 'refs/heads')).toBe('');
+
+    const result = seal(clone, '--tag', 'v1.0.0', '--main', 'refs/remotes/origin/main');
+
+    expect(result.code, result.stderr).toBe(0);
+    expect(engineJson(clone)).toEqual({ version: '1.0.0', sha: reviewed });
+  });
+
+  it('a name that is not fully qualified is refused with a clear message, even where it would resolve', () => {
+    const { root, reviewed } = releaseRepository();
+    git(root, 'tag', 'v1.0.0', reviewed);
+    git(root, 'switch', '-q', '--detach', 'v1.0.0');
+
+    for (const main of ['main', 'heads/main']) {
+      const result = seal(root, '--tag', 'v1.0.0', '--main', main);
+      expectRefused(root, result);
+      expect(result.stderr, main).toContain('refs/heads/');
+      expect(result.stderr, main).toContain('refs/remotes/');
+    }
+
+    const clone = checkoutOfTag(root, 'v1.0.0');
+    for (const main of ['main', 'origin/main']) {
+      const result = seal(clone, '--tag', 'v1.0.0', '--main', main);
+      expectRefused(clone, result);
+      expect(result.stderr, main).toContain('refs/heads/');
+      expect(result.stderr, main).toContain('refs/remotes/');
+    }
+  });
+
+  it('a tag named main on an unmerged history cannot stand in for the real main', () => {
+    // The reviewed commit is never merged into main; a side branch merges it and a tag `main`
+    // points at that merge, so a bare `main` would resolve to the tag.
+    const { root, reviewed } = releaseRepository({ merge: false });
+    git(root, 'switch', '-q', '-c', 'side', 'main');
+    git(root, 'merge', '-q', '--no-ff', '--no-edit', 'piece');
+    git(root, 'tag', 'main', git(root, 'rev-parse', 'HEAD'));
+    git(root, 'tag', 'v1.0.0', reviewed);
+    const clone = checkoutOfTag(root, 'v1.0.0');
+
+    for (const main of ['main', 'refs/tags/main', 'refs/remotes/origin/main']) {
+      expectRefused(clone, seal(clone, '--tag', 'v1.0.0', '--main', main));
+    }
+  });
+
+  it('a missing --main, or a fully qualified ref that does not exist, is refused', () => {
+    const { root, reviewed } = releaseRepository();
+    git(root, 'tag', 'v1.0.0', reviewed);
+    git(root, 'switch', '-q', '--detach', 'v1.0.0');
+
+    expectRefused(root, seal(root, '--tag', 'v1.0.0'));
+    expectRefused(root, seal(root, '--tag', 'v1.0.0', '--main'));
+    expectRefused(root, seal(root, '--tag', 'v1.0.0', '--main', 'refs/remotes/origin/main'));
   });
 });

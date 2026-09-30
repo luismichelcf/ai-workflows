@@ -94,6 +94,87 @@ describe('R6 §9.4 test 7: the release workflow', () => {
   });
 });
 
+// PLAN-13-R6 §15 (after the flock), what the release workflow adds:
+//   P4: the seal step passes `--main "refs/remotes/origin/$<VAR>"`, where the step's env sets <VAR>
+//       from `github.event.repository.default_branch` (a tag push leaves no local main, and a bare
+//       name could resolve to a tag). The dry-run (`workflow_dispatch`) takes a string input `sha`,
+//       the reviewed commit, and the packing job's checkout uses it as its `ref`.
+//   Least privilege: top-level `permissions: { contents: read }`; only the job that runs
+//       `gh release create` has `contents: write`; every actions/checkout sets
+//       `persist-credentials: false`.
+//   The release notes carry the one command `pnpm dlx <…>.tgz init`, and the packing job runs the
+//       package-content test (`pnpm test:package`, or vitest with vitest.package.config.ts) before
+//       `pnpm pack`.
+
+const packingJob = (): Job => {
+  const packing = jobsOf(release()).filter(([, job]) => stepsOf(job).some((step) => /pnpm pack/.test(runOf(step))));
+  expect(packing).toHaveLength(1);
+  return (packing[0] as [string, Job])[1];
+};
+
+describe('R6 §15 P4: the release seals against the remote main and the dry-run takes the reviewed SHA', () => {
+  it('every --main of the seal step is refs/remotes/origin/ plus the default branch', () => {
+    const steps = stepsOf(packingJob()).filter((step) => /node scripts\/seal\.mjs/.test(runOf(step)));
+    expect(steps.length).toBeGreaterThan(0);
+    for (const step of steps) {
+      const mains = [...runOf(step).matchAll(/--main[ \t]+(\S+)/g)].map((match) => match[1] ?? '');
+      expect(mains.length, runOf(step)).toBeGreaterThan(0);
+      for (const main of mains) {
+        const variable = /^"?refs\/remotes\/origin\/\$\{?(\w+)\}?"?$/.exec(main);
+        expect(variable, main).not.toBeNull();
+        const name = variable?.[1] ?? '';
+        expect(String(step['env']?.[name] ?? ''), `env ${name}`).toMatch(/\$\{\{\s*github\.event\.repository\.default_branch\s*\}\}/);
+      }
+    }
+  });
+
+  it('the dry-run accepts the reviewed SHA and the packing job checks it out', () => {
+    const sha = (release()['on'] as Record<string, any>)['workflow_dispatch']?.['inputs']?.['sha'];
+    expect(sha, 'workflow_dispatch input sha').toBeDefined();
+    expect(sha?.['type']).toBe('string');
+    const checkout = stepsOf(packingJob()).find((step) => String(step['uses'] ?? '').startsWith('actions/checkout@'));
+    expect(String(checkout?.['with']?.['ref'] ?? ''), 'the checkout ref').toMatch(/inputs\.sha/);
+  });
+});
+
+describe('R6 §15: the release workflow runs with the least privilege', () => {
+  it('the top level only reads contents', () => {
+    expect(release()['permissions']).toEqual({ contents: 'read' });
+  });
+
+  it('only the job that runs gh release create may write contents', () => {
+    for (const [id, job] of jobsOf(release())) {
+      const publishes = stepsOf(job).some((step) => /gh release create/.test(runOf(step)));
+      const permissions = job['permissions'];
+      const writes = permissions === 'write-all' || (typeof permissions === 'object' && permissions !== null && permissions['contents'] === 'write');
+      expect(writes, id).toBe(publishes);
+    }
+  });
+
+  it('no checkout keeps the token in the clone', () => {
+    const checkouts = jobsOf(release()).flatMap(([, job]) => stepsOf(job).filter((step) => String(step['uses'] ?? '').startsWith('actions/checkout@')));
+    expect(checkouts.length).toBeGreaterThan(0);
+    for (const checkout of checkouts) expect(checkout['with']?.['persist-credentials']).toBe(false);
+  });
+});
+
+describe('R6 §15: the release notes and the package-content test', () => {
+  it('the notes give the one command pnpm dlx <package>.tgz init, not pnpm add', () => {
+    const publish = jobsOf(release()).flatMap(([, job]) => stepsOf(job)).find((step) => /gh release create/.test(runOf(step)));
+    const run = runOf(publish ?? {});
+    expect(run).toMatch(/pnpm dlx [^\s`'"]+\.tgz init/);
+    expect(run).not.toMatch(/pnpm add/);
+  });
+
+  it('the packing job runs the package-content test before pnpm pack', () => {
+    const steps = stepsOf(packingJob());
+    const testAt = steps.findIndex((step) => /pnpm (run )?test:package|vitest run --config vitest\.package\.config\.ts/.test(runOf(step)));
+    const packAt = steps.findIndex((step) => /pnpm pack/.test(runOf(step)));
+    expect(testAt, 'a step that runs pnpm test:package').toBeGreaterThanOrEqual(0);
+    expect(testAt).toBeLessThan(packAt);
+  });
+});
+
 describe('R31: license and version', () => {
   it('LICENSE holds the MIT text', () => {
     expect(existsSync(new URL('../LICENSE', import.meta.url))).toBe(true);

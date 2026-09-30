@@ -101,6 +101,11 @@ describe('§1.1: explain says it in plain words', () => {
     expect(text).toContain('Un paso de staging a main no es una pieza: solo se revisa que no toque los archivos del motor');
   });
 
+  it('in English it joins the branches with "or" (PLAN-13-R6 §15)', () => {
+    const text = explainRecipe(recipeOf(withBranches('branches:', '  into: [staging, main]').replace('locale: es', 'locale: en')));
+    expect(text).toContain('Pieces enter staging or main.');
+  });
+
   it('without the section it says nothing about branches', () => {
     const text = explainRecipe(recipeOf(withBranches()));
     expect(text).not.toContain('Las piezas entran a');

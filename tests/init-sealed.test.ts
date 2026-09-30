@@ -1,13 +1,15 @@
-import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
-import { rename } from 'node:fs/promises';
-import { join, relative, resolve } from 'node:path';
+import { EventEmitter } from 'node:events';
+import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+import { rename, rm } from 'node:fs/promises';
+import { basename, join, relative, resolve } from 'node:path';
+import { PassThrough } from 'node:stream';
 
 import { afterEach, describe, expect, it } from 'vitest';
 import { parse } from 'yaml';
 
 import { installHooks, recipeCommand } from '../src/index.js';
 
-import { git, removeRepositories, repository, write } from './git-fixtures.js';
+import { emptyFolder, git, removeRepositories, repository, write } from './git-fixtures.js';
 import { writeTgz } from './tgz.js';
 
 // PLAN-13-R6 §9.2 and §9.4 (tests 1 to 5, 4b, 4c and 4d): `init` from a sealed engine.
@@ -208,7 +210,8 @@ describe('R6 §9.4 test 1: init with a seal writes the recipe and the three work
       template('pipeline.yml').replace(/https:\/\/github\.com\/luismichelcf\/ai-workflows\/releases\/download\/v[^/]+\/recipe\.schema\.json/, '<SCHEMA>'),
     );
     expectWorkflowsFromTemplates(root);
-    for (const path of [RECIPE, ...WORKFLOW_PATHS]) expect(output.text).toContain(`Created ${path}`);
+    // PLAN-13-R6 §15: the example recipe is `locale: es`, so init reports in Spanish (was `Created`).
+    for (const path of [RECIPE, ...WORKFLOW_PATHS]) expect(output.text).toContain(`Creado ${path}`);
     // What init cannot do is said at the end, with the switch variable named.
     expect(output.text).toContain('AI_WORKFLOWS_MODE');
   });
@@ -221,7 +224,8 @@ describe('R6 §9.4 test 1: init with a seal writes the recipe and the three work
 
     expect(output.ok, output.text).toBe(true);
     expect(read(root, RECIPE)).toBe(RECIPE_WITH_BRANCHES);
-    expect(output.text).toContain(`${RECIPE} already exists; init does not overwrite it.`);
+    // PLAN-13-R6 §15: this recipe is `locale: es`, so the line is Spanish (was English).
+    expect(output.text).toContain(`${RECIPE} ya existía; init no lo sobrescribe.`);
     expectWorkflowsFromTemplates(root);
     expect(branchesOf(judgeStep(root)['with']?.['branches'])).toEqual(['staging', 'main']);
   });
@@ -569,4 +573,299 @@ describe('R6 §9.4 test 5: the written judge passes the checks of tests/judge-te
     expect(all.length).toBeGreaterThan(0);
     for (const uses of all) expect(uses).toBe(`luismichelcf/ai-workflows@${SHA}`);
   });
+});
+
+// PLAN-13-R6 §15 (fixes after the flock). INTERFACE added here (the builder implements it):
+//
+//   - init refuses to run from a subfolder of a git repository (cwd is not the top level): it
+//     writes nothing, installs nothing, and says why, naming the root (`raíz` / `root`). A folder
+//     that is not a repository keeps today's behaviour.
+//   - init speaks the `locale` of `.ai-workflows/pipeline.yml` as it stands after step 2 (the example
+//     recipe, `locale: es`, when init wrote it): `es…` -> Spanish; anything else, missing or
+//     unreadable -> English. The per-file lines are
+//       es: `Creado <path>`  and  `<path> ya existía; init no lo sobrescribe.`
+//       en: `Created <path>` and  `<path> already exists; init does not overwrite it.`
+//     and none of the English lines appears in a Spanish run.
+//   - The closing text carries the exact commands `gh variable set AI_WORKFLOWS_MODE --body advisory`
+//     and `gh variable set AI_WORKFLOWS_MODE --body off`, and the line
+//       es: `Guarda estos archivos con un commit en una rama de pieza, no en la rama principal.`
+//       en: `Commit these files on a piece branch, not on the main branch.`
+//   - When the three workflows already exist, a full init reports each one as already there and
+//     still installs the hooks (the all-or-nothing rule is about writing the three, not the hooks).
+//   - New optional seams in the options of recipeCommand:
+//       spawnProcess?: (command: string, args: readonly string[], options: { cwd: string;
+//         shell?: boolean | string; windowsHide?: boolean; stdio?: unknown }) => ChildProcess-like
+//         How the default installer (used when runPackageInstall is omitted) starts the package
+//         manager. It must request no shell and start no shell program (cmd, powershell, sh…).
+//       templatesDir?: string
+//         The folder the four templates are read from (default: the package's templates/).
+//       removeFile?: (path: string) => Promise<void>
+//         Every removal of a rollback (renamed workflows and the temporary file) goes through it.
+//   - The judge template's anchor for the `branches` input is the engine step's line
+//     `          token: ${{ github.token }}`. If the recipe declares branches and the template has no
+//     anchor, init fails naming `branches` and the template, and writes none of the three.
+//   - The `branches` value is written as a quoted YAML scalar, so any git-valid name survives.
+//   - A rollback whose removal fails names the file that remains and never claims that none of
+//     the three was written.
+
+const ES_COMMIT = 'Guarda estos archivos con un commit en una rama de pieza, no en la rama principal.';
+const EN_COMMIT = 'Commit these files on a piece branch, not on the main branch.';
+const MODE_ADVISORY = 'gh variable set AI_WORKFLOWS_MODE --body advisory';
+const MODE_OFF = 'gh variable set AI_WORKFLOWS_MODE --body off';
+const ENGLISH_LINES = ['Created ', 'already exists; init does not overwrite it.', 'Next, by hand', 'Added ai-workflows'];
+
+const RECIPE_EN = RECIPE_WITH_BRANCHES.replace('locale: es', 'locale: en');
+const RECIPE_WITHOUT_BRANCHES = RECIPE_WITH_BRANCHES.replace(
+  lines('branches:', '  into: [staging, main]', '  promotions:', '    - { from: staging, to: main }'),
+  '',
+);
+const SEALED_PACKAGE = `${JSON.stringify({ name: 'app', private: true, devDependencies: { 'ai-workflows': RELEASE_URL } }, null, 2)}\n`;
+const norm = (path: string) => path.split('\\').join('/');
+
+describe('R6 §15: init runs only from the root of the repository', () => {
+  for (const argv of [['init'], ['init', '--judge-only']]) {
+    it(`${argv.join(' ')} from a subfolder refuses with the reason and writes nothing`, async () => {
+      const root = repository({ [RECIPE]: RECIPE_WITH_BRANCHES, 'package.json': PACKAGE_JSON, 'packages/app/README.md': '# app\n' });
+      const sub = join(root, 'packages', 'app');
+      const before = filesUnder(root);
+      const install = forbiddenInstall();
+
+      const output = await recipeCommand(argv, { cwd: sub, seal: SEAL, runPackageInstall: install.run });
+
+      expect(output.ok).toBe(false);
+      expect(output.text).not.toContain('Usage:');
+      expect(output.text).toMatch(/ra[ií]z|root/i);
+      expect(install.calls).toEqual([]);
+      expect(filesUnder(root)).toEqual(before);
+      expect(hooksPathOf(root)).toBe('');
+    });
+  }
+});
+
+describe('R6 §15: init speaks the language of the recipe', () => {
+  it('a new project gets the example recipe (locale: es), and the whole report is Spanish', async () => {
+    const root = repository({ 'README.md': '# app\n' });
+
+    const output = await recipeCommand(['init'], { cwd: root, seal: SEAL, runPackageInstall: fakeInstall().run });
+
+    expect(output.ok, output.text).toBe(true);
+    for (const path of [RECIPE, ...WORKFLOW_PATHS]) expect(output.text).toContain(`Creado ${path}`);
+    for (const english of ENGLISH_LINES) expect(output.text).not.toContain(english);
+  });
+
+  it('a Spanish recipe that exists: "ya existía" for it and "Creado" for the workflows', async () => {
+    const root = repository({ [RECIPE]: RECIPE_WITH_BRANCHES, 'package.json': PACKAGE_JSON });
+
+    const output = await recipeCommand(['init'], { cwd: root, seal: SEAL, runPackageInstall: fakeInstall().run });
+
+    expect(output.ok, output.text).toBe(true);
+    expect(output.text).toContain(`${RECIPE} ya existía; init no lo sobrescribe.`);
+    for (const path of WORKFLOW_PATHS) expect(output.text).toContain(`Creado ${path}`);
+    for (const english of ENGLISH_LINES) expect(output.text).not.toContain(english);
+  });
+
+  it('an English recipe keeps the English lines', async () => {
+    const root = repository({ [RECIPE]: RECIPE_EN, 'package.json': PACKAGE_JSON });
+
+    const output = await recipeCommand(['init'], { cwd: root, seal: SEAL, runPackageInstall: fakeInstall().run });
+
+    expect(output.ok, output.text).toBe(true);
+    expect(output.text).toContain(`${RECIPE} already exists; init does not overwrite it.`);
+    for (const path of WORKFLOW_PATHS) expect(output.text).toContain(`Created ${path}`);
+    expect(output.text).not.toContain('Creado ');
+    expect(output.text).not.toContain('ya existía');
+  });
+});
+
+describe('R6 §15: the closing text gives the exact commands and where to commit', () => {
+  it('Spanish (the example recipe): both switch commands and the piece-branch line', async () => {
+    const root = repository({ 'README.md': '# app\n' });
+
+    const output = await recipeCommand(['init'], { cwd: root, seal: SEAL, runPackageInstall: fakeInstall().run });
+
+    expect(output.ok, output.text).toBe(true);
+    expect(output.text).toContain(MODE_ADVISORY);
+    expect(output.text).toContain(MODE_OFF);
+    expect(output.text).toContain(ES_COMMIT);
+  });
+
+  it('English recipe: both switch commands and the piece-branch line', async () => {
+    const root = repository({ [RECIPE]: RECIPE_EN, 'package.json': PACKAGE_JSON });
+
+    const output = await recipeCommand(['init'], { cwd: root, seal: SEAL, runPackageInstall: fakeInstall().run });
+
+    expect(output.ok, output.text).toBe(true);
+    expect(output.text).toContain(MODE_ADVISORY);
+    expect(output.text).toContain(MODE_OFF);
+    expect(output.text).toContain(EN_COMMIT);
+  });
+
+  it('init --judge-only says the same', async () => {
+    const root = repository({ [RECIPE]: RECIPE_WITH_BRANCHES });
+
+    const output = await recipeCommand(['init', '--judge-only'], { cwd: root, seal: SEAL, runPackageInstall: forbiddenInstall().run });
+
+    expect(output.ok, output.text).toBe(true);
+    expect(output.text).toContain(MODE_ADVISORY);
+    expect(output.text).toContain(MODE_OFF);
+    expect(output.text).toContain(ES_COMMIT);
+  });
+});
+
+describe('R6 §15: re-running init where the three workflows already exist', () => {
+  it('reports them as already there, leaves them, and installs the hooks', async () => {
+    const files: Record<string, string> = { [RECIPE]: RECIPE_WITH_BRANCHES, 'package.json': SEALED_PACKAGE, 'pnpm-lock.yaml': '\n' };
+    for (const path of WORKFLOW_PATHS) files[path] = 'mine\n';
+    const root = repository(files);
+
+    const output = await recipeCommand(['init'], { cwd: root, seal: SEAL, runPackageInstall: fakeInstall().run });
+
+    for (const path of WORKFLOW_PATHS) {
+      expect(output.text).toContain(`${path} ya existía; init no lo sobrescribe.`);
+      expect(read(root, path), path).toBe('mine\n');
+    }
+    expect(output.ok, output.text).toBe(true);
+    expect(exists(root, '.claude/settings.json')).toBe(true);
+    expect(hooksPathOf(root)).not.toBe('');
+  });
+});
+
+describe('R6 §15: the package manager is started without a shell', () => {
+  it('the default installer asks for no shell and starts no shell program', async () => {
+    const root = repository({ 'package.json': PACKAGE_JSON, 'pnpm-lock.yaml': '\n' });
+    const spawned: { command: string; args: string[]; options: Record<string, any> }[] = [];
+    const spawnProcess = (command: string, args: readonly string[], options: Record<string, any>) => {
+      spawned.push({ command, args: [...args], options });
+      write(root, 'node_modules/ai-workflows/package.json', `${JSON.stringify({ name: 'ai-workflows', version: VERSION })}\n`);
+      write(root, 'node_modules/ai-workflows/engine.json', `${JSON.stringify(SEAL)}\n`);
+      const stdout = new PassThrough();
+      const stderr = new PassThrough();
+      const child = Object.assign(new EventEmitter(), { stdout, stderr, stdin: null, pid: 4242, kill: () => true });
+      setImmediate(() => {
+        stdout.end();
+        stderr.end();
+        child.emit('exit', 0, null);
+        child.emit('close', 0, null);
+      });
+      return child;
+    };
+
+    const output = await recipeCommand(['init'], { cwd: root, seal: SEAL, spawnProcess });
+
+    expect(spawned, 'the installer goes through the spawnProcess seam').toHaveLength(1);
+    const [call] = spawned;
+    expect(call?.options['shell'] ?? false, 'shell option').toBe(false);
+    const program = basename(norm(call?.command ?? '')).toLowerCase();
+    expect(program).not.toMatch(/^(cmd|powershell|pwsh|sh|bash)(\.exe)?$/);
+    expect(program, 'a .cmd or .bat needs a shell on Windows').not.toMatch(/\.(cmd|bat)$/);
+    expect([call?.command ?? '', ...(call?.args ?? [])].join(' ')).toMatch(/pnpm/i);
+    expect(call?.args).toContain('install');
+    expect(resolve(String(call?.options['cwd'] ?? ''))).toBe(resolve(root));
+    expect(output.ok, output.text).toBe(true);
+    expect(exists(root, '.claude/settings.json')).toBe(true);
+  });
+});
+
+describe('R6 §15: the branches input of the judge workflow', () => {
+  /** The four templates in a folder of their own, the judge's without the branches anchor. */
+  function templatesWithoutAnchor(): string {
+    const dir = emptyFolder();
+    cpSync(new URL('../templates', import.meta.url), dir, { recursive: true });
+    const judge = join(dir, 'ai-workflows.yml');
+    const text = readFileSync(judge, 'utf8');
+    const anchor = '          token: ${{ github.token }}\n';
+    expect(text).toContain(anchor);
+    writeFileSync(judge, text.replace(anchor, ''));
+    return dir;
+  }
+
+  it('a template without the anchor and a recipe that declares branches: init fails naming the reason and writes none', async () => {
+    const root = repository({ [RECIPE]: RECIPE_WITH_BRANCHES });
+
+    const output = await recipeCommand(['init', '--judge-only'], { cwd: root, seal: SEAL, runPackageInstall: forbiddenInstall().run, templatesDir: templatesWithoutAnchor() });
+
+    expect(output.ok, output.text).toBe(false);
+    expect(output.text).toContain('branches');
+    expect(output.text).toContain('ai-workflows.yml');
+    for (const path of WORKFLOW_PATHS) expect(exists(root, path), path).toBe(false);
+  });
+
+  it('the same template with a recipe without branches is fine: there is nothing to write there', async () => {
+    const root = repository({ [RECIPE]: RECIPE_WITHOUT_BRANCHES });
+    expect(RECIPE_WITHOUT_BRANCHES).not.toContain('branches:');
+
+    const output = await recipeCommand(['init', '--judge-only'], { cwd: root, seal: SEAL, runPackageInstall: forbiddenInstall().run, templatesDir: templatesWithoutAnchor() });
+
+    expect(output.ok, output.text).toBe(true);
+    for (const path of WORKFLOW_PATHS) expect(exists(root, path), path).toBe(true);
+  });
+
+  it('the value is written quoted', async () => {
+    const root = repository({ [RECIPE]: RECIPE_WITH_BRANCHES });
+
+    const output = await recipeCommand(['init', '--judge-only'], { cwd: root, seal: SEAL, runPackageInstall: forbiddenInstall().run });
+
+    expect(output.ok, output.text).toBe(true);
+    expect(read(root, '.github/workflows/ai-workflows.yml')).toMatch(/^ {10}branches: (["'])staging, main\1[ \t]*$/m);
+  });
+
+  it('git-valid names that YAML would misread plain survive: a leading # and a double quote', async () => {
+    const recipe = RECIPE_WITH_BRANCHES
+      .replace('  into: [staging, main]', `  into: ["#hotfix", 'say"hi', main]`)
+      .replace('    - { from: staging, to: main }', '    - { from: "#hotfix", to: main }');
+    const root = repository({ [RECIPE]: recipe });
+
+    const output = await recipeCommand(['init', '--judge-only'], { cwd: root, seal: SEAL, runPackageInstall: forbiddenInstall().run });
+
+    expect(output.ok, output.text).toBe(true);
+    expect(judgeStep(root)['with']?.['branches']).toBe('#hotfix, say"hi, main');
+  });
+});
+
+describe('R6 §15: a rollback that cannot remove a file says which one remains', () => {
+  it('the second rename fails and removing the first fails too: the message names the file left behind', async () => {
+    const root = repository({ [RECIPE]: RECIPE_EN });
+    const renameFile = async (from: string, to: string) => {
+      if (norm(to).endsWith('.github/workflows/ai-workflows-red-test.yml')) {
+        throw Object.assign(new Error('EPERM: operation not permitted, rename'), { code: 'EPERM' });
+      }
+      await rename(from, to);
+    };
+    const removeFile = async (path: string) => {
+      if (norm(path).endsWith('.github/workflows/ai-workflows.yml')) {
+        throw Object.assign(new Error('EBUSY: resource busy or locked, unlink'), { code: 'EBUSY' });
+      }
+      await rm(path, { force: true });
+    };
+
+    const output = await recipeCommand(['init', '--judge-only'], { cwd: root, seal: SEAL, runPackageInstall: forbiddenInstall().run, renameFile, removeFile });
+
+    expect(output.ok).toBe(false);
+    expect(output.text).toContain('.github/workflows/ai-workflows.yml');
+    expect(output.text).toContain('ai-workflows-red-test.yml');
+    expect(output.text).not.toContain('None of the three workflows was written');
+    expect(exists(root, '.github/workflows/ai-workflows.yml'), 'the file the rollback could not remove').toBe(true);
+  });
+});
+
+describe('R6 §15 (§9.2 step 3): hooks only when node_modules/ai-workflows carries this seal', () => {
+  const cases: readonly { label: string; landed?: unknown }[] = [
+    { label: 'the install writes no engine.json' },
+    { label: 'the engine.json has another sha', landed: { version: VERSION, sha: 'ffffffffffffffffffffffffffffffffffffffff' } },
+  ];
+  for (const { label, landed } of cases) {
+    it(`${label}: no hooks, and it says so`, async () => {
+      const root = repository({ 'package.json': PACKAGE_JSON, 'pnpm-lock.yaml': '\n' });
+      const runPackageInstall = async (request: InstallRequest) => {
+        mkdirSync(join(request.cwd, 'node_modules', 'ai-workflows'), { recursive: true });
+        if (landed !== undefined) write(request.cwd, 'node_modules/ai-workflows/engine.json', `${JSON.stringify(landed)}\n`);
+        return { ok: true as const };
+      };
+
+      const output = await recipeCommand(['init'], { cwd: root, seal: SEAL, runPackageInstall });
+
+      expectNoHooks(root);
+      expect(output.text).toContain('node_modules/ai-workflows');
+    });
+  }
 });

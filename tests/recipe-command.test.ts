@@ -44,7 +44,8 @@ describe('init', () => {
     // PLAN-13-R6 §9.2: init now also reports the workflows it refuses without a seal (this
     // development copy has none), so the text is one line among others and `ok` is covered by
     // tests/init-sealed.test.ts.
-    expect(output.text).toContain('Created .ai-workflows/pipeline.yml');
+    // PLAN-13-R6 §15: init speaks the recipe's language, and the example recipe is `locale: es`.
+    expect(output.text).toContain('Creado .ai-workflows/pipeline.yml');
     expect(await readFile(recipePath(), 'utf8')).toBe(await readFile(TEMPLATE_URL, 'utf8'));
   });
 
