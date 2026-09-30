@@ -5,8 +5,9 @@
 //
 // PLAN-13-R6 §4: `hook` loads only what it uses, so the cold start on Windows does not eat the
 // hook's budget. Every other command is imported when it is the one being run.
-import type { HookKind, HookResult } from './locks/hook-cli.js';
+import type { HookKind } from './locks/hook-cli.js';
 import type { HookClient } from './locks/install.js';
+import { finishHook } from './locks/hook-finish.js';
 
 const AGENT_COMMANDS: ReadonlySet<string> = new Set([
   'run',
@@ -50,34 +51,6 @@ function watchdogFrom(raw: string | undefined): number | undefined {
   if (raw === undefined || raw.trim() === '') return undefined;
   const value = Number(raw);
   return Number.isInteger(value) && value > 0 && value <= MAX_HOOK_WATCHDOG_MS ? value : undefined;
-}
-
-/**
- * Writes the answer and ends the process explicitly, with the streams flushed first, whatever
- * handle is still open. Claude Code cuts a hook that keeps running and lets the tool through, so
- * the process must not linger on a worker or on a pipe a grandchild holds.
- */
-function finishHook(result: HookResult, afterWrite?: () => void | Promise<void>): void {
-  const write = (stream: NodeJS.WriteStream, text: string, next: () => void): void => {
-    if (text.length === 0) {
-      next();
-      return;
-    }
-    stream.write(text, next);
-  };
-  write(process.stdout, result.stdout, () => {
-    write(process.stderr, result.stderr, () => {
-      // The cleanup of the deciding process may take a bounded moment (the kill command is
-      // dispatched and never waited for to finish); the answer is already written, so this only
-      // delays the explicit exit, never the answer the client reads.
-      const after = afterWrite?.();
-      if (after instanceof Promise) {
-        void after.then(() => process.exit(result.exitCode));
-      } else {
-        process.exit(result.exitCode);
-      }
-    });
-  });
 }
 
 if (command === 'hook') {

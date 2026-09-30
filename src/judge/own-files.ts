@@ -9,7 +9,7 @@
 // package manifest (`package.json`, `package.yaml`, `package.json5`, at any depth) and in
 // `pnpm-workspace.yaml`, every change is touched except a short list of harmless ones.
 
-import { parse as parseYaml } from 'yaml';
+import { isMap, isScalar, isSeq, parseDocument } from 'yaml';
 
 import {
   gitChangedPaths,
@@ -68,10 +68,11 @@ export function isEngineProtectedPath(path: string): boolean {
 }
 
 /**
- * PLAN-13-R6 §2.2: a key that names the engine wherever pnpm, npm or yarn read a dependency or a
- * patch rule. It bites `ai-workflows` and `algo>ai-workflows`, but never `ai-workflows-extra`.
+ * PLAN-13-R6 §2.2 and §15 (fourth delta): a key that names the engine wherever pnpm, npm or yarn
+ * read a dependency or a patch rule. It bites `ai-workflows` and `algo>ai-workflows`, but never
+ * `ai-workflows-extra`. The comparison ignores case: `AI-Workflows` is the engine too.
  */
-const ENGINE_KEY = /(^|>)ai-workflows(@|$)/;
+const ENGINE_KEY = /(^|>)ai-workflows(@|$)/i;
 
 /** The engine package name, exactly: only this `name` is dangerous (§15 third delta). */
 const ENGINE_NAME = 'ai-workflows';
@@ -217,6 +218,66 @@ function hasKey(value: unknown, key: string): boolean {
   return isRecord(value) && Object.prototype.hasOwnProperty.call(value, key);
 }
 
+/**
+ * PLAN-13-R6 §15 (fourth delta): whether a dependency or catalog entry that does not name the
+ * engine is harmless. It is, only when its value is a registry range, version or tag (nothing that
+ * leaves the registry: no protocol, no `/`, nothing starting with `.`), or when it starts with
+ * `workspace:` or `catalog:`. `file:`, `link:`, a git URL, `github:`, `npm:`, `patch:`, `portal:`,
+ * an address or a `.tgz` are touched, because the installer then resolves the dependency somewhere
+ * the registry range never would.
+ */
+function isRegistrySpec(value: unknown): boolean {
+  if (typeof value !== 'string') return false;
+  const spec = value.trim();
+  if (spec.length === 0) return false;
+  if (spec.startsWith('workspace:') || spec.startsWith('catalog:')) return true;
+  if (spec.startsWith('.')) return false;
+  if (spec.includes('/') || spec.includes(':')) return false;
+  return true;
+}
+
+/**
+ * PLAN-13-R6 §15 (fourth delta): whether `value` — or anything inside it — holds the key `forbidden`
+ * as its own. A plain JS object drops `__proto__` when it is assigned to; detecting it before any
+ * assignment is what lets the judge see what the installer would. `Object.entries` is used because
+ * it reads the own property even when it shadows `Object.prototype.__proto__`.
+ */
+function hasForbiddenKeyDeep(value: unknown, forbidden: string): boolean {
+  if (Array.isArray(value)) return value.some((entry) => hasForbiddenKeyDeep(entry, forbidden));
+  if (isRecord(value)) {
+    for (const [key, entry] of Object.entries(value)) {
+      if (key === forbidden) return true;
+      if (hasForbiddenKeyDeep(entry, forbidden)) return true;
+    }
+  }
+  return false;
+}
+
+/** Whether a YAML node — or anything inside it — holds a `<<` merge key at any depth. */
+function yamlHasMergeKey(node: unknown): boolean {
+  if (isMap(node)) {
+    for (const item of node.items) {
+      if (isScalar(item.key) && item.key.value === '<<') return true;
+      if (yamlHasMergeKey(item.value)) return true;
+    }
+    return false;
+  }
+  if (isSeq(node)) return node.items.some((item) => yamlHasMergeKey(item));
+  return false;
+}
+
+/**
+ * The JavaScript value of a YAML document, or `undefined` when it holds a `<<` merge key at any
+ * depth (§15 fourth delta): the judge and the installer do not read such a document the same way, so
+ * it is touched. Anchors and aliases without `<<` are read as their values. `parseDocument` is used
+ * with its default (the merge option is not set), so `<<` stays visible instead of being resolved.
+ */
+function yamlValue(content: string): unknown {
+  const doc = parseDocument(content);
+  if (yamlHasMergeKey(doc.contents)) return undefined;
+  return doc.toJS();
+}
+
 /** Every key of `section` that names the engine, under `prefix`. */
 function collectEngineKeys(section: unknown, prefix: string, out: Record<string, unknown>): void {
   if (!isRecord(section)) return;
@@ -252,7 +313,7 @@ function sanitizeManifest(value: unknown): string {
       }
       const kept: Record<string, unknown> = {};
       for (const [name, spec] of Object.entries(entry)) {
-        if (ENGINE_KEY.test(name)) kept[name] = spec;
+        if (ENGINE_KEY.test(name) || !isRegistrySpec(spec)) kept[name] = spec;
       }
       if (Object.keys(kept).length > 0) out[key] = kept;
       continue;
@@ -279,12 +340,12 @@ function sanitizeManifest(value: unknown): string {
   return canonical(out);
 }
 
-/** The engine-keyed entries of a catalog, or `undefined` when nothing is left. */
+/** The catalog entries that matter: the engine's, and any other whose spec leaves the registry. */
 function engineEntriesOnly(section: unknown): unknown {
   if (!isRecord(section)) return section;
   const kept: Record<string, unknown> = {};
   for (const [key, entry] of Object.entries(section)) {
-    if (ENGINE_KEY.test(key)) kept[key] = entry;
+    if (ENGINE_KEY.test(key) || !isRegistrySpec(entry)) kept[key] = entry;
   }
   return Object.keys(kept).length > 0 ? kept : undefined;
 }
@@ -326,9 +387,10 @@ function projectPnpmLock(value: unknown): string {
     for (const [name, importer] of Object.entries(importers)) {
       if (!isRecord(importer)) continue;
       for (const section of DEPENDENCY_SECTIONS) {
-        if (hasKey(importer[section], 'ai-workflows')) {
-          out[`importers.${name}.${section}.ai-workflows`] =
-            (importer[section] as Record<string, unknown>)['ai-workflows'];
+        const entries = importer[section];
+        if (!isRecord(entries)) continue;
+        for (const [key, entry] of Object.entries(entries)) {
+          if (ENGINE_KEY.test(key)) out[`importers.${name}.${section}.${key}`] = entry;
         }
       }
     }
@@ -345,9 +407,10 @@ function projectPackageLock(value: unknown): string {
   if (!isRecord(value)) throw new Error('package-lock.json is not an object');
   const out: Record<string, unknown> = {};
   const packages = value['packages'];
-  if (hasKey(packages, 'node_modules/ai-workflows')) {
-    out['packages.node_modules/ai-workflows'] =
-      (packages as Record<string, unknown>)['node_modules/ai-workflows'];
+  if (isRecord(packages)) {
+    for (const [key, entry] of Object.entries(packages)) {
+      if (key.toLowerCase() === 'node_modules/ai-workflows') out[`packages.${key}`] = entry;
+    }
   }
   return canonical(out);
 }
@@ -388,15 +451,33 @@ function yarnEngineBlocks(content: string): string[] {
 function projectionOf(file: string, content: string): string | undefined {
   try {
     const kind = manifestKindOf(file);
-    if (kind === 'json') return sanitizeManifest(JSON.parse(content));
-    if (kind === 'yaml') return sanitizeManifest(parseYaml(content));
+    if (kind === 'json') {
+      const parsed: unknown = JSON.parse(content);
+      // §15 (fourth delta): a `__proto__` key at any depth of a manifest is touched: a plain JS
+      // object drops it, so the judge would not see what the installer reads.
+      if (hasForbiddenKeyDeep(parsed, '__proto__')) return undefined;
+      return sanitizeManifest(parsed);
+    }
+    if (kind === 'yaml') {
+      const value = yamlValue(content);
+      if (value === undefined || hasForbiddenKeyDeep(value, '__proto__')) return undefined;
+      return sanitizeManifest(value);
+    }
     // §15 (third delta): package.json5 and binding.gyp have no reader here, so they are touched
     // whenever they change (a harmless field included), never read as a pass.
     if (kind === 'json5' || isBindingGyp(file)) return undefined;
     if (file === 'package-lock.json') return projectPackageLock(JSON.parse(content));
     if (file === 'yarn.lock') return canonical(yarnEngineBlocks(content));
-    if (file === 'pnpm-workspace.yaml') return sanitizeWorkspace(parseYaml(content));
-    if (file === 'pnpm-lock.yaml') return projectPnpmLock(parseYaml(content));
+    if (file === 'pnpm-workspace.yaml') {
+      const value = yamlValue(content);
+      if (value === undefined || hasForbiddenKeyDeep(value, '__proto__')) return undefined;
+      return sanitizeWorkspace(value);
+    }
+    if (file === 'pnpm-lock.yaml') {
+      const value = yamlValue(content);
+      if (value === undefined) return undefined;
+      return projectPnpmLock(value);
+    }
     return undefined;
   } catch {
     return undefined;
@@ -465,17 +546,33 @@ function normalizeRepoPath(value: unknown): string | undefined {
   return stack.join('/').toLowerCase();
 }
 
-/** The value of `only-built-dependencies-file` in an .npmrc, or `undefined` when it names none. */
-function npmrcBuildFile(content: string): unknown {
+/** A value with one layer of matching quotes removed, the way npm reads an .npmrc value. */
+function unquoted(value: string): string {
+  if (value.length >= 2) {
+    const first = value[0];
+    if ((first === '"' || first === "'") && value[value.length - 1] === first) {
+      return value.slice(1, -1);
+    }
+  }
+  return value;
+}
+
+/**
+ * Every value of `only-built-dependencies-file` in an .npmrc (§15 fourth delta): the installer reads
+ * each occurrence, so each names a file of the judge's own. A value in double or single quotes is
+ * unquoted before it is read as a path.
+ */
+function npmrcBuildFiles(content: string): string[] {
+  const found: string[] = [];
   for (const raw of content.split(/\r?\n/)) {
     const line = raw.trim();
     if (line.length === 0 || line.startsWith('#') || line.startsWith(';')) continue;
     const at = line.indexOf('=');
     if (at < 0) continue;
     if (line.slice(0, at).trim() !== 'only-built-dependencies-file') continue;
-    return line.slice(at + 1).trim();
+    found.push(unquoted(line.slice(at + 1).trim()));
   }
-  return undefined;
+  return found;
 }
 
 /**
@@ -497,7 +594,7 @@ async function namedBuildFiles(root: string, trusted: string): Promise<string[]>
   const workspace = await gitFileAt(root, trusted, 'pnpm-workspace.yaml', ENGINE_VERSION_MAX_BYTES);
   if (workspace.kind === 'file') {
     try {
-      const parsed = parseYaml(workspace.content ?? '');
+      const parsed: unknown = parseDocument(workspace.content ?? '').toJS();
       if (isRecord(parsed)) add(parsed['onlyBuiltDependenciesFile']);
     } catch {
       // Not YAML: its own projection already counts it as touched; no named file to add.
@@ -517,7 +614,9 @@ async function namedBuildFiles(root: string, trusted: string): Promise<string[]>
   }
 
   const npmrc = await gitFileAt(root, trusted, '.npmrc', ENGINE_VERSION_MAX_BYTES);
-  if (npmrc.kind === 'file') add(npmrcBuildFile(npmrc.content ?? ''));
+  if (npmrc.kind === 'file') {
+    for (const value of npmrcBuildFiles(npmrc.content ?? '')) add(value);
+  }
 
   return [...found];
 }
