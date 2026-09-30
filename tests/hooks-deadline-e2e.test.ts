@@ -205,4 +205,57 @@ describe('R6 §15 P6: the watchdog covers reading stdin', () => {
       expect(output.ms).toBeLessThan(15_000);
     }
   }, 120_000);
+
+  // Delta review of the flock fixes, finding M3: the seam may only SHORTEN the watchdog. A value
+  // above HOOK_WATCHDOG_MS (25 s) would let a client's 30 s cut arrive first, so it is ignored and
+  // the default applies: the answer comes at about 25 s, never at 60 s. (A value at or below 25 s
+  // is honoured: the test above, with 1.5 s.)
+  it('a watchdog above 25 s (60000) is ignored: the deny JSON before the client s 30 s', async () => {
+    const root = project('arreglo');
+    engine.install(root);
+    const env: NodeJS.ProcessEnv = { ...process.env, AI_WORKFLOWS_HOOK_WATCHDOG_MS: '60000' };
+    delete env.CLAUDE_PROJECT_DIR;
+    const output = await runWithOpenStdin(root, 'claude', env);
+    expect(output.status, 'the hook ended by itself, before the 40 s kill').not.toBeNull();
+    expect(output.ms).toBeLessThan(28_000);
+    denyReason(output);
+  }, 60_000);
+});
+
+// Delta review of the flock fixes, finding M4: ending a timed-out git on POSIX lists the process
+// tree with `ps` first. That listing gets its own timeout: a `ps` that hangs must not keep the hook
+// from answering. Here git hangs (so its call times out at HOOK_GIT_CALL_MS, 10 s) and the `ps`
+// first on PATH sleeps; the git hook `pre-commit` must still refuse with the reason, well within
+// GIT_HOOK_DEADLINE_MS (60 s).
+describe('M4: a hanging ps does not keep the git hook from answering', () => {
+  it.runIf(process.platform !== 'win32')('pre-commit with git and ps both hanging: exit 1 with the git timeout, before 60 s', async () => {
+    const root = project('arreglo');
+    engine.install(root);
+    const bin = emptyFolder();
+    const pids = join(bin, 'pids');
+    strays.push(pids);
+    for (const name of ['git', 'ps']) {
+      writeFileSync(join(bin, name), ['#!/usr/bin/env bash', `echo $$ >> '${pids}'`, 'exec sleep 120', ''].join('\n'));
+      chmodSync(join(bin, name), 0o755);
+    }
+    const env = { ...process.env, PATH: `${bin}${delimiter}${process.env.PATH ?? ''}` };
+
+    const output = await new Promise<Finished>((done) => {
+      const started = Date.now();
+      const child = spawn(process.execPath, [join(engine.packageDir, 'dist', 'bin.js'), 'hook', 'pre-commit'], { cwd: root, env, stdio: ['ignore', 'pipe', 'pipe'] });
+      let stdout = '';
+      let stderr = '';
+      child.stdout.setEncoding('utf8').on('data', (chunk: string) => (stdout += chunk));
+      child.stderr.setEncoding('utf8').on('data', (chunk: string) => (stderr += chunk));
+      const killer = setTimeout(() => child.kill('SIGKILL'), 70_000);
+      child.on('close', (status) => {
+        clearTimeout(killer);
+        done({ status, stdout, stderr, ms: Date.now() - started });
+      });
+    });
+
+    expect(output.status, 'the hook ended by itself, before the 70 s kill').toBe(1);
+    expect(output.ms).toBeLessThan(60_000);
+    expect(output.stderr).toMatch(/git no respondió a tiempo/i);
+  }, 90_000);
 });

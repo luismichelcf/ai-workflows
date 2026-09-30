@@ -993,3 +993,97 @@ describe('flock 6: engine entries of pnpm-lock.yaml that the tests did not reach
     expectRejectedForOwnFiles(w, head, report);
   });
 });
+
+// ---------------------------------------------------------------------------------------------
+// Delta review of the flock fixes (R32), findings B3 and M1: more of what runs when dependencies
+// are installed, or decides which installer runs, is the judge's own.
+//
+// Interface fixed here (for the builder):
+//   - B3. The lifecycle scripts of R32 also include `pnpm:devPreinstall`, `preprepare`,
+//     `postprepare`, `prepublish` and `dependencies` (each one runs during an install), and they
+//     count in the package.json of every workspace member too (`packages/a/package.json`), not
+//     only in the root one. An ordinary script of a member (`test`) stays out.
+//   - M1. `.yarnrc` (yarn classic's configuration), and the folders `.yarn/releases/` and
+//     `.yarn/plugins/` (the yarn binary and its plugins, which run on install) are protected paths.
+//     The projection of package.json also holds `packageManager` (it picks the installer through
+//     corepack) and `pnpm.onlyBuiltDependenciesFile`; the projection of pnpm-workspace.yaml also
+//     holds `dangerouslyAllowAllBuilds`, `onlyBuiltDependenciesFile` and `neverBuiltDependencies`.
+
+describe('B3: every lifecycle script that runs on install', () => {
+  for (const script of ['pnpm:devPreinstall', 'preprepare', 'postprepare', 'prepublish', 'dependencies']) {
+    it(`scripts.${script} added to the root package.json → failure`, async () => {
+      const w = world({ 'package.json': json(BASE_PACKAGE) });
+      const head = w.pr({ 'package.json': pkg((p) => { field(p, 'scripts')[script] = 'node x.js'; }) });
+      const report = await w.judge();
+      expectRejectedForOwnFiles(w, head, report);
+      expect(report.summary).toContain('package.json');
+    });
+  }
+
+  const MEMBER = 'packages/a/package.json';
+  const member = (scripts: Record<string, string>) => json({ name: 'a', version: '1.0.0', private: true, scripts });
+  const monorepo = () => world({
+    'package.json': pkg((p) => { p.workspaces = ['packages/*']; }),
+    'pnpm-workspace.yaml': lines('packages:', '  - packages/*'),
+    [MEMBER]: member({ test: 'vitest run' }),
+  });
+
+  it('scripts.postinstall added to a workspace member → failure', async () => {
+    const w = monorepo();
+    const head = w.pr({ [MEMBER]: member({ test: 'vitest run', postinstall: 'node x.js' }) });
+    const report = await w.judge();
+    expectRejectedForOwnFiles(w, head, report);
+    expect(report.summary).toContain(MEMBER);
+  });
+
+  // Guard: it passes today and must keep passing.
+  it('control: scripts.test changed in a workspace member → success', async () => {
+    const w = monorepo();
+    w.pr({ [MEMBER]: member({ test: 'vitest run --coverage' }) });
+    await w.judge();
+    expect(states(w)).toEqual(['success']);
+  });
+});
+
+describe('M1: yarn classic configuration, the yarn binary and its plugins', () => {
+  for (const path of ['.yarnrc', '.yarn/releases/x.cjs', '.yarn/plugins/x.cjs']) {
+    it(`${path} edited → failure`, async () => {
+      const w = world({ [path]: 'uno\n' });
+      const head = w.pr({ [path]: 'dos\n' });
+      const report = await w.judge();
+      expectRejectedForOwnFiles(w, head, report);
+      expect(report.summary).toContain(path);
+    });
+  }
+});
+
+describe('M1: the installer and its build allow-list', () => {
+  it('package.json packageManager changed → failure', async () => {
+    const w = world({ 'package.json': pkg((p) => { p.packageManager = 'pnpm@10.0.0'; }) });
+    const head = w.pr({ 'package.json': pkg((p) => { p.packageManager = 'pnpm@10.0.1'; }) });
+    const report = await w.judge();
+    expectRejectedForOwnFiles(w, head, report);
+  });
+
+  it('package.json pnpm.onlyBuiltDependenciesFile added → failure', async () => {
+    const w = world({ 'package.json': json(BASE_PACKAGE) });
+    const head = w.pr({ 'package.json': pkg((p) => { p.pnpm = { onlyBuiltDependenciesFile: 'built.json' }; }) });
+    const report = await w.judge();
+    expectRejectedForOwnFiles(w, head, report);
+  });
+
+  const WORKSPACE = lines('packages:', '  - apps/*');
+  for (const [what, extra] of [
+    ['dangerouslyAllowAllBuilds added', lines('', 'dangerouslyAllowAllBuilds: true')],
+    ['onlyBuiltDependenciesFile added', lines('', 'onlyBuiltDependenciesFile: built.json')],
+    ['neverBuiltDependencies added', lines('', 'neverBuiltDependencies:', '  - esbuild')],
+  ] as const) {
+    it(`pnpm-workspace.yaml ${what} → failure`, async () => {
+      const w = world({ 'pnpm-workspace.yaml': WORKSPACE });
+      const head = w.pr({ 'pnpm-workspace.yaml': `${WORKSPACE}${extra}` });
+      const report = await w.judge();
+      expectRejectedForOwnFiles(w, head, report);
+      expect(report.summary).toContain('pnpm-workspace.yaml');
+    });
+  }
+});

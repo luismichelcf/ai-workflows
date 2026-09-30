@@ -229,3 +229,23 @@ describe('R6 §15 P4: the seal on the checkout of a tag push, and only a fully q
     expectRefused(root, seal(root, '--tag', 'v1.0.0', '--main', 'refs/remotes/origin/main'));
   });
 });
+
+// Delta review of the flock fixes (a NOTE on §15 P4): a fully qualified name is not enough if git
+// is left to guess. `refs/remotes/origin/main` that does not exist must not resolve to a tag named
+// `refs/tags/refs/remotes/origin/main` (git's own lookup order tries `refs/tags/<name>` too): the
+// seal reads exactly the ref it was given, and refuses when that exact ref is missing.
+describe('NOTE: --main is read as that exact ref, never guessed', () => {
+  it('refs/remotes/origin/main missing, a tag refs/tags/refs/remotes/origin/main on a merge that contains the commit: refused', () => {
+    // The reviewed commit is never merged into main; a side branch merges it and the tag points at
+    // that merge, so the guessed ref would pass every other check.
+    const { root, reviewed } = releaseRepository({ merge: false });
+    git(root, 'switch', '-q', '-c', 'side', 'main');
+    git(root, 'merge', '-q', '--no-ff', '--no-edit', 'piece');
+    git(root, 'update-ref', 'refs/tags/refs/remotes/origin/main', git(root, 'rev-parse', 'HEAD'));
+    git(root, 'tag', 'v1.0.0', reviewed);
+    git(root, 'switch', '-q', '--detach', 'v1.0.0');
+    expect(git(root, 'for-each-ref', '--format=%(refname)', 'refs/remotes')).toBe('');
+
+    expectRefused(root, seal(root, '--tag', 'v1.0.0', '--main', 'refs/remotes/origin/main'));
+  });
+});

@@ -1,6 +1,8 @@
+import { join } from 'node:path';
+
 import { runJudge, type JudgeGitHub, type JudgeInput, type PullRequestComment } from '../src/index.js';
 
-import { commit, git, repository, write } from './git-fixtures.js';
+import { commit, emptyFolder, git, repository, write } from './git-fixtures.js';
 
 // PLAN-13-R6 §1: a world with several working branches for the judge. Git is real (one temporary
 // repository holds `main`, `staging` and every pull request head, so every object the judge would
@@ -226,6 +228,15 @@ export interface BranchWorld {
    * commit is not registered anywhere: use it as a branch tip or a pull request head.
    */
   commitOn(from: string, files: Readonly<Record<string, string | null>>, message?: string): string;
+  /**
+   * Only with `remote: true`. One commit over `from` that writes `files`, made in a separate clone
+   * and pushed to the bare remote, never into the judge's checkout: its objects arrive only through
+   * `fetchObjects`, like a tip that moved on GitHub while the judge was judging. With `merge`, the
+   * commit first merges that SHA into `from` (`--no-ff`), then writes `files` on top.
+   */
+  commitRemote(from: string, files: Readonly<Record<string, string | null>>, message?: string, merge?: string): string;
+  /** Whether the judge's checkout holds the commit `sha`. */
+  hasObject(sha: string): boolean;
   /** Registers the tips GitHub reports for `branch`, in order (the last one repeats). */
   setBranch(branch: string, ...tips: string[]): void;
   /** Registers pull request `n`. The head repository is this one unless said otherwise. */
@@ -245,6 +256,13 @@ export interface WorldOptions {
   readonly mainRecipe: string;
   /** The action input `branches`; by default the branches of §1.1. `null` leaves it out. */
   readonly branches?: readonly string[] | null;
+  /**
+   * B1 (delta review of the flock fixes): `fetchObjects` really runs `git fetch <bare> <sha>…`
+   * from a separate bare remote, instead of only recording the SHAs. Every object of the checkout
+   * is reachable there (the bare remote borrows the checkout's objects); `commitRemote` adds
+   * commits that only the remote has.
+   */
+  readonly remote?: boolean;
 }
 
 export function branchWorld(options: WorldOptions): BranchWorld {
@@ -260,6 +278,20 @@ export function branchWorld(options: WorldOptions): BranchWorld {
   github.heads.set('main', [main]);
   const fetched: string[] = [];
   const branches = options.branches === undefined ? ['staging', 'main'] : options.branches;
+  let bare: string | undefined;
+  let work: string | undefined;
+  if (options.remote === true) {
+    bare = join(emptyFolder(), 'remote.git');
+    git(root, 'clone', '-q', '--bare', '--shared', root, bare);
+    git(bare, 'config', 'uploadpack.allowAnySHA1InWant', 'true');
+    work = join(emptyFolder(), 'work');
+    git(root, 'clone', '-q', '--shared', '-c', 'core.autocrlf=false', root, work);
+    git(work, 'config', 'user.email', 'test@example.com');
+    git(work, 'config', 'user.name', 'Test');
+    git(work, 'config', 'core.autocrlf', 'false');
+    git(work, 'config', 'commit.gpgsign', 'false');
+  }
+  let remoteCommits = 0;
 
   const self: BranchWorld = {
     root,
@@ -275,6 +307,27 @@ export function branchWorld(options: WorldOptions): BranchWorld {
       const sha = commit(root, message);
       git(root, 'switch', '-q', 'main');
       return sha;
+    },
+    commitRemote(from, files, message = 'cambio remoto', merge) {
+      if (bare === undefined || work === undefined) throw new Error('commitRemote needs remote: true');
+      git(work, 'switch', '-q', '--detach', from);
+      if (merge !== undefined) git(work, 'merge', '-q', '--no-ff', '--no-edit', merge);
+      for (const [path, content] of Object.entries(files)) {
+        if (content === null) git(work, 'rm', '-q', path);
+        else write(work, path, content);
+      }
+      const sha = commit(work, message);
+      remoteCommits += 1;
+      git(work, 'push', '-q', bare, `HEAD:refs/heads/remote-${remoteCommits}`);
+      return sha;
+    },
+    hasObject(sha) {
+      try {
+        git(root, 'cat-file', '-e', `${sha}^{commit}`);
+        return true;
+      } catch {
+        return false;
+      }
     },
     setBranch(branch, ...tips) {
       github.heads.set(branch, [...tips]);
@@ -331,6 +384,7 @@ export function branchWorld(options: WorldOptions): BranchWorld {
         sleep: async () => {},
         fetchObjects: async (shas) => {
           fetched.push(...shas);
+          if (bare !== undefined && shas.length > 0) git(root, 'fetch', '-q', '--no-tags', bare, ...shas);
         },
       });
     },

@@ -194,3 +194,25 @@ describe('R31: license and version', () => {
     expect(pkg['files']).toContain('engine.json');
   });
 });
+
+// Delta review of the flock fixes, finding M2: the gate that publishing waits for must test the
+// same commit that is sealed and packed. On a dry-run the packing job checks out the `sha` input;
+// every job it `needs` that runs `pnpm check` checks out that same ref (the same expression), not
+// the dispatch branch.
+describe('M2: the gate checks out the same ref as the packing job', () => {
+  it('every gate job the packing job needs checks out the ref of the packing checkout', () => {
+    const packing = packingJob();
+    const packRef = stepsOf(packing).find((step) => String(step['uses'] ?? '').startsWith('actions/checkout@'))?.['with']?.['ref'];
+    expect(String(packRef ?? ''), 'the packing checkout ref').toMatch(/inputs\.sha/);
+    const jobs = new Map(jobsOf(release()));
+    const gates = needsOf(packing)
+      .map((id) => [id, jobs.get(id)] as const)
+      .filter(([, job]) => job !== undefined && stepsOf(job).some((step) => /pnpm check/.test(runOf(step))));
+    expect(gates.length, 'a gate job that runs pnpm check').toBeGreaterThan(0);
+    for (const [id, job] of gates) {
+      const checkout = stepsOf(job as Job).find((step) => String(step['uses'] ?? '').startsWith('actions/checkout@'));
+      expect(checkout, `${id}: a checkout`).toBeDefined();
+      expect(checkout?.['with']?.['ref'], `${id}: the checkout ref`).toBe(packRef);
+    }
+  });
+});
