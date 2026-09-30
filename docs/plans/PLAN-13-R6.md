@@ -959,3 +959,13 @@ motor, `name` que no sea el motor, `version`, `description`, `keywords`, `author
 compara contra vacío con la misma regla. `binding.gyp` a cualquier profundidad cuenta como tocado.
 `init` nunca busca el gestor en la carpeta del proyecto ni lanza uno por nombre sin ruta absoluta; y
 la orden de matar el árbol del gancho se lanza sin esperarla, para no gastar el margen de 30 s.
+
+**Cuarta revisión del delta (30-sep).** Sobre la regla por lista: un documento YAML con claves de
+mezcla (`<<`) o una clave `__proto__` a cualquier profundidad se lee distinto en el juez y en el
+instalador, así que cuenta como tocado; una dependencia o entrada de catálogo que no es el motor solo
+es inofensiva si su valor es un rango, versión o etiqueta del registro, o usa `workspace:` o
+`catalog:` (un `file:`, `link:`, `git`, `github:`, `npm:`, `patch:`, `portal:`, una dirección o un
+`.tgz` cuentan como tocados); el nombre del motor se compara sin distinguir mayúsculas en claves de
+dependencias, catálogo y bloqueos; el valor del archivo de lista de compilación en `.npmrc` se lee
+como lo lee el instalador (sin comillas, todas las apariciones); y la salida del gancho no puede
+cambiar su código por una falla al matar el árbol.
