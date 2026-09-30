@@ -525,9 +525,13 @@ describe('R6 §2.4 (7): pnpm-workspace.yaml', () => {
     expectRejectedForOwnFiles(w, head, report);
   });
 
-  it('another folder in packages → success', async () => {
+  // Changed after the second delta review (R32, PLAN-13-R6 §15): another folder in `packages`
+  // enlists its package.json, whose install scripts then run on install without that file
+  // changing, so it now needs the attestation (covered by the M-d test below). The guard that an
+  // ordinary workspace change passes is the catalog version of another package.
+  it('the catalog version of another package changes → success', async () => {
     const w = world({ 'pnpm-workspace.yaml': WORKSPACE });
-    w.pr({ 'pnpm-workspace.yaml': WORKSPACE.replace('  - apps/*', '  - apps/*\n  - libs/*') });
+    w.pr({ 'pnpm-workspace.yaml': WORKSPACE.replace('  react: 18.2.0', '  react: 18.3.0') });
     await w.judge();
     expect(states(w)).toEqual(['success']);
   });
