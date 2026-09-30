@@ -35,6 +35,7 @@ import {
   waitForMergeQueue,
   type Unofficial,
 } from './checks.js';
+import { engineVersionFilesIn, isEngineProtectedPath, touchedEngineVersionFiles } from './own-files.js';
 import { pieceOfBranch, readDeclaredKind } from './pieces.js';
 import type { CommitStatus, JudgeGitHub, JudgePullRequest } from './port.js';
 import { buildSummary, escapeReportText, type SummaryPiece } from './summary.js';
@@ -544,11 +545,14 @@ async function judgeStage(stage: RecipeStage, work: StageWork): Promise<JudgedSt
 // The judge's own files (§3.5)
 
 function isProtectedFile(file: string, judgePath: string, alsoProtect: readonly string[]): boolean {
+  // §2.1: the engine's own list, the run's workflow and `also-protect` are all compared without
+  // case, because a case-insensitive file system would let `.Claude/settings.json` overwrite the
+  // real file. The workflow path is not in the list: it changes from project to project.
+  const lower = file.toLowerCase();
   return (
-    file === '.ai-workflows' ||
-    file.startsWith('.ai-workflows/') ||
-    file === judgePath ||
-    alsoProtect.includes(file)
+    isEngineProtectedPath(file) ||
+    lower === judgePath.toLowerCase() ||
+    alsoProtect.some((entry) => entry.toLowerCase() === lower)
   );
 }
 
@@ -565,8 +569,46 @@ async function judgeFilesNote(
   alsoProtect: readonly string[],
 ): Promise<FilesNote> {
   const spanish = isSpanish(work.recipe.locale);
-  const touched = work.facts.files.filter((file) => isProtectedFile(file, judgePath, alsoProtect));
+  const protectedTouched = work.facts.files.filter((file) =>
+    isProtectedFile(file, judgePath, alsoProtect),
+  );
+
+  // §2.2: the engine version, compared against the merge base. It only runs when the pull request
+  // touches one of those files; the others pay nothing. A git failure is technical, and anything
+  // else — a file that cannot be read as its format, or that appears or disappears — is touched.
+  let versionTouched: readonly string[] = [];
+  if (engineVersionFilesIn(work.facts.files).length > 0) {
+    try {
+      versionTouched = await touchedEngineVersionFiles(
+        work.root,
+        work.facts.mergeBase,
+        work.target.head,
+        work.facts.files,
+      );
+    } catch (error) {
+      return {
+        error: pick(
+          spanish,
+          `No se pudo leer la versión del motor: ${reasonOf(error)}`,
+          `The engine version could not be read: ${reasonOf(error)}`,
+        ),
+      };
+    }
+  }
+
+  const touched = [...new Set([...protectedTouched, ...versionTouched])];
   if (touched.length === 0) return {};
+
+  // §2.3: what was touched goes to the run log, never to the published description, which keeps
+  // today's text (the limit of 140 characters preserves the order).
+  addNote(
+    work.notes,
+    pick(
+      spanish,
+      `Archivos propios del motor tocados: ${touched.join(', ')}.`,
+      `The engine's own files touched: ${touched.join(', ')}.`,
+    ),
+  );
 
   const owners = work.recipe.owner === undefined ? [] : [work.recipe.owner];
   let comments;

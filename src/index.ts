@@ -42,6 +42,7 @@ export {
   type StageOutcome as JudgeStageOutcome,
   type JudgeVerdict,
 } from './judge/judge.js';
+export { ENGINE_PROTECTED_PATHS } from './judge/own-files.js';
 export { createEngine } from './engine.js';
 export {
   launchInGroup,

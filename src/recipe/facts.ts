@@ -341,6 +341,34 @@ export function gitProjectFiles(root: string, sha: string): ProjectFiles {
   };
 }
 
+/**
+ * PLAN-13-R6 §2.2: one file of a commit, read with a caller-chosen size cap. The lockfiles that
+ * decide which engine is installed are larger than the shared 1 MB, so they are read with their
+ * own cap. A git failure still throws (it is technical, never an answer); a path that is not in
+ * the tree and a file over the cap are answers, and the cap never turns a read into a pass.
+ */
+export interface GitFileReading {
+  readonly kind: 'file' | 'missing' | 'too-large';
+  /** Present only when `kind` is `file`. */
+  readonly content?: string;
+}
+
+export async function gitFileAt(
+  root: string,
+  sha: string,
+  path: string,
+  maxBytes: number,
+): Promise<GitFileReading> {
+  requireProjectPath(path);
+  // The commit must exist: a git failure to resolve it is an error, never an absent file.
+  await runGit(root, ['rev-parse', '--verify', `${sha}^{commit}`]);
+  if (!(await pathInTree(root, sha, path))) return { kind: 'missing' };
+  const spec = `${sha}:${path}`;
+  const size = Number.parseInt(text(await runGit(root, ['cat-file', '-s', spec])), 10);
+  if (!Number.isFinite(size) || size > maxBytes) return { kind: 'too-large' };
+  return { kind: 'file', content: (await runGit(root, ['cat-file', 'blob', spec])).toString('utf8') };
+}
+
 /** PLAN-13-R3 §1.3: the project files of the working tree, with the same reading rules. */
 export function diskProjectFiles(root: string): ProjectFiles {
   return {

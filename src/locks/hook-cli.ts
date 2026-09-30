@@ -10,6 +10,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, writeFile
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 
 import { childEnvironment } from '../git-env.js';
+import { CLAUDE_SETTINGS_PATH } from '../judge/own-files.js';
 import { parseRecipe } from '../recipe/parse.js';
 import type { Recipe } from '../recipe/types.js';
 import { lockContextFor } from './context.js';
@@ -505,7 +506,9 @@ export async function installHooks(options: InstallHooksOptions): Promise<Instal
   };
   const ours: HooksFile = { hooks: { PreToolUse: [{ matcher, hooks: [ourHandler] }] } };
 
-  const settingsPath = join(copy.root, '.claude', 'settings.json');
+  // PLAN-13-R6 §2.1: the same constant the judge protects, so the installer and the list can
+  // never drift apart.
+  const settingsPath = join(copy.root, CLAUDE_SETTINGS_PATH);
   let merged: Record<string, unknown>;
   try {
     const existing = existsSync(settingsPath)
