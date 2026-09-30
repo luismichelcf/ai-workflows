@@ -696,11 +696,15 @@ describe('R6 §2.4 (11) and (13): the key that decides node_modules/ai-workflows
     expectRejectedForOwnFiles(w, head, report);
   });
 
-  it('an alias under another key ("x": "npm:ai-workflows@9.9.9"), the ai-workflows key untouched → success', async () => {
+  // Changed by the fourth delta review (PLAN-13-R6 §15, «Cuarta revisión del delta»): a dependency
+  // that is not the engine is harmless only when its value is a registry range, version or tag, or
+  // uses `workspace:` or `catalog:`; an `npm:` alias counts as touched whatever package it names.
+  // The guard that an ordinary dependency of another package passes is §2.4 (5) above.
+  it('an alias under another key ("x": "npm:ai-workflows@9.9.9"), the ai-workflows key untouched → failure (npm: is not a registry spec)', async () => {
     const w = world({ 'package.json': json(BASE_PACKAGE) });
-    w.pr({ 'package.json': pkg((p) => { field(p, 'dependencies').x = 'npm:ai-workflows@9.9.9'; }) });
-    await w.judge();
-    expect(states(w)).toEqual(['success']);
+    const head = w.pr({ 'package.json': pkg((p) => { field(p, 'dependencies').x = 'npm:ai-workflows@9.9.9'; }) });
+    const report = await w.judge();
+    expectRejectedForOwnFiles(w, head, report);
   });
 });
 
@@ -1425,6 +1429,307 @@ describe('third delta: every setting that names the build allow-list file', () =
       'pnpm-workspace.yaml': lines('packages:', '  - apps/*', '', 'onlyBuiltDependenciesFile: x/../b.json'),
       'b.json': json(['esbuild']),
     });
+    const head = w.pr({ 'b.json': json(['esbuild', 'postinstall-x']) });
+    const report = await w.judge();
+    expectRejectedForOwnFiles(w, head, report);
+    expect(report.summary).toContain('b.json');
+  });
+});
+// ---------------------------------------------------------------------------------------------
+// Fourth delta review of the flock fixes (PLAN-13-R6 §15, «Cuarta revisión del delta»): on the
+// rule by list of harmless changes, what the judge reads can differ from what the installer reads.
+//
+// Interface fixed here (for the builder):
+//   - A YAML document (package.yaml, pnpm-workspace.yaml, pnpm-lock.yaml) that holds a merge key
+//     (`<<`) at any depth, on a side that changes, is touched: the judge and the installer do not
+//     read it the same way. Anchors and aliases WITHOUT `<<` are read as usual (the alias is its
+//     value) and compared with the ordinary rule.
+//   - A key `__proto__` at any depth of a package manifest or of pnpm-workspace.yaml, on a side
+//     that changes, is touched (a plain JS object drops it, so the judge would not see it).
+//   - A dependency entry that is not the engine (in `dependencies`, `devDependencies`,
+//     `optionalDependencies`, `peerDependencies`) and a catalog entry that is not the engine are
+//     harmless only when the value is a registry range, version or tag, or starts with
+//     `workspace:` or `catalog:`. `file:`, `link:`, `git…`, `github:`, `npm:`, `patch:`,
+//     `portal:`, a URL or a `.tgz` count as touched.
+//   - The engine name is compared without case in the keys of dependency sections, catalogs and
+//     lockfiles (`AI-Workflows` is the engine).
+//   - `only-built-dependencies-file` in `.npmrc` is read the way the installer reads it: a value in
+//     double or single quotes is unquoted, and EVERY occurrence of the key names a file of the
+//     judge's own.
+//   The run log names the touched file.
+
+describe('fourth delta: YAML merge keys are touched', () => {
+  const MEMBER = 'packages/x/package.yaml';
+  const WORKSPACE = lines('packages:', '  - apps/*', '', 'catalog:', '  react: 18.2.0');
+
+  it(`a new ${MEMBER} with scripts: {<<: {postinstall}} → failure naming it`, async () => {
+    const w = world({ 'package.json': json(BASE_PACKAGE) });
+    const head = w.pr({ [MEMBER]: lines('name: x', 'scripts:', "  <<: { postinstall: 'node x.js' }") });
+    const report = await w.judge();
+    expectRejectedForOwnFiles(w, head, report);
+    expect(report.summary).toContain(MEMBER);
+  });
+
+  it('pnpm-workspace.yaml catalog gains <<: {ai-workflows: github:e/x} → failure naming it', async () => {
+    const w = world({ 'pnpm-workspace.yaml': WORKSPACE });
+    const head = w.pr({ 'pnpm-workspace.yaml': `${WORKSPACE}${lines("  <<: { ai-workflows: 'github:e/x' }")}` });
+    const report = await w.judge();
+    expectRejectedForOwnFiles(w, head, report);
+    expect(report.summary).toContain('pnpm-workspace.yaml');
+  });
+
+  it(`${MEMBER} dependencies gain a merge of an ordinary registry entry (<<: {react: 18.2.0}) → failure`, async () => {
+    const before = lines('name: x', 'dependencies:', '  lodash: 4.17.21');
+    const w = world({ 'package.json': json(BASE_PACKAGE), [MEMBER]: before });
+    const head = w.pr({ [MEMBER]: `${before}${lines('  <<: { react: 18.2.0 }')}` });
+    const report = await w.judge();
+    expectRejectedForOwnFiles(w, head, report);
+    expect(report.summary).toContain(MEMBER);
+  });
+
+  it("pnpm-lock.yaml importers['.'].dependencies gain <<: {ai-workflows: …} → failure naming it", async () => {
+    const w = world({ 'pnpm-lock.yaml': LOCK() });
+    const merged = LOCK().replace(
+      lines('    dependencies:', '      react:'),
+      lines('    dependencies:', "      <<: { ai-workflows: { specifier: 'github:e/x', version: 9.9.9 } }", '      react:'),
+    );
+    expect(merged).not.toBe(LOCK());
+    const head = w.pr({ 'pnpm-lock.yaml': merged });
+    const report = await w.judge();
+    expectRejectedForOwnFiles(w, head, report);
+    expect(report.summary).toContain('pnpm-lock.yaml');
+  });
+
+  // Guards: they pass today and must keep passing. Anchors and aliases without `<<` compare as
+  // their values.
+  it(`control: ${MEMBER} with an anchor and an alias only in harmless fields → success`, async () => {
+    const w = world({ 'package.json': json(BASE_PACKAGE), [MEMBER]: lines('name: x', 'description: uno') });
+    w.pr({ [MEMBER]: lines('name: x', 'description: &d dos', 'keywords: [*d]') });
+    await w.judge();
+    expect(states(w)).toEqual(['success']);
+  });
+
+  it('control: pnpm-workspace.yaml catalog entries of other packages through an anchor and an alias → success', async () => {
+    const w = world({ 'pnpm-workspace.yaml': WORKSPACE });
+    w.pr({ 'pnpm-workspace.yaml': lines('packages:', '  - apps/*', '', 'catalog:', '  react: &r 18.3.0', '  react-dom: *r') });
+    await w.judge();
+    expect(states(w)).toEqual(['success']);
+  });
+
+  it(`control: ${MEMBER} whose alias puts a lifecycle script (postinstall: *s) → failure`, async () => {
+    const w = world({ 'package.json': json(BASE_PACKAGE), [MEMBER]: lines('name: x', 'scripts:', '  test: node x.js') });
+    const head = w.pr({ [MEMBER]: lines('name: x', 'scripts:', '  test: &s node x.js', '  postinstall: *s') });
+    const report = await w.judge();
+    expectRejectedForOwnFiles(w, head, report);
+  });
+});
+
+describe('fourth delta: a __proto__ key is touched', () => {
+  const WORKSPACE = lines('packages:', '  - apps/*', '', 'catalog:', '  react: 18.2.0');
+
+  it('pnpm-workspace.yaml gains __proto__: {dangerouslyAllowAllBuilds: true} → failure naming it', async () => {
+    const w = world({ 'pnpm-workspace.yaml': WORKSPACE });
+    const head = w.pr({ 'pnpm-workspace.yaml': `${WORKSPACE}${lines('', '__proto__:', '  dangerouslyAllowAllBuilds: true')}` });
+    const report = await w.judge();
+    expectRejectedForOwnFiles(w, head, report);
+    expect(report.summary).toContain('pnpm-workspace.yaml');
+  });
+
+  it('pnpm-workspace.yaml catalog gains __proto__: {ai-workflows: …} → failure', async () => {
+    const w = world({ 'pnpm-workspace.yaml': WORKSPACE });
+    const head = w.pr({ 'pnpm-workspace.yaml': `${WORKSPACE}${lines('  __proto__:', "    ai-workflows: 'github:e/x'")}` });
+    const report = await w.judge();
+    expectRejectedForOwnFiles(w, head, report);
+  });
+
+  // The base already holds an empty `pnpm`, so the only change is the `__proto__` key inside it.
+  const withPnpm = pkg((p) => { p.pnpm = {}; });
+
+  it('package.json "pnpm": {} gains "__proto__": {"x": 1} → failure naming it', async () => {
+    const w = world({ 'package.json': withPnpm });
+    const after = withPnpm.replace('"pnpm": {}', '"pnpm": { "__proto__": { "x": 1 } }');
+    expect(after).not.toBe(withPnpm);
+    const head = w.pr({ 'package.json': after });
+    const report = await w.judge();
+    expectRejectedForOwnFiles(w, head, report);
+    expect(report.summary).toContain('package.json');
+  });
+
+  it('package.json gains a top-level "__proto__": {"scripts": {"postinstall": …}} → failure', async () => {
+    const before = json(BASE_PACKAGE);
+    const after = before.replace('{\n', '{\n  "__proto__": { "scripts": { "postinstall": "node x.js" } },\n');
+    expect(after).not.toBe(before);
+    const w = world({ 'package.json': before });
+    const head = w.pr({ 'package.json': after });
+    const report = await w.judge();
+    expectRejectedForOwnFiles(w, head, report);
+  });
+});
+
+describe('fourth delta: a dependency that is not the engine is harmless only with a registry spec', () => {
+  const base = pkg((p) => { field(p, 'dependencies').esbuild = '^0.21.0'; });
+  const withEsbuild = (spec: string): string => pkg((p) => { field(p, 'dependencies').esbuild = spec; });
+
+  for (const spec of ['file:./e.tgz', 'github:a/b', 'git+https://x/y.git', 'https://x/e.tgz', 'link:../e', 'npm:other@1']) {
+    it(`dependencies.esbuild from ^0.21.0 to ${spec} → failure naming package.json`, async () => {
+      const w = world({ 'package.json': base });
+      const head = w.pr({ 'package.json': withEsbuild(spec) });
+      const report = await w.judge();
+      expectRejectedForOwnFiles(w, head, report);
+      expect(report.summary).toContain('package.json');
+    });
+  }
+
+  // Guards: they pass today and must keep passing.
+  for (const spec of ['^0.22.0', 'workspace:*', 'catalog:']) {
+    it(`control: dependencies.esbuild from ^0.21.0 to ${spec} → success`, async () => {
+      const w = world({ 'package.json': base });
+      w.pr({ 'package.json': withEsbuild(spec) });
+      await w.judge();
+      expect(states(w)).toEqual(['success']);
+    });
+  }
+
+  it('a new member package.json with dependencies.x = link:../x → failure naming it', async () => {
+    const w = world({ 'package.json': json(BASE_PACKAGE) });
+    const head = w.pr({ 'packages/x/package.json': json({ name: 'x', dependencies: { x: 'link:../x' } }) });
+    const report = await w.judge();
+    expectRejectedForOwnFiles(w, head, report);
+    expect(report.summary).toContain('packages/x/package.json');
+  });
+
+  const WORKSPACE = (spec: string): string => lines('packages:', '  - apps/*', '', 'catalog:', `  esbuild: "${spec}"`);
+
+  it('pnpm-workspace.yaml catalog.esbuild from ^0.21.0 to github:a/b → failure naming it', async () => {
+    const w = world({ 'pnpm-workspace.yaml': WORKSPACE('^0.21.0') });
+    const head = w.pr({ 'pnpm-workspace.yaml': WORKSPACE('github:a/b') });
+    const report = await w.judge();
+    expectRejectedForOwnFiles(w, head, report);
+    expect(report.summary).toContain('pnpm-workspace.yaml');
+  });
+
+  // Guard: it passes today and must keep passing.
+  it('control: pnpm-workspace.yaml catalog.esbuild from ^0.21.0 to ^0.22.0 → success', async () => {
+    const w = world({ 'pnpm-workspace.yaml': WORKSPACE('^0.21.0') });
+    w.pr({ 'pnpm-workspace.yaml': WORKSPACE('^0.22.0') });
+    await w.judge();
+    expect(states(w)).toEqual(['success']);
+  });
+});
+
+describe('fourth delta: the engine name is compared without case', () => {
+  it('package.json gains dependencies["AI-Workflows"] = "npm:x@1" → failure', async () => {
+    const w = world({ 'package.json': json(BASE_PACKAGE) });
+    const head = w.pr({ 'package.json': pkg((p) => { field(p, 'dependencies')['AI-Workflows'] = 'npm:x@1'; }) });
+    const report = await w.judge();
+    expectRejectedForOwnFiles(w, head, report);
+  });
+
+  // A registry version, so only the case rule (not the registry-spec rule) can catch it.
+  it('package.json gains dependencies["AI-Workflows"] = "9.9.9" → failure', async () => {
+    const w = world({ 'package.json': json(BASE_PACKAGE) });
+    const head = w.pr({ 'package.json': pkg((p) => { field(p, 'dependencies')['AI-Workflows'] = '9.9.9'; }) });
+    const report = await w.judge();
+    expectRejectedForOwnFiles(w, head, report);
+  });
+
+  it('pnpm-workspace.yaml catalog["AI-Workflows"] from 1.0.0 to 9.9.9 → failure', async () => {
+    const workspace = (version: string): string => lines('packages:', '  - apps/*', '', 'catalog:', `  AI-Workflows: ${version}`);
+    const w = world({ 'pnpm-workspace.yaml': workspace('1.0.0') });
+    const head = w.pr({ 'pnpm-workspace.yaml': workspace('9.9.9') });
+    const report = await w.judge();
+    expectRejectedForOwnFiles(w, head, report);
+  });
+
+  const UPPER_LOCK = (importerVersion = '1.0.0', integrity = 'sha512-AAAA', extra: readonly string[] = []): string => lines(
+    "lockfileVersion: '9.0'",
+    '',
+    ...extra,
+    'importers:',
+    '',
+    '  .:',
+    '    dependencies:',
+    '      AI-Workflows:',
+    `        specifier: ${importerVersion}`,
+    `        version: ${importerVersion}`,
+    '',
+    'packages:',
+    '',
+    '  AI-Workflows@1.0.0:',
+    `    resolution: {integrity: ${integrity}}`,
+    '',
+    'snapshots:',
+    '',
+    '  AI-Workflows@1.0.0: {}',
+  );
+
+  it('pnpm-lock.yaml: only the importer entry AI-Workflows changes → failure naming it', async () => {
+    const w = world({ 'pnpm-lock.yaml': UPPER_LOCK() });
+    const head = w.pr({ 'pnpm-lock.yaml': UPPER_LOCK('9.9.9') });
+    const report = await w.judge();
+    expectRejectedForOwnFiles(w, head, report);
+    expect(report.summary).toContain('pnpm-lock.yaml');
+  });
+
+  it('pnpm-lock.yaml: a new override keyed AI-Workflows → failure', async () => {
+    const w = world({ 'pnpm-lock.yaml': UPPER_LOCK() });
+    const head = w.pr({ 'pnpm-lock.yaml': UPPER_LOCK('1.0.0', 'sha512-AAAA', ['overrides:', '  AI-Workflows: 9.9.9', '']) });
+    const report = await w.judge();
+    expectRejectedForOwnFiles(w, head, report);
+  });
+
+  // Guard: it passes today and must keep passing (package keys are already folded).
+  it('control: pnpm-lock.yaml: the package AI-Workflows@1.0.0 changes its integrity → failure', async () => {
+    const w = world({ 'pnpm-lock.yaml': UPPER_LOCK() });
+    const head = w.pr({ 'pnpm-lock.yaml': UPPER_LOCK('1.0.0', 'sha512-BBBB') });
+    const report = await w.judge();
+    expectRejectedForOwnFiles(w, head, report);
+  });
+
+  it('package-lock.json: the entry node_modules/AI-Workflows changes → failure', async () => {
+    const npmLock = (integrity: string): string => json({
+      name: 'proyecto',
+      lockfileVersion: 3,
+      requires: true,
+      packages: {
+        '': { name: 'proyecto', dependencies: { 'AI-Workflows': '1.0.0' } },
+        'node_modules/AI-Workflows': { version: '1.0.0', resolved: 'https://registry.npmjs.org/x/-/x-1.0.0.tgz', integrity },
+      },
+    });
+    const w = world({ 'package-lock.json': npmLock('sha512-AAAA') });
+    const head = w.pr({ 'package-lock.json': npmLock('sha512-BBBB') });
+    const report = await w.judge();
+    expectRejectedForOwnFiles(w, head, report);
+  });
+});
+
+describe('fourth delta: .npmrc only-built-dependencies-file read as the installer reads it', () => {
+  for (const [what, npmrc] of [
+    ['in double quotes', 'only-built-dependencies-file="allow.json"\n'],
+    ['in single quotes', "only-built-dependencies-file='allow.json'\n"],
+  ] as const) {
+    it(`.npmrc names allow.json ${what}; allow.json edited → failure naming it`, async () => {
+      const w = world({ '.npmrc': npmrc, 'allow.json': json(['esbuild']) });
+      const head = w.pr({ 'allow.json': json(['esbuild', 'postinstall-x']) });
+      const report = await w.judge();
+      expectRejectedForOwnFiles(w, head, report);
+      expect(report.summary).toContain('allow.json');
+    });
+  }
+
+  const TWICE = lines('only-built-dependencies-file=a.json', 'only-built-dependencies-file=b.json');
+
+  // Guard: it passes today (the first occurrence is read) and must keep passing.
+  it('.npmrc with the key twice (a.json, then b.json); a.json edited → failure naming it', async () => {
+    const w = world({ '.npmrc': TWICE, 'a.json': json(['esbuild']), 'b.json': json(['esbuild']) });
+    const head = w.pr({ 'a.json': json(['esbuild', 'postinstall-x']) });
+    const report = await w.judge();
+    expectRejectedForOwnFiles(w, head, report);
+    expect(report.summary).toContain('a.json');
+  });
+
+  it('.npmrc with the key twice (a.json, then b.json); b.json edited → failure naming it', async () => {
+    const w = world({ '.npmrc': TWICE, 'a.json': json(['esbuild']), 'b.json': json(['esbuild']) });
     const head = w.pr({ 'b.json': json(['esbuild', 'postinstall-x']) });
     const report = await w.judge();
     expectRejectedForOwnFiles(w, head, report);
