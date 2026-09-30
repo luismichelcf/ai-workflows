@@ -5,10 +5,10 @@
 // the loader is missing, when it exits with an error or dies without answering: it must print the
 // deny JSON itself and exit 0, naming the engine. These run the order exactly as installed, through
 // the shell Codex uses (cmd.exe and Windows PowerShell on Windows, `sh -c` elsewhere).
-import { spawnSync, type SpawnSyncReturns } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { spawn, spawnSync, type SpawnSyncReturns } from 'node:child_process';
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { delimiter, join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { installHooks } from '../src/index.js';
@@ -98,7 +98,7 @@ const input = JSON.stringify({
   cwd: '<CWD>',
 });
 
-function expectCodexDeny(result: SpawnSyncReturns<string>): void {
+function expectCodexDeny(result: { readonly status: number | null; readonly stdout: string }): void {
   expect(result.status).toBe(0);
   const answer = JSON.parse(result.stdout.trim()) as {
     hookSpecificOutput?: { hookEventName?: string; permissionDecision?: string; permissionDecisionReason?: string };
@@ -134,4 +134,171 @@ describe('R6 §3.3: the installed Codex order fails closed on its own', () => {
     writeFileSync(join(root, '.ai-workflows', 'hook.cjs'), "process.stdout.write('no es json');\nprocess.exit(0);\n");
     for (const result of runThroughShells(root, input.replace('<CWD>', root.replaceAll('\\', '\\\\')))) expectCodexDeny(result);
   }, 120_000);
+});
+
+// PLAN-13-R6 §15 P5 (the flock, 30-sep): the order has its own clock. `git rev-parse` gets about
+// 3 s and the loader what is left up to about 27 s; when either runs out, the order prints the deny
+// JSON itself and exits 0, because Codex cuts it at `timeout: 30` and then lets the tool through.
+// These run the order exactly as installed, through the shells Codex uses, and time the whole run
+// (shell, node and all): it must end in under 30 s.
+//
+// The hanging git is a fake first on PATH: a `.cmd` on Windows (found by cmd.exe through PATHEXT)
+// and a script elsewhere. Its sleeping process does not hold the order's pipes (`exec` on POSIX,
+// redirections on Windows), as a hung git of its own would not either; killing the process the
+// order started is enough to end it. (If the fix runs git without a shell on Windows, libuv does
+// not pick up a `.cmd`, the real git answers and the test still asserts a timely deny.)
+
+const CLIENT_CUT_MS = 30_000;
+
+interface Timed {
+  readonly result: { readonly status: number | null; readonly stdout: string };
+  readonly ms: number;
+}
+
+/** The environment with `bin` first on PATH, whatever the case of the variable's name. */
+function withFirstOnPath(bin: string): NodeJS.ProcessEnv {
+  const out = env();
+  const key = Object.keys(out).find((name) => name.toUpperCase() === 'PATH') ?? 'PATH';
+  out[key] = `${bin}${delimiter}${out[key] ?? ''}`;
+  return out;
+}
+
+/** A folder holding a `git` that sleeps 120 s. */
+function hangingGit(): string {
+  const bin = mkdtempSync(join(tmpdir(), 'aiw-codex-git-'));
+  created.push(bin);
+  if (process.platform === 'win32') {
+    writeFileSync(join(bin, 'git.cmd'), '@node -e "setTimeout(function(){},120000)" <nul >nul 2>nul\r\n');
+  } else {
+    writeFileSync(join(bin, 'git'), '#!/bin/sh\nexec sleep 120\n');
+    chmodSync(join(bin, 'git'), 0o755);
+  }
+  return bin;
+}
+
+const GIVE_UP_MS = 45_000;
+
+/** Kills a process and everything it started (the shell, the order, the loader, the fake git). */
+function killTree(pid: number): void {
+  if (process.platform === 'win32') {
+    spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore' });
+    return;
+  }
+  try {
+    process.kill(-pid, 'SIGKILL');
+  } catch {
+    // Already gone.
+  }
+}
+
+/**
+ * Runs one shell line asynchronously and times it. A run still going at 45 s is killed with its
+ * whole tree (a synchronous spawn would wait on the grandchild that holds the pipes, forever) and
+ * reported with no status.
+ */
+function timed(command: string, args: readonly string[], options: { cwd: string; env: NodeJS.ProcessEnv; stdin: string; shell?: boolean }): Promise<Timed> {
+  return new Promise((done) => {
+    const started = Date.now();
+    const child = spawn(command, args, {
+      cwd: options.cwd,
+      env: options.env,
+      shell: options.shell ?? false,
+      detached: process.platform !== 'win32',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let finished = false;
+    const finish = (status: number | null): void => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(killer);
+      done({ result: { status, stdout }, ms: Date.now() - started });
+    };
+    child.stdout.setEncoding('utf8').on('data', (chunk: string) => (stdout += chunk));
+    child.stderr.resume();
+    const killer = setTimeout(() => {
+      if (child.pid !== undefined) killTree(child.pid);
+      setTimeout(() => finish(null), 3_000);
+    }, GIVE_UP_MS);
+    child.on('error', () => finish(null));
+    child.on('close', (status) => finish(Date.now() - started >= GIVE_UP_MS ? null : status));
+    child.stdin.on('error', () => {});
+    child.stdin.end(options.stdin);
+  });
+}
+
+/** Runs the installed order through every shell Codex uses, timing each run; the test gives up at 45 s. */
+async function runTimed(root: string, stdin: string, options: { env?: NodeJS.ProcessEnv; cwd?: string } = {}): Promise<Timed[]> {
+  const order = installedOrder(root);
+  const base = { cwd: options.cwd ?? root, env: options.env ?? env(), stdin };
+  if (process.platform === 'win32') {
+    return [
+      await timed(order.commandWindows, [], { ...base, shell: true }),
+      await timed(
+        'powershell.exe',
+        ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(order.commandWindows, 'utf16le').toString('base64')],
+        base,
+      ),
+    ];
+  }
+  return [await timed('sh', ['-c', order.command], base)];
+}
+
+function expectDenyInTime(run: Timed): void {
+  // A run the test had to kill has no status and no answer: that is the failure these tests catch.
+  expect(run.result.status).toBe(0);
+  expect(run.ms).toBeLessThan(CLIENT_CUT_MS);
+  expectCodexDeny(run.result);
+}
+
+const codexStdin = (cwd: string) => input.replace('<CWD>', cwd.replaceAll('\\', '\\\\'));
+
+describe('R6 §15 P5: the Codex order has its own clock and fails closed on time', () => {
+  it('a git that hangs 120 s: the deny JSON with exit 0, in under 30 s', async () => {
+    const root = project();
+    await installHooks({ root, apply: true });
+    const bin = hangingGit();
+    for (const run of await runTimed(root, codexStdin(root), { env: withFirstOnPath(bin) })) expectDenyInTime(run);
+  }, 200_000);
+
+  it('a loader that never answers: the deny JSON with exit 0, in under 30 s', async () => {
+    const root = project();
+    await installHooks({ root, apply: true });
+    writeFileSync(join(root, '.ai-workflows', 'hook.cjs'), 'setInterval(function () {}, 1000);\n');
+    for (const run of await runTimed(root, codexStdin(root))) expectDenyInTime(run);
+  }, 200_000);
+
+  it('the real loader with an engine that never answers: the deny JSON with exit 0, in under 30 s', async () => {
+    const root = project();
+    await installHooks({ root, apply: true });
+    mkdirSync(join(root, 'node_modules', 'ai-workflows', 'dist'), { recursive: true });
+    writeFileSync(join(root, 'node_modules', 'ai-workflows', 'package.json'), '{"type":"module"}\n');
+    writeFileSync(join(root, 'node_modules', 'ai-workflows', 'dist', 'bin.js'), 'setInterval(() => {}, 1000);\n');
+    for (const run of await runTimed(root, codexStdin(root))) expectDenyInTime(run);
+  }, 200_000);
+});
+
+// The flock's surviving mutants on the order (guards): a forwarded answer must be a DENY, and a
+// session outside any repository is a refusal, never a pass.
+describe('R6 §15: the Codex order forwards only a deny and refuses outside a repository', () => {
+  it('a loader that prints an allow JSON with exit 0: the order prints its own deny', async () => {
+    const root = project();
+    await installHooks({ root, apply: true });
+    writeFileSync(
+      join(root, '.ai-workflows', 'hook.cjs'),
+      "process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'allow' } }));\nprocess.exit(0);\n",
+    );
+    for (const run of await runTimed(root, codexStdin(root))) {
+      expectDenyInTime(run);
+      expect(run.result.stdout).not.toMatch(/"allow"/);
+    }
+  }, 200_000);
+
+  it('run from a folder that is in no repository: the deny JSON with exit 0', async () => {
+    const root = project();
+    await installHooks({ root, apply: true });
+    const outside = mkdtempSync(join(tmpdir(), 'aiw-codex-outside-'));
+    created.push(outside);
+    for (const run of await runTimed(root, codexStdin(outside), { cwd: outside })) expectDenyInTime(run);
+  }, 200_000);
 });

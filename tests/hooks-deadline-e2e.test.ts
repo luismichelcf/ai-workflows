@@ -161,3 +161,48 @@ describe('§4 test 3: end to end, the process ends before 30 s with the refusal 
     denyReason(output);
   }, 60_000);
 });
+
+// PLAN-13-R6 §15 P6 (the flock, 30-sep): the watchdog is armed when the process starts, and reading
+// stdin is inside its time. A client (or the Codex order, whose stdin is inherited) that never
+// closes stdin must still get the refusal before its cut.
+//
+// Interface this test fixes: `AI_WORKFLOWS_HOOK_WATCHDOG_MS`, a positive whole number of
+// milliseconds, shortens the watchdog of `hook editor`. Only `bin.ts` reads it (a seam for tests;
+// no client sets it); anything else leaves the watchdog at HOOK_WATCHDOG_MS (25 s).
+describe('R6 §15 P6: the watchdog covers reading stdin', () => {
+  /** Runs the compiled `hook editor` with stdin left open after a partial request. */
+  function runWithOpenStdin(root: string, client: 'claude' | 'codex', env: NodeJS.ProcessEnv, killAfterMs = 40_000): Promise<Finished> {
+    return new Promise((done) => {
+      const started = Date.now();
+      const child = spawn(process.execPath, [join(engine.packageDir, 'dist', 'bin.js'), 'hook', 'editor', '--client', client], {
+        cwd: root,
+        env,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+      let stdout = '';
+      let stderr = '';
+      child.stdout.setEncoding('utf8').on('data', (chunk: string) => (stdout += chunk));
+      child.stderr.setEncoding('utf8').on('data', (chunk: string) => (stderr += chunk));
+      const killer = setTimeout(() => child.kill('SIGKILL'), killAfterMs);
+      child.on('close', (status) => {
+        clearTimeout(killer);
+        done({ status, stdout, stderr, ms: Date.now() - started });
+      });
+      child.stdin.on('error', () => {});
+      // Half a request, and stdin is never ended.
+      child.stdin.write('{"tool_name":"Write","tool_input":');
+    });
+  }
+
+  it('stdin never closed: the deny JSON and exit 0, well within the client s 30 s', async () => {
+    const root = project('arreglo');
+    engine.install(root);
+    const env: NodeJS.ProcessEnv = { ...process.env, AI_WORKFLOWS_HOOK_WATCHDOG_MS: '1500' };
+    delete env.CLAUDE_PROJECT_DIR;
+    for (const client of ['claude', 'codex'] as const) {
+      const output = await runWithOpenStdin(root, client, env);
+      denyReason(output);
+      expect(output.ms).toBeLessThan(15_000);
+    }
+  }, 120_000);
+});

@@ -366,3 +366,30 @@ describe('§3.5 test 9: an internal failure answers in the client s format', () 
     expect(refusal(verdictOf('opencode', opencode))).toMatch(/falla inventada/);
   });
 });
+
+// PLAN-13-R6 §15 (the flock's minors): the known reading tools that carry a path pass. OpenCode's
+// `list` sends `{path}` and Codex's `view_image` sends `{path}`; both only read, so the rule for an
+// unknown tool with a path must not catch them. An unknown tool with the same `{path}` is still
+// refused, in both clients.
+describe('R6 §15: known read-only tools with a path pass; an unknown one is still refused', () => {
+  it('OpenCode list with a path passes without a piece, and parses without error', async () => {
+    const root = project('arreglo');
+    const payload = opencodeCall(root, 'list', { path: '.' });
+    expect(parseClientInput('opencode', JSON.stringify(payload))).not.toHaveProperty('error');
+    expect(verdictOf('opencode', await run('opencode', root, payload))).toEqual({ allow: true });
+  });
+
+  it('Codex view_image with a path passes without a piece, and parses without error', async () => {
+    const root = project('arreglo');
+    const payload = codexTool(root, 'view_image', { path: inProject(root, 'docs/foto.png') });
+    expect(parseClientInput('codex', JSON.stringify(payload))).not.toHaveProperty('error');
+    expect(verdictOf('codex', await run('codex', root, payload))).toEqual({ allow: true });
+  });
+
+  it('control: an unknown tool with the same {path} is refused in both, naming the tool', async () => {
+    const root = project('arreglo');
+    const file = inProject(root, 'src/x.mjs');
+    expect(refusal(verdictOf('codex', await run('codex', root, codexTool(root, 'herramienta_nueva', { path: file }))))).toContain('herramienta_nueva');
+    expect(refusal(verdictOf('opencode', await run('opencode', root, opencodeCall(root, 'herramienta_nueva', { path: file }))))).toContain('herramienta_nueva');
+  });
+});

@@ -6,6 +6,7 @@ import { pathToFileURL } from 'node:url';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 
 import { installHooks, runAgentCli, runHook } from '../src/index.js';
+import { CODEX_HOOK_ORDER, CODEX_HOOK_ORDER_WINDOWS } from '../src/locks/client-files.js';
 
 import { buildEngine, type BuiltEngine } from './built-engine.js';
 import { OPENCODE_INPUT, addFilePatch, codexPatch, codexTool, inProject, opencodeWrite } from './client-payloads.js';
@@ -492,6 +493,152 @@ describe('doctor checks the Codex and OpenCode hooks', () => {
 });
 
 // ------------------------------------------------------------------------------------------------
+// PLAN-13-R6 §15 (the flock's minors on the local side).
+//
+// Interface these tests fix:
+//   - Reinstalling replaces OUR Codex handler, recognized by the loader it runs (isOurCodexHandler),
+//     never adds a second one: an old order of ours becomes exactly one handler equal to the
+//     current CODEX_HOOK_ORDER / CODEX_HOOK_ORDER_WINDOWS.
+//   - doctor compares our Codex handler with what the installer writes: a handler that merely
+//     mentions the loader but is not the current order does not count as installed ("falta" or
+//     "alterado" on the Codex line).
+//   - doctor warns, on a line naming Codex and «tiempo», when our Codex handler's timeout is 25 s
+//     or less (the engine's watchdog), naming the value; the installed 30 s gives no warning.
+//   - doctor names `disableAllHooks` when .claude/settings.local.json switches every hook off.
+//   - The loader forwards the engine's own refusal for OpenCode (the engine exits 2 with the reason
+//     on stderr): the reason reaches the plugin's error as is, never labelled as the engine failing
+//     to review («no pudo revisar»). Any other exit is still a refusal.
+//   - `hooks install --apply` names every path it wrote and says that Codex `exec` skips hooks that
+//     were not approved unless it runs with `--dangerously-bypass-hook-trust` (§3.3).
+
+describe('R6 §15: reinstalling replaces an old Codex order of ours', () => {
+  it('an old order of ours in .codex/hooks.json leaves exactly one handler of ours, equal to the current order', async () => {
+    const root = project();
+    const foreign = { matcher: 'Bash', hooks: [{ type: 'command', command: 'node otro.mjs', timeout: 5 }] };
+    const old = { type: 'command', command: 'node .ai-workflows/hook.cjs codex', commandWindows: 'node .ai-workflows/hook.cjs codex', timeout: 30 };
+    write(root, '.codex/hooks.json', JSON.stringify({ hooks: { PreToolUse: [foreign, { matcher: '.*', hooks: [old] }] } }));
+    expect((await installHooks({ root, apply: true })).ok).toBe(true);
+    const file = readCodex(root);
+    const ours = file.hooks.PreToolUse.flatMap((group) => group.hooks).filter(isOurCodexHandler);
+    expect(ours).toHaveLength(1);
+    expect(ours[0]).toMatchObject({ command: CODEX_HOOK_ORDER, commandWindows: CODEX_HOOK_ORDER_WINDOWS, timeout: 30 });
+    expect(file.hooks.PreToolUse.filter((group) => JSON.stringify(group) === JSON.stringify(foreign))).toHaveLength(1);
+    expect(ourCodexGroup(root).group.matcher).toBe('.*');
+  });
+});
+
+/** Rewrites our Codex handler in place with `change`. */
+function editOurCodexHandler(root: string, change: (handler: Record<string, unknown>) => Record<string, unknown>): void {
+  const file = readCodex(root);
+  const edited = {
+    ...file,
+    hooks: {
+      ...file.hooks,
+      PreToolUse: file.hooks.PreToolUse.map((group) => ({ ...group, hooks: group.hooks.map((handler) => (isOurCodexHandler(handler) ? change(handler) : handler)) })),
+    },
+  };
+  writeFileSync(join(root, ...CODEX_FILE), JSON.stringify(edited));
+}
+
+describe('R6 §15: doctor compares the Codex hook with what it installs', () => {
+  it('a handler that only mentions the loader is not our hook: missing or altered', async () => {
+    const root = project();
+    expect((await installHooks({ root, apply: true })).ok).toBe(true);
+    editOurCodexHandler(root, (handler) => ({ ...handler, command: 'echo .ai-workflows/hook.cjs', commandWindows: 'echo .ai-workflows/hook.cjs' }));
+    const all = await doctorLines(root);
+    expect(says(all, /Codex/, /falta|alterad/i)).toBe(true);
+    expect(says(all, /Codex/, /gancho instalado/i)).toBe(false);
+  });
+
+  it('warns when the Codex timeout is 25 s or less, naming it; the installed 30 s gives no warning', async () => {
+    const warned = project();
+    expect((await installHooks({ root: warned, apply: true })).ok).toBe(true);
+    editOurCodexHandler(warned, (handler) => ({ ...handler, timeout: 25 }));
+    const all = await doctorLines(warned);
+    expect(all.some((line) => /Codex/.test(line) && /tiempo/i.test(line) && /\b25\b/.test(line))).toBe(true);
+
+    const low = project();
+    expect((await installHooks({ root: low, apply: true })).ok).toBe(true);
+    editOurCodexHandler(low, (handler) => ({ ...handler, timeout: 10 }));
+    expect(says(await doctorLines(low), /Codex/, /tiempo/i)).toBe(true);
+
+    const installed = project();
+    expect((await installHooks({ root: installed, apply: true })).ok).toBe(true);
+    expect(says(await doctorLines(installed), /Codex/, /tiempo/i)).toBe(false);
+  });
+
+  it('names disableAllHooks when .claude/settings.local.json switches every hook off', async () => {
+    const root = project();
+    expect((await installHooks({ root, apply: true })).ok).toBe(true);
+    expect((await doctorLines(root)).join('\n')).not.toContain('disableAllHooks');
+    write(root, '.claude/settings.local.json', JSON.stringify({ disableAllHooks: true }));
+    expect((await doctorLines(root)).join('\n')).toContain('disableAllHooks');
+  });
+});
+
+describe('R6 §15: the loader forwards the engine s refusal for OpenCode as the engine s reason', () => {
+  const REASON = 'Esta carpeta no tiene una pieza activa: src/x.mjs';
+  const refusingEngine = `process.stderr.write(${JSON.stringify(REASON)});\nprocess.exit(2);\n`;
+
+  it('the loader: an exit other than 0 with the engine s reason, not «no pudo revisar»', async () => {
+    const root = project('arreglo');
+    await installHooks({ root, apply: true });
+    fakeEngine(root, refusingEngine);
+    const output = runLoader(root, 'opencode', JSON.stringify(opencodeWrite(root, 'src/x.mjs')));
+    expect(output.status).not.toBe(0);
+    expect(output.stderr).toContain(REASON);
+    expect(output.stderr).not.toMatch(/no pudo revisar/);
+  });
+
+  it('the plugin: its error carries the engine s reason, not «no pudo revisar»', async () => {
+    const root = project('arreglo');
+    await installHooks({ root, apply: true });
+    fakeEngine(root, refusingEngine);
+    const before = await beforeHook(root);
+    const message = await rejectionOf(before(call, { args: { filePath: inProject(root, 'src/x.mjs'), content: 's' } }));
+    expect(message).toContain(REASON);
+    expect(message).not.toMatch(/no pudo revisar/);
+  });
+
+  it('control: an engine that exits 1 is still a refusal', async () => {
+    const root = project('arreglo');
+    await installHooks({ root, apply: true });
+    fakeEngine(root, "process.stderr.write('roto');\nprocess.exit(1);\n");
+    expect(runLoader(root, 'opencode', JSON.stringify(opencodeWrite(root, 'docs/x.md'))).status).not.toBe(0);
+  });
+});
+
+/** The message a promise rejects with; a promise that resolves fails the test. */
+async function rejectionOf(promise: Promise<unknown>): Promise<string> {
+  try {
+    await promise;
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
+  }
+  throw new Error('se esperaba un rechazo y la llamada pasó');
+}
+
+describe('R6 §15: hooks install --apply names what it wrote and the Codex exec limit', () => {
+  it('lists every written path and says Codex exec skips unapproved hooks', async () => {
+    const root = project();
+    const result = await installHooks({ root, apply: true });
+    expect(result.ok).toBe(true);
+    for (const file of [
+      '.claude/settings.json',
+      '.ai-workflows/githooks/pre-commit',
+      '.ai-workflows/githooks/pre-push',
+      '.codex/hooks.json',
+      '.opencode/plugins/ai-workflows.js',
+      '.ai-workflows/hook.cjs',
+    ]) {
+      expect(result.text).toContain(file);
+    }
+    expect(result.text).toMatch(/\bexec\b/);
+    expect(result.text).toContain('--dangerously-bypass-hook-trust');
+  });
+});
+
+// ------------------------------------------------------------------------------------------------
 // End to end with the compiled engine: the CLI flags, the loader, the installed Codex order run
 // through the shell from a subfolder (§3.5 test 5), and the plugin with the real engine.
 
@@ -572,5 +719,29 @@ describe('end to end with the compiled engine', () => {
     const before = await beforeHook(root);
     await expect(before(call, { args: { filePath: inProject(root, 'src/x.mjs'), content: 's' } })).rejects.toThrow(/pieza/);
     await expect(before(call, { args: { filePath: inProject(root, 'docs/x.md'), content: 's' } })).resolves.toBeUndefined();
+  });
+
+  // R6 §15: OpenCode started in a subfolder still finds `.opencode/plugins/` by walking up, but the
+  // loader lives at the repository root: the plugin looks for it from `ctx.worktree` (or the git
+  // top), not from `ctx.directory`.
+  it('R6 §15: with ctx.directory in a subfolder and ctx.worktree at the root, read passes and code without a piece is refused with the engine s reason', async () => {
+    const root = project('arreglo');
+    await installHooks({ root, apply: true });
+    engine.install(root);
+    const before = await beforeHook(root, undefined, join(root, 'src'));
+    await expect(before({ ...call, tool: 'read' }, { args: { filePath: inProject(root, 'src/a.mjs') } })).resolves.toBeUndefined();
+    const message = await rejectionOf(before(call, { args: { filePath: inProject(root, 'src/x.mjs'), content: 's' } }));
+    expect(message).toMatch(/pieza/);
+    expect(message).not.toMatch(/no se pudo cargar/);
+  });
+
+  it('R6 §15: the real engine s refusal reaches the plugin without «no pudo revisar»', async () => {
+    const root = project('arreglo');
+    await installHooks({ root, apply: true });
+    engine.install(root);
+    const before = await beforeHook(root);
+    const message = await rejectionOf(before(call, { args: { filePath: inProject(root, 'src/x.mjs'), content: 's' } }));
+    expect(message).toMatch(/pieza/);
+    expect(message).not.toMatch(/no pudo revisar/);
   });
 });
