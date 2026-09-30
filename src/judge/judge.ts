@@ -36,7 +36,7 @@ import {
   type CheckOrigin,
   type Unofficial,
 } from './checks.js';
-import { engineVersionFilesIn, isEngineProtectedPath, touchedEngineVersionFiles } from './own-files.js';
+import { isEngineProtectedPath, scanOwnFiles, type OwnFilesScan } from './own-files.js';
 import { pieceOfBranch, readDeclaredKind } from './pieces.js';
 import type { CommitStatus, JudgeGitHub, JudgePullRequest } from './port.js';
 import { buildSummary, escapeReportText, type SummaryPiece } from './summary.js';
@@ -170,6 +170,7 @@ const REVIEW_SIGNAL_PATH = '.github/workflows/ai-workflows-review-signal.yml';
 
 /** PLAN-13-R6 §1.2: what the judge says when the action input and the recipe disagree. */
 const MISMATCH = 'el workflow del juez y la receta no declaran las mismas ramas';
+const MISMATCH_EN = 'the judge workflow and the recipe do not declare the same branches';
 
 /** PLAN-13-R6 §6: how many times the reads before the piece's pull requests are known are tried. */
 const ISSUE_READ_ATTEMPTS = 3;
@@ -686,34 +687,31 @@ async function judgeFilesNote(
   alsoProtect: readonly string[],
 ): Promise<FilesNote> {
   const spanish = isSpanish(work.recipe.locale);
-  const protectedTouched = work.facts.files.filter((file) =>
-    isProtectedFile(file, judgePath, alsoProtect),
-  );
 
-  // §2.2: the engine version, compared against the merge base. It only runs when the pull request
-  // touches one of those files; the others pay nothing. A git failure is technical, and anything
-  // else — a file that cannot be read as its format, or that appears or disappears — is touched.
-  let versionTouched: readonly string[] = [];
-  if (engineVersionFilesIn(work.facts.files).length > 0) {
-    try {
-      versionTouched = await touchedEngineVersionFiles(
-        work.root,
-        work.facts.mergeBase,
-        work.target.head,
-        work.facts.files,
-      );
-    } catch (error) {
-      return {
-        error: pick(
-          spanish,
-          `No se pudo leer la versión del motor: ${reasonOf(error)}`,
-          `The engine version could not be read: ${reasonOf(error)}`,
-        ),
-      };
-    }
+  // PLAN-13-R6 §2.2 and §15 P3: the engine's own files and the engine version are measured on what
+  // truly lands when the head is merged into the trusted tip (every merge base and the merge tree),
+  // so a criss-cross merge cannot hide a change. A git failure is technical; a conflicting merge
+  // tree counts as touched, never as a pass.
+  let scan: OwnFilesScan;
+  try {
+    scan = await scanOwnFiles(work.root, work.trusted, work.target.head);
+  } catch (error) {
+    return {
+      error: pick(
+        spanish,
+        `No se pudieron medir los archivos del motor: ${reasonOf(error)}`,
+        `The engine's own files could not be measured: ${reasonOf(error)}`,
+      ),
+    };
   }
 
-  const touched = [...new Set([...protectedTouched, ...versionTouched])];
+  const protectedTouched = scan.files.filter((file) =>
+    isProtectedFile(file, judgePath, alsoProtect),
+  );
+  const touched = [...new Set([...protectedTouched, ...scan.versionTouched])];
+  if (scan.conflicted) {
+    touched.push(pick(spanish, 'el árbol de mezcla tiene conflictos', 'the merge tree conflicts'));
+  }
   if (touched.length === 0) return {};
 
   // §2.3: what was touched goes to the run log, never to the published description, which keeps
@@ -1212,20 +1210,6 @@ export async function runJudge(input: JudgeInput, deps: JudgeDeps): Promise<Judg
       ));
       return finish();
     }
-    const open = await retryRead(() => github.openPullRequests());
-    const matching = open.filter((pr) => {
-      if (!into.includes(pr.baseRef)) return false;
-      const piece = pieceOfBranch(baseRecipe, pr.headRef, pr.number);
-      return 'piece' in piece && piece.piece === String(issueNumber);
-    });
-    if (matching.length === 0) {
-      addNote(notes, pick(
-        spanish,
-        `La pieza ${String(issueNumber)} no tiene pull requests abiertos hacia una rama de trabajo`,
-        `Piece ${String(issueNumber)} has no open pull requests into a working branch`,
-      ));
-      return finish();
-    }
 
     // A publish that fails is said and never stops the other pull requests, but a run that could
     // not write a status ends as failed: the CLI exits 1 and the log keeps the motive.
@@ -1251,217 +1235,363 @@ export async function runJudge(input: JudgeInput, deps: JudgeDeps): Promise<Judg
       }
     };
 
+    const open = await retryRead(() => github.openPullRequests());
+    const matching = open.filter((pr) => {
+      if (!into.includes(pr.baseRef)) return false;
+      const piece = pieceOfBranch(baseRecipe, pr.headRef, pr.number);
+      return 'piece' in piece && piece.piece === String(issueNumber);
+    });
+
+    // PLAN-13-R6 §15 P1: the list may report an old head, so the live head of each pull request of
+    // the piece is read here: the grouping and every judgement use the head that is really open.
+    interface IssueTarget {
+      readonly number: number;
+      readonly head: string;
+      readonly headRef: string;
+      readonly baseRef: string;
+      readonly headRepo: string;
+    }
+    const liveMatching: IssueTarget[] = [];
+    for (const pr of matching) {
+      let live: JudgePullRequest;
+      try {
+        live = await github.pullRequest(pr.number);
+      } catch (error) {
+        await safePublish(pr.headSha, 'error', reasonOf(error), baseRecipe.locale);
+        continue;
+      }
+      if (live.state !== 'open') continue;
+      if (!into.includes(live.baseRef)) {
+        addNote(notes, pick(
+          spanish,
+          `la rama destino del PR #${String(live.number)} es "${live.baseRef}", fuera de las ramas de trabajo: no se juzga`,
+          `the target branch of pull request #${String(live.number)} is "${live.baseRef}", outside the working branches: nothing is judged`,
+        ));
+        continue;
+      }
+      liveMatching.push({
+        number: live.number,
+        head: live.headSha,
+        headRef: live.headRef,
+        baseRef: live.baseRef,
+        headRepo: live.headRepo,
+      });
+    }
+
+    // PLAN-13-R6 §1.2 and §15 P1: the action input and the recipe must declare the same branches.
+    // When they do not, every head of the piece gets the error and none gets a verdict.
+    if (!sameBranches(wanted, into)) {
+      for (const head of [...new Set(liveMatching.map((pr) => pr.head))]) {
+        await safePublish(head, 'error', pick(spanish, MISMATCH, MISMATCH_EN), baseRecipe.locale);
+      }
+      if (failures.length > 0) throw new Error(failures.join('; '));
+      return finish();
+    }
+
+    if (liveMatching.length === 0) {
+      addNote(notes, pick(
+        spanish,
+        `La pieza ${String(issueNumber)} no tiene pull requests abiertos hacia una rama de trabajo`,
+        `Piece ${String(issueNumber)} has no open pull requests into a working branch`,
+      ));
+      return finish();
+    }
+
+    // PLAN-13-R6 §15 P1: the piece's pull requests are grouped by head. Each head is judged once,
+    // with the worst verdict of every open pull request with that head into `into` (§1.2).
+    const heads: string[] = [];
+    const headFirstPr = new Map<string, number>();
+    const headNumbers = new Map<string, number[]>();
+    for (const pr of liveMatching) {
+      if (!headFirstPr.has(pr.head)) {
+        heads.push(pr.head);
+        headFirstPr.set(pr.head, pr.number);
+      }
+      const numbers = headNumbers.get(pr.head) ?? [];
+      numbers.push(pr.number);
+      headNumbers.set(pr.head, numbers);
+    }
+
     // PLAN-13-R6 §6: before judging the first pull request, retire every old green with `pending`
     // «juzgando» on each head of the piece, unless a newer official run already published there. A
     // head whose pending cannot be written is not judged in this run (it keeps no new verdict).
-    const skipped = new Set<number>();
-    for (const candidate of matching) {
-      if (await isNewerOfficial(candidate.headSha)) {
-        skipped.add(candidate.number);
+    const skippedHeads = new Set<string>();
+    for (const head of heads) {
+      if (await isNewerOfficial(head)) {
+        skippedHeads.add(head);
         continue;
       }
-      const written = await safePublish(candidate.headSha, 'pending', JUZGANDO, baseRecipe.locale);
+      const written = await safePublish(head, 'pending', JUZGANDO, baseRecipe.locale);
       if (!written) {
         failures.push(pick(
           spanish,
-          `No se publicó el pending inicial del PR #${String(candidate.number)}`,
-          `The initial pending of pull request #${String(candidate.number)} was not published`,
+          `No se publicó el pending inicial del PR #${String(headFirstPr.get(head) ?? 0)}`,
+          `The initial pending of pull request #${String(headFirstPr.get(head) ?? 0)} was not published`,
         ));
-        skipped.add(candidate.number);
+        skippedHeads.add(head);
       }
     }
 
     const judgedAll: JudgedPr[] = [];
     const unofficialAll: Unofficial[] = [];
-    for (const candidate of matching) {
-      if (skipped.has(candidate.number)) continue;
-      let live: JudgePullRequest;
+
+    /**
+     * PLAN-13-R6 §15 P1 and P2: judges one head. Every open pull request with that head into `into`
+     * is judged with the trusted tip and recipe of its own target branch (of another piece and
+     * promotions included, found with `openPullRequestsWithHead`), and one worst verdict is
+     * published. A target branch that moves while judging updates every judgement of that branch at
+     * once and is judged again; moved twice, it is an error that names the branch (§1.2).
+     */
+    const judgeHead = async (head: string): Promise<JudgedPr[]> => {
+      let numbers: number[];
       try {
-        live = await github.pullRequest(candidate.number);
+        const extra = await github.openPullRequestsWithHead(head);
+        numbers = [
+          ...new Set([...(headNumbers.get(head) ?? []), ...extra]),
+        ];
       } catch (error) {
-        await safePublish(candidate.headSha, 'error', reasonOf(error), baseRecipe.locale);
-        continue;
+        failures.push(reasonOf(error));
+        await safePublish(head, 'error', reasonOf(error), baseRecipe.locale);
+        return [];
       }
-      if (!into.includes(live.baseRef)) {
+
+      interface IssueWork {
+        readonly target: Target;
+        readonly promotion: boolean;
+        trusted: string;
+        recipe: Recipe;
+        error?: string;
+        piece?: JudgedPr;
+      }
+
+      const targets: Target[] = [];
+      for (const number of numbers) {
+        let live: JudgePullRequest;
+        try {
+          live = await github.pullRequest(number);
+        } catch (error) {
+          failures.push(reasonOf(error));
+          await safePublish(head, 'error', reasonOf(error), baseRecipe.locale);
+          return [];
+        }
+        if (live.state !== 'open') continue;
+        if (live.headSha !== head) continue;
+        if (!into.includes(live.baseRef)) continue;
+        targets.push({
+          pr: live.number,
+          head,
+          headRef: live.headRef,
+          baseRef: live.baseRef,
+          headRepo: live.headRepo,
+        });
+      }
+      if (targets.length === 0) {
         addNote(notes, pick(
-          isSpanish(baseRecipe.locale),
-          `la rama destino del PR #${String(candidate.number)} es "${live.baseRef}", fuera de las ramas de trabajo: no se juzga`,
-          `the target branch of pull request #${String(candidate.number)} is "${live.baseRef}", outside the working branches: nothing is judged`,
+          spanish,
+          `La cabeza ${head} ya no tiene pull requests abiertos hacia una rama de trabajo`,
+          `The head ${head} has no open pull requests into a working branch anymore`,
         ));
-        continue;
+        return [];
       }
 
-      // The trusted base of this pull request is the live tip of its own target branch, and the
+      // The trusted base of each pull request is the live tip of its own target branch, and the
       // recipe that decides its stages comes from there (PLAN-13-R6 §1.2).
-      let currentTrusted = trusted;
-      let currentRecipe = baseRecipe;
-      const branchLabel = live.baseRef === principal ? 'la rama principal' : `la rama "${live.baseRef}"`;
-      if (live.baseRef !== principal) {
-        try {
-          currentTrusted = await github.branchHead(live.baseRef);
-          await deps.fetchObjects([currentTrusted]);
-          await checkout(input.root, currentTrusted);
-        } catch (error) {
-          await safePublish(live.headSha, 'error', reasonOf(error), baseRecipe.locale);
+      const works: IssueWork[] = [];
+      for (const target of targets) {
+        const promotion =
+          (baseRecipe.branches?.promotions ?? []).some(
+            (pair) => pair.from === target.headRef && pair.to === target.baseRef,
+          ) && target.headRepo === input.repository;
+        if (target.baseRef === principal) {
+          works.push({ target, promotion, trusted, recipe: baseRecipe });
           continue;
         }
-        const branchRead = await readRecipeAt(currentTrusted, branchLabel);
+        const branchLabel = `la rama "${target.baseRef}"`;
+        let tip: string;
+        try {
+          tip = await github.branchHead(target.baseRef);
+          await deps.fetchObjects([tip]);
+          await checkout(input.root, tip);
+        } catch (error) {
+          works.push({ target, promotion, trusted: '', recipe: baseRecipe, error: reasonOf(error) });
+          continue;
+        }
+        const branchRead = await readRecipeAt(tip, branchLabel);
         if (!branchRead.ok) {
-          await safePublish(
-            live.headSha,
-            'error',
-            `La receta de ${branchLabel} no se pudo leer: ${branchRead.reason}`,
-            baseRecipe.locale,
-          );
+          works.push({
+            target,
+            promotion,
+            trusted: tip,
+            recipe: baseRecipe,
+            error: `La receta de ${branchLabel} no se pudo leer: ${branchRead.reason}`,
+          });
           continue;
         }
-        currentRecipe = branchRead.recipe;
+        works.push({ target, promotion, trusted: tip, recipe: branchRead.recipe });
       }
 
-      const promotion =
-        (baseRecipe.branches?.promotions ?? []).some(
-          (pair) => pair.from === live.headRef && pair.to === live.baseRef,
-        ) && live.headRepo === input.repository;
-      const target: Target = {
-        pr: live.number,
-        head: live.headSha,
-        headRef: live.headRef,
-        baseRef: live.baseRef,
-        headRepo: live.headRepo,
+      const judgeWork = (
+        work: IssueWork,
+        recipe: Recipe,
+        at: string,
+      ): Promise<JudgedPr> => {
+        const workLike = {
+          recipe,
+          judgedSha: head,
+          root: input.root,
+          github,
+          fetchObjects: deps.fetchObjects,
+          judgePath,
+          alsoProtect: input.alsoProtect,
+          group: false,
+          notes,
+        };
+        const info = { headRef: work.target.headRef, baseRef: work.target.baseRef };
+        return work.promotion
+          ? judgePromotion(recipe, at, work.target, workLike)
+          : judgeOne(recipe, at, work.target, info, workLike);
       };
-      const judgeLive = (recipe: Recipe, at: string): Promise<JudgedPr> =>
-        promotion
-          ? judgePromotion(recipe, at, target, {
-              recipe,
-              judgedSha: live.headSha,
-              root: input.root,
-              github,
-              fetchObjects: deps.fetchObjects,
-              judgePath,
-              alsoProtect: input.alsoProtect,
-              group: false,
-              notes,
-            })
-          : judgeOne(
-              recipe,
-              at,
-              target,
-              { headRef: live.headRef, baseRef: live.baseRef },
-              {
-                recipe,
-                judgedSha: live.headSha,
-                root: input.root,
-                github,
-                fetchObjects: deps.fetchObjects,
-                judgePath,
-                alsoProtect: input.alsoProtect,
-                group: false,
-                notes,
-              },
-            );
-
-      let judged: JudgedPr;
-      try {
-        judged = await judgeLive(currentRecipe, currentTrusted);
-      } catch (error) {
-        // An exception inside the engine is technical for this pull request only (SV-03c).
-        await safePublish(live.headSha, 'error', reasonOf(error), currentRecipe.locale);
-        continue;
+      for (const work of works) {
+        if (work.error !== undefined) {
+          work.piece = { pr: work.target.pr, verdict: 'technical', stages: [], note: work.error };
+          continue;
+        }
+        try {
+          work.piece = await judgeWork(work, work.recipe, work.trusted);
+        } catch (error) {
+          // An exception inside the engine is technical for this pull request only (SV-03c).
+          work.piece = { pr: work.target.pr, verdict: 'technical', stages: [], note: reasonOf(error) };
+        }
       }
+      const pieces = (): JudgedPr[] =>
+        works.map((work) => work.piece).filter((piece): piece is JudgedPr => piece !== undefined);
 
-      let done = false;
-      for (let attempt = 0; !done; attempt += 1) {
-        // (a) the head and destination, one last time before writing.
-        let before: JudgePullRequest;
-        try {
-          before = await github.pullRequest(candidate.number);
-        } catch (error) {
-          const reason = pick(
-            isSpanish(currentRecipe.locale),
-            `no se pudo releer el PR #${String(candidate.number)} antes de publicar: ${reasonOf(error)}`,
-            `pull request #${String(candidate.number)} could not be re-read before publishing: ${reasonOf(error)}`,
-          );
-          addNote(notes, reason);
-          failures.push(reason);
-          // PLAN-13-R6 §6: the head the run knows carries «juzgando»; the failed re-read leaves an
-          // honest `error` there, never a quiet green.
-          await safePublish(candidate.headSha, 'error', reasonOf(error), currentRecipe.locale);
-          break;
+      // Re-read before publishing: the head and destination, the tip of each target branch (per
+      // branch, updated for all its judgements at once), and a newer official run (§1.2, §15).
+      const branchMoves = new Map<string, number>();
+      for (;;) {
+        let moved = false;
+        for (const work of works) {
+          let live: JudgePullRequest;
+          try {
+            live = await github.pullRequest(work.target.pr);
+          } catch (error) {
+            addNote(notes, pick(
+              isSpanish(baseRecipe.locale),
+              `no se pudo releer el PR #${String(work.target.pr)} antes de publicar: ${reasonOf(error)}`,
+              `pull request #${String(work.target.pr)} could not be re-read before publishing: ${reasonOf(error)}`,
+            ));
+            failures.push(reasonOf(error));
+            await safePublish(head, 'error', reasonOf(error), baseRecipe.locale);
+            return pieces();
+          }
+          if (live.headSha !== work.target.head) {
+            addNote(notes, pick(
+              isSpanish(baseRecipe.locale),
+              `la cabeza del PR #${String(work.target.pr)} cambió antes de publicar; no se publica veredicto`,
+              `the head of pull request #${String(work.target.pr)} moved before publishing; no verdict is published`,
+            ));
+            moved = true;
+          }
+          if (!into.includes(live.baseRef)) {
+            addNote(notes, pick(
+              isSpanish(baseRecipe.locale),
+              `la rama destino del PR #${String(work.target.pr)} pasó a ser "${live.baseRef}"; no se publica`,
+              `the target branch of pull request #${String(work.target.pr)} became "${live.baseRef}"; nothing is published`,
+            ));
+            moved = true;
+          }
         }
-        if (before.headSha !== live.headSha || !into.includes(before.baseRef)) {
-          addNote(notes, pick(
-            isSpanish(currentRecipe.locale),
-            `la cabeza o la rama destino del PR #${String(candidate.number)} cambió antes de publicar; no se publica veredicto`,
-            `the head or the target branch of pull request #${String(candidate.number)} moved before publishing; no verdict is published`,
-          ));
-          break;
-        }
+        if (moved) return pieces();
 
-        // (b) a target branch that moved while judging is judged again from the new tip, once.
-        let nowBase: string;
-        try {
-          nowBase = await github.branchHead(live.baseRef);
-        } catch (error) {
-          const reason = pick(
-            isSpanish(currentRecipe.locale),
-            `no se pudo releer la rama ${live.baseRef} del PR #${String(candidate.number)}: ${reasonOf(error)}`,
-            `the branch ${live.baseRef} of pull request #${String(candidate.number)} could not be re-read: ${reasonOf(error)}`,
-          );
-          addNote(notes, reason);
-          failures.push(reason);
-          await safePublish(candidate.headSha, 'error', reasonOf(error), currentRecipe.locale);
-          break;
+        let changed: { branch: string; tip: string } | undefined;
+        for (const work of works) {
+          if (work.error !== undefined) continue;
+          let tip: string;
+          try {
+            tip = await github.branchHead(work.target.baseRef);
+          } catch (error) {
+            addNote(notes, pick(
+              isSpanish(baseRecipe.locale),
+              `no se pudo releer la rama ${work.target.baseRef}: ${reasonOf(error)}`,
+              `the branch ${work.target.baseRef} could not be re-read: ${reasonOf(error)}`,
+            ));
+            failures.push(reasonOf(error));
+            await safePublish(head, 'error', reasonOf(error), baseRecipe.locale);
+            return pieces();
+          }
+          if (tip !== work.trusted) {
+            changed = { branch: work.target.baseRef, tip };
+            break;
+          }
         }
-        if (nowBase !== currentTrusted) {
-          if (attempt >= 1) {
-            await safePublish(live.headSha, 'error', pick(
-              isSpanish(currentRecipe.locale),
-              live.baseRef === principal ? 'la rama principal cambió mientras se juzgaba' : `la rama ${live.baseRef} cambió mientras se juzgaba`,
-              live.baseRef === principal ? 'the main branch changed while the run was judging' : `the branch ${live.baseRef} changed while the run was judging`,
-            ), currentRecipe.locale);
-            break;
+        if (changed !== undefined) {
+          const label = changed.branch === principal ? 'la rama principal' : `la rama "${changed.branch}"`;
+          const moves = (branchMoves.get(changed.branch) ?? 0) + 1;
+          branchMoves.set(changed.branch, moves);
+          if (moves >= 2) {
+            await safePublish(head, 'error', pick(
+              isSpanish(baseRecipe.locale),
+              changed.branch === principal ? 'la rama principal cambió mientras se juzgaba' : `la rama ${changed.branch} cambió mientras se juzgaba`,
+              changed.branch === principal ? 'the main branch changed while the run was judging' : `the branch ${changed.branch} changed while the run was judging`,
+            ), baseRecipe.locale);
+            return pieces();
           }
-          currentTrusted = nowBase;
-          try {
-            await deps.fetchObjects([currentTrusted]);
-            await checkout(input.root, currentTrusted);
-          } catch (error) {
-            await safePublish(candidate.headSha, 'error', reasonOf(error), currentRecipe.locale);
-            break;
-          }
-          const read = await readRecipeAt(currentTrusted, branchLabel);
-          if (!read.ok) {
-            await safePublish(candidate.headSha, 'error', pick(
-              isSpanish(currentRecipe.locale),
-              `La receta de ${branchLabel} no se pudo leer: ${read.reason}`,
-              `The recipe of ${branchLabel} could not be read: ${read.reason}`,
-            ), currentRecipe.locale);
-            break;
-          }
-          currentRecipe = read.recipe;
-          try {
-            judged = await judgeLive(currentRecipe, currentTrusted);
-          } catch (error) {
-            await safePublish(live.headSha, 'error', reasonOf(error), currentRecipe.locale);
-            break;
+          // Every judgement against the branch that moved is updated to the new tip at once.
+          for (const work of works) {
+            if (work.target.baseRef !== changed.branch) continue;
+            if (work.error !== undefined) continue;
+            work.trusted = changed.tip;
+            // A head that already landed in the new tip has nothing new to judge: its verdict
+            // stands, and re-judging it would compare it against itself (an empty change).
+            let landed: boolean;
+            try {
+              landed = await gitIsAncestor(input.root, work.target.head, work.trusted);
+            } catch (error) {
+              work.error = reasonOf(error);
+              work.piece = { pr: work.target.pr, verdict: 'technical', stages: [], note: reasonOf(error) };
+              continue;
+            }
+            if (landed) continue;
+            try {
+              await deps.fetchObjects([work.trusted]);
+              await checkout(input.root, work.trusted);
+            } catch (error) {
+              work.error = reasonOf(error);
+              work.piece = { pr: work.target.pr, verdict: 'technical', stages: [], note: reasonOf(error) };
+              continue;
+            }
+            const branchRead = await readRecipeAt(work.trusted, label);
+            if (!branchRead.ok) {
+              work.error = `La receta de ${label} no se pudo leer: ${branchRead.reason}`;
+              work.piece = { pr: work.target.pr, verdict: 'technical', stages: [], note: work.error };
+              continue;
+            }
+            work.recipe = branchRead.recipe;
+            try {
+              work.piece = await judgeWork(work, work.recipe, work.trusted);
+            } catch (error) {
+              work.piece = { pr: work.target.pr, verdict: 'technical', stages: [], note: reasonOf(error) };
+            }
           }
           continue;
         }
 
         // (c) abstain only when the newest state of this context is an official run that started
-        // after this one. An older one, or a foreign state, never silences the verdict.
-        let statuses: readonly CommitStatus[] = [];
+        // after this one. An older one, or a foreign state, never silences the verdict. A statuses
+        // read that fails publishes the honest error on this head and fails the run, never a green.
+        let statuses: readonly CommitStatus[];
         try {
-          statuses = await github.statuses(live.headSha);
+          statuses = await github.statuses(head);
         } catch (error) {
           addNote(notes, pick(
-            isSpanish(currentRecipe.locale),
-            `no se pudieron leer los estados de ${live.headSha}: ${reasonOf(error)}`,
-            `the statuses of ${live.headSha} could not be read: ${reasonOf(error)}`,
+            isSpanish(baseRecipe.locale),
+            `no se pudieron leer los estados de ${head}: ${reasonOf(error)}`,
+            `the statuses of ${head} could not be read: ${reasonOf(error)}`,
           ));
           failures.push(reasonOf(error));
-          await safePublish(live.headSha, 'error', reasonOf(error), currentRecipe.locale);
-          break;
+          await safePublish(head, 'error', reasonOf(error), baseRecipe.locale);
+          return pieces();
         }
         const newest = statuses.find((status) => status.context === targetContext);
         if (newest !== undefined) {
@@ -1470,7 +1600,7 @@ export async function runJudge(input: JudgeInput, deps: JudgeDeps): Promise<Judg
             official = await officialRunId(github, newest, input.repository, judgePath, principal, input.serverUrl);
           } catch (error) {
             addNote(notes, pick(
-              isSpanish(currentRecipe.locale),
+              isSpanish(baseRecipe.locale),
               `no se pudo comprobar el estado más reciente de ${targetContext}: ${reasonOf(error)}`,
               `the newest status of ${targetContext} could not be checked: ${reasonOf(error)}`,
             ));
@@ -1478,49 +1608,49 @@ export async function runJudge(input: JudgeInput, deps: JudgeDeps): Promise<Judg
           }
           if (official !== undefined && official > input.runId) {
             addNote(notes, pick(
-              isSpanish(currentRecipe.locale),
+              isSpanish(baseRecipe.locale),
               `otra corrida oficial del juez publicó después (${official}); esta no publica`,
               `another official judge run published later (${official}); this one stays quiet`,
             ));
-            break;
+            return pieces();
           }
         }
 
-        const written = await safePublish(
-          live.headSha,
-          stateOf(judged.verdict),
-          describeVerdict([judged], currentRecipe.locale),
-          currentRecipe.locale,
-        );
-        if (!written) break;
-        done = true;
+        const finalPieces = pieces();
+        const verdict = finalPieces.reduce<JudgeVerdict>((acc, piece) => worstPiece(acc, piece.verdict), 'passed');
+        await safePublish(head, stateOf(verdict), describeVerdict(finalPieces, baseRecipe.locale), baseRecipe.locale);
+        return finalPieces;
       }
-      if (!done) continue;
+    };
 
+    for (const head of heads) {
+      if (skippedHeads.has(head)) continue;
+      const headPieces = await judgeHead(head);
+      for (const piece of headPieces) judgedAll.push(piece);
+      if (headPieces.length === 0) continue;
       const collected = await collectUnofficial(
         github,
-        live.headSha,
+        head,
         input.repository,
         judgePath,
         principal,
         input.serverUrl,
         traceContexts,
-        currentRecipe.locale,
+        baseRecipe.locale,
       );
       for (const note of collected.notes) addNote(notes, note);
       for (const entry of collected.unofficial) unofficialAll.push(entry);
       if (collected.unofficial.length > 0) {
         try {
-          await github.upsertTraceComment(candidate.number, traceComment(collected.unofficial, currentRecipe.locale));
+          await github.upsertTraceComment(headFirstPr.get(head) ?? 0, traceComment(collected.unofficial, baseRecipe.locale));
         } catch (error) {
           addNote(notes, pick(
-            isSpanish(currentRecipe.locale),
-            `No se pudo escribir el rastro en el PR #${String(candidate.number)}: ${reasonOf(error)}`,
-            `The trace could not be written on pull request #${String(candidate.number)}: ${reasonOf(error)}`,
+            isSpanish(baseRecipe.locale),
+            `No se pudo escribir el rastro en la cabeza ${head}: ${reasonOf(error)}`,
+            `The trace could not be written on head ${head}: ${reasonOf(error)}`,
           ));
         }
       }
-      judgedAll.push(judged);
     }
 
     const summaryPieces: SummaryPiece[] = judgedAll.map((piece) => ({
@@ -1622,7 +1752,7 @@ export async function runJudge(input: JudgeInput, deps: JudgeDeps): Promise<Judg
   const principalRecipe = read.recipe;
   const into = principalRecipe.branches?.into ?? [principal];
   if (!sameBranches(wanted, into)) {
-    await publish(targets.sha, targetContext, 'error', MISMATCH);
+    await publish(targets.sha, targetContext, 'error', pick(isSpanish(principalRecipe.locale), MISMATCH, MISMATCH_EN));
     return conclude([], principalRecipe.locale);
   }
 
@@ -1736,8 +1866,11 @@ export async function runJudge(input: JudgeInput, deps: JudgeDeps): Promise<Judg
   for (const work of worksRef) work.piece = await judgeWork(work);
 
   // §3.8 corridas que se cruzan: (a) head and destination, (b) the tip of every target branch,
-  // (c) another official run.
-  for (let attempt = 0; ; attempt += 1) {
+  // (c) another official run. «Changed again» is counted per branch, and when a branch moves every
+  // judgement against it is updated to the new tip at once and judged again, so two pull requests
+  // into the same branch do not eject each other (PLAN-13-R6 §1.2 and §15 P2).
+  const branchMoves = new Map<string, number>();
+  for (;;) {
     let moved = false;
     for (const work of worksRef) {
       const target = work.target;
@@ -1778,9 +1911,9 @@ export async function runJudge(input: JudgeInput, deps: JudgeDeps): Promise<Judg
     if (moved) return conclude(judgedShaFor(), principalRecipe.locale);
 
     // The tip of every target branch is read again before publishing: a verdict computed with a
-    // tip that already changed is never written. Changed once, the branch is judged again with the
-    // new tip; changed twice, it is an error that names the branch (PLAN-13-R6 §1.2).
-    let changedWork: Work | undefined;
+    // tip that already changed is never written. Changed once, every judgement of that branch is
+    // judged again with the new tip; changed twice, it is an error that names the branch.
+    let changed: { branch: string; tip: string } | undefined;
     for (const work of worksRef) {
       if (work.error !== undefined) continue;
       let tip: string;
@@ -1797,49 +1930,68 @@ export async function runJudge(input: JudgeInput, deps: JudgeDeps): Promise<Judg
         return conclude(judgedShaFor(), principalRecipe.locale);
       }
       if (tip !== work.trusted) {
-        changedWork = work;
-        work.trusted = tip;
+        changed = { branch: work.target.baseRef, tip };
         break;
       }
     }
-    if (changedWork !== undefined) {
-      const target = changedWork.target;
-      const label = target.baseRef === principal ? 'la rama principal' : `la rama "${target.baseRef}"`;
-      if (attempt >= 1) {
+    if (changed !== undefined) {
+      const label = changed.branch === principal ? 'la rama principal' : `la rama "${changed.branch}"`;
+      const moves = (branchMoves.get(changed.branch) ?? 0) + 1;
+      branchMoves.set(changed.branch, moves);
+      if (moves >= 2) {
         await publish(
           targets.sha,
           targetContext,
           'error',
           pick(
             isSpanish(principalRecipe.locale),
-            target.baseRef === principal ? 'la rama principal cambió mientras se juzgaba' : `la rama ${target.baseRef} cambió mientras se juzgaba`,
-            target.baseRef === principal ? 'the main branch changed while the run was judging' : `the branch ${target.baseRef} changed while the run was judging`,
+            changed.branch === principal ? 'la rama principal cambió mientras se juzgaba' : `la rama ${changed.branch} cambió mientras se juzgaba`,
+            changed.branch === principal ? 'the main branch changed while the run was judging' : `the branch ${changed.branch} changed while the run was judging`,
           ),
         );
         return conclude(judgedShaFor(), principalRecipe.locale);
       }
-      try {
-        await deps.fetchObjects([changedWork.trusted]);
-        await checkout(input.root, changedWork.trusted);
-      } catch (error) {
-        changedWork.error = reasonOf(error);
-        changedWork.piece = { pr: target.pr, verdict: 'technical', stages: [], note: reasonOf(error) };
-        continue;
-      }
-      const branchRead = await readRecipeAt(changedWork.trusted, label);
-      if (!branchRead.ok) {
-        changedWork.error = `La receta de ${label} no se pudo leer: ${branchRead.reason}`;
-        changedWork.piece = { pr: target.pr, verdict: 'technical', stages: [], note: changedWork.error };
-        continue;
-      }
-      changedWork.recipe = branchRead.recipe;
-      changedWork.piece = await judgeWork(changedWork);
-      if (isGroup) {
-        const problem = await groupAncestorProblem(changedWork.trusted);
-        if (problem !== undefined) {
-          await publish(targets.sha, targetContext, 'error', problem);
-          return conclude(judgedShaFor(), principalRecipe.locale);
+      // Every judgement against the branch that moved is updated to the new tip at once.
+      let problem: string | undefined;
+      for (const work of worksRef) {
+        if (work.target.baseRef !== changed.branch) continue;
+        if (work.error !== undefined) continue;
+        work.trusted = changed.tip;
+        // A head that already landed in the new tip has nothing new to judge: its verdict stands,
+        // and re-judging it would compare it against itself (an empty change).
+        let landed: boolean;
+        try {
+          landed = await gitIsAncestor(input.root, work.target.head, work.trusted);
+        } catch (error) {
+          work.error = reasonOf(error);
+          work.piece = { pr: work.target.pr, verdict: 'technical', stages: [], note: reasonOf(error) };
+          continue;
         }
+        if (landed) continue;
+        try {
+          await deps.fetchObjects([work.trusted]);
+          await checkout(input.root, work.trusted);
+        } catch (error) {
+          work.error = reasonOf(error);
+          work.piece = { pr: work.target.pr, verdict: 'technical', stages: [], note: reasonOf(error) };
+          continue;
+        }
+        const branchRead = await readRecipeAt(work.trusted, label);
+        if (!branchRead.ok) {
+          work.error = `La receta de ${label} no se pudo leer: ${branchRead.reason}`;
+          work.piece = { pr: work.target.pr, verdict: 'technical', stages: [], note: work.error };
+          continue;
+        }
+        work.recipe = branchRead.recipe;
+        work.piece = await judgeWork(work);
+        if (isGroup) {
+          problem = await groupAncestorProblem(work.trusted);
+          if (problem !== undefined) break;
+        }
+      }
+      if (problem !== undefined) {
+        await publish(targets.sha, targetContext, 'error', problem);
+        return conclude(judgedShaFor(), principalRecipe.locale);
       }
       continue;
     }
