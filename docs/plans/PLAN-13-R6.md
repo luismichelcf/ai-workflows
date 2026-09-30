@@ -969,3 +969,12 @@ es inofensiva si su valor es un rango, versión o etiqueta del registro, o usa `
 dependencias, catálogo y bloqueos; el valor del archivo de lista de compilación en `.npmrc` se lee
 como lo lee el instalador (sin comillas, todas las apariciones); y la salida del gancho no puede
 cambiar su código por una falla al matar el árbol.
+
+**Quinta revisión del delta (30-sep).** Para cortar la diferencia entre lectores de YAML, un
+`package.yaml`, `pnpm-workspace.yaml` o `pnpm-lock.yaml` que use cualquier función avanzada del
+formato (directivas, anclas o alias, etiquetas, claves que no son escalares, claves de mezcla, más de
+un documento o errores de lectura) cuenta como tocado sin interpretarlo. Un valor de dependencia es
+inofensivo solo si es un rango o versión del registro escrito con los caracteres de semver, una
+etiqueta sin puntos ni barras, o empieza con `workspace:` o `catalog:`; un `.tgz`, `.tar` o
+`.tar.gz`, o un valor que empieza con `\` o `~/`, cuenta como tocado. `.npmrc` se lee como el lector
+`ini` (comentarios en línea, comillas y claves entre comillas).
