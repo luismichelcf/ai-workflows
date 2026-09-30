@@ -1,5 +1,5 @@
 import { execFileSync, spawn } from 'node:child_process';
-import { chmodSync, existsSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, linkSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { delimiter, join } from 'node:path';
 
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
@@ -258,4 +258,187 @@ describe('M4: a hanging ps does not keep the git hook from answering', () => {
     expect(output.ms).toBeLessThan(60_000);
     expect(output.stderr).toMatch(/git no respondió a tiempo/i);
   }, 90_000);
+});
+
+// ---------------------------------------------------------------------------------------------
+// Second delta review of the flock fixes (PLAN-13-R6 §15), finding M-a: the watchdog ends the
+// deciding process with its tree (`cancel()` of `spawnHookProcess`), but `bin.ts` calls it on EVERY
+// run, before writing the answer, synchronously and without a time limit (on Windows
+// `spawnSync('taskkill', … /T /F)` with no timeout). A child that already closed by itself has no
+// tree left to end: killing by its old pid (or process group) can reach an unrelated process that
+// now owns the number, and a kill command that hangs holds the answer past the client's 30 s cut.
+//
+// Interface these tests fix (no new export; the builder chooses how):
+//  - After the deciding process closed by itself, nothing is ended: no `taskkill` is started
+//    (Windows) and the hook process sends no kill signal (`process.kill` with a signal other than
+//    0, POSIX).
+//  - When the watchdog fires, the tree IS ended (the control below, a guard that passes today), but
+//    the kill command cannot delay the answer: with the default watchdog (25 s) and a `taskkill`
+//    that never returns, the hook still writes the deny JSON and exits 0 within the client's 30 s.
+//    (Windows only: on POSIX the kill is a signal, a system call that cannot hang, so there is no
+//    command to stub.)
+//
+// The spy is a preload given through NODE_OPTIONS. In the hook process (argv holds `hook`, not
+// `--child`) it records every `process.kill` with a real signal. In a process whose executable is
+// named `taskkill.exe` (a link to node placed first on PATH, which is where `spawnSync('taskkill')`
+// finds it) it records the call and then exits 0 — or, with AIW_SPY_HANG=1, blocks for 120 s like a
+// `taskkill` that never returns (its pid goes to AIW_SPY_STRAYS, killed after the test).
+
+const SPY = [
+  "'use strict';",
+  "const { appendFileSync } = require('node:fs');",
+  "const { basename } = require('node:path');",
+  'const log = process.env.AIW_SPY_LOG;',
+  "const record = (file, line) => { if (file) appendFileSync(file, line + '\\n'); };",
+  "if (basename(process.execPath).toLowerCase().startsWith('taskkill')) {",
+  "  record(log, 'taskkill ' + process.argv.slice(2).join(' '));",
+  "  if (process.env.AIW_SPY_HANG === '1') {",
+  '    record(process.env.AIW_SPY_STRAYS, String(process.pid));',
+  '    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 120000);',
+  '  }',
+  '  process.exit(0);',
+  "} else if (process.argv.includes('hook') && !process.argv.includes('--child')) {",
+  '  const kill = process.kill.bind(process);',
+  '  process.kill = (pid, signal) => {',
+  "    if (signal !== 0) record(log, 'kill ' + pid + ' ' + String(signal));",
+  '    return kill(pid, signal);',
+  '  };',
+  '}',
+  '',
+].join('\n');
+
+interface Spy {
+  readonly env: NodeJS.ProcessEnv;
+  /** The recorded lines: `taskkill <its arguments after /pid>` or `kill <pid> <signal>`. */
+  lines(): string[];
+}
+
+/** The environment of a spied hook run; `hang` makes the fake `taskkill` block for 120 s. */
+function spy(hang: boolean, extra: NodeJS.ProcessEnv = {}): Spy {
+  const bin = emptyFolder();
+  const preload = join(bin, 'spy.cjs');
+  writeFileSync(preload, SPY);
+  const log = join(bin, 'spy.log');
+  const hung = join(bin, 'strays');
+  strays.push(hung);
+  if (process.platform === 'win32') {
+    // A hard link spares copying the executable; another volume falls back to a copy.
+    try {
+      linkSync(process.execPath, join(bin, 'taskkill.exe'));
+    } catch {
+      copyFileSync(process.execPath, join(bin, 'taskkill.exe'));
+    }
+  }
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  // Windows keeps the variable as `Path`: replace that same key, never add a second one.
+  const pathKey = Object.keys(env).find((key) => key.toUpperCase() === 'PATH') ?? 'PATH';
+  env[pathKey] = `${bin}${delimiter}${env[pathKey] ?? ''}`;
+  env.NODE_OPTIONS = `--require "${preload.replace(/\\/g, '/')}"`;
+  env.AIW_SPY_LOG = log;
+  env.AIW_SPY_STRAYS = hung;
+  env.AIW_SPY_HANG = hang ? '1' : '0';
+  delete env.CLAUDE_PROJECT_DIR;
+  Object.assign(env, extra);
+  return { env, lines: () => (existsSync(log) ? readFileSync(log, 'utf8').split('\n').filter((line) => line !== '') : []) };
+}
+
+/** Runs the compiled `hook editor`; with `request` undefined, stdin gets half a request and stays open. */
+function runHookEditor(root: string, env: NodeJS.ProcessEnv, request: string | undefined, killAfterMs: number): Promise<Finished> {
+  return new Promise((done) => {
+    const started = Date.now();
+    const child = spawn(process.execPath, [join(engine.packageDir, 'dist', 'bin.js'), 'hook', 'editor'], {
+      cwd: root,
+      env,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.setEncoding('utf8').on('data', (chunk: string) => (stdout += chunk));
+    child.stderr.setEncoding('utf8').on('data', (chunk: string) => (stderr += chunk));
+    const killer = setTimeout(() => child.kill('SIGKILL'), killAfterMs);
+    child.on('close', (status) => {
+      clearTimeout(killer);
+      // Release the deciding process too, if it is still waiting on this stdin.
+      child.stdin.destroy();
+      done({ status, stdout, stderr, ms: Date.now() - started });
+    });
+    child.stdin.on('error', () => {});
+    if (request === undefined) child.stdin.write('{"tool_name":"Write","tool_input":');
+    else child.stdin.end(request);
+  });
+}
+
+describe('M-a: the deciding process is ended only when the watchdog fires, and never holds the answer', () => {
+  it('a normal answer: after the deciding process closed, no taskkill is started and no kill signal is sent', async () => {
+    const root = project('arreglo');
+    engine.install(root);
+    const watch = spy(false);
+
+    const output = await runHookEditor(root, watch.env, writeRequest(join(root, 'docs', 'b.md'), root), 40_000);
+
+    expect(output.stderr).toBe('');
+    expect(output.status).toBe(0);
+    expect(output.stdout).toBe('');
+    expect(watch.lines(), 'the deciding process had already closed: nothing to end').toEqual([]);
+  }, 60_000);
+
+  // Guard: it passes today and must keep passing. It is also the positive control of the spy: when
+  // the watchdog fires, the deciding process (blocked on stdin) is ended with its tree.
+  it('control: the watchdog fires (1.5 s) and the tree of the deciding process is ended', async () => {
+    const root = project('arreglo');
+    engine.install(root);
+    const watch = spy(false, { AI_WORKFLOWS_HOOK_WATCHDOG_MS: '1500' });
+
+    const output = await runHookEditor(root, watch.env, undefined, 40_000);
+
+    denyReason(output);
+    const recorded = watch.lines();
+    if (process.platform === 'win32') {
+      expect(recorded.some((line) => /^taskkill .*\/T/.test(line)), recorded.join('\n')).toBe(true);
+    } else {
+      expect(recorded.some((line) => /^kill -?\d+ SIGKILL$/.test(line)), recorded.join('\n')).toBe(true);
+    }
+  }, 60_000);
+
+  it.runIf(process.platform === 'win32')('a taskkill that never returns cannot delay the answer: deny JSON and exit 0 before 30 s with the watchdog at 25 s', async () => {
+    const root = project('arreglo');
+    engine.install(root);
+    const watch = spy(true);
+
+    const output = await runHookEditor(root, watch.env, undefined, 45_000);
+
+    expect(output.status, 'the hook ended by itself, before the 45 s kill').not.toBeNull();
+    expect(output.ms).toBeLessThan(30_000);
+    denyReason(output);
+  }, 90_000);
+});
+
+// Second delta review, finding M-b (POSIX): the watchdog ends the process group of the deciding
+// process, but the hook's git runs `detached`, in a group of its own, so a git that hangs outlives
+// the process that started it. When the watchdog ends the deciding process, that git (and what it
+// started) is ended too.
+describe('M-b: the watchdog also ends the git the deciding process started', () => {
+  it.runIf(process.platform !== 'win32')('git hangs, the watchdog fires at 1.5 s: afterwards no process of that git is alive', async () => {
+    const root = project('arreglo');
+    engine.install(root);
+    const bin = emptyFolder();
+    const pids = join(bin, 'pids');
+    strays.push(pids);
+    writeFileSync(join(bin, 'git'), ['#!/usr/bin/env bash', `echo $$ >> '${pids}'`, `sleep 120 & echo $! >> '${pids}'`, 'sleep 120', ''].join('\n'));
+    chmodSync(join(bin, 'git'), 0o755);
+    const env: NodeJS.ProcessEnv = { ...process.env, PATH: `${bin}${delimiter}${process.env.PATH ?? ''}`, AI_WORKFLOWS_HOOK_WATCHDOG_MS: '1500' };
+    delete env.CLAUDE_PROJECT_DIR;
+
+    const output = await runHookEditor(root, env, writeRequest(join(root, 'src', 'b.mjs'), root), 40_000);
+
+    denyReason(output);
+    // The watchdog answered, not git's own 10 s limit inside the deciding process.
+    expect(output.ms).toBeLessThan(10_000);
+    const started = (readFileSync(pids, 'utf8').match(/\d+/g) ?? []).map(Number);
+    expect(started.length).toBeGreaterThan(0);
+    // A killed process may take a moment to be reaped.
+    const until = Date.now() + 3_000;
+    while (started.some(alive) && Date.now() < until) await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(started.filter(alive)).toEqual([]);
+  }, 60_000);
 });

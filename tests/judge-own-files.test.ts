@@ -1087,3 +1087,134 @@ describe('M1: the installer and its build allow-list', () => {
     });
   }
 });
+
+// ---------------------------------------------------------------------------------------------
+// Second delta review of the flock fixes (R32), findings M-c and M-d.
+//
+// Interface fixed here (for the builder):
+//   - M-c. A package.json of a workspace member (any `…/package.json` other than the root one) that
+//     is ADDED or DELETED is compared like an edited one: the missing side counts as a package.json
+//     without any of the fields of the projection. So a new member with only `name` and ordinary
+//     dependencies passes, a new member with a lifecycle script (`scripts.postinstall`) needs the
+//     attestation, and deleting a member without lifecycle scripts passes. The ROOT package.json
+//     added or removed stays touched, and a member that cannot be read as JSON stays touched.
+//   - M-d. More of what decides which packages are installed, or which of them run code, is in the
+//     projections: `workspaces` of the root package.json (which folders are members, so whose
+//     lifecycle scripts run) and `dependenciesMeta`; `packages`, `configDependencies` and
+//     `allowBuilds` of pnpm-workspace.yaml. And the file NAMED by `onlyBuiltDependenciesFile` (in
+//     pnpm-workspace.yaml or in `pnpm` of package.json, as read on the trusted side) is one of the
+//     judge's own files: editing it needs the attestation, and the run log names it.
+
+describe('M-c: a workspace member package.json added or deleted is compared field by field', () => {
+  const MEMBER = 'packages/x/package.json';
+
+  it('a new member with only name and dependencies.lodash → success', async () => {
+    const w = world({ 'package.json': json(BASE_PACKAGE) });
+    w.pr({ [MEMBER]: json({ name: 'x', dependencies: { lodash: '4.17.21' } }) });
+    await w.judge();
+    expect(states(w)).toEqual(['success']);
+  });
+
+  // Guard: it passes today and must keep passing.
+  it('a new member with scripts.postinstall → failure with /approve-judge-change', async () => {
+    const w = world({ 'package.json': json(BASE_PACKAGE) });
+    const head = w.pr({ [MEMBER]: json({ name: 'x', dependencies: { lodash: '4.17.21' }, scripts: { postinstall: 'node x.js' } }) });
+    const report = await w.judge();
+    expectRejectedForOwnFiles(w, head, report);
+    expect(report.summary).toContain(MEMBER);
+  });
+
+  it('deleting a member without lifecycle scripts → success', async () => {
+    const w = world({ 'package.json': json(BASE_PACKAGE), [MEMBER]: json({ name: 'x', scripts: { test: 'vitest run' }, dependencies: { lodash: '4.17.21' } }) });
+    w.pr({ [MEMBER]: null });
+    await w.judge();
+    expect(states(w)).toEqual(['success']);
+  });
+
+  // Guards: they pass today and must keep passing. (Adding the root package.json is the guard
+  // «adding package.json → failure» of §2.2 above.)
+  it('deleting the root package.json → failure', async () => {
+    const w = world({ 'package.json': json({ name: 'proyecto', dependencies: { react: '18.2.0' } }) });
+    const head = w.pr({ 'package.json': null });
+    const report = await w.judge();
+    expectRejectedForOwnFiles(w, head, report);
+  });
+
+  it('a new member that is not valid JSON → failure', async () => {
+    const w = world({ 'package.json': json(BASE_PACKAGE) });
+    const head = w.pr({ [MEMBER]: '{ "name": "x", \n' });
+    const report = await w.judge();
+    expectRejectedForOwnFiles(w, head, report);
+  });
+
+  it('a member edited into invalid JSON → failure', async () => {
+    const w = world({ 'package.json': json(BASE_PACKAGE), [MEMBER]: json({ name: 'x' }) });
+    const head = w.pr({ [MEMBER]: '{ "name": "x", \n' });
+    const report = await w.judge();
+    expectRejectedForOwnFiles(w, head, report);
+  });
+});
+
+describe('M-d: workspaces, build settings and the build allow-list file', () => {
+  it('only workspaces of the root package.json changed → failure', async () => {
+    const w = world({ 'package.json': pkg((p) => { p.workspaces = ['apps/*']; }) });
+    const head = w.pr({ 'package.json': pkg((p) => { p.workspaces = ['apps/*', 'packages/*']; }) });
+    const report = await w.judge();
+    expectRejectedForOwnFiles(w, head, report);
+    expect(report.summary).toContain('package.json');
+  });
+
+  it('only dependenciesMeta of package.json added → failure', async () => {
+    const w = world({ 'package.json': json(BASE_PACKAGE) });
+    const head = w.pr({ 'package.json': pkg((p) => { p.dependenciesMeta = { esbuild: { built: true } }; }) });
+    const report = await w.judge();
+    expectRejectedForOwnFiles(w, head, report);
+  });
+
+  const WORKSPACE = lines('packages:', '  - apps/*');
+  for (const [what, after] of [
+    ['only packages changed', lines('packages:', '  - apps/*', '  - packages/*')],
+    ['only configDependencies added', `${WORKSPACE}${lines('', 'configDependencies:', '  pnpm-plugin-x: "1.0.0+sha512-AAAA"')}`],
+    ['only allowBuilds added', `${WORKSPACE}${lines('', 'allowBuilds:', '  esbuild: true')}`],
+  ] as const) {
+    it(`pnpm-workspace.yaml ${what} → failure`, async () => {
+      const w = world({ 'pnpm-workspace.yaml': WORKSPACE });
+      const head = w.pr({ 'pnpm-workspace.yaml': after });
+      const report = await w.judge();
+      expectRejectedForOwnFiles(w, head, report);
+      expect(report.summary).toContain('pnpm-workspace.yaml');
+    });
+  }
+
+  const BUILDS = '.pnpm-builds.json';
+  it(`${BUILDS}, named by onlyBuiltDependenciesFile in pnpm-workspace.yaml, edited → failure naming it`, async () => {
+    const w = world({
+      'pnpm-workspace.yaml': `${WORKSPACE}${lines('', `onlyBuiltDependenciesFile: ${BUILDS}`)}`,
+      [BUILDS]: json(['esbuild']),
+    });
+    const head = w.pr({ [BUILDS]: json(['esbuild', 'postinstall-x']) });
+    const report = await w.judge();
+    expectRejectedForOwnFiles(w, head, report);
+    expect(report.summary).toContain(BUILDS);
+  });
+
+  it(`${BUILDS}, named by pnpm.onlyBuiltDependenciesFile in package.json, edited → failure naming it`, async () => {
+    const w = world({
+      'package.json': pkg((p) => { p.pnpm = { onlyBuiltDependenciesFile: BUILDS }; }),
+      [BUILDS]: json(['esbuild']),
+    });
+    const head = w.pr({ [BUILDS]: json(['esbuild', 'postinstall-x']) });
+    const report = await w.judge();
+    expectRejectedForOwnFiles(w, head, report);
+    expect(report.summary).toContain(BUILDS);
+  });
+
+  // Guard: it passes today and must keep passing. The same file name, not named by any setting, is
+  // an ordinary file.
+  it(`control: ${BUILDS} edited when no setting names it → success`, async () => {
+    const w = world({ 'pnpm-workspace.yaml': WORKSPACE, [BUILDS]: json(['esbuild']) });
+    w.pr({ [BUILDS]: json(['esbuild', 'postinstall-x']) });
+    await w.judge();
+    expect(states(w)).toEqual(['success']);
+  });
+});

@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events';
 import { existsSync } from 'node:fs';
-import { basename, join } from 'node:path';
+import { basename, isAbsolute, join, resolve } from 'node:path';
 import { PassThrough } from 'node:stream';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -138,5 +138,35 @@ describe('B2: the entry of npm is npm-cli.js', () => {
     await recipeCommand(['init'], { cwd: root, seal: SEAL, spawnProcess });
 
     expect(spawned).toEqual([{ command: process.execPath, args: [npm.file, 'install'] }]);
+  });
+});
+
+// Second delta review of the flock fixes, finding N2: a relative folder on PATH (`.`, or any path
+// that is not absolute) is resolved against the folder init runs in, which is the project. A
+// project that carries `node_modules/pnpm/bin/pnpm.cjs` would then have its own file run as the
+// installer. Interface: only absolute PATH entries are searched for the manager's entry; a
+// relative one is skipped. Here PATH is `.;<a real global pnpm>` and the process runs in the
+// project, as init does.
+describe('N2: a relative folder on PATH never makes init run a file of the project', () => {
+  it('pnpm-lock.yaml, PATH=".;<global>", the project holds node_modules/pnpm/bin/pnpm.cjs: the project file is never run', async () => {
+    const root = repository({ 'package.json': PACKAGE_JSON, 'pnpm-lock.yaml': '\n' });
+    write(root, 'node_modules/pnpm/bin/pnpm.cjs', '// the project s own file\n');
+    const pnpm = globalEntry('pnpm', 'pnpm.cjs');
+    vi.stubEnv('npm_execpath', '');
+    vi.stubEnv('PATH', `.;${pnpm.dir}`);
+    const { spawned, spawnProcess } = fakeSpawn(root);
+
+    const before = process.cwd();
+    process.chdir(root);
+    try {
+      await recipeCommand(['init'], { cwd: root, seal: SEAL, spawnProcess });
+    } finally {
+      process.chdir(before);
+    }
+
+    const scripts = spawned.filter((call) => scriptOf(call) !== '').map((call) => resolve(root, call.args[0] ?? ''));
+    expect(scripts.filter((script) => script.toLowerCase().startsWith(resolve(root).toLowerCase())), 'a file of the project ran as the installer').toEqual([]);
+    // The global pnpm is still found through the absolute folder of PATH.
+    expect(spawned.filter((call) => scriptOf(call) !== '').map((call) => [isAbsolute(call.args[0] ?? ''), scriptOf(call)])).toEqual([[true, 'pnpm.cjs']]);
   });
 });
