@@ -764,3 +764,232 @@ describe('R6 §2.4 (12): every file hooks install --apply writes is in the prote
     expect(written.filter((path) => !covered(path))).toEqual([]);
   });
 });
+
+// ---------------------------------------------------------------------------------------------
+// PLAN-13-R6 §15 and R32 (the flock of slice 6): what runs when dependencies are installed is the
+// judge's own. Changing the project's lifecycle scripts (`preinstall`, `install`, `postinstall`,
+// `prepare`), the installer's configuration (`.npmrc`, `.yarnrc.yml`, the pnpmfile path,
+// `onlyBuiltDependencies`) or OpenCode's plugin and tool folders needs the owner's attestation,
+// like every other file of the judge. Also: lockfile keys with a leading `/` (older pnpm
+// lockfiles) name the engine too.
+//
+// Interface fixed here (for the builder): `ENGINE_PROTECTED_PATHS` also holds `.npmrc`,
+// `.yarnrc.yml`, `.opencode/plugin/`, `.opencode/tool/` and `.opencode/tools/`; the projection of
+// package.json also holds `scripts.{preinstall,install,postinstall,prepare}` and
+// `pnpm.onlyBuiltDependencies`; the projection of pnpm-workspace.yaml also holds
+// `onlyBuiltDependencies` and `pnpmfile`; a pnpm-lock key `/ai-workflows@…` counts like
+// `ai-workflows@…`.
+
+describe('R32: lifecycle scripts of package.json', () => {
+  for (const script of ['preinstall', 'install', 'postinstall', 'prepare']) {
+    it(`scripts.${script} added → failure`, async () => {
+      const w = world({ 'package.json': json(BASE_PACKAGE) });
+      const head = w.pr({ 'package.json': pkg((p) => { field(p, 'scripts')[script] = 'node x.js'; }) });
+      const report = await w.judge();
+      expectRejectedForOwnFiles(w, head, report);
+      expect(report.summary).toContain('package.json');
+    });
+
+    it(`scripts.${script} changed → failure`, async () => {
+      const w = world({ 'package.json': pkg((p) => { field(p, 'scripts')[script] = 'node a.js'; }) });
+      const head = w.pr({ 'package.json': pkg((p) => { field(p, 'scripts')[script] = 'node b.js'; }) });
+      const report = await w.judge();
+      expectRejectedForOwnFiles(w, head, report);
+    });
+  }
+
+  it('control: another script added (lint) → success', async () => {
+    const w = world({ 'package.json': json(BASE_PACKAGE) });
+    w.pr({ 'package.json': pkg((p) => { field(p, 'scripts').lint = 'eslint .'; }) });
+    await w.judge();
+    expect(states(w)).toEqual(['success']);
+  });
+
+  it('control: scripts.test changed → success', async () => {
+    const w = world({ 'package.json': json(BASE_PACKAGE) });
+    w.pr({ 'package.json': pkg((p) => { field(p, 'scripts').test = 'vitest run --coverage'; }) });
+    await w.judge();
+    expect(states(w)).toEqual(['success']);
+  });
+});
+
+describe('R32: the installer configuration', () => {
+  for (const path of ['.npmrc', '.yarnrc.yml']) {
+    it(`${path} added → failure`, async () => {
+      const w = world();
+      const head = w.pr({ [path]: 'pnpmfile=otro.cjs\n' });
+      const report = await w.judge();
+      expectRejectedForOwnFiles(w, head, report);
+      expect(report.summary).toContain(path);
+    });
+  }
+
+  it('package.json pnpm.onlyBuiltDependencies added → failure', async () => {
+    const w = world({ 'package.json': json(BASE_PACKAGE) });
+    const head = w.pr({ 'package.json': pkg((p) => { p.pnpm = { onlyBuiltDependencies: ['esbuild'] }; }) });
+    const report = await w.judge();
+    expectRejectedForOwnFiles(w, head, report);
+  });
+
+  it('package.json pnpm.onlyBuiltDependencies changed → failure', async () => {
+    const w = world({ 'package.json': pkg((p) => { p.pnpm = { onlyBuiltDependencies: ['esbuild'] }; }) });
+    const head = w.pr({ 'package.json': pkg((p) => { p.pnpm = { onlyBuiltDependencies: ['esbuild', 'otro'] }; }) });
+    const report = await w.judge();
+    expectRejectedForOwnFiles(w, head, report);
+  });
+
+  const WORKSPACE = lines('packages:', '  - apps/*');
+  for (const [what, extra] of [
+    ['onlyBuiltDependencies added', lines('', 'onlyBuiltDependencies:', '  - esbuild')],
+    ['pnpmfile added', lines('', 'pnpmfile: otro.cjs')],
+  ] as const) {
+    it(`pnpm-workspace.yaml ${what} → failure`, async () => {
+      const w = world({ 'pnpm-workspace.yaml': WORKSPACE });
+      const head = w.pr({ 'pnpm-workspace.yaml': `${WORKSPACE}${extra}` });
+      const report = await w.judge();
+      expectRejectedForOwnFiles(w, head, report);
+      expect(report.summary).toContain('pnpm-workspace.yaml');
+    });
+  }
+
+  it('pnpm-workspace.yaml pnpmfile changed → failure', async () => {
+    const w = world({ 'pnpm-workspace.yaml': `${WORKSPACE}${lines('', 'pnpmfile: uno.cjs')}` });
+    const head = w.pr({ 'pnpm-workspace.yaml': `${WORKSPACE}${lines('', 'pnpmfile: dos.cjs')}` });
+    const report = await w.judge();
+    expectRejectedForOwnFiles(w, head, report);
+  });
+});
+
+describe('R32: OpenCode plugin and tool folders', () => {
+  for (const path of ['.opencode/plugin/x.js', '.opencode/tool/x.js', '.opencode/tools/x.js']) {
+    it(`${path} → failure`, async () => {
+      const w = world();
+      const head = w.pr({ [path]: 'export default {};\n' });
+      const report = await w.judge();
+      expectRejectedForOwnFiles(w, head, report);
+      expect(report.summary).toContain(path);
+    });
+  }
+
+  it('the list holds the new entries of R32, in lower case', () => {
+    expect(ENGINE_PROTECTED_PATHS).toEqual(expect.arrayContaining([
+      '.npmrc',
+      '.yarnrc.yml',
+      '.opencode/plugin/',
+      '.opencode/tool/',
+      '.opencode/tools/',
+    ]));
+  });
+
+  // Guards (the flock's surviving mutant of the folder rule): the bare folder name is covered too.
+  it('a pull request adding .opencode/plugins as a file → failure', async () => {
+    const w = world();
+    const head = w.pr({ '.opencode/plugins': 'no soy carpeta\n' });
+    const report = await w.judge();
+    expectRejectedForOwnFiles(w, head, report);
+  });
+
+  it('a pull request adding .opencode/plugins as a symlink → failure', async () => {
+    const w = world();
+    // The attestation is looked up on PR 7, registered first with a harmless change; its head is
+    // then replaced by a commit whose only change is the symlink.
+    w.pr({ 'docs/x.md': 'hola\n' });
+    const main = git(w.root, 'rev-parse', 'main');
+    const head = commitSymlink(w.root, main, '.opencode/plugins', '../otro');
+    w.github.prs.set(7, { number: 7, state: 'open', headSha: head, headRef: BRANCH, baseRef: 'main', headRepo: REPO });
+    w.github.green.add(head);
+    const report = await w.judge({
+      event: {
+        pull_request: {
+          number: 7,
+          head: { sha: head, ref: BRANCH, repo: { full_name: REPO } },
+          base: { sha: main, ref: 'main' },
+        },
+        repository: { full_name: REPO, default_branch: 'main' },
+      },
+    });
+    expect(w.github.on().filter((entry) => entry.sha === head)).toEqual([
+      expect.objectContaining({ state: 'failure', description: expect.stringContaining(`/approve-judge-change ${head.slice(0, 16)}`) }),
+    ]);
+    expect(report.pieces[0]?.verdict).toBe('rejected');
+  });
+});
+
+/** A commit on `parent` that adds `path` as a symbolic link to `target` (mode 120000). */
+function commitSymlink(root: string, parent: string, path: string, target: string): string {
+  const folder = mkdtempSync(join(tmpdir(), 'aiw-index-'));
+  try {
+    const env = { ...process.env, GIT_INDEX_FILE: join(folder, 'index') };
+    const plumbing = (args: string[], input?: string): string =>
+      execFileSync('git', args, { cwd: root, env, encoding: 'utf8', ...(input === undefined ? {} : { input }) }).trim();
+    plumbing(['read-tree', parent]);
+    const blob = plumbing(['hash-object', '-w', '--stdin'], target);
+    plumbing(['update-index', '--add', '--cacheinfo', `120000,${blob},${path}`]);
+    const tree = plumbing(['write-tree']);
+    return plumbing(['commit-tree', tree, '-p', parent, '-m', 'symlink']);
+  } finally {
+    rmSync(folder, { recursive: true, force: true });
+  }
+}
+
+describe('flock 6: engine entries of pnpm-lock.yaml that the tests did not reach', () => {
+  // An older pnpm lockfile (format 6): the package keys start with `/`.
+  const OLD_LOCK = (engineIntegrity = 'sha512-AAAA', reactIntegrity = 'sha512-RRRR'): string => lines(
+    "lockfileVersion: '6.0'",
+    '',
+    'devDependencies:',
+    '  ai-workflows:',
+    `    specifier: ${ENGINE}`,
+    '    version: 1.0.0',
+    '',
+    'packages:',
+    '',
+    '  /ai-workflows@1.0.0:',
+    `    resolution: {integrity: ${engineIntegrity}}`,
+    '    dev: true',
+    '',
+    '  /react@18.2.0:',
+    `    resolution: {integrity: ${reactIntegrity}}`,
+    '    dev: false',
+  );
+
+  it('the package key /ai-workflows@1.0.0 changes its integrity → failure', async () => {
+    const w = world({ 'pnpm-lock.yaml': OLD_LOCK() });
+    const head = w.pr({ 'pnpm-lock.yaml': OLD_LOCK('sha512-BBBB') });
+    const report = await w.judge();
+    expectRejectedForOwnFiles(w, head, report);
+  });
+
+  it('control: the package key /react@18.2.0 changes its integrity → success', async () => {
+    const w = world({ 'pnpm-lock.yaml': OLD_LOCK() });
+    w.pr({ 'pnpm-lock.yaml': OLD_LOCK('sha512-AAAA', 'sha512-SSSS') });
+    await w.judge();
+    expect(states(w)).toEqual(['success']);
+  });
+
+  // Guards (surviving mutants of the flock): they pass today and must keep passing.
+  it('only the importer changes, to a link with no package entry → failure', async () => {
+    const w = world({ 'pnpm-lock.yaml': LOCK() });
+    const importerOnly = LOCK().replace('version: 0.3.0', 'version: link:../otro');
+    expect(importerOnly).not.toBe(LOCK());
+    const head = w.pr({ 'pnpm-lock.yaml': importerOnly });
+    const report = await w.judge();
+    expectRejectedForOwnFiles(w, head, report);
+  });
+
+  it('only the snapshot of ai-workflows@ changes its dependencies → failure', async () => {
+    const w = world({ 'pnpm-lock.yaml': LOCK() });
+    const snapshot = LOCK().replace('  ai-workflows@0.3.0: {}', lines('  ai-workflows@0.3.0:', '    dependencies:', '      yaml: 2.5.0').trimEnd());
+    expect(snapshot).not.toBe(LOCK());
+    const head = w.pr({ 'pnpm-lock.yaml': snapshot });
+    const report = await w.judge();
+    expectRejectedForOwnFiles(w, head, report);
+  });
+
+  it('package.json that is not JSON on both sides, with different content → failure', async () => {
+    const w = world({ 'package.json': '{ "name": "proyecto", \n' });
+    const head = w.pr({ 'package.json': '{ "name": "otro", \n' });
+    const report = await w.judge();
+    expectRejectedForOwnFiles(w, head, report);
+  });
+});

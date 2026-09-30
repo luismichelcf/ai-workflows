@@ -422,3 +422,43 @@ describe('PLAN-13-R6 §7: the port reads the chain', () => {
     await expect(port([[/workflows/, ok({ id: 4 })]]).github.workflowById(4)).rejects.toThrow();
   });
 });
+
+// PLAN-13-R6 §15 (the flock of slice 6): mutants of the chain that survived. They pass today and
+// must keep passing: only `success` is green, the newest official run decides, and a job ties to
+// its own check-run id only.
+describe('flock 6: guards on the red-test chain', () => {
+  for (const conclusion of ['skipped', 'cancelled']) {
+    it(`an official check-run that ended ${conclusion} is rejected, never green`, async () => {
+      const f = fake();
+      f.add(10, 'completed', conclusion);
+      expect((await judge(f.github)).outcome).toBe('rejected');
+    });
+  }
+
+  it('two official runs, the newest failed: rejected', async () => {
+    const f = fake();
+    f.add(10, 'completed', 'success');
+    f.add(20, 'completed', 'failure');
+    expect((await judge(f.github)).outcome).toBe('rejected');
+  });
+
+  it('two official runs, the newest passed: passed', async () => {
+    const f = fake();
+    f.add(10, 'completed', 'failure');
+    f.add(20, 'completed', 'success');
+    expect((await judge(f.github)).outcome).toBe('passed');
+  });
+
+  it('the newest decides whatever order GitHub lists them in', async () => {
+    const f = fake();
+    f.add(20, 'completed', 'failure');
+    f.add(10, 'completed', 'success');
+    expect((await judge(f.github)).outcome).toBe('rejected');
+  });
+
+  it('a job whose check_run_url ends in /check-runs/1234 does not tie check-run 123: waits', async () => {
+    const f = fake();
+    f.add(123, 'completed', 'success', { jobsPointTo: [1234] });
+    expect((await judge(f.github)).outcome).toBe('waiting');
+  });
+});

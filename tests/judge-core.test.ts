@@ -2038,3 +2038,47 @@ describe('PLAN-13-R6 §7: the judge ties the red test to its official run', () =
     expect(w.github.on()).toEqual([expect.objectContaining({ sha: group, state: 'pending' })]);
   });
 });
+
+// PLAN-13-R6 §15, P2 (the flock of slice 6): when the tip of main changes while judging, every
+// judgement against main is updated to the new tip at once, and «changed again» is counted per
+// branch. Before slice 6 every pull request of a group was judged again together; a group of two
+// whose main moves once (the group ahead merged, the normal case under a queue) must not be
+// ejected with «la rama principal cambió mientras se juzgaba».
+describe('flock 6 (P2): main moves once during a group of two pull requests', () => {
+  function twoPrGroup() {
+    const w = world();
+    const seven = behaviorPr(w, 7, 'feat/13-a');
+    const eight = w.pr(8, 'feat/14-b', { 'docs/plans/PLAN-14.md': lines('## En tres líneas', 'x', 'Tipo de cambio: comportamiento'), 'lib/b.ts': 'b\n' });
+    w.green(7, seven);
+    w.green(8, eight);
+    const group = mergeGroup(w, [7, 8]);
+    w.github.setCheck(group, 'todo-verde', green());
+    w.github.setCheck(group, 'ai-workflows/red-test', green());
+    return { w, group };
+  }
+
+  it('main moves once, to the group ahead: judged again, success on the group, no «cambió» error', async () => {
+    const { w, group } = twoPrGroup();
+    const ahead = (w.github.queue as { headSha: string }[])[0]?.headSha as string;
+    w.github.mainHeads = [w.main, ahead];
+    w.github.pendingFromConsoleStep(group);
+
+    await w.judge(groupInput(w, group));
+
+    expect(w.fetched).toContain(ahead);
+    expect(w.github.on().map((entry) => entry.description)).not.toContain('la rama principal cambió mientras se juzgaba');
+    expect(w.github.on()).toEqual([expect.objectContaining({ sha: group, state: 'success' })]);
+  });
+
+  // A guard: it errors today and must keep erroring.
+  it('main moves twice: error on the group, naming the principal', async () => {
+    const { w, group } = twoPrGroup();
+    const ahead = (w.github.queue as { headSha: string }[])[0]?.headSha as string;
+    w.github.mainHeads = [w.main, ahead, group];
+    w.github.pendingFromConsoleStep(group);
+
+    await w.judge(groupInput(w, group));
+
+    expect(w.github.on()).toEqual([expect.objectContaining({ sha: group, state: 'error', description: expect.stringMatching(/principal/) })]);
+  });
+});

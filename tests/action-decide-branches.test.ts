@@ -247,6 +247,37 @@ describe('§1.2 and §1.5 (13, 15): closed, and edited out of the input, go on t
   });
 });
 
+// PLAN-13-R6 §15 (the flock of slice 6): `closed` and `edited` out of the input respect the switch.
+// With the engine off (`off`, or no value) nothing is judged: the step publishes nothing and does
+// not go on to build the engine.
+describe('flock 6: closed, and edited out of the input, with the engine off', () => {
+  for (const mode of ['off', '', ' OFF ']) {
+    it(`closed into staging, mode «${mode}»: stops, nothing published`, () => {
+      const run = decide('pull_request_target', prEvent('closed', 'staging'), { branches: 'staging,main', mode });
+      expect(run.code, run.stderr).toBe(0);
+      expect(run.outputs).toMatchObject({ continue: 'false' });
+      expect(run.statuses).toEqual([]);
+    });
+
+    it(`edited out of the input (staging → develop), mode «${mode}»: stops, nothing published`, () => {
+      const run = decide('pull_request_target', prEvent('edited', 'develop', { changes: { base: { ref: { from: 'staging' } } } }), { branches: 'staging,main', mode });
+      expect(run.code, run.stderr).toBe(0);
+      expect(run.outputs).toMatchObject({ continue: 'false' });
+      expect(run.statuses).toEqual([]);
+    });
+  }
+
+  // Controls: with the engine on or in advisory, they still go on to the judge without publishing.
+  for (const mode of ['on', 'advisory']) {
+    it(`closed into staging, mode «${mode}»: goes on, nothing published`, () => {
+      const run = decide('pull_request_target', prEvent('closed', 'staging'), { branches: 'staging,main', mode });
+      expect(run.code, run.stderr).toBe(0);
+      expect(run.outputs).toMatchObject({ continue: 'true' });
+      expect(run.statuses).toEqual([]);
+    });
+  }
+});
+
 describe('§1.5 (15) through the whole action: the only pull request with that head is closed', () => {
   it('neither the decide step nor the judge publishes anything, not even «juzgando»', async () => {
     const w = branchWorld({ mainRecipe: recipe(['todo-verde'], BRANCHES) });

@@ -325,6 +325,21 @@ describe('PLAN-13-R6 §6: before the pull requests of the piece are known', () =
     expect(verdicts(t.published)).toEqual([expect.objectContaining({ sha: t.quiet, state: 'success' })]);
   });
 
+  // PLAN-13-R6 §15 (flock of slice 6): the guard (c) at publishing time on the issue path was
+  // untested; only the guard before the initial pending was. A guard: it passes today.
+  it('11. a newer official run publishes on a head after the initial pending: that pull request gets no verdict; the other is judged', async () => {
+    const t = setup({
+      over: ({ published, heads }) => ({
+        statuses: async (sha: string) => sha === heads.visible && published.some((entry) => entry.sha === sha && initial(entry))
+          ? [{ context: 'ai-workflows', state: 'pending', targetUrl: 'https://github.com/duena/proyecto/actions/runs/200', createdAt: '2026-09-29T12:00:00Z' }]
+          : [],
+      }),
+    });
+    await t.judge();
+    expect(on(t.published, t.visible)).toEqual([{ sha: t.visible, context: 'ai-workflows', state: 'pending', description: JUZGANDO }]);
+    expect(verdicts(on(t.published, t.quiet))).toEqual([expect.objectContaining({ state: 'success' })]);
+  });
+
   it('10b. the head of the principal fails twice and answers the third time: judged normally', async () => {
     let failures = 0;
     const t = setup({
