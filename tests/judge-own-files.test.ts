@@ -1442,8 +1442,8 @@ describe('third delta: every setting that names the build allow-list file', () =
 // Interface fixed here (for the builder):
 //   - A YAML document (package.yaml, pnpm-workspace.yaml, pnpm-lock.yaml) that holds a merge key
 //     (`<<`) at any depth, on a side that changes, is touched: the judge and the installer do not
-//     read it the same way. Anchors and aliases WITHOUT `<<` are read as usual (the alias is its
-//     value) and compared with the ordinary rule.
+//     read it the same way. (Superseded by the fifth delta, below: any anchor or alias is touched
+//     too.)
 //   - A key `__proto__` at any depth of a package manifest or of pnpm-workspace.yaml, on a side
 //     that changes, is touched (a plain JS object drops it, so the judge would not see it).
 //   - A dependency entry that is not the engine (in `dependencies`, `devDependencies`,
@@ -1500,20 +1500,24 @@ describe('fourth delta: YAML merge keys are touched', () => {
     expect(report.summary).toContain('pnpm-lock.yaml');
   });
 
-  // Guards: they pass today and must keep passing. Anchors and aliases without `<<` compare as
-  // their values.
-  it(`control: ${MEMBER} with an anchor and an alias only in harmless fields → success`, async () => {
+  // Changed by the fifth delta review (PLAN-13-R6 §15, «Quinta revisión del delta»): these two were
+  // guards expecting success («anchors and aliases without `<<` compare as their values»). Any
+  // anchor or alias is now an advanced YAML feature, touched without being read, so both expect
+  // failure.
+  it(`${MEMBER} with an anchor and an alias only in harmless fields → failure (fifth delta: anchors and aliases are touched)`, async () => {
     const w = world({ 'package.json': json(BASE_PACKAGE), [MEMBER]: lines('name: x', 'description: uno') });
-    w.pr({ [MEMBER]: lines('name: x', 'description: &d dos', 'keywords: [*d]') });
-    await w.judge();
-    expect(states(w)).toEqual(['success']);
+    const head = w.pr({ [MEMBER]: lines('name: x', 'description: &d dos', 'keywords: [*d]') });
+    const report = await w.judge();
+    expectRejectedForOwnFiles(w, head, report);
+    expect(report.summary).toContain(MEMBER);
   });
 
-  it('control: pnpm-workspace.yaml catalog entries of other packages through an anchor and an alias → success', async () => {
+  it('pnpm-workspace.yaml catalog entries of other packages through an anchor and an alias → failure (fifth delta: anchors and aliases are touched)', async () => {
     const w = world({ 'pnpm-workspace.yaml': WORKSPACE });
-    w.pr({ 'pnpm-workspace.yaml': lines('packages:', '  - apps/*', '', 'catalog:', '  react: &r 18.3.0', '  react-dom: *r') });
-    await w.judge();
-    expect(states(w)).toEqual(['success']);
+    const head = w.pr({ 'pnpm-workspace.yaml': lines('packages:', '  - apps/*', '', 'catalog:', '  react: &r 18.3.0', '  react-dom: *r') });
+    const report = await w.judge();
+    expectRejectedForOwnFiles(w, head, report);
+    expect(report.summary).toContain('pnpm-workspace.yaml');
   });
 
   it(`control: ${MEMBER} whose alias puts a lifecycle script (postinstall: *s) → failure`, async () => {
@@ -1735,4 +1739,169 @@ describe('fourth delta: .npmrc only-built-dependencies-file read as the installe
     expectRejectedForOwnFiles(w, head, report);
     expect(report.summary).toContain('b.json');
   });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Fifth delta review of the flock fixes (PLAN-13-R6 §15, «Quinta revisión del delta»): to cut the
+// difference between YAML readers, and to keep registry specs strict.
+//
+// Interface fixed here (for the builder):
+//   - A `package.yaml` (any depth), `pnpm-workspace.yaml` or `pnpm-lock.yaml` that uses ANY advanced
+//     YAML feature on either side of a change is touched, without being interpreted: a directive
+//     (`%YAML`, `%TAG`), an anchor or an alias, an explicit tag (`!!str`, `!!merge`, `!x`), a key
+//     that is not a scalar, a merge key (`<<`), more than one document, or any error of the reader
+//     (a duplicated key included). A plain YAML change of a harmless field keeps passing.
+//   - A dependency or catalog value that is not the engine is harmless only when it is a registry
+//     range or version written with the characters of semver, a tag without dots or slashes, or it
+//     starts with `workspace:` or `catalog:`. A `.tgz`, `.tar` or `.tar.gz` (any case), or a value
+//     starting with `\` or `~/`, is touched.
+//   - `.npmrc` is read the way the `ini` reader reads it: an inline comment (` ; …` or ` # …`)
+//     ends the value, and a key in quotes is unquoted before it is compared.
+//   The run log names the touched file.
+
+describe('fifth delta: advanced YAML is touched without being read', () => {
+  const MEMBER = 'packages/x/package.yaml';
+  const MEMBER_BASE = lines('name: x', 'description: uno');
+  const memberWorld = (): World => world({ 'package.json': json(BASE_PACKAGE), [MEMBER]: MEMBER_BASE });
+  const WORKSPACE = lines('packages:', '  - apps/*', '', 'catalog:', '  react: 18.2.0');
+
+  it(`the reviewer's case: a new ${MEMBER} with a complex key holding an anchored merge, and scripts: *s → failure naming it`, async () => {
+    const w = world({ 'package.json': json(BASE_PACKAGE) });
+    const head = w.pr({ [MEMBER]: 'name: probe\nrepository:\n  ? &s {<<: {postinstall: "x"}}\n  : x\nscripts: *s\n' });
+    const report = await w.judge();
+    expectRejectedForOwnFiles(w, head, report);
+    expect(report.summary).toContain(MEMBER);
+  });
+
+  it(`${MEMBER} gains a %YAML 1.1 directive (and a new description) → failure naming it`, async () => {
+    const w = memberWorld();
+    const head = w.pr({ [MEMBER]: lines('%YAML 1.1', '---', 'name: x', 'description: dos') });
+    const report = await w.judge();
+    expectRejectedForOwnFiles(w, head, report);
+    expect(report.summary).toContain(MEMBER);
+  });
+
+  it(`${MEMBER} gains a !!merge tagged key that only merges a description → failure naming it`, async () => {
+    const w = memberWorld();
+    const head = w.pr({ [MEMBER]: lines('name: x', 'description: uno', '!!merge extra: { description: dos }') });
+    const report = await w.judge();
+    expectRejectedForOwnFiles(w, head, report);
+    expect(report.summary).toContain(MEMBER);
+  });
+
+  it(`${MEMBER} description written with an explicit !!str tag → failure naming it`, async () => {
+    const w = memberWorld();
+    const head = w.pr({ [MEMBER]: lines('name: x', 'description: !!str dos') });
+    const report = await w.judge();
+    expectRejectedForOwnFiles(w, head, report);
+    expect(report.summary).toContain(MEMBER);
+  });
+
+  it('pnpm-lock.yaml: the integrity of another package written with an explicit !!str tag → failure naming it', async () => {
+    const w = world({ 'pnpm-lock.yaml': LOCK() });
+    const tagged = LOCK().replace('{integrity: sha512-RRRR}', '{integrity: !!str sha512-SSSS}');
+    expect(tagged).not.toBe(LOCK());
+    const head = w.pr({ 'pnpm-lock.yaml': tagged });
+    const report = await w.judge();
+    expectRejectedForOwnFiles(w, head, report);
+    expect(report.summary).toContain('pnpm-lock.yaml');
+  });
+
+  it(`${MEMBER} gains a non-scalar key inside repository (? [a, b] : c) → failure naming it`, async () => {
+    const w = memberWorld();
+    const head = w.pr({ [MEMBER]: lines('name: x', 'description: uno', 'repository:', '  ? [a, b]', '  : c') });
+    const report = await w.judge();
+    expectRejectedForOwnFiles(w, head, report);
+    expect(report.summary).toContain(MEMBER);
+  });
+
+  it('pnpm-workspace.yaml gains a second document after --- → failure naming it', async () => {
+    const w = world({ 'pnpm-workspace.yaml': WORKSPACE });
+    const head = w.pr({ 'pnpm-workspace.yaml': `${WORKSPACE}${lines('---', 'onlyBuiltDependencies:', '  - esbuild')}` });
+    const report = await w.judge();
+    expectRejectedForOwnFiles(w, head, report);
+    expect(report.summary).toContain('pnpm-workspace.yaml');
+  });
+
+  it(`${MEMBER} with a duplicated key (scripts twice, the first with postinstall) → failure naming it`, async () => {
+    const w = memberWorld();
+    const head = w.pr({ [MEMBER]: lines('name: x', 'description: uno', 'scripts:', '  postinstall: node x.js', 'scripts:', '  test: vitest') });
+    const report = await w.judge();
+    expectRejectedForOwnFiles(w, head, report);
+    expect(report.summary).toContain(MEMBER);
+  });
+
+  it('pnpm-workspace.yaml whose BASE side uses an anchor and an alias, changed by the PR to plain YAML → failure naming it', async () => {
+    const w = world({ 'pnpm-workspace.yaml': lines('packages:', '  - apps/*', '', 'catalog:', '  react: &r 18.2.0', '  react-dom: *r') });
+    const head = w.pr({ 'pnpm-workspace.yaml': lines('packages:', '  - apps/*', '', 'catalog:', '  react: 18.3.0', '  react-dom: 18.3.0') });
+    const report = await w.judge();
+    expectRejectedForOwnFiles(w, head, report);
+    expect(report.summary).toContain('pnpm-workspace.yaml');
+  });
+
+  // Guard: it passes today and must keep passing.
+  it(`control: ${MEMBER} with only a plain change of description → success`, async () => {
+    const w = memberWorld();
+    w.pr({ [MEMBER]: lines('name: x', 'description: dos') });
+    await w.judge();
+    expect(states(w)).toEqual(['success']);
+  });
+});
+
+describe('fifth delta: a registry spec is written with the characters of semver', () => {
+  const base = pkg((p) => { field(p, 'dependencies').esbuild = '^0.21.0'; });
+
+  // `~/z` and `tags/next` already fail today (they hold a slash); they stay as guards of the rule.
+  for (const [name, spec] of [
+    ['helper', 'helper.tgz'],
+    ['x', 'X.TAR.GZ'],
+    ['y', 'y.tar'],
+    ['z', '~/z'],
+    ['w', '\\\\srv\\w'],
+    ['t', 'release.candidate'],
+    ['u', 'tags/next'],
+  ] as const) {
+    it(`package.json gains dependencies.${name} = ${JSON.stringify(spec)} → failure naming package.json`, async () => {
+      const w = world({ 'package.json': base });
+      const head = w.pr({ 'package.json': pkg((p) => { field(p, 'dependencies').esbuild = '^0.21.0'; field(p, 'dependencies')[name] = spec; }) });
+      const report = await w.judge();
+      expectRejectedForOwnFiles(w, head, report);
+      expect(report.summary).toContain('package.json');
+    });
+  }
+
+  it('pnpm-workspace.yaml catalog gains helper: helper.tgz → failure naming it', async () => {
+    const WORKSPACE = lines('packages:', '  - apps/*', '', 'catalog:', '  react: 18.2.0');
+    const w = world({ 'pnpm-workspace.yaml': WORKSPACE });
+    const head = w.pr({ 'pnpm-workspace.yaml': `${WORKSPACE}${lines('  helper: helper.tgz')}` });
+    const report = await w.judge();
+    expectRejectedForOwnFiles(w, head, report);
+    expect(report.summary).toContain('pnpm-workspace.yaml');
+  });
+
+  // Guards: they pass today and must keep passing.
+  for (const spec of ['^1.2.3', '1.x', '>=1 <2', '1.0.0-beta.1', 'latest', 'next']) {
+    it(`control: dependencies.esbuild from ^0.21.0 to ${spec} → success`, async () => {
+      const w = world({ 'package.json': base });
+      w.pr({ 'package.json': pkg((p) => { field(p, 'dependencies').esbuild = spec; }) });
+      await w.judge();
+      expect(states(w)).toEqual(['success']);
+    });
+  }
+});
+
+describe('fifth delta: .npmrc read the way the ini reader reads it', () => {
+  for (const [what, npmrc] of [
+    ['with an inline ; comment', 'only-built-dependencies-file=allow.json ; note\n'],
+    ['with an inline # comment', 'only-built-dependencies-file=allow.json # note\n'],
+    ['under a quoted key', '"only-built-dependencies-file"=allow.json\n'],
+  ] as const) {
+    it(`.npmrc names allow.json ${what}; allow.json edited → failure naming it`, async () => {
+      const w = world({ '.npmrc': npmrc, 'allow.json': json(['esbuild']) });
+      const head = w.pr({ 'allow.json': json(['esbuild', 'postinstall-x']) });
+      const report = await w.judge();
+      expectRejectedForOwnFiles(w, head, report);
+      expect(report.summary).toContain('allow.json');
+    });
+  }
 });

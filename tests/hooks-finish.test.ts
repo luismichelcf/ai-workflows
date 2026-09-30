@@ -1,3 +1,4 @@
+import { EventEmitter } from 'node:events';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -164,5 +165,86 @@ describe('fourth delta: the hook exit code survives a failing kill step', () => 
     const bin = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'src', 'bin.ts'), 'utf8');
     expect(bin).not.toMatch(/function\s+finishHook\s*\(/);
     expect(bin).toMatch(/['"]\.\/locks\/hook-finish\.js['"]/);
+  });
+});
+
+// PLAN-13-R6 §15, «Quinta revisión del delta»: when the client closes its end of the pipe, writing
+// the answer fails with EPIPE. A real `process.stdout` then calls the write callback with the error
+// AND emits 'error' on a later tick; with no 'error' listener, Node turns that event into an
+// uncaught exception and the process ends with code 1, whatever the answer's code was.
+//
+// Interface fixed here (for the builder):
+//  - Each stream of `HookFinishIO` may also carry `on(event: 'error', listener: (error: Error) => void)`
+//    (`process.stdout` and `process.stderr` do). `finishHook` subscribes to 'error' on a stream that
+//    has `on` BEFORE writing to it, so an 'error' event is never unhandled.
+//  - A write that fails — the callback receives an error, the stream emits 'error' (with or without
+//    calling the callback), or `write` throws synchronously — still ends in `exit` called EXACTLY
+//    ONCE with `result.exitCode`. `finishHook` itself never throws.
+//
+// The fake below models Node: an 'error' event with no listener is recorded as `unhandled` (the real
+// process would crash with code 1) instead of being thrown into the test runner.
+
+interface BrokenIo {
+  io: Parameters<FinishModule['finishHook']>[2] & object;
+  recorded: Recorded;
+  unhandled: Error[];
+}
+
+/** An io whose stdout fails with EPIPE the way `mode` says; stderr and exit are the recorded fakes. */
+function brokenStdoutIo(mode: 'callback-and-event' | 'event-only' | 'throws'): BrokenIo {
+  const { io, recorded } = fakeIo();
+  const unhandled: Error[] = [];
+  const emitter = new EventEmitter();
+  const epipe = (): Error => Object.assign(new Error('write EPIPE'), { code: 'EPIPE' });
+  const stdout = {
+    on(event: string, listener: (error: Error) => void): unknown {
+      emitter.on(event, listener);
+      return stdout;
+    },
+    write(text: string, done: (error?: Error | null) => void): boolean {
+      recorded.events.push(`stdout:${text}`);
+      if (mode === 'throws') throw epipe();
+      const error = epipe();
+      setImmediate(() => {
+        if (mode === 'callback-and-event') done(error);
+        if (emitter.listenerCount('error') === 0) unhandled.push(error);
+        else emitter.emit('error', error);
+      });
+      return false;
+    },
+  };
+  return { io: { ...io, stdout } as unknown as BrokenIo['io'], recorded, unhandled };
+}
+
+const GIT_REFUSAL_ON_STDOUT: HookResult = { exitCode: 1, stdout: 'rechazado\n', stderr: '' };
+
+describe('fifth delta: the hook exit code survives a broken stdout (EPIPE)', () => {
+  it("stdout calls back with EPIPE and emits 'error': the error is handled and exit is called once with the answer's code", async () => {
+    const { finishHook } = await load();
+    const { io, recorded, unhandled } = brokenStdoutIo('callback-and-event');
+    finishHook(DENY, undefined, io);
+    expect(await exitWithin(recorded)).toBe(0);
+    await settle();
+    expect(unhandled).toEqual([]);
+    expect(recorded.exits).toEqual([0]);
+  });
+
+  it("stdout emits 'error' without calling back: the error is handled and exit is still called once with the answer's code", async () => {
+    const { finishHook } = await load();
+    const { io, recorded, unhandled } = brokenStdoutIo('event-only');
+    finishHook({ exitCode: 2, stdout: 'a', stderr: '' }, undefined, io);
+    expect(await exitWithin(recorded)).toBe(2);
+    await settle();
+    expect(unhandled).toEqual([]);
+    expect(recorded.exits).toEqual([2]);
+  });
+
+  it("stdout.write throws EPIPE synchronously: finishHook does not throw and exit is called once with the answer's code", async () => {
+    const { finishHook } = await load();
+    const { io, recorded } = brokenStdoutIo('throws');
+    expect(() => finishHook(GIT_REFUSAL_ON_STDOUT, undefined, io)).not.toThrow();
+    expect(await exitWithin(recorded)).toBe(1);
+    await settle();
+    expect(recorded.exits).toEqual([1]);
   });
 });
