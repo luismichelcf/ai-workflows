@@ -29,7 +29,7 @@ import { compileRecipe, runProviderInGroup } from '../recipe/compile.js';
 import { recordCleanUpdate, verifyCleanUpdate } from '../recipe/validity.js';
 import { diskProjectFiles, type ChangeDeclared } from '../recipe/facts.js';
 import { pieceOfBranch, readDeclaredKind } from '../judge/pieces.js';
-import { HOOK_LOADER } from '../locks/hook-cli.js';
+import { HOOK_LOADER, HOOK_WATCHDOG_MS } from '../locks/hook-cli.js';
 import type { Recipe } from '../recipe/types.js';
 import type { ProviderRunner } from '../blocks/definition.js';
 import {
@@ -1205,12 +1205,21 @@ async function commandDoctor(deps: AgentCliDeps): Promise<CommandOutput> {
 
   let settingsHook = false;
   let settingsUnreadable = false;
+  let editorHookTimeout: number | undefined;
   try {
     const settings = JSON.parse(readFileSync(join(root, '.claude', 'settings.json'), 'utf8')) as {
-      hooks?: { PreToolUse?: { hooks?: { command?: unknown; args?: unknown }[] }[] };
+      hooks?: { PreToolUse?: { hooks?: { command?: unknown; args?: unknown; timeout?: unknown }[] }[] };
     };
     const groups = settings.hooks?.PreToolUse ?? [];
-    settingsHook = groups.some((group) => (group.hooks ?? []).some(isOurEditorHook));
+    for (const group of groups) {
+      for (const handler of group.hooks ?? []) {
+        if (!isOurEditorHook(handler)) continue;
+        settingsHook = true;
+        if (typeof handler.timeout === 'number' && Number.isInteger(handler.timeout) && handler.timeout > 0) {
+          editorHookTimeout = handler.timeout;
+        }
+      }
+    }
   } catch {
     // A file that cannot be read is said as such, never as a missing hook: they are different
     // problems and the owner fixes them differently.
@@ -1231,6 +1240,17 @@ async function commandDoctor(deps: AgentCliDeps): Promise<CommandOutput> {
       es
         ? 'El gancho del editor o los de git: faltan. Ejecuta: ai-workflows hooks install --apply'
         : 'The editor hook or the git hooks: missing. Run: ai-workflows hooks install --apply',
+    );
+  }
+  // PLAN-13-R6 §4 test 7: a hook timeout that does not leave room over the watchdog would let the
+  // tool through by timeout, so it is said and named.
+  if (editorHookTimeout !== undefined && editorHookTimeout * 1000 <= HOOK_WATCHDOG_MS) {
+    lines.push(
+      es
+        ? `Aviso: el tiempo del gancho del editor (${editorHookTimeout} s) no supera el vigilante ` +
+          `(${HOOK_WATCHDOG_MS / 1000} s): el CLI podría dejar pasar una herramienta por tiempo.`
+        : `Warning: the editor hook's timeout (${editorHookTimeout} s) does not exceed the watchdog ` +
+          `(${HOOK_WATCHDOG_MS / 1000} s): the CLI could let a tool through by timeout.`,
     );
   }
 
