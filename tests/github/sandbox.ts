@@ -111,6 +111,11 @@ export interface Sandbox {
   writeMainFiles(files: Record<string, string>, message: string): Promise<string>;
   createIssue(title: string): Promise<number>;
   createBranch(name: string, sha: string): Promise<void>;
+  /**
+   * PLAN-13-R6 §11: writes files on top of a branch the run itself created (a working branch such
+   * as `staging`) and returns its new head. A branch the run did not create is never written.
+   */
+  writeBranchFiles(name: string, files: Record<string, string>): Promise<string>;
   createDeployment(o: { sha: string; environment: string; url: string }): Promise<number>;
   trackPullRequest(number: number, branch: string): Promise<void>;
   noteMerged(number: number): Promise<void>;
@@ -332,6 +337,8 @@ async function performReconcile(port: SandboxPort, state: SandboxState): Promise
     if (entry.resource === 'branch') {
       const remote = await port.getRef(`refs/heads/${entry.path ?? ''}`);
       if (remote === entry.after) entry.done = true;
+      // A write on the run's own branch that never landed leaves the head it had before (§11 R6).
+      else if (typeof entry.before === 'string' && remote === entry.before) remove();
       else if (remote === undefined) remove();
       else problems.push(`rama ${entry.path ?? ''}: no se pudo conciliar la intención con el estado remoto`);
       continue;
@@ -588,9 +595,14 @@ async function performRestore(port: SandboxPort, state: SandboxState): Promise<s
     }
   }
 
+  // A branch the run wrote to more than once is compared with the LAST thing the run wrote there.
+  const branchNames = new Set<string>();
   for (const entry of state.journal) {
-    if (entry.resource !== 'branch' || !entry.done || entry.path === undefined) continue;
-    const name = entry.path;
+    if (entry.resource === 'branch' && entry.done && entry.path !== undefined) branchNames.add(entry.path);
+  }
+  for (const name of branchNames) {
+    const entry = lastEntry(state, 'branch', (candidate) => candidate.path === name);
+    if (entry === undefined) continue;
     await attempt(problems, `rama ${name}`, async () => {
       const current = await port.getRef(`refs/heads/${name}`);
       if (current === entry.after) await port.deleteBranch(name);
@@ -899,6 +911,26 @@ function makeSandbox(port: SandboxPort, run: string): { sandbox: Sandbox; adopt:
         const created = await port.createRef(`refs/heads/${name}`, sha);
         if (created === 'exists') throw new Error(`la rama ${name} ya existía`);
         await markDone(index);
+      });
+    },
+
+    async writeBranchFiles(name: string, files: Record<string, string>): Promise<string> {
+      return serialize(async () => {
+        await refresh();
+        const own = state.journal.some((entry) => entry.resource === 'branch' && entry.op === 'create-branch' && entry.path === name && entry.done);
+        if (!own) throw new Error(`la rama ${name} no la creó esta corrida: el arnés solo escribe en ramas propias`);
+        const last = lastEntry(state, 'branch', (candidate) => candidate.path === name);
+        const current = await port.getRef(`refs/heads/${name}`);
+        if (current === undefined || current !== last?.after) {
+          throw new Error(`la rama ${name} no coincide con lo último que escribió la corrida`);
+        }
+        // The commit exists before the intention, so the intention names the exact new head.
+        const commit = await port.writeCommit(files, current);
+        const index = await addIntention({ op: 'write-branch', resource: 'branch', path: name, before: current, after: commit });
+        const moved = await port.updateRef(`refs/heads/${name}`, commit, current);
+        if (moved === 'conflict') throw new Error(`la rama ${name} se movió antes de escribir`);
+        await markDone(index);
+        return commit;
       });
     },
 
