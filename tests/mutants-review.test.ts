@@ -138,7 +138,9 @@ describe('the judgement from the issue, one pull request at a time (J6, J8, J9)'
       statuses: async () => [],
       workflowRun: async () => ({ path: '.github/workflows/ai-workflows.yml', event: 'pull_request_target', headBranch: 'main' }),
       forcePushedHeads: async () => [],
-      publishStatus: async (sha: string, status: { state: string }) => {
+      publishStatus: async (sha: string, status: { state: string; description: string }) => {
+        // PLAN-13-R6 §6: the initial «juzgando» of the judgement from the issue is not a verdict.
+        if (status.description === 'juzgando') return;
         published.push({ sha, state: status.state });
       },
       upsertTraceComment: async () => {},
@@ -158,7 +160,7 @@ describe('the judgement from the issue, one pull request at a time (J6, J8, J9)'
       serverUrl: 'https://github.com',
       alsoProtect: [],
       root: w.root,
-    }, { github, fetchObjects: async () => {} });
+    }, { github, fetchObjects: async () => {}, sleep: async () => {} });
 
   it('one pull request of the piece that makes the engine throw gets its error; the other gets its verdict', async () => {
     const w = world();

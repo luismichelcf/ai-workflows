@@ -42,6 +42,13 @@ const RECIPE = lines(
 const EVENT = { action: 'created', issue: { number: 13 }, comment: { body: 'Veredicto\n\n<!-- ai-workflows:event {"type":"verdict"} -->' } };
 const JUDGE_PATH = '.github/workflows/ai-workflows.yml';
 
+// PLAN-13-R6 §6: the judgement from the issue first publishes `pending` «juzgando» on every head of
+// the piece (unless a newer official run already wrote there), then the verdicts. `verdicts` leaves
+// out that initial pending; everything else about these guarantees is unchanged.
+const JUZGANDO = 'juzgando';
+const verdicts = (published: readonly { sha: string; state: string; description: string }[]) =>
+  published.filter((entry) => entry.description !== JUZGANDO);
+
 function setup(over: Partial<JudgeGitHub> = {}) {
   const root = repository({ '.ai-workflows/pipeline.yml': RECIPE, 'app/page.tsx': 'uno\n' });
   write(root, 'app/page.tsx', 'dos\n');
@@ -91,6 +98,7 @@ function setup(over: Partial<JudgeGitHub> = {}) {
       fetchObjects: async (shas) => {
         fetched.push(shas);
       },
+      sleep: async () => {},
     });
   return { head, main, movedMain, published, fetched, judge };
 }
@@ -109,7 +117,7 @@ describe('the judgement from the issue keeps the guarantees of §3.8', () => {
       statuses: async () => [{ context: 'ai-workflows', state: 'success', targetUrl: 'https://github.com/duena/proyecto/actions/runs/50', createdAt: '2026-09-25T12:00:00Z' }],
     } as Partial<JudgeGitHub>);
     await t.judge();
-    expect(t.published.map((entry) => entry.sha)).toEqual([t.head]);
+    expect(verdicts(t.published).map((entry) => entry.sha)).toEqual([t.head]);
   });
 
   it('(b) a main that moved while judging is judged again from the new main before publishing', async () => {
@@ -127,7 +135,7 @@ describe('the judgement from the issue keeps the guarantees of §3.8', () => {
     holder.moved = t.movedMain;
     await t.judge();
     expect(t.fetched.flat()).toContain(t.movedMain);
-    expect(t.published.map((entry) => entry.sha)).toEqual([t.head]);
+    expect(verdicts(t.published).map((entry) => entry.sha)).toEqual([t.head]);
   });
 });
 
@@ -137,7 +145,11 @@ describe('a read that fails in the judgement from the issue is never a quiet gre
     const bad = setup({ branchHead: async () => 'f'.repeat(40) } as Partial<JudgeGitHub>);
     void t;
     await expect(bad.judge()).rejects.toThrow();
-    expect(bad.published).toEqual([]);
+    // R6 §6: the open pull requests into the branches of the input still get a broad pending, so an
+    // old green does not stay; never a verdict.
+    expect(bad.published).toEqual([
+      { sha: bad.head, state: 'pending', description: expect.stringContaining('no pude leer la receta') },
+    ]);
   });
 
   it('the open pull requests cannot be read: the run fails', async () => {
@@ -149,7 +161,8 @@ describe('a read that fails in the judgement from the issue is never a quiet gre
   it('a pull request that cannot be re-read gets an error status on the head already known', async () => {
     const t = setup({ pullRequest: async () => { throw new Error('HTTP 502 al releer'); } } as Partial<JudgeGitHub>);
     await t.judge().catch(() => undefined);
-    expect(t.published).toEqual([expect.objectContaining({ sha: t.head, state: 'error' })]);
+    // R6 §6: «juzgando» may come first; the error lands on the head already known, never a verdict.
+    expect(verdicts(t.published)).toEqual([expect.objectContaining({ sha: t.head, state: 'error' })]);
   });
 
   // Round 2: the statuses cannot be read before publishing (§3.8 c cannot be decided): no verdict is
@@ -158,8 +171,9 @@ describe('a read that fails in the judgement from the issue is never a quiet gre
     const t = setup({ statuses: async () => { throw new Error('HTTP 502 al leer estados'); } } as Partial<JudgeGitHub>);
     await expect(t.judge()).rejects.toThrow(/502/);
     expect(t.published.map((entry) => entry.state)).not.toContain('success');
-    expect(t.published.map((entry) => entry.state)).not.toContain('pending');
-    expect(t.published).toEqual([expect.objectContaining({ sha: t.head, state: 'error' })]);
+    // R6 §6: the only pending allowed is the initial «juzgando»; no verdict.
+    expect(verdicts(t.published).map((entry) => entry.state)).not.toContain('pending');
+    expect(verdicts(t.published)).toEqual([expect.objectContaining({ sha: t.head, state: 'error' })]);
   });
 
   it('a verdict that cannot be published makes the run fail after the other pull requests were judged', async () => {
@@ -180,8 +194,9 @@ describe('a read that fails in the judgement from the issue is never a quiet gre
     expect(seen).toContain(other);
   });
 
-  // Round 3: the last re-read before publishing fails. Nothing may be published on a head that
-  // might have moved, but the run must not end quietly: it fails.
+  // Round 3: the last re-read before publishing fails. No verdict may be published on a head that
+  // might have moved, and the run must not end quietly: it fails. R6 §6: the head already carries
+  // «juzgando», and the failed re-read now publishes `error` with its motive there.
   it('the last re-read before publishing fails: no verdict, and the run fails', async () => {
     let reads = 0;
     const t = setup({
@@ -193,7 +208,8 @@ describe('a read that fails in the judgement from the issue is never a quiet gre
     } as Partial<JudgeGitHub>);
     await expect(t.judge()).rejects.toThrow(/502/);
     expect(t.published.map((entry) => entry.state)).not.toContain('success');
-    expect(t.published.map((entry) => entry.state)).not.toContain('pending');
+    expect(t.published[0]).toEqual({ sha: t.head, state: 'pending', description: JUZGANDO });
+    expect(verdicts(t.published)).toEqual([{ sha: t.head, state: 'error', description: expect.stringContaining('502') }]);
   });
 
   it('an error status that cannot be published for one pull request does not stop the others', async () => {
