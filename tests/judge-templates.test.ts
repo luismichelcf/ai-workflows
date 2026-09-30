@@ -30,7 +30,9 @@ function steps(job: Record<string, any>): Record<string, any>[] {
 describe('action.yml', () => {
   it('is a composite action with the inputs of §6', () => {
     expect(ACTION['runs']?.['using']).toBe('composite');
-    expect(Object.keys(ACTION['inputs'] ?? {}).sort()).toEqual(['also-protect', 'context', 'mode', 'task', 'token']);
+    // PLAN-13-R6 §1.2 adds the input `branches` (the working branches the decide step needs
+    // before the engine is built): the list changes by design.
+    expect(Object.keys(ACTION['inputs'] ?? {}).sort()).toEqual(['also-protect', 'branches', 'context', 'mode', 'task', 'token']);
     expect(ACTION['inputs']?.['context']?.['default']).toBe('ai-workflows');
   });
 
@@ -83,7 +85,9 @@ describe('templates/ai-workflows.yml (the judge)', () => {
     expect((on['workflow_dispatch'] as any)?.inputs?.pr).toBeDefined();
     expect((on['workflow_run'] as any)?.types).toEqual(['completed']);
     // edited: changing the target branch (or coming back to main) runs the judge again.
-    expect([...((on['pull_request_target'] as any)?.types ?? [])].sort()).toEqual(['edited', 'opened', 'reopened', 'synchronize']);
+    // closed (PLAN-13-R6 §1.2, §1.5 test 16): a pull request that stops counting re-judges the
+    // others with its head, so the judge listens to it; the list changes by design.
+    expect([...((on['pull_request_target'] as any)?.types ?? [])].sort()).toEqual(['closed', 'edited', 'opened', 'reopened', 'synchronize']);
     expect((on['workflow_run'] as any)?.workflows).toContain(RED['name']);
   });
 
