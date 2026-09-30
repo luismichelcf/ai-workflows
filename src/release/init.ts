@@ -8,17 +8,25 @@
 // the three workflows, from the recipe that already exists, and touches neither package.json, nor
 // the lock file, nor the hooks. `--package <path>` installs from that package instead of the
 // version address, but only after checking that its `engine.json` is the same seal.
+//
+// PLAN-13-R6 §15 (fixes after the flock): `init` refuses to run from a subfolder of a repository,
+// speaks the language of the recipe it ends up with, gives the closing text with the exact
+// `gh variable set` commands and the piece-branch line, treats three already-present workflows as
+// reported and still installs the hooks, starts the package manager without a shell (the JS entry
+// point on Windows), fails when the judge template has no anchor for `branches`, writes the
+// `branches` value quoted, and names any file a failed rollback could not remove.
 
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync, type ChildProcess, type SpawnOptions } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
-import { basename, dirname, join, relative } from 'node:path';
+import { basename, dirname, join, relative, resolve } from 'node:path';
 
 import { parse } from 'yaml';
 
 import type { CommandOutput } from '../cli.js';
 import { installHooks } from '../locks/hook-cli.js';
 import { isValidBranchName } from '../locks/refname.js';
+import { languageOf, type Language } from '../recipe/applies.js';
 import { safeTerminalText } from '../safe-text.js';
 import { readPackageSeal } from './package.js';
 
@@ -26,6 +34,7 @@ export const RECIPE_USAGE = 'Usage: ai-workflows <validate|explain|init> [file]'
 
 const RECIPE_PATH = '.ai-workflows/pipeline.yml';
 const ENGINE = 'luismichelcf/ai-workflows';
+const BRANCHES_ANCHOR = '          token: ${{ github.token }}\n';
 
 /** The three judge workflows, by the path init writes and the template it takes them from. */
 const WORKFLOW_TEMPLATES: Readonly<Record<string, string>> = {
@@ -33,17 +42,6 @@ const WORKFLOW_TEMPLATES: Readonly<Record<string, string>> = {
   '.github/workflows/ai-workflows-red-test.yml': 'ai-workflows-red-test.yml',
   '.github/workflows/ai-workflows-review-signal.yml': 'ai-workflows-review-signal.yml',
 };
-
-/**
- * What `init` cannot do for the owner, said at the end and always naming the switch variable
- * (§9.2). Turning the judge on and requiring its status is always the owner's own step.
- */
-const HINT = [
-  'Next, by hand:',
-  '  - adjust the install and test steps of .github/workflows/ai-workflows-red-test.yml to this project;',
-  '  - add your required-check workflows to the `workflow_run` list of .github/workflows/ai-workflows.yml;',
-  '  - set the repository variable AI_WORKFLOWS_MODE to `off` or `advisory` to try the judge. Turning it `on` and requiring the status is a separate step you take.',
-].join('\n');
 
 export interface InstallRequest {
   readonly manager: 'pnpm' | 'npm' | 'yarn';
@@ -54,6 +52,16 @@ export type InstallResult = { readonly ok: true } | { readonly ok: false; readon
 
 export type RunPackageInstall = (request: InstallRequest) => Promise<InstallResult>;
 
+/**
+ * How the default installer starts the package manager. The real one is `child_process.spawn`; the
+ * tests inject a fake. It must be asked for no shell and must not start a shell program.
+ */
+export type SpawnProcess = (
+  command: string,
+  args: readonly string[],
+  options: SpawnOptions,
+) => ChildProcess;
+
 /** What the CLI passes to `init`; the tests inject the external edges to keep it hermetic. */
 export interface RecipeCommandOptions {
   readonly cwd: string;
@@ -63,6 +71,12 @@ export interface RecipeCommandOptions {
   readonly runPackageInstall?: RunPackageInstall;
   /** How a temporary workflow is moved into place; injected only to make a rename fail (4b). */
   readonly renameFile?: (from: string, to: string) => Promise<void>;
+  /** How every rollback removal happens; injected only to make a removal fail (§15). */
+  readonly removeFile?: (path: string) => Promise<void>;
+  /** How the default installer starts the package manager; injected in tests (§15). */
+  readonly spawnProcess?: SpawnProcess;
+  /** Where the four templates are read from; default: the package's `templates/`. */
+  readonly templatesDir?: string;
 }
 
 interface Seal {
@@ -128,15 +142,28 @@ export async function runInit(
   const args = parseInitArgs(rest);
   if (args.kind === 'usage') return { ok: false, text: RECIPE_USAGE };
 
+  // A piece branch lives at the root of the repository: running from a subfolder would write the
+  // recipe and the workflows in the wrong place. A folder that is not a repository is left as it
+  // was, so `init` still works outside git.
+  const top = repositoryRoot(options.cwd);
+  if (top !== undefined && !samePath(top, options.cwd)) {
+    return {
+      ok: false,
+      text: `Run init from the repository root (${top}), not from a subfolder.`,
+    };
+  }
+
   const fromPackageJson = options.seal === undefined;
   const rawSeal = fromPackageJson ? await readInstalledSeal() : options.seal;
   const seal = asSeal(rawSeal);
   if (seal === undefined) {
     // Without a valid seal nothing is installed and no workflow is written; the example recipe is
     // still written, as the development copy always did, and the reason names the seal.
-    const lines = [sealReason(fromPackageJson)];
-    if (args.packagePath === undefined) lines.push(await writeRecipe(options.cwd, undefined));
-    lines.push(HINT);
+    const recipe = args.packagePath === undefined ? await writeRecipe(options.cwd, undefined, options.templatesDir) : undefined;
+    const words = INIT_WORDS[await initLanguage(options.cwd)];
+    const lines = [fromPackageJson ? words.sealMissing : words.sealInvalid];
+    if (recipe !== undefined) lines.push(fileStatusText(words, RECIPE_PATH, recipe));
+    lines.push(words.hint);
     return { ok: false, text: lines.join('\n') };
   }
 
@@ -146,7 +173,7 @@ export async function runInit(
       return {
         ok: false,
         text:
-          `No installé nada: ${safeTerminalText(args.packagePath)} no trae el mismo sello ` +
+          `No instalé nada: ${safeTerminalText(args.packagePath)} no trae el mismo sello ` +
           '(engine.json) que este init.',
       };
     }
@@ -155,14 +182,14 @@ export async function runInit(
   const address =
     args.packagePath === undefined ? releaseAddress(seal) : `file:${args.packagePath}`;
 
-  if (args.judgeOnly) return judgeOnly(options.cwd, seal, options.renameFile);
-  return fullInit(options.cwd, seal, address, options.runPackageInstall, options.renameFile);
+  if (args.judgeOnly) return judgeOnly(options.cwd, seal, options);
+  return fullInit(options.cwd, seal, address, options);
 }
 
 async function judgeOnly(
   cwd: string,
   seal: Seal,
-  renameFile: RecipeCommandOptions['renameFile'],
+  options: RecipeCommandOptions,
 ): Promise<CommandOutput> {
   if (!existsSync(join(cwd, RECIPE_PATH))) {
     return {
@@ -170,54 +197,66 @@ async function judgeOnly(
       text: `${RECIPE_PATH}: not found. Write the recipe before running init --judge-only.`,
     };
   }
+  const words = INIT_WORDS[await initLanguage(cwd)];
   const branches = await recipeBranches(cwd);
-  const written = await writeWorkflows(cwd, seal, branches, renameFile);
+  const written = await writeWorkflows(cwd, seal, branches, words, options);
   if (!written.ok) return { ok: false, text: written.text };
-  return { ok: true, text: [...written.created.map((path) => `Created ${path}`), HINT].join('\n') };
+  return { ok: true, text: workflowLines(words, written).concat(words.hint).join('\n') };
 }
 
 async function fullInit(
   cwd: string,
   seal: Seal,
   address: string,
-  runPackageInstall: RunPackageInstall | undefined,
-  renameFile: RecipeCommandOptions['renameFile'],
+  options: RecipeCommandOptions,
 ): Promise<CommandOutput> {
-  const lines: string[] = [];
-
-  const dependency = await prepareDependency(cwd, seal, address, runPackageInstall);
+  const dependency = await prepareDependency(cwd, seal, address, options);
   if (!dependency.ok) return { ok: false, text: dependency.reason };
-  lines.push(dependency.line);
 
-  lines.push(await writeRecipe(cwd, seal.version));
+  const recipe = await writeRecipe(cwd, seal.version, options.templatesDir);
+  const words = INIT_WORDS[await initLanguage(cwd)];
+
+  const lines: string[] = [];
+  lines.push(dependencyText(words, dependency.line));
+  lines.push(fileStatusText(words, RECIPE_PATH, recipe));
 
   const branches = await recipeBranches(cwd);
-  const written = await writeWorkflows(cwd, seal, branches, renameFile);
+  const written = await writeWorkflows(cwd, seal, branches, words, options);
   if (!written.ok) {
-    lines.push(written.text, HINT);
+    lines.push(written.text, words.hint);
     return { ok: false, text: lines.join('\n') };
   }
-  lines.push(...written.created.map((path) => `Created ${path}`));
+  lines.push(...workflowLines(words, written));
 
   if (dependency.installHooks) {
     const installed = await installHooks({ root: cwd, apply: true });
-    lines.push(installed.text, HINT);
+    lines.push(installed.text, words.hint);
     return { ok: installed.ok, text: lines.join('\n') };
   }
 
-  lines.push(dependency.skipHooksReason, HINT);
+  lines.push(dependency.line.kind === 'declared-other' ? words.skipDeclared : words.skipLanded);
+  lines.push(words.hint);
   return { ok: true, text: lines.join('\n') };
 }
 
+type DependencyLine =
+  | { readonly kind: 'declared-other'; readonly version: string }
+  | { readonly kind: 'landed-miss'; readonly version: string; readonly manager: string }
+  | { readonly kind: 'installed'; readonly version: string; readonly manager: string };
+
 type DependencyOutcome =
-  | { readonly ok: true; readonly line: string; readonly installHooks: boolean; readonly skipHooksReason: string }
+  | {
+      readonly ok: true;
+      readonly line: DependencyLine;
+      readonly installHooks: boolean;
+    }
   | { readonly ok: false; readonly reason: string };
 
 async function prepareDependency(
   cwd: string,
   seal: Seal,
   address: string,
-  runPackageInstall: RunPackageInstall | undefined,
+  options: RecipeCommandOptions,
 ): Promise<DependencyOutcome> {
   const packagePath = join(cwd, 'package.json');
   let pkg: Record<string, unknown> = {};
@@ -234,14 +273,11 @@ async function prepareDependency(
 
   const declared = declaredEngine(pkg);
   if (declared !== undefined && declared !== address) {
+    const version = versionIn(declared);
     return {
       ok: true,
-      line:
-        `ai-workflows already depends on ${versionIn(declared)}; init does not change it. ` +
-        'The hooks were not installed, because they would load that other engine.',
+      line: { kind: 'declared-other', version },
       installHooks: false,
-      skipHooksReason:
-        'The hooks were not installed: node_modules/ai-workflows would not carry this engine.',
     };
   }
 
@@ -260,7 +296,7 @@ async function prepareDependency(
   }
 
   const manager = detectManager(cwd);
-  const install = runPackageInstall ?? defaultInstall();
+  const install = options.runPackageInstall ?? defaultInstall(options.spawnProcess);
   let result: InstallResult;
   try {
     result = await install({ manager, cwd });
@@ -275,17 +311,14 @@ async function prepareDependency(
   if (!sameSeal(landed, seal)) {
     return {
       ok: true,
-      line: `ai-workflows ${seal.version} was declared and ${manager} ran, but node_modules/ai-workflows does not carry this engine's seal.`,
+      line: { kind: 'landed-miss', version: seal.version, manager },
       installHooks: false,
-      skipHooksReason:
-        'The hooks were not installed: node_modules/ai-workflows does not carry this engine\'s seal.',
     };
   }
   return {
     ok: true,
-    line: `Added ai-workflows ${seal.version} to devDependencies and installed it with ${manager}.`,
+    line: { kind: 'installed', version: seal.version, manager },
     installHooks: true,
-    skipHooksReason: '',
   };
 }
 
@@ -306,8 +339,14 @@ function detectManager(cwd: string): InstallRequest['manager'] {
   return 'pnpm';
 }
 
-/** The package manager at the external edge. Injected in tests, so it is only the real default. */
-function defaultInstall(): RunPackageInstall {
+/**
+ * The package manager at the external edge, started with no shell (§15). On Windows a bare `pnpm`
+ * is a `.cmd` the system cannot run without a shell, so the manager's JS entry point is found and
+ * run with this same `node`; on Linux the manager itself runs.
+ */
+function defaultInstall(spawnProcess: SpawnProcess | undefined): RunPackageInstall {
+  const launch: SpawnProcess =
+    spawnProcess ?? ((command, args, spawnOptions) => spawn(command, args, spawnOptions));
   return (request) =>
     new Promise<InstallResult>((resolve) => {
       let settled = false;
@@ -316,14 +355,16 @@ function defaultInstall(): RunPackageInstall {
         settled = true;
         resolve(result);
       };
-      let child;
+      const { command, args } = managerCommand(request.manager);
+      const launchOptions: SpawnOptions = {
+        cwd: request.cwd,
+        windowsHide: true,
+        shell: false,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      };
+      let child: ChildProcess;
       try {
-        child = spawn(request.manager, ['install'], {
-          cwd: request.cwd,
-          windowsHide: true,
-          shell: process.platform === 'win32',
-          stdio: ['ignore', 'pipe', 'pipe'],
-        });
+        child = launch(command, args, launchOptions);
       } catch (error) {
         finish({ ok: false, reason: reasonOf(error) });
         return;
@@ -334,10 +375,34 @@ function defaultInstall(): RunPackageInstall {
         if (stderr.length < 65536) stderr += chunk;
       });
       child.on('error', (error) => finish({ ok: false, reason: reasonOf(error) }));
-      child.on('close', (code) =>
+      child.on('close', (code: number | null) =>
         code === 0 ? finish({ ok: true }) : finish({ ok: false, reason: stderr.trim() || `exit ${code}` }),
       );
     });
+}
+
+/** The command that starts `manager install`, with the JS entry point on Windows (§15). */
+function managerCommand(manager: InstallRequest['manager']): { command: string; args: string[] } {
+  if (process.platform === 'win32') {
+    const script = windowsManagerScript(manager);
+    if (script !== undefined) return { command: process.execPath, args: [script, 'install'] };
+  }
+  return { command: manager, args: ['install'] };
+}
+
+/** The JS entry point of a globally installed manager on Windows, if it can be found. */
+function windowsManagerScript(manager: string): string | undefined {
+  const candidates = (process.env['PATH'] ?? '')
+    .split(';')
+    .map((dir) => dir.trim())
+    .filter((dir) => dir.length > 0)
+    .map((dir) => join(dir, 'node_modules', manager, 'bin', `${manager}.cjs`));
+  const execpath = process.env['npm_execpath'];
+  if (typeof execpath === 'string' && execpath.length > 0) candidates.push(execpath);
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) return candidate;
+  }
+  return undefined;
 }
 
 async function nodeModulesSeal(cwd: string): Promise<unknown> {
@@ -350,11 +415,20 @@ async function nodeModulesSeal(cwd: string): Promise<unknown> {
   }
 }
 
+type FileStatus =
+  | { readonly kind: 'created' }
+  | { readonly kind: 'existed' }
+  | { readonly kind: 'failed'; readonly reason: string };
+
 /** Writes the example recipe if it is missing; never overwrites, and reports which of the two. */
-async function writeRecipe(cwd: string, version: string | undefined): Promise<string> {
+async function writeRecipe(
+  cwd: string,
+  version: string | undefined,
+  templatesDir: string | undefined,
+): Promise<FileStatus> {
   const target = join(cwd, RECIPE_PATH);
-  if (existsSync(target)) return `${RECIPE_PATH} already exists; init does not overwrite it.`;
-  let template = await readFile(new URL('../../templates/pipeline.yml', import.meta.url), 'utf8');
+  if (existsSync(target)) return { kind: 'existed' };
+  let template = await readFile(templateFile('pipeline.yml', templatesDir), 'utf8');
   if (version !== undefined) {
     template = template.replace(
       /(releases\/download\/)v[^/]+(\/recipe\.schema\.json)/,
@@ -364,12 +438,10 @@ async function writeRecipe(cwd: string, version: string | undefined): Promise<st
   try {
     await mkdir(dirname(target), { recursive: true });
     await writeFile(target, template, { flag: 'wx' });
-    return `Created ${RECIPE_PATH}`;
+    return { kind: 'created' };
   } catch (error) {
-    if (errorCode(error) === 'EEXIST') {
-      return `${RECIPE_PATH} already exists; init does not overwrite it.`;
-    }
-    return `Could not write ${RECIPE_PATH}: ${reasonOf(error)}`;
+    if (errorCode(error) === 'EEXIST') return { kind: 'existed' };
+    return { kind: 'failed', reason: reasonOf(error) };
   }
 }
 
@@ -398,40 +470,60 @@ async function recipeBranches(cwd: string): Promise<readonly string[]> {
 }
 
 type WorkflowsOutcome =
-  | { readonly ok: true; readonly created: readonly string[] }
+  | { readonly ok: true; readonly created: readonly string[]; readonly existing: readonly string[] }
   | { readonly ok: false; readonly text: string };
 
+/** A template that cannot take the `branches` input because it lost its anchor (§15). */
+class WorkflowTemplateError extends Error {
+  readonly template: string;
+
+  constructor(template: string) {
+    super(`the template ${template} has no anchor for the branches input`);
+    this.template = template;
+  }
+}
+
 /**
- * Writes the three workflows all or nothing (§9.2): if any of them exists none is written and the
- * one that exists is named; each is written to a temporary file and renamed into place, and if a
- * rename fails the ones already renamed are removed and no temporary file stays behind.
+ * Writes the three workflows all or nothing (§9.2): if some — but not all — of them exist none is
+ * written and the ones that exist are named; if all three exist each is reported as already there
+ * and nothing is touched (§15). Each is written to a temporary file and renamed into place, and if
+ * a rename fails the ones already renamed and the temporary file are removed (§15: naming any file
+ * the rollback could not remove).
  */
 async function writeWorkflows(
   cwd: string,
   seal: Seal,
   branches: readonly string[],
-  renameFile: RecipeCommandOptions['renameFile'],
+  words: InitWords,
+  options: RecipeCommandOptions,
 ): Promise<WorkflowsOutcome> {
   const paths = Object.keys(WORKFLOW_TEMPLATES);
   const existing = paths.filter((path) => existsSync(join(cwd, path)));
-  if (existing.length > 0) {
-    return {
-      ok: false,
-      text:
-        `None of the three workflows was written: ${existing.join(', ')} already exists; ` +
-        'init does not overwrite it.',
-    };
+  if (existing.length === paths.length) {
+    return { ok: true, created: [], existing };
+  }
+  if (existing.length > 0) return { ok: false, text: words.partialExisting(existing) };
+
+  let rendered: { readonly path: string; readonly content: string }[];
+  try {
+    rendered = [];
+    for (const path of paths) {
+      const name = WORKFLOW_TEMPLATES[path];
+      if (name === undefined) continue;
+      rendered.push({ path, content: await renderWorkflow(name, seal, branches, options.templatesDir) });
+    }
+  } catch (error) {
+    if (error instanceof WorkflowTemplateError) return { ok: false, text: words.anchorMissing(error.template) };
+    return { ok: false, text: words.noneWritten('', reasonOf(error)) };
   }
 
-  const move = renameFile ?? rename;
+  const move = options.renameFile ?? rename;
+  const drop = options.removeFile ?? ((path: string) => rm(path, { force: true }));
   const created: string[] = [];
   let temporary: string | undefined;
   let target: string | undefined;
   try {
-    for (const path of paths) {
-      const name = WORKFLOW_TEMPLATES[path];
-      if (name === undefined) continue;
-      const content = await renderWorkflow(name, seal, branches);
+    for (const { path, content } of rendered) {
       target = join(cwd, path);
       await mkdir(dirname(target), { recursive: true });
       temporary = `${target}.init-${process.pid}-${Math.random().toString(36).slice(2)}`;
@@ -440,55 +532,222 @@ async function writeWorkflows(
       temporary = undefined;
       created.push(path);
     }
-    return { ok: true, created };
+    return { ok: true, created, existing: [] };
   } catch (error) {
     const named = target === undefined ? '' : relative(cwd, target).split('\\').join('/');
+    const left: string[] = [];
     for (const path of created) {
       try {
-        await rm(join(cwd, path), { force: true });
+        await drop(join(cwd, path));
       } catch {
-        // Best effort: the reply names the failure below.
+        left.push(path);
       }
     }
     if (temporary !== undefined) {
       try {
-        await rm(temporary, { force: true });
+        await drop(temporary);
       } catch {
-        // Best effort.
+        left.push(relative(cwd, temporary).split('\\').join('/'));
       }
     }
-    return {
-      ok: false,
-      text: `None of the three workflows was written: moving ${named} failed (${reasonOf(error)}).`,
-    };
+    const text =
+      left.length === 0
+        ? words.noneWritten(named, reasonOf(error))
+        : words.rollbackLeft(named, reasonOf(error), left);
+    return { ok: false, text };
   }
 }
 
 /**
  * One workflow as its template, with the only allowed substitutions: the engine pinned by the
  * sealed SHA (`# v<version>`), and — in the judge workflow only — the `branches` input taken from
- * the recipe. Everything else stays byte for byte.
+ * the recipe. The value is a quoted YAML scalar, so any git-valid name survives (§15).
  */
 async function renderWorkflow(
   name: string,
   seal: Seal,
   branches: readonly string[],
+  templatesDir: string | undefined,
 ): Promise<string> {
-  const template = await readFile(new URL(`../../templates/${name}`, import.meta.url), 'utf8');
-  const pinned = template.replace(
-    `${ENGINE}@<ENGINE_SHA>`,
-    `${ENGINE}@${seal.sha} # v${seal.version}`,
-  );
+  const template = await readFile(templateFile(name, templatesDir), 'utf8');
+  const pinned = template.replace(`${ENGINE}@<ENGINE_SHA>`, `${ENGINE}@${seal.sha} # v${seal.version}`);
   if (name !== 'ai-workflows.yml' || branches.length === 0) return pinned;
-  const anchor = '          token: ${{ github.token }}\n';
-  if (!pinned.includes(anchor)) return pinned;
-  return pinned.replace(anchor, `${anchor}          branches: ${branches.join(', ')}\n`);
+  if (!pinned.includes(BRANCHES_ANCHOR)) throw new WorkflowTemplateError(name);
+  return pinned.replace(
+    BRANCHES_ANCHOR,
+    `${BRANCHES_ANCHOR}          branches: ${JSON.stringify(branches.join(', '))}\n`,
+  );
 }
 
-function sealReason(fromPackageJson: boolean): string {
-  return fromPackageJson
-    ? 'No install and no workflow written: this engine has no engine.json (a development copy). Only a sealed release can install.'
-    : 'No install and no workflow written: the seal (engine.json) is not valid: it needs a version X.Y.Z and a 40-hex sha.';
+/** The template file, from the injected folder or the package's own `templates/`. */
+function templateFile(name: string, templatesDir: string | undefined): URL | string {
+  return templatesDir === undefined
+    ? new URL(`../../templates/${name}`, import.meta.url)
+    : join(templatesDir, name);
+}
+
+/** A file status as it is reported, in the running language (§15). */
+function fileStatusText(words: InitWords, path: string, status: FileStatus): string {
+  switch (status.kind) {
+    case 'created':
+      return words.created(path);
+    case 'existed':
+      return words.existed(path);
+    case 'failed':
+      return words.couldNotWrite(path, status.reason);
+  }
+}
+
+function workflowLines(
+  words: InitWords,
+  outcome: { readonly created: readonly string[]; readonly existing: readonly string[] },
+): string[] {
+  return [
+    ...outcome.created.map((path) => words.created(path)),
+    ...outcome.existing.map((path) => words.existed(path)),
+  ];
+}
+
+/** The closed-repository root of `cwd`, or `undefined` when it is not inside a repository. */
+function repositoryRoot(cwd: string): string | undefined {
+  const result = spawnSync('git', ['rev-parse', '--show-toplevel'], {
+    cwd,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'ignore'],
+  });
+  if (result.status !== 0) return undefined;
+  const out = (result.stdout ?? '').trim();
+  return out.length > 0 ? out : undefined;
+}
+
+/** Same folder, whatever the separator or the case (Windows). */
+function samePath(left: string, right: string): boolean {
+  const a = resolve(left);
+  const b = resolve(right);
+  return process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
+}
+
+/** The language of the recipe as it stands after step 2; anything else is English (§15). */
+async function initLanguage(cwd: string): Promise<Language> {
+  try {
+    const document = parse(await readFile(join(cwd, RECIPE_PATH), 'utf8'));
+    if (isRecord(document) && typeof document['locale'] === 'string') {
+      return languageOf(document['locale']);
+    }
+  } catch {
+    // Fall through: no readable recipe means English.
+  }
+  return 'en';
+}
+
+interface InitWords {
+  readonly created: (path: string) => string;
+  readonly existed: (path: string) => string;
+  readonly couldNotWrite: (path: string, reason: string) => string;
+  readonly added: (version: string, manager: string) => string;
+  readonly declaredOther: (version: string) => string;
+  readonly landedMiss: (version: string, manager: string) => string;
+  readonly skipDeclared: string;
+  readonly skipLanded: string;
+  readonly partialExisting: (paths: readonly string[]) => string;
+  readonly anchorMissing: (template: string) => string;
+  readonly noneWritten: (target: string, reason: string) => string;
+  readonly rollbackLeft: (target: string, reason: string, left: readonly string[]) => string;
+  readonly sealMissing: string;
+  readonly sealInvalid: string;
+  readonly hint: string;
+}
+
+const COMMON_HINT_ES = [
+  '  - ajusta los pasos de instalación y prueba de .github/workflows/ai-workflows-red-test.yml a tu proyecto;',
+  '  - agrega tus workflows de checks exigidos a la lista `workflow_run` de .github/workflows/ai-workflows.yml;',
+  '  - pon la variable del repositorio AI_WORKFLOWS_MODE: `gh variable set AI_WORKFLOWS_MODE --body advisory` para probar el juez, o `gh variable set AI_WORKFLOWS_MODE --body off` para apagarlo. Encenderlo (`on`) y exigir su estado es un paso aparte tuyo;',
+  '  - Guarda estos archivos con un commit en una rama de pieza, no en la rama principal.',
+];
+
+const COMMON_HINT_EN = [
+  '  - adjust the install and test steps of .github/workflows/ai-workflows-red-test.yml to this project;',
+  '  - add your required-check workflows to the `workflow_run` list of .github/workflows/ai-workflows.yml;',
+  '  - set the repository variable AI_WORKFLOWS_MODE: `gh variable set AI_WORKFLOWS_MODE --body advisory` to try the judge, or `gh variable set AI_WORKFLOWS_MODE --body off` to switch it off. Turning it `on` and requiring its status is a separate step you take;',
+  '  - Commit these files on a piece branch, not on the main branch.',
+];
+
+const INIT_WORDS: Record<Language, InitWords> = {
+  es: {
+    created: (path) => `Creado ${path}`,
+    existed: (path) => `${path} ya existía; init no lo sobrescribe.`,
+    couldNotWrite: (path, reason) => `No se pudo escribir ${path}: ${reason}`,
+    added: (version, manager) =>
+      `Se añadió ai-workflows ${version} a devDependencies y se instaló con ${manager}.`,
+    declaredOther: (version) =>
+      `ai-workflows ya depende de ${version}; init no lo cambia. ` +
+      'Los ganchos no se instalaron, porque cargarían ese otro motor.',
+    landedMiss: (version, manager) =>
+      `ai-workflows ${version} se declaró y ${manager} corrió, pero node_modules/ai-workflows ` +
+      'no trae el sello de este motor.',
+    skipDeclared:
+      'Los ganchos no se instalaron: node_modules/ai-workflows no traería este motor.',
+    skipLanded:
+      'Los ganchos no se instalaron: node_modules/ai-workflows no trae el sello de este motor.',
+    partialExisting: (paths) =>
+      `No se escribió ninguno de los tres workflows: ${paths.join(', ')} ya existe; ` +
+      'init no lo sobrescribe.',
+    anchorMissing: (template) =>
+      `No se escribió ninguno de los tres workflows: ${template} no tiene dónde escribir la entrada branches.`,
+    noneWritten: (target, reason) =>
+      `No se escribió ninguno de los tres workflows: mover ${target} falló (${reason}).`,
+    rollbackLeft: (target, reason, left) =>
+      `Mover ${target} falló (${reason}); no se escribió ninguno de los tres workflows que faltaban. ` +
+      `No se pudo borrar en el retroceso: ${left.join(', ')}; quedan en su sitio.`,
+    sealMissing:
+      'No se instaló nada ni se escribió ningún workflow: este motor no trae sello (engine.json, una copia de desarrollo). Solo una versión sellada puede instalar.',
+    sealInvalid:
+      'No se instaló nada ni se escribió ningún workflow: el sello (engine.json) no es válido: necesita una versión X.Y.Z y un sha de 40 hex.',
+    hint: ['Siguiente, a mano:', ...COMMON_HINT_ES].join('\n'),
+  },
+  en: {
+    created: (path) => `Created ${path}`,
+    existed: (path) => `${path} already exists; init does not overwrite it.`,
+    couldNotWrite: (path, reason) => `Could not write ${path}: ${reason}`,
+    added: (version, manager) =>
+      `Added ai-workflows ${version} to devDependencies and installed it with ${manager}.`,
+    declaredOther: (version) =>
+      `ai-workflows already depends on ${version}; init does not change it. ` +
+      'The hooks were not installed, because they would load that other engine.',
+    landedMiss: (version, manager) =>
+      `ai-workflows ${version} was declared and ${manager} ran, but node_modules/ai-workflows ` +
+      "does not carry this engine's seal.",
+    skipDeclared:
+      'The hooks were not installed: node_modules/ai-workflows would not carry this engine.',
+    skipLanded:
+      "The hooks were not installed: node_modules/ai-workflows does not carry this engine's seal.",
+    partialExisting: (paths) =>
+      `None of the three workflows was written: ${paths.join(', ')} already exists; ` +
+      'init does not overwrite it.',
+    anchorMissing: (template) =>
+      `None of the three workflows was written: ${template} has no place to write the branches input.`,
+    noneWritten: (target, reason) =>
+      `None of the three workflows was written: moving ${target} failed (${reason}).`,
+    rollbackLeft: (target, reason, left) =>
+      `Moving ${target} failed (${reason}); none of the missing three workflows was written. ` +
+      `The rollback could not remove: ${left.join(', ')}; they stay in place.`,
+    sealMissing:
+      'No install and no workflow written: this engine has no engine.json (a development copy). Only a sealed release can install.',
+    sealInvalid:
+      'No install and no workflow written: the seal (engine.json) is not valid: it needs a version X.Y.Z and a 40-hex sha.',
+    hint: ['Next, by hand:', ...COMMON_HINT_EN].join('\n'),
+  },
+};
+
+function dependencyText(words: InitWords, line: DependencyLine): string {
+  switch (line.kind) {
+    case 'declared-other':
+      return words.declaredOther(line.version);
+    case 'landed-miss':
+      return words.landedMiss(line.version, line.manager);
+    case 'installed':
+      return words.added(line.version, line.manager);
+  }
 }
 
 /** The semver found in a dependency value, for the plain message when it names another version. */

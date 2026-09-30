@@ -16,9 +16,17 @@ on:
         required: false
         type: boolean
         default: false
+      # PLAN-13-R6 §15 P4: the reviewed commit, so a rehearsal seals and packs exactly what the
+      # flock reviewed instead of an arbitrary checkout.
+      sha:
+        description: The reviewed commit to seal and pack during a dry-run.
+        required: false
+        type: string
 
+# Least privilege (PLAN-13-R6 §15): the top level only reads; only the job that creates the
+# release asks for `contents: write`.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   # The gate runs where the users run it. Publishing waits for it.
@@ -31,6 +39,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
@@ -51,12 +61,18 @@ jobs:
     name: Seal and publish
     needs: check
     runs-on: ubuntu-latest
+    # The only job that writes to the repository: it creates the release.
+    permissions:
+      contents: write
     steps:
       # Full history: the seal walks main's first-parent history to find the merge that brought the
-      # reviewed commit in, and compares the two trees.
+      # reviewed commit in, and compares the two trees. On a dry-run it checks out the reviewed
+      # commit given by hand.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.sha || github.ref }}
+          persist-credentials: false
 
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
@@ -71,16 +87,22 @@ jobs:
 
       # Seal HEAD (the tag's commit on a release, the reviewed commit on a dry-run) after checking
       # it is the tag's commit, an ancestor of main, and its tree equals the merge that contains it.
+      # PLAN-13-R6 §15 P4: a tag push leaves no local main, so the seal reads the remote branch, and
+      # a bare name could resolve to a tag.
       - name: Seal the reviewed commit
         env:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           RELEASE_TAG: ${{ github.event_name == 'push' && github.ref_name || '' }}
         run: |
           if [ -n "$RELEASE_TAG" ]; then
-            node scripts/seal.mjs --main "$DEFAULT_BRANCH" --tag "$RELEASE_TAG"
+            node scripts/seal.mjs --main "refs/remotes/origin/$DEFAULT_BRANCH" --tag "$RELEASE_TAG"
           else
-            node scripts/seal.mjs --main "$DEFAULT_BRANCH"
+            node scripts/seal.mjs --main "refs/remotes/origin/$DEFAULT_BRANCH"
           fi
+
+      # The package-content test (PLAN-13-R6 §15): what the tarball will hold, before packing it.
+      - name: Test the package content
+        run: pnpm test:package
 
       - name: Pack
         run: pnpm pack
@@ -102,4 +124,4 @@ jobs:
           version="$(node -p "require('./package.json').version")"
           gh release create "$GITHUB_REF_NAME" "ai-workflows-${version}.tgz" schema/recipe.schema.json \
             --title "$GITHUB_REF_NAME" \
-            --notes "Install: \`pnpm add https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/ai-workflows-${version}.tgz\`"
+            --notes "Install: \`pnpm dlx https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/ai-workflows-${version}.tgz init\`"

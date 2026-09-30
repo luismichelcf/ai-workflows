@@ -13,6 +13,11 @@
 // Success: exit 0 and ./engine.json = {"version": "<version>", "sha": "<40 hex of HEAD>"}.
 // Refusal: exit code other than 0, no engine.json, and a line on stderr that starts with
 // `seal refused: ` and says why.
+//
+// PLAN-13-R6 §15 P4: <ref> must be a fully qualified branch ref, `refs/heads/…` or
+// `refs/remotes/…`. Anything else (`main`, `origin/main`, `refs/tags/main`) is refused with a line
+// that names both accepted forms, because git resolves a bare name to a tag first. The release
+// workflow passes `refs/remotes/origin/<default branch>`: a tag push leaves no local main.
 
 import { execFileSync, spawnSync } from 'node:child_process';
 import { readFileSync, writeFileSync } from 'node:fs';
@@ -36,6 +41,11 @@ function refuse(reason) {
   process.exit(1);
 }
 
+/** `<ref>` must name a branch fully: `refs/heads/…` or `refs/remotes/…`, never a bare name. */
+function isFullyQualifiedBranch(ref) {
+  return /^refs\/(heads|remotes)\/.+/.test(ref);
+}
+
 function parseArgs(argv) {
   let main;
   let tag;
@@ -46,6 +56,11 @@ function parseArgs(argv) {
     else refuse(`unknown argument ${arg}`);
   }
   if (main === undefined || main.length === 0) refuse('missing --main <ref>');
+  if (!isFullyQualifiedBranch(main)) {
+    refuse(
+      `--main must be a fully qualified branch ref (refs/heads/… or refs/remotes/…), not "${main}"`,
+    );
+  }
   return { main, tag };
 }
 
