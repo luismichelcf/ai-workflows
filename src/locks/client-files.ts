@@ -13,8 +13,8 @@ export const OPENCODE_PLUGIN_HEADER =
 export const LOADER_RELATIVE = '.ai-workflows/hook.cjs';
 
 /**
- * The Codex order (§3.2 and §3.3). It finds the loader from the repository root, not from the
- * folder the session started in, and runs it with the `codex` client.
+ * The Codex order (§3.2, §3.3 and §15 P5). It finds the loader from the repository root, not from
+ * the folder the session started in, and runs it with the `codex` client.
  *
  * Codex lets the tool through on any exit that is not 0 with the deny JSON (§3.1: an exit 1 or a
  * signal death is read as a pass), so the order fails closed on its own: it lets the tool through
@@ -23,11 +23,16 @@ export const LOADER_RELATIVE = '.ai-workflows/hook.cjs';
  * not starting, another exit code or a signal, output that is not that JSON — makes the order
  * print the deny JSON itself, naming the engine or the loader, and exit 0.
  *
+ * §15 P5: the order has its own clock, because Codex cuts it at `timeout: 30` and then lets the
+ * tool through. `git rev-parse` gets about 3 s and the loader what is left up to about 27 s, so the
+ * whole run ends well inside the cut even when git hangs; a spent budget is a deny like any other
+ * failure. (The plan says the order stands alone, so it does not depend on `bin.ts` clock.)
+ *
  * `sh`, cmd.exe and Windows PowerShell all accept the same line: the whole script rides inside one
  * double-quoted `node -e` argument with no shell metacharacter, so no quoting of any of the three
  * can break it.
  */
-export const CODEX_HOOK_ORDER = `node -e "const cp=require('child_process'),fs=require('fs');function deny(r){process.stdout.write(JSON.stringify({hookSpecificOutput:{hookEventName:'PreToolUse',permissionDecision:'deny',permissionDecisionReason:r}}),function(){process.exit(0)})}function main(){let root='';try{root=cp.execSync('git rev-parse --show-toplevel',{encoding:'utf8'}).trim()}catch(e){deny('ai-workflows: no se pudo cargar el motor (no encontre el repositorio: '+(e&&e.message?e.message:String(e))+')');return}if(root===''){deny('ai-workflows: no se pudo cargar el motor (git no dijo la raiz del repositorio)');return}const loader=root+'/.ai-workflows/hook.cjs';if(fs.existsSync(loader)===false){deny('ai-workflows: no se pudo cargar el cargador ('+loader+')');return}const p=cp.spawnSync(process.execPath,[loader,'codex'],{stdio:['inherit','pipe','pipe'],encoding:'utf8'});if(p.error){deny('ai-workflows: no se pudo cargar el cargador ('+(p.error.message?p.error.message:String(p.error))+')');return}if(p.status===0){const out=p.stdout===null||p.stdout===undefined?'':String(p.stdout).trim();if(out===''){process.exit(0)}let good=false;try{const j=JSON.parse(out);good=Boolean(j&&j.hookSpecificOutput&&j.hookSpecificOutput.hookEventName==='PreToolUse'&&j.hookSpecificOutput.permissionDecision==='deny'&&j.hookSpecificOutput.permissionDecisionReason)}catch(e){}if(good){process.stdout.write(p.stdout,function(){process.exit(0)});return}deny('ai-workflows: el motor contesto algo inesperado en su salida');return}deny('ai-workflows: el motor no pudo revisar la herramienta (codigo '+p.status+')')}main()"`;
+export const CODEX_HOOK_ORDER = `node -e "const cp=require('child_process'),fs=require('fs');function deny(r){process.stdout.write(JSON.stringify({hookSpecificOutput:{hookEventName:'PreToolUse',permissionDecision:'deny',permissionDecisionReason:r}}),function(){process.exit(0)})}function main(){var start=Date.now(),total=27000,gitMs=3000;function left(){var t=total-(Date.now()-start);return t>0?t:0}function budget(ms){var t=left();return t>ms?ms:t}var command='git rev-parse --show-toplevel',parts=command.split(' '),root='';try{var g=cp.spawnSync(parts[0],parts.slice(1),{encoding:'utf8',timeout:Math.max(1,budget(gitMs))});if(g.error||g.status!==0||!g.stdout){var why=g.error&&g.error.message?g.error.message:(g.stderr?String(g.stderr).trim():'git no dijo la raiz del repositorio');deny('ai-workflows: no se pudo cargar el motor (no encontre el repositorio: '+why+')');return}root=String(g.stdout).trim()}catch(e){deny('ai-workflows: no se pudo cargar el motor (no encontre el repositorio: '+(e&&e.message?e.message:String(e))+')');return}if(root===''){deny('ai-workflows: no se pudo cargar el motor (git no dijo la raiz del repositorio)');return}var loader=root+'/.ai-workflows/hook.cjs';if(fs.existsSync(loader)===false){deny('ai-workflows: no se pudo cargar el cargador ('+loader+')');return}var p=cp.spawnSync(process.execPath,[loader,'codex'],{stdio:['inherit','pipe','pipe'],encoding:'utf8',timeout:Math.max(1,left())});if(p.error){deny('ai-workflows: no se pudo cargar el cargador ('+(p.error.message?p.error.message:String(p.error))+')');return}if(p.status===0){var out=p.stdout===null||p.stdout===undefined?'':String(p.stdout).trim();if(out===''){process.exit(0)}var good=false;try{var j=JSON.parse(out);good=Boolean(j&&j.hookSpecificOutput&&j.hookSpecificOutput.hookEventName==='PreToolUse'&&j.hookSpecificOutput.permissionDecision==='deny'&&j.hookSpecificOutput.permissionDecisionReason)}catch(e){}if(good){process.stdout.write(p.stdout,function(){process.exit(0)});return}deny('ai-workflows: el motor contesto algo inesperado en su salida');return}deny('ai-workflows: el motor no pudo revisar la herramienta (codigo '+p.status+')')}main()"`;
 
 /** The same order is the one cmd.exe and Windows PowerShell run. */
 export const CODEX_HOOK_ORDER_WINDOWS = CODEX_HOOK_ORDER;
@@ -101,7 +106,14 @@ export const HOOK_LOADER_CJS = [
   '      end(process.stdout, stdout, 0);',
   '      return;',
   '    }',
-  "    refuse('ai-workflows: el motor no pudo revisar la herramienta (' + (stderr.trim() || ('terminó con código ' + code)) + ')');",
+  "    var reason = stderr.trim();",
+  '    // §15: exit 2 is the engine s own refusal (OpenCode reads it); its reason is forwarded as is,',
+  '    // never dressed up as the engine failing to review.',
+  '    if (code === 2) {',
+  "      refuse(reason.length > 0 ? reason : 'el motor rechazó la herramienta (código 2)');",
+  '      return;',
+  '    }',
+  "    refuse('ai-workflows: el motor no pudo revisar la herramienta (' + (reason || ('terminó con código ' + code)) + ')');",
   '  });',
   "  process.stdin.on('error', function () {});",
   '  process.stdin.pipe(child.stdin);',
@@ -119,7 +131,7 @@ export const HOOK_LOADER_CJS = [
  */
 export const OPENCODE_PLUGIN_JS = [
   OPENCODE_PLUGIN_HEADER,
-  "import { spawn } from 'node:child_process';",
+  "import { spawn, spawnSync } from 'node:child_process';",
   "import { join } from 'node:path';",
   "import { tmpdir } from 'node:os';",
   '',
@@ -127,25 +139,41 @@ export const OPENCODE_PLUGIN_JS = [
   '',
   'export const AiWorkflows = async (ctx, options) => {',
   "  const directory = ctx && typeof ctx.directory === 'string' ? ctx.directory : process.cwd();",
+  '  // §15: the loader lives at the repository root, not at the folder OpenCode runs in. OpenCode',
+  '  // finds the plugin by walking up, but `ctx.directory` can be a subfolder, so the hook is looked',
+  '  // up from `ctx.worktree` and, when that is missing, from git s top of the project.',
+  '  const root = rootOf(ctx, directory);',
   "  const timeoutMs = options && typeof options.timeoutMs === 'number' ? options.timeoutMs : DEFAULT_TIMEOUT_MS;",
   '  return {',
   "    'tool.execute.before': (input, output) =>",
-  "      runLoader(directory, { tool: input.tool, sessionID: input.sessionID, callID: input.callID, args: output.args, cwd: directory }, timeoutMs),",
+  "      runLoader(root, { tool: input.tool, sessionID: input.sessionID, callID: input.callID, args: output.args, cwd: root }, timeoutMs),",
   '  };',
   '};',
+  '',
+  'function rootOf(ctx, directory) {',
+  "  if (ctx && typeof ctx.worktree === 'string' && ctx.worktree.length > 0) return ctx.worktree;",
+  '  try {',
+  "    const found = spawnSync('git', ['rev-parse', '--show-toplevel'], { cwd: directory, encoding: 'utf8' });",
+  "    const top = found.stdout === null || found.stdout === undefined ? '' : String(found.stdout).trim();",
+  '    return top.length > 0 ? top : directory;',
+  '  } catch (error) {',
+  '    return directory;',
+  '  }',
+  '}',
   '',
   'function messageOf(error) {',
   '  return error && error.message ? error.message : String(error);',
   '}',
   '',
-  'function runLoader(directory, payload, timeoutMs) {',
+  'function runLoader(root, payload, timeoutMs) {',
   '  return new Promise((resolve, reject) => {',
   '    let child;',
   '    try {',
-  "      // The loader is named in full and run from a neutral folder: the project the engine judges",
-  "      // comes from `cwd` in the payload, so the child never holds the project folder as its own",
-  "      // working directory (killing it would otherwise keep that folder locked on Windows).",
-  "      child = spawn('node', [join(directory, '.ai-workflows', 'hook.cjs'), 'opencode'], { cwd: tmpdir(), stdio: ['pipe', 'pipe', 'pipe'] });",
+  "      // The loader is named in full (at the repository root) and run from a neutral folder: the",
+  "      // project the engine judges comes from `cwd` in the payload, so the child never holds the",
+  "      // project folder as its own working directory (killing it would otherwise keep that folder",
+  "      // locked on Windows).",
+  "      child = spawn('node', [join(root, '.ai-workflows', 'hook.cjs'), 'opencode'], { cwd: tmpdir(), stdio: ['pipe', 'pipe', 'pipe'] });",
   '    } catch (error) {',
   "      reject(new Error('ai-workflows: no se pudo lanzar el cargador (' + messageOf(error) + ')'));",
   '      return;',

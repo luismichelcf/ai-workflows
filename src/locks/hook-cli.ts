@@ -26,6 +26,7 @@ import {
   HOOK_LOADER_CJS,
   LOADER_RELATIVE,
   OPENCODE_PLUGIN_JS,
+  isOurCodexHandler,
   isOurPlugin,
 } from './client-files.js';
 import { lockContextFor } from './context.js';
@@ -187,6 +188,73 @@ function timeoutReason(timeoutMs: number): string {
 }
 
 /**
+ * The pids below `root`, walking the tree, so a grandchild that left the process group (spawned
+ * `detached`) is still named before the group is killed and can be ended by its own pid. On POSIX
+ * only. `pgrep -P` returning nothing (exit 1) is caught; a child that cannot be listed is missed.
+ */
+function posixDescendants(root: number): number[] {
+  let output = '';
+  try {
+    // One listing, then walk it: `ps -A -o pid=,ppid=` works on Linux and on macOS without a shell.
+    output = execFileSync('ps', ['-A', '-o', 'pid=,ppid='], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+  } catch {
+    return [];
+  }
+  const childrenOf = new Map<number, number[]>();
+  for (const line of output.split('\n')) {
+    const match = /^\s*(\d+)\s+(\d+)\s*$/.exec(line);
+    if (match === null) continue;
+    const pid = Number.parseInt(match[1] as string, 10);
+    const ppid = Number.parseInt(match[2] as string, 10);
+    const list = childrenOf.get(ppid);
+    if (list === undefined) childrenOf.set(ppid, [pid]);
+    else list.push(pid);
+  }
+  const found: number[] = [];
+  const pending: number[] = [root];
+  const seen = new Set<number>([root]);
+  while (pending.length > 0) {
+    const parent = pending.pop() as number;
+    for (const child of childrenOf.get(parent) ?? []) {
+      if (seen.has(child)) continue;
+      seen.add(child);
+      found.push(child);
+      pending.push(child);
+    }
+  }
+  return found;
+}
+
+/**
+ * Ends one process tree on POSIX: the process group first (which holds every descendant that did
+ * not leave it), then the detached descendants by their own pid. A process that is already gone
+ * is not a reason to fail; the signal is best effort.
+ */
+function killPosixTree(pid: number): void {
+  if (pid <= 0) return;
+  const descendants = posixDescendants(pid);
+  try {
+    process.kill(-pid, 'SIGKILL');
+  } catch {
+    try {
+      process.kill(pid, 'SIGKILL');
+    } catch {
+      // Already gone.
+    }
+  }
+  for (const descendant of descendants) {
+    try {
+      process.kill(descendant, 'SIGKILL');
+    } catch {
+      // Already gone.
+    }
+  }
+}
+
+/**
  * Ends whatever a finished git left behind still holding its pipes (a grandchild that inherited
  * them): the process group on POSIX, the descendants by parent id on Windows. It only runs when
  * the pipes did not close after `exit`, so a normal git call never pays for it. Best effort: a
@@ -197,15 +265,7 @@ function timeoutReason(timeoutMs: number): string {
 async function killLeftovers(pid: number | undefined): Promise<void> {
   if (pid === undefined || pid <= 0) return;
   if (process.platform !== 'win32') {
-    try {
-      process.kill(-pid, 'SIGKILL');
-    } catch {
-      try {
-        process.kill(pid, 'SIGKILL');
-      } catch {
-        // Already gone.
-      }
-    }
+    killPosixTree(pid);
     return;
   }
   let descendants: number[] = [];
@@ -291,15 +351,9 @@ export function runHookGit(request: RunHookGitRequest): Promise<HookGitAnswer> {
         }
         return;
       }
-      try {
-        process.kill(-pid, 'SIGKILL');
-      } catch {
-        try {
-          process.kill(pid, 'SIGKILL');
-        } catch {
-          // Already gone.
-        }
-      }
+      // §15: a grandchild that left the process group is named before the group is killed, so a
+      // timed-out or aborted git leaves nothing alive behind.
+      killPosixTree(pid);
     };
 
     const teardown = (): void => {
@@ -974,7 +1028,9 @@ export async function installHooks(options: InstallHooksOptions): Promise<Instal
       const existing = existsSync(codexPath)
         ? (JSON.parse(readFileSync(codexPath, 'utf8')) as unknown)
         : undefined;
-      mergedCodex = mergeHooksConfig(existing, codexOurs);
+      // §15: an older order of ours is recognized by the loader it runs, so a reinstall replaces
+      // it in place instead of adding a second entry; foreign hooks are left exactly as they were.
+      mergedCodex = mergeHooksConfig(existing, codexOurs, { isOur: isOurCodexHandler });
     } catch (error) {
       return {
         ok: false,
@@ -1048,10 +1104,25 @@ export async function installHooks(options: InstallHooksOptions): Promise<Instal
     return { ok: false, text: `No se pudo instalar: ${reasonOf(error)}` };
   }
 
-  return {
-    ok: true,
-    text:
-      'Ganchos instalados.' +
-      (withCodex || withOpencode ? ' En Codex interactivo, aprueba el gancho una vez en /hooks.' : ''),
-  };
+  // §15: name every path that was written, so the owner can see what changed, and say the one
+  // thing Codex does not do on its own: `exec` skips a hook that was never approved.
+  const written: string[] = [];
+  if (withClaude) written.push('.claude/settings.json');
+  written.push(`${HOOKS_PATH}/pre-commit`);
+  written.push(`${HOOKS_PATH}/pre-push`);
+  if (withCodex) written.push('.codex/hooks.json');
+  if (withOpencode) written.push('.opencode/plugins/ai-workflows.js');
+  if (withLoader) written.push(LOADER_RELATIVE);
+
+  const installed = ['Ganchos instalados. Archivos escritos:'];
+  for (const file of written) installed.push(`  ${file}`);
+  if (withCodex || withOpencode) {
+    installed.push('');
+    installed.push(
+      'En Codex interactivo, aprueba el gancho una vez en /hooks. Codex exec salta los ganchos no ' +
+        'aprobados salvo con --dangerously-bypass-hook-trust.',
+    );
+  }
+
+  return { ok: true, text: installed.join('\n') };
 }

@@ -147,12 +147,26 @@ function copyOurGroups(groups: readonly HookGroup[], timeout: number | undefined
   }));
 }
 
+export interface MergeHooksOptions {
+  /**
+   * §15: how to recognize a handler as ours. Claude's entry is told apart by its command AND
+   * arguments; Codex's old and new entries differ in the command text, but both run the same
+   * loader, so Codex passes a predicate over the loader it names. Without it, the command/argument
+   * signature is used.
+   */
+  readonly isOur?: (handler: unknown) => boolean;
+}
+
 /**
  * Adds our entry to an existing settings or hooks file without touching anything else in
  * it. Installing twice changes nothing the second time, and reinstalling repairs an earlier
  * install in place: an outdated matcher is refreshed and duplicate copies collapse to one.
  */
-export function mergeHooksConfig(existing: unknown, ours: HooksFile): Record<string, unknown> {
+export function mergeHooksConfig(
+  existing: unknown,
+  ours: HooksFile,
+  options: MergeHooksOptions = {},
+): Record<string, unknown> {
   // `undefined` and `null` mean the file does not exist yet, not that it has a strange shape.
   // A brand-new file is simply ours, deep-copied so the caller cannot mutate us through it.
   if (existing === undefined || existing === null) {
@@ -188,6 +202,8 @@ export function mergeHooksConfig(existing: unknown, ours: HooksFile): Record<str
   const currentGroups = readGroups(Array.isArray(preValue) ? preValue : []);
 
   const ourSignature = entrySignature(ours);
+  const recognize = (handler: unknown): boolean =>
+    options.isOur === undefined ? isOurHandler(handler, ourSignature) : options.isOur(handler);
   const ourGroups = ours.hooks.PreToolUse;
 
   // Rule 1: look for a usable timeout the user set on one of our handlers before we rebuild
@@ -199,7 +215,7 @@ export function mergeHooksConfig(existing: unknown, ours: HooksFile): Record<str
     const handlers = Array.isArray(group.hooks) ? group.hooks : undefined;
     if (handlers === undefined) continue;
     for (const handler of handlers) {
-      if (!isOurHandler(handler, ourSignature) || !isRecord(handler)) continue;
+      if (!recognize(handler) || !isRecord(handler)) continue;
       ourTimeout = validTimeout(handler.timeout);
       if (ourTimeout !== undefined) break;
     }
@@ -211,7 +227,7 @@ export function mergeHooksConfig(existing: unknown, ours: HooksFile): Record<str
 
   for (const group of currentGroups) {
     const handlers: readonly unknown[] | undefined = Array.isArray(group.hooks) ? group.hooks : undefined;
-    const holdsOurs = handlers !== undefined && handlers.some((handler) => isOurHandler(handler, ourSignature));
+    const holdsOurs = handlers !== undefined && handlers.some((handler) => recognize(handler));
 
     // Rule 2: not ours (checked across every group, not just the first) stays exactly as it was.
     // `group` is already a deep copy, so pushing it shares nothing with the file we were given.
@@ -222,7 +238,7 @@ export function mergeHooksConfig(existing: unknown, ours: HooksFile): Record<str
 
     // Rule 2: pull our handler out of this group. Foreign handlers keep the group's own
     // matcher — we never widen it to ours — and an empty group disappears entirely.
-    const foreigners = handlers.filter((handler) => !isOurHandler(handler, ourSignature));
+    const foreigners = handlers.filter((handler) => !recognize(handler));
 
     // Rule 2: every copy of ours collapses into this one, placed where the first copy was.
     // Placing it at the first occurrence, rather than appending, keeps a correct file in order.
