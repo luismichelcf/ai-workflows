@@ -6,7 +6,7 @@
 // parent relays the request, watches the clock and exits cleanly even while the child is stuck on
 // the read. This module is both the child entry and the helper the main thread uses to start it.
 
-import { spawn, type ChildProcess } from 'node:child_process';
+import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 import { runHook, type HookKind, type HookResult, type RunHookOptions } from './hook-cli.js';
@@ -56,7 +56,11 @@ async function childMain({ kind, client }: ChildRequest): Promise<void> {
       ? { projectDir, cwd: process.cwd(), stdin }
       : { client, cwd: process.cwd(), stdin };
   const result = await runHook(kind, options);
-  process.stdout.write(JSON.stringify(result));
+  // PLAN-13-R6 §15: leave only once the write is flushed. Exiting right after `write` can drop the
+  // answer on a pipe the parent has not drained yet, which the parent would read as a crash.
+  await new Promise<void>((resolve) => {
+    process.stdout.write(JSON.stringify(result), () => resolve());
+  });
 }
 
 if (process.argv[2] === CHILD_FLAG) {
@@ -65,10 +69,39 @@ if (process.argv[2] === CHILD_FLAG) {
   childMain({ kind, client }).then(
     () => process.exit(0),
     (error) => {
-      process.stderr.write(`${reasonOf(error)}\n`);
-      process.exit(2);
+      process.stderr.write(`${reasonOf(error)}\n`, () => process.exit(2));
     },
   );
+}
+
+/**
+ * Ends a process and its whole tree, best effort. PLAN-13-R6 §15: the deciding child may have its
+ * own children (the git calls it starts), so the watchdog ends the tree, not only the child. On
+ * POSIX the child is its own process group leader (`detached`) and the group is signalled; on
+ * Windows `taskkill /T` walks the tree.
+ */
+function killProcessTree(pid: number | undefined): void {
+  if (pid === undefined || pid <= 0) return;
+  if (process.platform === 'win32') {
+    try {
+      spawnSync('taskkill', ['/pid', String(pid), '/T', '/F'], {
+        windowsHide: true,
+        stdio: 'ignore',
+      });
+    } catch {
+      // Best effort: a process already gone is not a reason to fail.
+    }
+    return;
+  }
+  try {
+    process.kill(-pid, 'SIGKILL');
+  } catch {
+    try {
+      process.kill(pid, 'SIGKILL');
+    } catch {
+      // Already gone.
+    }
+  }
 }
 
 export interface HookProcess {
@@ -88,6 +121,9 @@ export function spawnHookProcess(kind: HookKind, client: HookClient): HookProces
   const child: ChildProcess = spawn(process.execPath, [entry, CHILD_FLAG, kind, client], {
     stdio: ['inherit', 'pipe', 'pipe'],
     windowsHide: true,
+    // On POSIX a detached child leads its own process group, so the watchdog can end its whole
+    // tree; on Windows the tree is ended by `taskkill /T` (§15).
+    detached: process.platform !== 'win32',
   });
   let stdout = '';
   let stderr = '';
@@ -126,11 +162,7 @@ export function spawnHookProcess(kind: HookKind, client: HookClient): HookProces
   return {
     result,
     cancel(): void {
-      try {
-        child.kill('SIGKILL');
-      } catch {
-        // Already gone.
-      }
+      killProcessTree(child.pid);
     },
   };
 }

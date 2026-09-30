@@ -33,7 +33,10 @@ export const ENGINE_PROTECTED_PATHS: readonly string[] = [
   '.opencode/tools/',
   '.pnpmfile.cjs',
   '.npmrc',
+  '.yarnrc',
   '.yarnrc.yml',
+  '.yarn/releases/',
+  '.yarn/plugins/',
   '.github/workflows/ai-workflows-red-test.yml',
   '.github/workflows/ai-workflows-review-signal.yml',
 ];
@@ -70,8 +73,20 @@ const DEPENDENCY_SECTIONS = [
 /**
  * PLAN-13-R6 §15 and R32: the scripts that run when dependencies are installed. Changing any of
  * them needs the owner's attestation, because one can rewrite the engine on the agents' machine.
+ * B3 of the delta review adds the rest npm and pnpm run around an install, including
+ * `dependencies`, which pnpm runs after every install.
  */
-const LIFECYCLE_SCRIPTS = ['preinstall', 'install', 'postinstall', 'prepare'] as const;
+const LIFECYCLE_SCRIPTS = [
+  'preinstall',
+  'install',
+  'postinstall',
+  'prepare',
+  'pnpm:devPreinstall',
+  'preprepare',
+  'postprepare',
+  'prepublish',
+  'dependencies',
+] as const;
 
 /** The lockfiles that decide which engine is installed, read with their own cap (§2.2). */
 export const ENGINE_VERSION_FILES: readonly string[] = [
@@ -85,10 +100,19 @@ export const ENGINE_VERSION_FILES: readonly string[] = [
 /** The real lockfiles pass 1 MB; over this, they count as touched, never as "passes" (§2.2). */
 export const ENGINE_VERSION_MAX_BYTES = 50 * 1024 * 1024;
 
+/**
+ * PLAN-13-R6 §15 (B3): a package.json anywhere — the root or a workspace member — carries the
+ * lifecycle scripts that run on install, so it is compared field by field like the root one.
+ */
+function isPackageJson(file: string): boolean {
+  const lower = file.toLowerCase();
+  return lower === 'package.json' || lower.endsWith('/package.json');
+}
+
 /** The canonical engine-version files a pull request touches, whatever the case it committed. */
 export function engineVersionFilesIn(files: readonly string[]): string[] {
-  const lower = new Set(files.map((file) => file.toLowerCase()));
-  return ENGINE_VERSION_FILES.filter((file) => lower.has(file));
+  const canonical = new Set(ENGINE_VERSION_FILES);
+  return files.filter((file) => isPackageJson(file) || canonical.has(file.toLowerCase()));
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -147,6 +171,8 @@ function projectPackageJson(value: unknown): string {
       if (hasKey(scripts, name)) out[`scripts.${name}`] = scripts[name];
     }
   }
+  // PLAN-13-R6 §15 (M1): `packageManager` picks the installer through corepack.
+  if (hasKey(value, 'packageManager')) out['packageManager'] = value['packageManager'];
   collectEngineKeys(value['overrides'], 'overrides', out);
   collectEngineKeys(value['resolutions'], 'resolutions', out);
   const pnpm = value['pnpm'];
@@ -154,6 +180,8 @@ function projectPackageJson(value: unknown): string {
     collectEngineKeys(pnpm['overrides'], 'pnpm.overrides', out);
     collectEngineKeys(pnpm['patchedDependencies'], 'pnpm.patchedDependencies', out);
     if (hasKey(pnpm, 'onlyBuiltDependencies')) out['pnpm.onlyBuiltDependencies'] = pnpm['onlyBuiltDependencies'];
+    // PLAN-13-R6 §15 (M1): another build allow-list a pnpm install would read.
+    if (hasKey(pnpm, 'onlyBuiltDependenciesFile')) out['pnpm.onlyBuiltDependenciesFile'] = pnpm['onlyBuiltDependenciesFile'];
   }
   return canonical(out);
 }
@@ -165,7 +193,14 @@ function projectWorkspace(value: unknown): string {
   collectEngineKeys(value['overrides'], 'overrides', out);
   collectEngineKeys(value['patchedDependencies'], 'patchedDependencies', out);
   // PLAN-13-R6 §15/R32: the build allow-list and a custom pnpmfile run when dependencies install.
-  for (const key of ['onlyBuiltDependencies', 'pnpmfile'] as const) {
+  // M1 of the delta review adds the rest of the pnpm workspace knobs that decide what runs.
+  for (const key of [
+    'onlyBuiltDependencies',
+    'pnpmfile',
+    'dangerouslyAllowAllBuilds',
+    'onlyBuiltDependenciesFile',
+    'neverBuiltDependencies',
+  ] as const) {
     if (hasKey(value, key)) out[key] = value[key];
   }
   if (hasKey(value['catalog'], 'ai-workflows')) {
@@ -252,7 +287,8 @@ function yarnEngineBlocks(content: string): string[] {
 /** The projection of a version file, or `undefined` when it cannot be read as its format. */
 function projectionOf(file: string, content: string): string | undefined {
   try {
-    if (file === 'package.json') return projectPackageJson(JSON.parse(content));
+    // PLAN-13-R6 §15 (B3): any package.json of the workspace, root or member, projects the same.
+    if (isPackageJson(file)) return projectPackageJson(JSON.parse(content));
     if (file === 'package-lock.json') return projectPackageLock(JSON.parse(content));
     if (file === 'yarn.lock') return canonical(yarnEngineBlocks(content));
     if (file === 'pnpm-workspace.yaml') return projectWorkspace(parseYaml(content));

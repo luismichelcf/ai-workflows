@@ -37,15 +37,19 @@ async function readStdin(): Promise<string> {
   return Buffer.concat(chunks).toString('utf8');
 }
 
+/** The default watchdog of `hook editor` (HOOK_WATCHDOG_MS): the seam may only shorten it. */
+const MAX_HOOK_WATCHDOG_MS = 25_000;
+
 /**
- * §15 P6: the watchdog of `hook editor`, shortened for the tests by
- * `AI_WORKFLOWS_HOOK_WATCHDOG_MS`. Only a positive whole number of milliseconds counts; anything
- * else leaves the default. Read here and nowhere else.
+ * §15 P6 and M3: the watchdog of `hook editor`, shortened for the tests by
+ * `AI_WORKFLOWS_HOOK_WATCHDOG_MS`. Only a positive whole number of milliseconds at or below the
+ * default counts; anything else (zero, a fraction, a value above the default, garbage) leaves the
+ * default, so a client's 30 s cut can never arrive before the answer. Read here and nowhere else.
  */
 function watchdogFrom(raw: string | undefined): number | undefined {
   if (raw === undefined || raw.trim() === '') return undefined;
   const value = Number(raw);
-  return Number.isInteger(value) && value > 0 ? value : undefined;
+  return Number.isInteger(value) && value > 0 && value <= MAX_HOOK_WATCHDOG_MS ? value : undefined;
 }
 
 /**

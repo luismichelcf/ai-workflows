@@ -1236,11 +1236,13 @@ export async function runJudge(input: JudgeInput, deps: JudgeDeps): Promise<Judg
     };
 
     const open = await retryRead(() => github.openPullRequests());
-    const matching = open.filter((pr) => {
-      if (!into.includes(pr.baseRef)) return false;
+    // PLAN-13-R6 §15 P1 NOTE: the piece's pull requests, whatever their target branch, so the
+    // mismatch between the action input and the recipe is reported for the extra branches too.
+    const piecePrs = open.filter((pr) => {
       const piece = pieceOfBranch(baseRecipe, pr.headRef, pr.number);
       return 'piece' in piece && piece.piece === String(issueNumber);
     });
+    const matching = piecePrs.filter((pr) => into.includes(pr.baseRef));
 
     // PLAN-13-R6 §15 P1: the list may report an old head, so the live head of each pull request of
     // the piece is read here: the grouping and every judgement use the head that is really open.
@@ -1279,9 +1281,24 @@ export async function runJudge(input: JudgeInput, deps: JudgeDeps): Promise<Judg
     }
 
     // PLAN-13-R6 §1.2 and §15 P1: the action input and the recipe must declare the same branches.
-    // When they do not, every head of the piece gets the error and none gets a verdict.
+    // When they do not, every head of the piece gets the error and none gets a verdict. The NOTE of
+    // the delta review: when the input lists MORE branches than the recipe, the heads of pull
+    // requests into those extra branches get the error too, exactly as on the pull request path.
     if (!sameBranches(wanted, into)) {
-      for (const head of [...new Set(liveMatching.map((pr) => pr.head))]) {
+      const heads = new Set<string>(liveMatching.map((pr) => pr.head));
+      for (const pr of piecePrs) {
+        if (into.includes(pr.baseRef) || !wanted.includes(pr.baseRef)) continue;
+        let live: JudgePullRequest;
+        try {
+          live = await github.pullRequest(pr.number);
+        } catch (error) {
+          await safePublish(pr.headSha, 'error', reasonOf(error), baseRecipe.locale);
+          continue;
+        }
+        if (live.state !== 'open' || !wanted.includes(live.baseRef)) continue;
+        heads.add(live.headSha);
+      }
+      for (const head of heads) {
         await safePublish(head, 'error', pick(spanish, MISMATCH, MISMATCH_EN), baseRecipe.locale);
       }
       if (failures.length > 0) throw new Error(failures.join('; '));
@@ -1542,6 +1559,18 @@ export async function runJudge(input: JudgeInput, deps: JudgeDeps): Promise<Judg
             if (work.target.baseRef !== changed.branch) continue;
             if (work.error !== undefined) continue;
             work.trusted = changed.tip;
+            // PLAN-13-R6 §15 (finding B1): the new tip was pushed after the checkout, so its
+            // commit is not here yet. Bring it before asking git anything about it — whether the
+            // head already landed, the recipe, the merge base: asking first about a missing object
+            // would turn the work into a technical error. A failed fetch is technical, as before.
+            try {
+              await deps.fetchObjects([work.trusted]);
+              await checkout(input.root, work.trusted);
+            } catch (error) {
+              work.error = reasonOf(error);
+              work.piece = { pr: work.target.pr, verdict: 'technical', stages: [], note: reasonOf(error) };
+              continue;
+            }
             // A head that already landed in the new tip has nothing new to judge: its verdict
             // stands, and re-judging it would compare it against itself (an empty change).
             let landed: boolean;
@@ -1553,14 +1582,6 @@ export async function runJudge(input: JudgeInput, deps: JudgeDeps): Promise<Judg
               continue;
             }
             if (landed) continue;
-            try {
-              await deps.fetchObjects([work.trusted]);
-              await checkout(input.root, work.trusted);
-            } catch (error) {
-              work.error = reasonOf(error);
-              work.piece = { pr: work.target.pr, verdict: 'technical', stages: [], note: reasonOf(error) };
-              continue;
-            }
             const branchRead = await readRecipeAt(work.trusted, label);
             if (!branchRead.ok) {
               work.error = `La receta de ${label} no se pudo leer: ${branchRead.reason}`;
@@ -1957,6 +1978,17 @@ export async function runJudge(input: JudgeInput, deps: JudgeDeps): Promise<Judg
         if (work.target.baseRef !== changed.branch) continue;
         if (work.error !== undefined) continue;
         work.trusted = changed.tip;
+        // PLAN-13-R6 §15 (finding B1): the new tip was pushed after the checkout, so its commit is
+        // not here yet. Bring it before asking git anything about it — whether the head already
+        // landed, the recipe, the merge base. A failed fetch is technical, as before.
+        try {
+          await deps.fetchObjects([work.trusted]);
+          await checkout(input.root, work.trusted);
+        } catch (error) {
+          work.error = reasonOf(error);
+          work.piece = { pr: work.target.pr, verdict: 'technical', stages: [], note: reasonOf(error) };
+          continue;
+        }
         // A head that already landed in the new tip has nothing new to judge: its verdict stands,
         // and re-judging it would compare it against itself (an empty change).
         let landed: boolean;
@@ -1968,14 +2000,6 @@ export async function runJudge(input: JudgeInput, deps: JudgeDeps): Promise<Judg
           continue;
         }
         if (landed) continue;
-        try {
-          await deps.fetchObjects([work.trusted]);
-          await checkout(input.root, work.trusted);
-        } catch (error) {
-          work.error = reasonOf(error);
-          work.piece = { pr: work.target.pr, verdict: 'technical', stages: [], note: reasonOf(error) };
-          continue;
-        }
         const branchRead = await readRecipeAt(work.trusted, label);
         if (!branchRead.ok) {
           work.error = `La receta de ${label} no se pudo leer: ${branchRead.reason}`;

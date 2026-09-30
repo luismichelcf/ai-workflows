@@ -17,7 +17,7 @@
 // `branches` value quoted, and names any file a failed rollback could not remove.
 
 import { spawn, spawnSync, type ChildProcess, type SpawnOptions } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, realpathSync } from 'node:fs';
 import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { basename, dirname, join, relative, resolve } from 'node:path';
 
@@ -390,15 +390,36 @@ function managerCommand(manager: InstallRequest['manager']): { command: string; 
   return { command: manager, args: ['install'] };
 }
 
-/** The JS entry point of a globally installed manager on Windows, if it can be found. */
-function windowsManagerScript(manager: string): string | undefined {
-  const candidates = (process.env['PATH'] ?? '')
-    .split(';')
-    .map((dir) => dir.trim())
-    .filter((dir) => dir.length > 0)
-    .map((dir) => join(dir, 'node_modules', manager, 'bin', `${manager}.cjs`));
+/**
+ * PLAN-13-R6 §15 (B2): the JS entry point of each manager, as a global install leaves it. npm
+ * ships `npm-cli.js`, pnpm `pnpm.cjs` and yarn classic `yarn.js`; using one manager's entry to
+ * run another is what this guards against.
+ */
+const MANAGER_ENTRY: Readonly<Record<InstallRequest['manager'], string>> = {
+  npm: 'npm-cli.js',
+  pnpm: 'pnpm.cjs',
+  yarn: 'yarn.js',
+};
+
+/**
+ * The JS entry point of the DETECTED manager on Windows, if it can be found, so `node <entry>
+ * install` runs it. `npm_execpath` (set by whichever manager started this process) is used only
+ * when its file name is the detected manager's entry: otherwise a pnpm path would start pnpm for
+ * an npm project. When nothing is found, `undefined` lets the caller fail honestly naming the
+ * manager, never start another one.
+ */
+function windowsManagerScript(manager: InstallRequest['manager']): string | undefined {
+  const entry = MANAGER_ENTRY[manager];
+  // npm is also where Node's installer puts it, next to the running `node`.
+  const candidates: string[] = [join(dirname(process.execPath), 'node_modules', manager, 'bin', entry)];
+  for (const dir of (process.env['PATH'] ?? '').split(';')) {
+    const trimmed = dir.trim();
+    if (trimmed.length > 0) candidates.push(join(trimmed, 'node_modules', manager, 'bin', entry));
+  }
   const execpath = process.env['npm_execpath'];
-  if (typeof execpath === 'string' && execpath.length > 0) candidates.push(execpath);
+  if (typeof execpath === 'string' && execpath.length > 0 && basename(execpath).toLowerCase() === entry) {
+    candidates.unshift(execpath);
+  }
   for (const candidate of candidates) {
     if (existsSync(candidate)) return candidate;
   }
@@ -620,11 +641,24 @@ function repositoryRoot(cwd: string): string | undefined {
   return out.length > 0 ? out : undefined;
 }
 
-/** Same folder, whatever the separator or the case (Windows). */
+/**
+ * Same folder, whatever the separator or the case (Windows). PLAN-13-R6 §15: on Windows a
+ * temporary folder can be reached by a short 8.3 name (`RUNNER~1`) while git reports the long one,
+ * so both sides are compared by their real, long path.
+ */
 function samePath(left: string, right: string): boolean {
-  const a = resolve(left);
-  const b = resolve(right);
+  const a = realPathOf(left);
+  const b = realPathOf(right);
   return process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
+}
+
+/** The real, long path when the file system can give it; the resolved path otherwise. */
+function realPathOf(path: string): string {
+  try {
+    return realpathSync.native(path);
+  } catch {
+    return resolve(path);
+  }
 }
 
 /** The language of the recipe as it stands after step 2; anything else is English (§15). */

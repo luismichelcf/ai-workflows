@@ -38,8 +38,11 @@ jobs:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
+      # PLAN-13-R6 §15 M2: the gate tests the same commit the packing job seals and packs. On a
+      # dry-run that is the reviewed `sha` input, not the branch the dispatch ran from.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.sha || github.ref }}
           persist-credentials: false
 
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4

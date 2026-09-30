@@ -61,6 +61,11 @@ function parseArgs(argv) {
       `--main must be a fully qualified branch ref (refs/heads/… or refs/remotes/…), not "${main}"`,
     );
   }
+  // PLAN-13-R6 §15: the ref must exist EXACTLY. A bare `git rev-parse <ref>` would try
+  // `refs/tags/<ref>` too, so a tag named like the branch could stand in for it; `show-ref
+  // --verify` reads only the ref named.
+  const exists = spawnSync('git', ['show-ref', '--verify', '--quiet', main], { stdio: 'ignore' });
+  if (exists.status !== 0) refuse(`--main "${main}" does not exist`);
   return { main, tag };
 }
 

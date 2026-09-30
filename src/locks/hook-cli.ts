@@ -68,6 +68,8 @@ export const HOOK_WATCHDOG_MS = 25_000;
 export const GIT_HOOK_DEADLINE_MS = 60_000;
 /** Kept free at the end of the deadline so the answer is written before the cut, not after it. */
 const HOOK_GIT_RESERVE_MS = 500;
+/** PLAN-13-R6 §15 (M4): a hanging `ps` may not hold the tree walk; the group kill goes on without it. */
+const POSIX_PS_TIMEOUT_MS = 2_000;
 
 const HOOK_ENV: Readonly<Record<string, string>> = {
   LC_ALL: 'C',
@@ -196,9 +198,13 @@ function posixDescendants(root: number): number[] {
   let output = '';
   try {
     // One listing, then walk it: `ps -A -o pid=,ppid=` works on Linux and on macOS without a shell.
+    // PLAN-13-R6 §15 (M4): `ps` gets its own short limit; a `ps` that hangs must not keep the hook
+    // from answering. On timeout it throws here, the walk returns nothing, and the caller still
+    // kills the process group.
     output = execFileSync('ps', ['-A', '-o', 'pid=,ppid='], {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: POSIX_PS_TIMEOUT_MS,
     });
   } catch {
     return [];
