@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events';
-import { existsSync } from 'node:fs';
-import { basename, isAbsolute, join, resolve } from 'node:path';
+import { chmodSync, existsSync } from 'node:fs';
+import { basename, delimiter, isAbsolute, join, resolve, sep } from 'node:path';
 import { PassThrough } from 'node:stream';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -168,5 +168,135 @@ describe('N2: a relative folder on PATH never makes init run a file of the proje
     expect(scripts.filter((script) => script.toLowerCase().startsWith(resolve(root).toLowerCase())), 'a file of the project ran as the installer').toEqual([]);
     // The global pnpm is still found through the absolute folder of PATH.
     expect(spawned.filter((call) => scriptOf(call) !== '').map((call) => [isAbsolute(call.args[0] ?? ''), scriptOf(call)])).toEqual([[true, 'pnpm.cjs']]);
+  });
+});
+
+// Third delta review (PLAN-13-R6 §15, last paragraph): «init nunca busca el gestor en la carpeta del
+// proyecto ni lanza uno por nombre sin ruta absoluta». Today, when no JS entry is found on Windows,
+// init falls back to spawning the bare name `pnpm`; without a shell, Windows looks for `pnpm.exe` in
+// the current folder first, which is the project, so a project carrying `pnpm.exe` at its root would
+// have that file run as the installer. On POSIX init always spawns the bare name.
+//
+// Interface these tests fix (the seam is still `spawnProcess`):
+//  - Windows: only `node <absolute entry>` is ever spawned (the entry found as B2/N2 fix); when no
+//    entry is found, nothing is spawned and init fails honestly naming the manager.
+//  - POSIX: the manager is spawned only by an ABSOLUTE path, `<absolute PATH folder>/<manager>`,
+//    found in an absolute entry of PATH (split with `path.delimiter`); relative entries are skipped.
+//    When none is found, nothing is spawned and init fails honestly naming the manager.
+//  - In both, nothing under the project folder is ever spawned or run as the installer.
+
+/** Whether `file` lies in `folder` (compared case-insensitively, as Windows does). */
+const inside = (folder: string, file: string): boolean => {
+  const base = resolve(folder).toLowerCase();
+  const target = resolve(folder, file).toLowerCase();
+  return target === base || target.startsWith(`${base}${sep}`);
+};
+
+/** A spawn that runs `node <existing script>` or an absolute existing program, like the OS would. */
+function fakeSpawnAbsolute(root: string) {
+  const spawned: Spawned[] = [];
+  const spawnProcess = (command: string, args: readonly string[]) => {
+    spawned.push({ command, args: [...args] });
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    const child = Object.assign(new EventEmitter(), { stdout, stderr, stdin: null, pid: 4243, kill: () => true });
+    const runnable =
+      (command === process.execPath && typeof args[0] === 'string' && existsSync(args[0])) ||
+      (command !== process.execPath && isAbsolute(command) && existsSync(command));
+    setImmediate(() => {
+      if (!runnable) {
+        child.emit('error', Object.assign(new Error(`spawn ${command} ENOENT`), { code: 'ENOENT' }));
+        return;
+      }
+      write(root, 'node_modules/ai-workflows/package.json', `${JSON.stringify({ name: 'ai-workflows', version: SEAL.version })}\n`);
+      write(root, 'node_modules/ai-workflows/engine.json', `${JSON.stringify(SEAL)}\n`);
+      stdout.end();
+      stderr.end();
+      child.emit('exit', 0, null);
+      child.emit('close', 0, null);
+    });
+    return child as never;
+  };
+  return { spawned, spawnProcess };
+}
+
+async function initInside(root: string, spawnProcess: ReturnType<typeof fakeSpawnAbsolute>['spawnProcess']) {
+  const before = process.cwd();
+  process.chdir(root);
+  try {
+    return await recipeCommand(['init'], { cwd: root, seal: SEAL, spawnProcess });
+  } finally {
+    process.chdir(before);
+  }
+}
+
+describe('third delta: init never spawns a manager from the project, nor by a bare name', () => {
+  it('Windows, pnpm.exe at the project root, absolute PATH folders without any manager: no bare pnpm, nothing of the project; an honest failure naming pnpm', async () => {
+    const root = repository({ 'package.json': PACKAGE_JSON, 'pnpm-lock.yaml': '\n' });
+    write(root, 'pnpm.exe', 'MZ not really a program\n');
+    vi.stubEnv('npm_execpath', '');
+    vi.stubEnv('PATH', `${emptyFolder()};${emptyFolder()}`);
+    const { spawned, spawnProcess } = fakeSpawnAbsolute(root);
+
+    const output = await initInside(root, spawnProcess);
+
+    for (const call of spawned) {
+      expect(isAbsolute(call.command), `spawned by a bare name: ${call.command}`).toBe(true);
+      expect(inside(root, call.command), `spawned from the project: ${call.command}`).toBe(false);
+      expect(inside(root, call.args[0] ?? '..'), `ran a file of the project: ${call.args[0]}`).toBe(false);
+    }
+    const launched = spawned.filter((call) => scriptOf(call) !== '');
+    if (launched.length > 0) {
+      // Only when a real global pnpm sits next to this node (dirname(process.execPath)).
+      expect(launched.map(scriptOf)).toEqual(['pnpm.cjs']);
+    } else {
+      expect(spawned).toEqual([]);
+      expect(output.ok, output.text).toBe(false);
+      expect(output.text).toContain('pnpm');
+    }
+  });
+
+  describe('POSIX', () => {
+    beforeEach(() => {
+      Object.defineProperty(process, 'platform', { ...realPlatform, value: 'linux' });
+    });
+
+    /** A folder holding an executable file named `name`, as a global install leaves it on PATH. */
+    function globalProgram(name: string): { dir: string; file: string } {
+      const dir = emptyFolder();
+      write(dir, name, '#!/bin/sh\nexit 0\n');
+      const file = join(dir, name);
+      chmodSync(file, 0o755);
+      return { dir, file };
+    }
+
+    it('PATH = "tools" (relative, the project holds tools/pnpm) + an empty absolute folder + a global pnpm: that absolute pnpm runs install', async () => {
+      const root = repository({ 'package.json': PACKAGE_JSON, 'pnpm-lock.yaml': '\n' });
+      write(root, 'tools/pnpm', '#!/bin/sh\nexit 0\n');
+      write(root, 'pnpm', '#!/bin/sh\nexit 0\n');
+      const pnpm = globalProgram('pnpm');
+      vi.stubEnv('npm_execpath', '');
+      vi.stubEnv('PATH', ['tools', emptyFolder(), pnpm.dir].join(delimiter));
+      const { spawned, spawnProcess } = fakeSpawnAbsolute(root);
+
+      await initInside(root, spawnProcess);
+
+      expect(spawned).toEqual([{ command: pnpm.file, args: ['install'] }]);
+    });
+
+    it('PATH with only a relative folder (the project holds it): nothing is spawned; an honest failure naming pnpm', async () => {
+      const root = repository({ 'package.json': PACKAGE_JSON, 'pnpm-lock.yaml': '\n' });
+      write(root, 'tools/pnpm', '#!/bin/sh\nexit 0\n');
+      write(root, 'pnpm', '#!/bin/sh\nexit 0\n');
+      vi.stubEnv('npm_execpath', '');
+      vi.stubEnv('PATH', 'tools');
+      const { spawned, spawnProcess } = fakeSpawnAbsolute(root);
+
+      const output = await initInside(root, spawnProcess);
+
+      expect(spawned).toEqual([]);
+      expect(output.ok, output.text).toBe(false);
+      expect(output.text).toContain('pnpm');
+    });
   });
 });

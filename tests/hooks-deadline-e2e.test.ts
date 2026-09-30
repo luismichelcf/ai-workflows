@@ -411,7 +411,40 @@ describe('M-a: the deciding process is ended only when the watchdog fires, and n
     expect(output.ms).toBeLessThan(30_000);
     denyReason(output);
   }, 90_000);
+
+  // Third delta review (PLAN-13-R6 §15, last paragraph): «la orden de matar el árbol del gancho se
+  // lanza sin esperarla, para no gastar el margen de 30 s». Today the hook waits for `taskkill` up to
+  // its 2 s limit before it answers and exits. Interface: when the watchdog fires, the kill command
+  // is started and NOT waited for; the hook writes the deny JSON and ends at once, and the pipes it
+  // gives the client are not held by the kill command. With the watchdog at 1.5 s and a `taskkill`
+  // that hangs 120 s, the whole run ends in under 3.5 s = 1.5 s of watchdog + the 2 s kill limit
+  // (KILL_COMMAND_TIMEOUT_MS): a hook that waits that limit can never fit, whatever its start-up
+  // time (measured today: 3.66 s), while one that does not wait ends near 1.7 s.
+  it.runIf(process.platform === 'win32')('the watchdog fires (1.5 s) and taskkill hangs 120 s: the hook process ends in under 3.5 s, without waiting for the kill', async () => {
+    const root = project('arreglo');
+    engine.install(root);
+    const watch = spy(true, { AI_WORKFLOWS_HOOK_WATCHDOG_MS: '1500' });
+
+    const output = await runHookEditor(root, watch.env, undefined, 45_000);
+
+    expect(output.status, 'the hook ended by itself, before the 45 s kill').not.toBeNull();
+    denyReason(output);
+    // The kill command was started (the tree is still ended), only not waited for.
+    const recorded = await eventuallyRecorded(watch, /^taskkill .*\/T/, 5_000);
+    expect(recorded.some((line) => /^taskkill .*\/T/.test(line)), recorded.join('\n')).toBe(true);
+    expect(output.ms, 'the hook waited for the kill command').toBeLessThan(3_500);
+  }, 90_000);
 });
+
+/** The spy's lines once one matches `pattern`, or whatever it holds after `withinMs`. */
+async function eventuallyRecorded(watch: Spy, pattern: RegExp, withinMs: number): Promise<string[]> {
+  const until = Date.now() + withinMs;
+  for (;;) {
+    const recorded = watch.lines();
+    if (recorded.some((line) => pattern.test(line)) || Date.now() >= until) return recorded;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+}
 
 // Second delta review, finding M-b (POSIX): the watchdog ends the process group of the deciding
 // process, but the hook's git runs `detached`, in a group of its own, so a git that hangs outlives

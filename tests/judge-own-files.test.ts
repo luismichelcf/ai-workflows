@@ -414,7 +414,11 @@ describe('R6 §2.4 (5): package.json changes that do not decide the engine → s
     ['only dependencies.react', pkg((p) => { field(p, 'dependencies').react = '18.3.1'; })],
     ['only scripts.test', pkg((p) => { field(p, 'scripts').test = 'vitest run --coverage'; })],
     ['the same pin, reordered and reformatted', reordered],
-    ['an override for another package whose name only starts like the engine', pkg((p) => { p.overrides = { 'ai-workflows-extra': '1.0.0', react: '18.3.1' }; })],
+    // Changed by the third delta review (PLAN-13-R6 §15, last paragraph): `overrides` is not in the
+    // list of harmless changes, so any new override now needs the attestation (see «the allow-list
+    // of harmless changes» below). The name that only starts like the engine is kept as a
+    // dependency entry, which is harmless for any package other than the engine.
+    ['a dependency of another package whose name only starts like the engine', pkg((p) => { field(p, 'dependencies')['ai-workflows-extra'] = '1.0.0'; })],
   ];
   for (const [what, text] of cases) {
     it(`${what} → success`, async () => {
@@ -1220,5 +1224,210 @@ describe('M-d: workspaces, build settings and the build allow-list file', () => 
     w.pr({ [BUILDS]: json(['esbuild', 'postinstall-x']) });
     await w.judge();
     expect(states(w)).toEqual(['success']);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Third delta review of the flock fixes (PLAN-13-R6 §15, last paragraph): protecting the package
+// manifests with a list of dangerous keys never closes (another manifest format, another installer
+// option), so the rule is inverted. In a package manifest (`package.json`, `package.yaml`,
+// `package.json5`, at any depth) and in `pnpm-workspace.yaml`, EVERY change counts as touched
+// except a short list of harmless ones.
+//
+// Interface fixed here (for the builder):
+//   - Harmless in a package manifest: the entries of `dependencies`, `devDependencies`,
+//     `optionalDependencies` and `peerDependencies` whose key is not the engine (`ai-workflows`);
+//     `name` when it is not `ai-workflows`; `version`, `description`, `keywords`, `author`,
+//     `contributors`, `license`, `repository`, `homepage`, `bugs`, `private`; and the scripts that
+//     do not run on install (any other than preinstall, install, postinstall, prepare, preprepare,
+//     postprepare, prepublish, dependencies, pnpm:devPreinstall). Anything else changing — a key
+//     added, removed or edited anywhere outside that list — is touched.
+//   - Harmless in pnpm-workspace.yaml: only the entries of `catalog` and `catalogs` whose key is
+//     not the engine.
+//   - A member manifest (any manifest that is not the root `package.json`) added or deleted is
+//     compared against an empty one with the same rule; the root package.json added or removed
+//     stays touched; a manifest that cannot be read as its format is touched.
+//   - `package.json5` (pinned here): touched whenever it changes, harmless fields included. No
+//     JSON5 reader is needed, so no new dependency.
+//   - `binding.gyp`, at any depth, is touched whenever it changes (npm runs `node-gyp rebuild` on
+//     install when a package has one and no install script).
+//   - The build allow-list file named by `onlyBuiltDependenciesFile` on the trusted side is the
+//     judge's own whichever setting names it: `pnpm-workspace.yaml`, `pnpm` of package.json (both,
+//     when both name different files) and `only-built-dependencies-file` of `.npmrc`; the name is
+//     normalized (`x/../b.json` is `b.json`).
+//   The run log names the touched file.
+
+describe('third delta: a package manifest of any format, anywhere', () => {
+  const FOLDER = 'packages/x';
+
+  it(`a new ${FOLDER}/package.yaml with scripts.postinstall → failure naming it`, async () => {
+    const w = world({ 'package.json': json(BASE_PACKAGE) });
+    const head = w.pr({ [`${FOLDER}/package.yaml`]: lines('name: x', 'scripts:', '  postinstall: node x.js') });
+    const report = await w.judge();
+    expectRejectedForOwnFiles(w, head, report);
+    expect(report.summary).toContain(`${FOLDER}/package.yaml`);
+  });
+
+  it(`${FOLDER}/package.json deleted and ${FOLDER}/package.yaml with postinstall added in the same PR → failure`, async () => {
+    const w = world({ 'package.json': json(BASE_PACKAGE), [`${FOLDER}/package.json`]: json({ name: 'x', dependencies: { lodash: '4.17.21' } }) });
+    const head = w.pr({
+      [`${FOLDER}/package.json`]: null,
+      [`${FOLDER}/package.yaml`]: lines('name: x', 'dependencies:', '  lodash: 4.17.21', 'scripts:', '  postinstall: node x.js'),
+    });
+    const report = await w.judge();
+    expectRejectedForOwnFiles(w, head, report);
+    expect(report.summary).toContain(`${FOLDER}/package.yaml`);
+  });
+
+  // Guard: it passes today and must keep passing (a member added with only harmless fields).
+  it(`a new ${FOLDER}/package.yaml with only name and dependencies → success`, async () => {
+    const w = world({ 'package.json': json(BASE_PACKAGE) });
+    w.pr({ [`${FOLDER}/package.yaml`]: lines('name: x', 'dependencies:', '  lodash: 4.17.21') });
+    await w.judge();
+    expect(states(w)).toEqual(['success']);
+  });
+
+  it(`a new ${FOLDER}/package.yaml that is not YAML → failure`, async () => {
+    const w = world({ 'package.json': json(BASE_PACKAGE) });
+    const head = w.pr({ [`${FOLDER}/package.yaml`]: 'name: [x\n  : :\n' });
+    const report = await w.judge();
+    expectRejectedForOwnFiles(w, head, report);
+  });
+
+  it(`${FOLDER}/package.json5 whose only change is description → failure (package.json5 is touched whenever it changes)`, async () => {
+    const w = world({ 'package.json': json(BASE_PACKAGE), [`${FOLDER}/package.json5`]: "{ name: 'x', description: 'uno' }\n" });
+    const head = w.pr({ [`${FOLDER}/package.json5`]: "{ name: 'x', description: 'dos' }\n" });
+    const report = await w.judge();
+    expectRejectedForOwnFiles(w, head, report);
+    expect(report.summary).toContain(`${FOLDER}/package.json5`);
+  });
+
+  it(`a new member ${FOLDER}/package.json named ai-workflows → failure`, async () => {
+    const w = world({ 'package.json': json(BASE_PACKAGE) });
+    const head = w.pr({ [`${FOLDER}/package.json`]: json({ name: 'ai-workflows', version: '1.0.0' }) });
+    const report = await w.judge();
+    expectRejectedForOwnFiles(w, head, report);
+    expect(report.summary).toContain(`${FOLDER}/package.json`);
+  });
+
+  for (const path of ['binding.gyp', `${FOLDER}/binding.gyp`]) {
+    it(`${path} added → failure naming it`, async () => {
+      const w = world({ 'package.json': json(BASE_PACKAGE) });
+      const head = w.pr({ [path]: "{ 'targets': [ { 'target_name': 'x', 'sources': [ 'x.cc' ] } ] }\n" });
+      const report = await w.judge();
+      expectRejectedForOwnFiles(w, head, report);
+      expect(report.summary).toContain(path);
+    });
+  }
+});
+
+describe('third delta: the root package.json outside the list of harmless changes', () => {
+  const cases: [string, string][] = [
+    ['only pnpm.neverBuiltDependencies added', pkg((p) => { p.pnpm = { neverBuiltDependencies: ['esbuild'] }; })],
+    ['only pnpm.ignoredBuiltDependencies added', pkg((p) => { p.pnpm = { ignoredBuiltDependencies: ['esbuild'] }; })],
+    ['only main added', pkg((p) => { p.main = 'x.js'; })],
+    ['only exports added', pkg((p) => { p.exports = { '.': './x.js' }; })],
+    ['only bin added', pkg((p) => { p.bin = { x: './x.js' }; })],
+    ['only type added', pkg((p) => { p.type = 'module'; })],
+    ['only an override of another package added', pkg((p) => { p.overrides = { react: '18.3.1' }; })],
+    ['only name changed to ai-workflows', pkg((p) => { p.name = 'ai-workflows'; })],
+  ];
+  for (const [what, text] of cases) {
+    it(`${what} → failure`, async () => {
+      const w = world({ 'package.json': json(BASE_PACKAGE) });
+      const head = w.pr({ 'package.json': text });
+      const report = await w.judge();
+      expectRejectedForOwnFiles(w, head, report);
+      expect(report.summary).toContain('package.json');
+    });
+  }
+
+  // Guards: they pass today and must keep passing.
+  const withLodash = pkg((p) => { field(p, 'dependencies').lodash = '4.17.20'; });
+  const harmless: [string, string, string][] = [
+    ['only description changed', json(BASE_PACKAGE), pkg((p) => { p.description = 'otro'; })],
+    ['only the dependency version of lodash changed', withLodash, pkg((p) => { field(p, 'dependencies').lodash = '4.17.21'; })],
+    ['only scripts.test changed', json(BASE_PACKAGE), pkg((p) => { field(p, 'scripts').test = 'vitest run --coverage'; })],
+    ['every other harmless field at once (name, version, keywords, author, contributors, license, repository, homepage, bugs, private, scripts.lint)', json(BASE_PACKAGE), pkg((p) => {
+      p.name = 'otro';
+      p.version = '2.0.0';
+      p.keywords = ['x'];
+      p.author = 'Alguien';
+      p.contributors = ['Otra'];
+      p.license = 'MIT';
+      p.repository = 'github:duena/proyecto';
+      p.homepage = 'https://example.com';
+      p.bugs = 'https://example.com/bugs';
+      p.private = false;
+      field(p, 'scripts').lint = 'eslint .';
+    })],
+  ];
+  for (const [what, before, after] of harmless) {
+    it(`control: ${what} → success`, async () => {
+      const w = world({ 'package.json': before });
+      w.pr({ 'package.json': after });
+      await w.judge();
+      expect(states(w)).toEqual(['success']);
+    });
+  }
+});
+
+describe('third delta: pnpm-workspace.yaml outside its catalogs', () => {
+  const WORKSPACE = lines('packages:', '  - apps/*', '', 'catalog:', '  react: 18.2.0');
+  for (const [what, extra] of [
+    ['only scriptShell added', lines('', 'scriptShell: ./x.sh')],
+    ['only nodeOptions added', lines('', 'nodeOptions: --require ./x.cjs')],
+    ['only linkWorkspacePackages added', lines('', 'linkWorkspacePackages: true')],
+    ['only packageExtensions added', lines('', 'packageExtensions:', '  react:', '    dependencies:', '      x: 1.0.0')],
+  ] as const) {
+    it(`${what} → failure`, async () => {
+      const w = world({ 'pnpm-workspace.yaml': WORKSPACE });
+      const head = w.pr({ 'pnpm-workspace.yaml': `${WORKSPACE}${extra}` });
+      const report = await w.judge();
+      expectRejectedForOwnFiles(w, head, report);
+      expect(report.summary).toContain('pnpm-workspace.yaml');
+    });
+  }
+
+  // Guard: it passes today and must keep passing (the catalog guard of §2.4 (7) covers `catalog`).
+  it('control: only a named catalog of another package added → success', async () => {
+    const w = world({ 'pnpm-workspace.yaml': WORKSPACE });
+    w.pr({ 'pnpm-workspace.yaml': `${WORKSPACE}${lines('', 'catalogs:', '  viejo:', '    react: 17.0.2')}` });
+    await w.judge();
+    expect(states(w)).toEqual(['success']);
+  });
+});
+
+describe('third delta: every setting that names the build allow-list file', () => {
+  it('pnpm-workspace.yaml names a.json and package.json#pnpm names b.json; b.json edited → failure naming it', async () => {
+    const w = world({
+      'pnpm-workspace.yaml': lines('packages:', '  - apps/*', '', 'onlyBuiltDependenciesFile: a.json'),
+      'package.json': pkg((p) => { p.pnpm = { onlyBuiltDependenciesFile: 'b.json' }; }),
+      'a.json': json(['esbuild']),
+      'b.json': json(['esbuild']),
+    });
+    const head = w.pr({ 'b.json': json(['esbuild', 'postinstall-x']) });
+    const report = await w.judge();
+    expectRejectedForOwnFiles(w, head, report);
+    expect(report.summary).toContain('b.json');
+  });
+
+  it('.npmrc with only-built-dependencies-file=b.json in the base; b.json edited → failure naming it', async () => {
+    const w = world({ '.npmrc': 'only-built-dependencies-file=b.json\n', 'b.json': json(['esbuild']) });
+    const head = w.pr({ 'b.json': json(['esbuild', 'postinstall-x']) });
+    const report = await w.judge();
+    expectRejectedForOwnFiles(w, head, report);
+    expect(report.summary).toContain('b.json');
+  });
+
+  it('onlyBuiltDependenciesFile: x/../b.json; b.json edited → failure naming it', async () => {
+    const w = world({
+      'pnpm-workspace.yaml': lines('packages:', '  - apps/*', '', 'onlyBuiltDependenciesFile: x/../b.json'),
+      'b.json': json(['esbuild']),
+    });
+    const head = w.pr({ 'b.json': json(['esbuild', 'postinstall-x']) });
+    const report = await w.judge();
+    expectRejectedForOwnFiles(w, head, report);
+    expect(report.summary).toContain('b.json');
   });
 });

@@ -432,6 +432,22 @@ describe('§4 test 6: the constants keep their order', () => {
     expect(HOOK_DEADLINE_MS).toBeLessThan(HOOK_WATCHDOG_MS);
     expect(HOOK_WATCHDOG_MS).toBeLessThan(timeoutMs - coldStartMs);
   });
+
+  // Third delta review (PLAN-13-R6 §15, last paragraph). Guard: it passes today and must keep
+  // passing. The watchdog plus the measured cold start keeps a 2 s margin below the installed
+  // timeout. The kill command adds nothing to this sum because it is started without being waited
+  // for (the end-to-end test of hooks-deadline-e2e, «without waiting for the kill», holds that part);
+  // were it waited for, its 2 s limit would eat the whole margin (25 + 2.4 + 2 > 30 − 2).
+  it('the watchdog plus the cold start stays 2 s below the installed hook timeout, the kill not counted because it is not waited for', async () => {
+    const root = project('feat/13-x');
+    expect((await installHooks({ root, apply: true })).ok).toBe(true);
+    const settings = JSON.parse(readFileSync(join(root, '.claude', 'settings.json'), 'utf8')) as { hooks: { PreToolUse: { hooks: { timeout: number }[] }[] } };
+    const timeoutMs = (settings.hooks.PreToolUse[0]?.hooks[0]?.timeout ?? 0) * 1000;
+    expect(timeoutMs).toBe(30_000);
+    const coldStartMs = 2_400;
+    const marginMs = 2_000;
+    expect(HOOK_WATCHDOG_MS + coldStartMs).toBeLessThan(timeoutMs - marginMs);
+  });
 });
 
 describe('§4 test 7: doctor warns when the hook timeout does not leave room for the watchdog', () => {
