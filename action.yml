@@ -30,6 +30,10 @@ inputs:
     description: Rutas de workflows que el juez trata como propios (separadas por comas o saltos).
     required: false
     default: ''
+  branches:
+    description: Ramas de trabajo que reciben piezas (separadas por comas o saltos); vacío = solo la principal.
+    required: false
+    default: ''
 
 runs:
   using: composite
@@ -55,6 +59,7 @@ runs:
         INPUT_TASK: ${{ inputs.task }}
         INPUT_MODE: ${{ inputs.mode }}
         INPUT_CONTEXT: ${{ inputs.context }}
+        INPUT_BRANCHES: ${{ inputs.branches }}
         GH_TOKEN: ${{ inputs.token }}
       run: |
         set -euo pipefail
@@ -124,6 +129,17 @@ runs:
         }
         trap 'on_exit "$?"' EXIT
 
+        # PLAN-13-R6 §1.2: si una rama está en la lista de trabajo (o es la principal sin lista).
+        in_branches() {
+          local wanted="$1" entry
+          for entry in $branches_list; do
+            if [ "$entry" = "$wanted" ]; then
+              return 0
+            fi
+          done
+          return 1
+        }
+
         # La cabeza y la rama destino del PR vivo, para un comentario o un despacho. El número
         # debe ser un número o nada se publica; un PR hacia otra rama no se juzga.
         read_live_pr() {
@@ -142,8 +158,8 @@ runs:
           fi
           local base
           base="$(printf '%s' "$live" | jq -r '.base.ref // empty')"
-          if [ "$base" != "$default_branch" ]; then
-            stop "la rama destino es «$base», no $default_branch"
+          if ! in_branches "$base"; then
+            stop "la rama destino es «$base», no una rama de trabajo"
           fi
           sha="$(printf '%s' "$live" | jq -r '.head.sha // empty')"
         }
@@ -171,6 +187,15 @@ runs:
           stop "no se pudo leer la rama principal"
         fi
 
+        # PLAN-13-R6 §1.2: las ramas de trabajo que reciben piezas, tal como las declara la receta
+        # y las escribe `init` en la entrada `branches`. El paso de decisión las necesita antes de
+        # compilar el motor. Vacío = solo la principal. Los nombres de rama no llevan espacios, así
+        # que basta con partir por comas y saltos de línea.
+        branches_list="$(printf '%s' "${INPUT_BRANCHES:-}" | tr ',\n' ' ' | tr -s ' ' ' ' | sed -e 's/^ *//' -e 's/ *$//')"
+        if [ -z "$branches_list" ]; then
+          branches_list="$default_branch"
+        fi
+
         # Procedencia del YAML (§3.1): `merge_group` corre desde `refs/heads/gh-readonly-queue/…`;
         # todo lo demás, desde la propia rama principal. Un `workflow_dispatch` lanzado sobre otra
         # rama no juzga ni publica nada.
@@ -191,10 +216,34 @@ runs:
         case "$GITHUB_EVENT_NAME" in
           pull_request_target)
             base="$(jq -r '.pull_request.base.ref // empty' "$GITHUB_EVENT_PATH")"
-            if [ "$base" != "$default_branch" ]; then
-              stop "la rama destino es «$base», no $default_branch"
+            pr_action="$(jq -r '.action // empty' "$GITHUB_EVENT_PATH")"
+            if ! in_branches "$base"; then
+              # PLAN-13-R6 §1.2: un PR que sale de las ramas de trabajo (o se cierra) no publica
+              # «juzgando»: el juez decide si quedan otros PRs abiertos con esa cabeza y los
+              # rejuzga. Cualquier otro evento hacia fuera de la lista no juzga ni publica.
+              case "$pr_action" in
+                closed|edited)
+                  continue='true'
+                  publish='false'
+                  sha=''
+                  decided='true'
+                  emit
+                  exit 0
+                  ;;
+                *) stop "la rama destino es «$base», no una rama de trabajo" ;;
+              esac
             fi
             sha="$(jq -r '.pull_request.head.sha // empty' "$GITHUB_EVENT_PATH")"
+            if [ "$pr_action" = 'closed' ]; then
+              # Un PR cerrado deja de contar: no se publica «juzgando»; el juez rejuzga a los demás
+              # con esa misma cabeza y, si no queda ninguno, no publica nada.
+              continue='true'
+              publish='false'
+              sha=''
+              decided='true'
+              emit
+              exit 0
+            fi
             ;;
           issue_comment)
             issue_number="$(jq -r '.issue.number // empty' "$GITHUB_EVENT_PATH")"
@@ -263,10 +312,11 @@ runs:
                 queue_group='true'
               elif [ "$run_event" = 'pull_request' ]; then
                 match="$(gh api "repos/$GITHUB_REPOSITORY/commits/${sha}/pulls?per_page=100" --paginate --slurp \
-                  | jq -r --arg head "$sha" --arg base "$default_branch" \
-                    '[.[][] | select(.state == "open" and .head.sha == $head and .base.ref == $base)] | length')"
+                  | jq -r --arg head "$sha" --arg branches "$branches_list" \
+                    '[.[][] | select(.state == "open" and .head.sha == $head) | .base.ref]
+                      | map(select(. as $b | ($branches | split(" ")) | index($b))) | length')"
                 if [ "$match" = '0' ]; then
-                  stop "no hay un PR abierto con la cabeza $sha hacia $default_branch"
+                  stop "no hay un PR abierto con la cabeza $sha hacia una rama de trabajo"
                 fi
               else
                 stop "workflow_run de un evento no juzgado: $run_event"
@@ -362,6 +412,7 @@ runs:
         AI_WORKFLOWS_MODE: ${{ inputs.mode }}
         AI_WORKFLOWS_CONTEXT: ${{ inputs.context }}
         AI_WORKFLOWS_ALSO_PROTECT: ${{ inputs.also-protect }}
+        AI_WORKFLOWS_BRANCHES: ${{ inputs.branches }}
         AI_WORKFLOWS_ACTION_REF: ${{ github.action_ref }}
       run: |
         node "$GITHUB_ACTION_PATH/dist/bin.js" judge

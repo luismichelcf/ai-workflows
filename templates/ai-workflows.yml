@@ -19,9 +19,10 @@ name: ai-workflows
 on:
   # `edited` hace que cambiar la rama destino (o volver a la principal con el mismo SHA) dispare
   # otra corrida: la procedencia no lo dice, porque `pull_request_target` corre el YAML de la
-  # principal sea cual sea el destino.
+  # principal sea cual sea el destino. `closed` (PLAN-13-R6 §1.2): un PR que deja de contar
+  # rejuzga a los demás con su misma cabeza, así que el juez lo escucha y no publica «juzgando».
   pull_request_target:
-    types: [opened, synchronize, reopened, edited]
+    types: [opened, synchronize, reopened, edited, closed]
   merge_group:
     types: [checks_requested]
   # El visto bueno llega como comentario del PR: al crearse, editarlo o borrarlo hay que reevaluar.

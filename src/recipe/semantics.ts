@@ -2,6 +2,7 @@ import { isAbsolute, posix } from 'node:path';
 
 import { validGlob } from './glob.js';
 import { validateCommandLine } from './command-line.js';
+import { isValidBranchName } from '../locks/refname.js';
 import {
   nodeStart,
   type LocatedIssue,
@@ -435,6 +436,68 @@ function validateHooks(root: YamlNode, issues: LocatedIssue[]): void {
   }
 }
 
+/** PLAN-13-R6 §1.1 (R27): a simple branch name, as `src/locks/refname.ts` reads it, without `refs/`. */
+function simpleBranch(name: string): boolean {
+  return isValidBranchName(name) && !name.startsWith('refs/');
+}
+
+/**
+ * PLAN-13-R6 §1.1: `branches:` declares the working branches and the promotions between them. A
+ * branch is a plain name git would accept; a promotion goes between two distinct members of `into`.
+ */
+function validateBranches(root: YamlNode, issues: LocatedIssue[]): void {
+  const branches = yamlField(root, 'branches');
+  if (branches === null) return;
+
+  const into = new Set<string>();
+  for (const item of listNodes(yamlField(branches, 'into'))) {
+    const name = yamlWord(item);
+    if (!simpleBranch(name)) {
+      add(
+        issues,
+        item,
+        `branch ${JSON.stringify(name)} must be a simple branch name (git rules, no wildcards and no "refs/")`,
+      );
+      continue;
+    }
+    into.add(name);
+  }
+
+  for (const entry of listNodes(yamlField(branches, 'promotions'))) {
+    const fromNode = yamlField(entry, 'from');
+    const toNode = yamlField(entry, 'to');
+    const from = yamlWord(fromNode);
+    const to = yamlWord(toNode);
+    if (!simpleBranch(from)) {
+      add(
+        issues,
+        fromNode,
+        `promotion from ${JSON.stringify(from)} must be a simple branch name (git rules, no wildcards and no "refs/")`,
+      );
+    }
+    if (!simpleBranch(to)) {
+      add(
+        issues,
+        toNode,
+        `promotion to ${JSON.stringify(to)} must be a simple branch name (git rules, no wildcards and no "refs/")`,
+      );
+    }
+    if (simpleBranch(from) && !into.has(from)) {
+      add(issues, entry, `promotion from "${from}" is not in branches.into`);
+    }
+    if (simpleBranch(to) && !into.has(to)) {
+      add(issues, entry, `promotion to "${to}" is not in branches.into`);
+    }
+    if (from === to) {
+      add(
+        issues,
+        entry,
+        `a promotion must go between two different branches, not "${from}" to "${to}"`,
+      );
+    }
+  }
+}
+
 /** PLAN-13-R4 §6: the summary file must be a relative path with no escape. */
 function validateMessages(root: YamlNode, issues: LocatedIssue[]): void {
   const summary = yamlField(yamlField(root, 'messages'), 'summary');
@@ -627,6 +690,7 @@ export function validateSemantics(root: YamlNode): LocatedIssue[] {
   validateVocabulary(root, stages, declared, issues);
   validatePieces(root, issues);
   validateHooks(root, issues);
+  validateBranches(root, issues);
   validateServerForms(root, stages, issues);
   validatePhases(stages, stagesNode, issues);
   validateStageRules(stages, issues);

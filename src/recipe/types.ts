@@ -85,6 +85,16 @@ export interface RecipePieces {
   };
 }
 
+/**
+ * PLAN-13-R6 §1.1 (R27): the branches that receive pieces and the promotions from one branch to
+ * another. `into` is never empty and its first entry is where the `pull-request` block opens the
+ * piece's pull request; a promotion is a pass between two branches of `into`, never a piece.
+ */
+export interface RecipeBranches {
+  readonly into: readonly string[];
+  readonly promotions: readonly { readonly from: string; readonly to: string }[];
+}
+
 export interface Recipe {
   readonly version: 1;
   readonly locale: string;
@@ -97,6 +107,8 @@ export interface Recipe {
   readonly pieces?: RecipePieces;
   /** PLAN-13-R5 §1.1: the folders the editor and git locks may write without a piece. */
   readonly hooks?: RecipeHooks;
+  /** PLAN-13-R6 §1.1: the working branches that receive pieces, and the promotions between them. */
+  readonly branches?: RecipeBranches;
   /** Named file classes retain declaration order for condition messages. */
   readonly classify: Readonly<Record<string, readonly string[]>>;
   readonly kinds?: {

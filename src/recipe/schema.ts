@@ -181,6 +181,35 @@ export const recipeSchema = {
         },
       },
     },
+    branches: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['into'],
+      description:
+        'PLAN-13-R6 §1.1: the branches that receive pieces, and the promotions between them.',
+      properties: {
+        into: {
+          type: 'array',
+          minItems: 1,
+          uniqueItems: true,
+          items: { type: 'string', minLength: 1 },
+          description: 'Working branches that receive pieces; the first opens the pull requests.',
+        },
+        promotions: {
+          type: 'array',
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            required: ['from', 'to'],
+            properties: {
+              from: { type: 'string', minLength: 1 },
+              to: { type: 'string', minLength: 1 },
+            },
+          },
+          description: 'Passes from one branch of `into` to another; never pieces.',
+        },
+      },
+    },
     stages: {
       type: 'array',
       minItems: 1,
