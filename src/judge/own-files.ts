@@ -9,7 +9,7 @@
 // package manifest (`package.json`, `package.yaml`, `package.json5`, at any depth) and in
 // `pnpm-workspace.yaml`, every change is touched except a short list of harmless ones.
 
-import { isMap, isScalar, isSeq, parseDocument } from 'yaml';
+import { isAlias, isMap, isScalar, isSeq, parseDocument, type Document } from 'yaml';
 
 import {
   gitChangedPaths,
@@ -219,12 +219,37 @@ function hasKey(value: unknown, key: string): boolean {
 }
 
 /**
- * PLAN-13-R6 §15 (fourth delta): whether a dependency or catalog entry that does not name the
- * engine is harmless. It is, only when its value is a registry range, version or tag (nothing that
- * leaves the registry: no protocol, no `/`, nothing starting with `.`), or when it starts with
- * `workspace:` or `catalog:`. `file:`, `link:`, a git URL, `github:`, `npm:`, `patch:`, `portal:`,
- * an address or a `.tgz` are touched, because the installer then resolves the dependency somewhere
- * the registry range never would.
+ * PLAN-13-R6 §15 (fifth delta): a node-semver range or version. The parts follow semver's own
+ * grammar (numeric, `x`/`X`/`*` wildcards, an optional `v`, a prerelease and build metadata), so a
+ * range like `1.x`, `>=1 <2` or `1.0.0-beta.1` is harmless while a look-alike with a dot but no
+ * version — `release.candidate` — is not.
+ */
+const XRANGE = '(?:[xX*]|0|[1-9][0-9]*)';
+const PRERELEASE_ID = '(?:0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*)';
+const PRERELEASE = `(?:-${PRERELEASE_ID}(?:\\.${PRERELEASE_ID})*)`;
+const BUILD_ID = '[0-9a-zA-Z-]+';
+const BUILD = `(?:\\+${BUILD_ID}(?:\\.${BUILD_ID})*)`;
+const VERSION = `v?${XRANGE}(?:\\.${XRANGE}(?:\\.${XRANGE})?)?${PRERELEASE}?${BUILD}?`;
+const COMPARATOR = `(?:[<>=~^]=?[ ]*)?${VERSION}`;
+const HYPHEN_RANGE = `${VERSION}[ ]+-[ ]+${VERSION}`;
+const RANGE_TOKEN = `(?:${HYPHEN_RANGE}|${COMPARATOR})`;
+const SEMVER_RANGE = new RegExp(
+  `^\\s*${RANGE_TOKEN}(?:[ ]+${RANGE_TOKEN})*(?:\\s*\\|\\|\\s*${RANGE_TOKEN}(?:[ ]+${RANGE_TOKEN})*)*\\s*$`,
+);
+
+/** PLAN-13-R6 §15 (fifth delta): a tag is letters, digits, `-` and `_`, with no dots or slashes. */
+const TAG_SPEC = /^[A-Za-z0-9_-]+$/;
+
+/** PLAN-13-R6 §15 (fifth delta): a tarball by extension, whatever the case. */
+const TARBALL_SPEC = /\.(?:tgz|tar|tar\.gz)$/i;
+
+/**
+ * PLAN-13-R6 §15 (fourth and fifth delta): whether a dependency or catalog entry that does not name
+ * the engine is harmless. It is, only when its value is a registry range or version written with the
+ * characters of semver, a tag without dots or slashes, or starts with `workspace:` or `catalog:`.
+ * Everything that leaves the registry is touched: `file:`, `link:`, a git URL, `github:`, `npm:`,
+ * `patch:`, `portal:`, an address, anything with a `/` or `:`, a `.tgz`/`.tar`/`.tar.gz`, a value
+ * starting with `.`, `\` or `~/`, and any look-alike that is neither a range nor a tag.
  */
 function isRegistrySpec(value: unknown): boolean {
   if (typeof value !== 'string') return false;
@@ -232,8 +257,10 @@ function isRegistrySpec(value: unknown): boolean {
   if (spec.length === 0) return false;
   if (spec.startsWith('workspace:') || spec.startsWith('catalog:')) return true;
   if (spec.startsWith('.')) return false;
+  if (spec.startsWith('\\') || spec.startsWith('~/')) return false;
+  if (TARBALL_SPEC.test(spec)) return false;
   if (spec.includes('/') || spec.includes(':')) return false;
-  return true;
+  return SEMVER_RANGE.test(spec) || TAG_SPEC.test(spec);
 }
 
 /**
@@ -253,28 +280,55 @@ function hasForbiddenKeyDeep(value: unknown, forbidden: string): boolean {
   return false;
 }
 
-/** Whether a YAML node — or anything inside it — holds a `<<` merge key at any depth. */
-function yamlHasMergeKey(node: unknown): boolean {
+/**
+ * PLAN-13-R6 §15 (fifth delta): whether a YAML node is one the installer's reader and the judge read
+ * the same way — a map, a sequence or a scalar, with scalar keys and no anchor, alias or explicit
+ * tag. Anything else (an anchor, an alias, a non-scalar key, a merge key) is an advanced feature, so
+ * the document is touched without being interpreted.
+ */
+function isPlainYamlNode(node: unknown): boolean {
+  if (node === null || node === undefined) return true;
+  if (isAlias(node)) return false;
+  if (isScalar(node)) return node.anchor === undefined && node.tag === undefined;
   if (isMap(node)) {
+    if (node.anchor !== undefined || node.tag !== undefined) return false;
     for (const item of node.items) {
-      if (isScalar(item.key) && item.key.value === '<<') return true;
-      if (yamlHasMergeKey(item.value)) return true;
+      if (!isScalar(item.key)) return false;
+      if (item.key.anchor !== undefined || item.key.tag !== undefined) return false;
+      if (item.key.value === '<<') return false;
+      if (!isPlainYamlNode(item.value)) return false;
     }
-    return false;
+    return true;
   }
-  if (isSeq(node)) return node.items.some((item) => yamlHasMergeKey(item));
+  if (isSeq(node)) {
+    if (node.anchor !== undefined || node.tag !== undefined) return false;
+    return node.items.every((item) => isPlainYamlNode(item));
+  }
   return false;
 }
 
 /**
- * The JavaScript value of a YAML document, or `undefined` when it holds a `<<` merge key at any
- * depth (§15 fourth delta): the judge and the installer do not read such a document the same way, so
- * it is touched. Anchors and aliases without `<<` are read as their values. `parseDocument` is used
- * with its default (the merge option is not set), so `<<` stays visible instead of being resolved.
+ * PLAN-13-R6 §15 (fifth delta): whether a parsed document uses only plain YAML. A directive
+ * (`%YAML`, `%TAG`), any error or warning of the reader (a duplicated key or a second document
+ * included), or an advanced node makes it touched without being interpreted. `parseDocument` keeps
+ * explicit tags and merge keys visible (the merge option is not set), so this traversal sees them.
+ */
+function isPlainYamlDocument(doc: Document): boolean {
+  if (doc.errors.length > 0 || doc.warnings.length > 0) return false;
+  if (doc.directives?.yaml?.explicit === true) return false;
+  const tags = doc.directives?.tags ?? {};
+  if (Object.keys(tags).some((key) => key !== '!!')) return false;
+  return isPlainYamlNode(doc.contents);
+}
+
+/**
+ * The JavaScript value of a YAML document, or `undefined` when it uses any advanced YAML feature
+ * (§15 fifth delta): the judge and the installer do not read such a document the same way, so it is
+ * touched without being interpreted.
  */
 function yamlValue(content: string): unknown {
   const doc = parseDocument(content);
-  if (yamlHasMergeKey(doc.contents)) return undefined;
+  if (!isPlainYamlDocument(doc)) return undefined;
   return doc.toJS();
 }
 
@@ -558,9 +612,31 @@ function unquoted(value: string): string {
 }
 
 /**
- * Every value of `only-built-dependencies-file` in an .npmrc (§15 fourth delta): the installer reads
- * each occurrence, so each names a file of the judge's own. A value in double or single quotes is
- * unquoted before it is read as a path.
+ * PLAN-13-R6 §15 (fifth delta): an .npmrc value with its inline comment cut, the way the `ini`
+ * reader reads it — ` ; …` or ` # …` ends the value. A `;` or `#` inside a quoted value is kept, so
+ * a quoted path is not truncated.
+ */
+function iniValue(raw: string): string {
+  let quote: string | undefined;
+  for (let i = 0; i < raw.length; i += 1) {
+    const ch = raw.charAt(i);
+    if (quote !== undefined) {
+      if (ch === quote) quote = undefined;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      continue;
+    }
+    if ((ch === ';' || ch === '#') && i > 0 && /\s/.test(raw.charAt(i - 1))) return raw.slice(0, i);
+  }
+  return raw;
+}
+
+/**
+ * Every value of `only-built-dependencies-file` in an .npmrc (§15 fourth and fifth delta): the
+ * installer reads each occurrence, so each names a file of the judge's own. A key in double or
+ * single quotes is unquoted before it is compared, and an inline comment ends the value.
  */
 function npmrcBuildFiles(content: string): string[] {
   const found: string[] = [];
@@ -569,8 +645,8 @@ function npmrcBuildFiles(content: string): string[] {
     if (line.length === 0 || line.startsWith('#') || line.startsWith(';')) continue;
     const at = line.indexOf('=');
     if (at < 0) continue;
-    if (line.slice(0, at).trim() !== 'only-built-dependencies-file') continue;
-    found.push(unquoted(line.slice(at + 1).trim()));
+    if (unquoted(line.slice(0, at).trim()) !== 'only-built-dependencies-file') continue;
+    found.push(unquoted(iniValue(line.slice(at + 1)).trim()));
   }
   return found;
 }
