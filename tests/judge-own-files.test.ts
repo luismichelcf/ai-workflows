@@ -1950,3 +1950,22 @@ describe('sixth delta: .npmrc comments without a space before them', () => {
     });
   }
 });
+
+// Seventh delta review (PLAN-13-R6 §15): `.npmrc` single quotes and bare carriage returns read as
+// ini reads them. ini strips single quotes and then JSON-decodes what is left when it can, and it
+// ends a line at any `\r` or `\n`.
+describe('seventh delta: .npmrc single quotes and bare carriage returns', () => {
+  for (const [what, npmrc] of [
+    ['a single-quoted JSON value', `only-built-dependencies-file='"allow.json"'\n`],
+    ['a single-quoted JSON key', `'"only-built-dependencies-file"'=allow.json\n`],
+    ['a line that ends with a bare carriage return', 'foo=bar\ronly-built-dependencies-file=allow.json\n'],
+  ] as const) {
+    it(`.npmrc names allow.json with ${what}; allow.json edited → failure naming it`, async () => {
+      const w = world({ '.npmrc': npmrc, 'allow.json': json(['esbuild']) });
+      const head = w.pr({ 'allow.json': json(['esbuild', 'postinstall-x']) });
+      const report = await w.judge();
+      expectRejectedForOwnFiles(w, head, report);
+      expect(report.summary).toContain('allow.json');
+    });
+  }
+});
