@@ -606,7 +606,8 @@ function normalizeRepoPath(value: unknown): string | undefined {
 /**
  * PLAN-13-R6 §15 (fifth and sixth delta): an .npmrc key or value read exactly as the `ini` reader
  * reads it. The whole string is trimmed. An entirely double-quoted value is decoded as JSON; an
- * entirely single-quoted one has its quotes removed. Otherwise it ends at the first `;` or `#` that
+ * entirely single-quoted one has its quotes removed, and what remains is then decoded as JSON when
+ * it is a JSON string (`'"x"'` reads as `x`). Otherwise it ends at the first `;` or `#` that
  * is not escaped — with no need for a blank before it — while `\;`, `\#` and `\\` stand for a
  * literal `;`, `#` and `\` and any other backslash is kept as it is.
  */
@@ -624,7 +625,16 @@ function iniValue(raw: string): string {
         }
         return value;
       }
-      if (first === "'") return value.slice(1, -1);
+      if (first === "'") {
+        const inner = value.slice(1, -1);
+        try {
+          const parsed: unknown = JSON.parse(inner);
+          if (typeof parsed === 'string') return parsed;
+        } catch {
+          // Not JSON: fall back to the text without its single quotes.
+        }
+        return inner;
+      }
     }
   }
   let escaped = false;
@@ -655,7 +665,7 @@ function iniValue(raw: string): string {
  */
 function npmrcBuildFiles(content: string): string[] {
   const found: string[] = [];
-  for (const raw of content.split(/\r?\n/)) {
+  for (const raw of content.split(/[\r\n]+/)) {
     const line = raw.trim();
     if (line.length === 0 || line.startsWith('#') || line.startsWith(';')) continue;
     const at = line.indexOf('=');
