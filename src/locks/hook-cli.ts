@@ -18,6 +18,15 @@ import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { gitEnvironment } from '../git-env.js';
 import { parseRecipe } from '../recipe/parse.js';
 import type { Recipe } from '../recipe/types.js';
+import { parseClientInput, renderClientOutput } from './clients.js';
+import {
+  CODEX_HOOK_ORDER,
+  CODEX_HOOK_ORDER_WINDOWS,
+  HOOK_LOADER_CJS,
+  LOADER_RELATIVE,
+  OPENCODE_PLUGIN_JS,
+  isOurPlugin,
+} from './client-files.js';
 import { lockContextFor } from './context.js';
 import { isUnder, readAbsolute } from './paths.js';
 import {
@@ -25,8 +34,6 @@ import {
   decideToolUse,
   isCoveredWriteTool,
   orderRefusal,
-  parseHookInput,
-  renderHookOutput,
   writeTargets,
   type HookInput,
   type LockContext,
@@ -43,6 +50,7 @@ import {
 import {
   buildHooksConfig,
   mergeHooksConfig,
+  type HookClient,
   type HookHandler,
   type HooksFile,
 } from './install.js';
@@ -90,8 +98,14 @@ export interface HookGitAnswer {
 export type HookGitRunner = (request: HookGitRequest) => Promise<HookGitAnswer>;
 
 export interface RunHookOptions {
-  /** The folder the hook was installed in; Claude substitutes it for `${CLAUDE_PROJECT_DIR}`. */
-  readonly projectDir: string;
+  /**
+   * The folder the hook was installed in; Claude substitutes it for `${CLAUDE_PROJECT_DIR}`. Codex
+   * and OpenCode do not hand it over: their project root is read from `cwd` with git (§3.2), so it
+   * is optional and only Claude needs it.
+   */
+  readonly projectDir?: string;
+  /** The client whose request and answer shape this run speaks. Claude by default. */
+  readonly client?: HookClient;
   /** The folder of the request (the CLI's `cwd`), which relative paths are read against. */
   readonly cwd: string;
   readonly stdin: string;
@@ -113,6 +127,11 @@ export interface HookResult {
 export interface InstallHooksOptions {
   readonly root: string;
   readonly apply: boolean;
+  /**
+   * §3.3: without it all three clients are written; with it, only that one (plus the shared loader
+   * when it is Codex or OpenCode). Claude by default when the caller asks for nothing.
+   */
+  readonly client?: HookClient;
 }
 
 export interface InstallHooksResult {
@@ -575,9 +594,8 @@ function resolveTarget(target: string, cwd: string): string {
   return isAbsolute(target) ? target : resolve(cwd, target);
 }
 
-function editorOutput(decision: LockDecision): HookResult {
-  const out = renderHookOutput(decision);
-  return { stdout: out.stdout, stderr: '', exitCode: out.exitCode };
+function editorOutput(client: HookClient, decision: LockDecision): HookResult {
+  return renderClientOutput(client, decision);
 }
 
 /** The real path of an existing folder, or the same spelling when it cannot be resolved. */
@@ -591,18 +609,43 @@ function realPathOf(value: string): string {
   }
 }
 
-async function runEditor(options: RunHookOptions, run: GitRun): Promise<HookResult> {
-  const parsed = parseHookInput(options.stdin);
+/**
+ * PLAN-13-R6 §3.2: Codex and OpenCode do not hand the project folder over. It is read from the
+ * folder the hook runs in and from the request's `cwd` with git; if neither is in a work tree the
+ * caller refuses in that client's format. The request's own `cwd` is tried first, since the hook
+ * may run in a neutral folder; if neither resolves, that first failure is the answer.
+ */
+async function clientWorkCopy(cwd: string, requestCwd: string, run: GitRun): Promise<WorkCopyLookup> {
+  // The request's own `cwd` is the session's folder and is tried first: the folder the hook runs
+  // in may be a neutral one (the OpenCode plugin runs the loader outside the project), and that
+  // must never be mistaken for the project the tool is writing into.
+  const order = requestCwd.length > 0 && requestCwd !== cwd ? [requestCwd, cwd] : [cwd];
+  let firstFailure: WorkCopyLookup | undefined;
+  for (const dir of order) {
+    const found = await lookupWorkCopyAt(dir, run);
+    if (found.kind === 'copy') return found;
+    if (firstFailure === undefined) firstFailure = found;
+  }
+  return firstFailure ?? { kind: 'outside' };
+}
+
+async function runEditor(options: RunHookOptions, run: GitRun, client: HookClient): Promise<HookResult> {
+  const parsed = parseClientInput(client, options.stdin);
   if ('error' in parsed) {
-    return editorOutput({
+    return editorOutput(client, {
       allow: false,
       reason: `No pude leer la solicitud del CLI (${parsed.error}); me niego en vez de dejar pasar a ciegas.`,
     });
   }
 
-  const watchedLookup = await lookupWorkCopyAt(options.projectDir, run);
+  // Claude is told its project folder by `${CLAUDE_PROJECT_DIR}`; the other two are not, and their
+  // root comes from git over the folders the hook runs in and the request names (§3.2).
+  const watchedLookup =
+    client === 'claude'
+      ? await lookupWorkCopyAt(options.projectDir ?? options.cwd, run)
+      : await clientWorkCopy(options.cwd, parsed.cwd, run);
   if (watchedLookup.kind === 'failed') {
-    return editorOutput({
+    return editorOutput(client, {
       allow: false,
       reason:
         `Git no pudo decir a qué repositorio pertenece la carpeta del proyecto (${watchedLookup.reason}); ` +
@@ -610,7 +653,7 @@ async function runEditor(options: RunHookOptions, run: GitRun): Promise<HookResu
     });
   }
   if (watchedLookup.kind === 'outside') {
-    return editorOutput({
+    return editorOutput(client, {
       allow: false,
       reason:
         'La carpeta del proyecto no es un repositorio de git: el candado no puede vigilar nada y ' +
@@ -623,7 +666,7 @@ async function runEditor(options: RunHookOptions, run: GitRun): Promise<HookResu
 
   // Rule 0 once on the whole request: writing an order is refused wherever the target folder is.
   const order = orderRefusal(parsed, sessionContext);
-  if (order !== undefined) return editorOutput(order);
+  if (order !== undefined) return editorOutput(client, order);
 
   if (!isCoveredWriteTool(parsed.toolName)) return { stdout: '', stderr: '', exitCode: 0 };
 
@@ -631,7 +674,7 @@ async function runEditor(options: RunHookOptions, run: GitRun): Promise<HookResu
   // A writing tool whose paths cannot be read is refused, exactly like rule 5: an empty patch is
   // not "nothing to judge" but a request the lock could not read.
   if (targets === undefined || targets.length === 0) {
-    return editorOutput({
+    return editorOutput(client, {
       allow: false,
       reason:
         'No pude leer las rutas de esta herramienta: el candado se niega a adivinar. Revisa el ' +
@@ -652,7 +695,7 @@ async function runEditor(options: RunHookOptions, run: GitRun): Promise<HookResu
     if (found.kind === 'failed') {
       // A git that fails for a reason other than "no repository" might be a real work tree the
       // lock cannot read: refusing is the only honest answer (PLAN-13-R5 §1.2).
-      return editorOutput({
+      return editorOutput(client, {
         allow: false,
         reason:
           `Git no pudo decir a qué repositorio pertenece esta ruta (${found.reason}); el candado ` +
@@ -664,7 +707,7 @@ async function runEditor(options: RunHookOptions, run: GitRun): Promise<HookResu
       // call a work tree. That is this lock's business, judged with the copy that owns it.
       const owner = await workCopyOwningGitPath(judged, watched, run);
       if (owner.kind === 'failed') {
-        return editorOutput({
+        return editorOutput(client, {
           allow: false,
           reason:
             `Git no pudo decir a qué repositorio pertenece esta ruta (${owner.reason}); el candado ` +
@@ -673,7 +716,7 @@ async function runEditor(options: RunHookOptions, run: GitRun): Promise<HookResu
       }
       if (owner.kind === 'copy') {
         const decision = decideGitFolder(contextForCopy(owner.copy));
-        if (!decision.allow) return editorOutput(decision);
+        if (!decision.allow) return editorOutput(client, decision);
         continue;
       }
       // A path under the watched work tree whose git failed (a broken `.git` in a subfolder) is
@@ -687,7 +730,7 @@ async function runEditor(options: RunHookOptions, run: GitRun): Promise<HookResu
           cwd: parsed.cwd,
         };
         const decision = decideToolUse(single, sessionContext);
-        if (!decision.allow) return editorOutput(decision);
+        if (!decision.allow) return editorOutput(client, decision);
       }
       continue;
     }
@@ -704,7 +747,7 @@ async function runEditor(options: RunHookOptions, run: GitRun): Promise<HookResu
       cwd: parsed.cwd,
     };
     const decision = decideToolUse(single, contextForCopy(copy));
-    if (!decision.allow) return editorOutput(decision);
+    if (!decision.allow) return editorOutput(client, decision);
   }
 
   return { stdout: '', stderr: '', exitCode: 0 };
@@ -778,9 +821,9 @@ async function runPrePush(options: RunHookOptions, run: GitRun): Promise<HookRes
  * (§4). It is the refusal of that client: editor, the deny JSON with exit 0; git hooks, the reason
  * on stderr with exit 1.
  */
-function watchdogRefusal(kind: HookKind, watchdogMs: number): HookResult {
+function watchdogRefusal(kind: HookKind, watchdogMs: number, client: HookClient): HookResult {
   const reason = `El gancho tardó más tiempo del permitido (${secondsLabel(watchdogMs)} s): me niego en vez de dejar pasar a ciegas.`;
-  if (kind === 'editor') return editorOutput({ allow: false, reason });
+  if (kind === 'editor') return editorOutput(client, { allow: false, reason });
   return { stdout: '', stderr: reason, exitCode: 1 };
 }
 
@@ -793,6 +836,7 @@ export function superviseHook(
   kind: HookKind,
   work: Promise<HookResult>,
   watchdogMs = HOOK_WATCHDOG_MS,
+  client: HookClient = 'claude',
 ): Promise<HookResult> {
   return new Promise((resolve) => {
     let settled = false;
@@ -802,13 +846,13 @@ export function superviseHook(
       clearTimeout(timer);
       resolve(result);
     };
-    const timer = setTimeout(() => finish(watchdogRefusal(kind, watchdogMs)), Math.max(0, watchdogMs));
+    const timer = setTimeout(() => finish(watchdogRefusal(kind, watchdogMs, client)), Math.max(0, watchdogMs));
     work.then(
       (result) => finish(result),
       (error) =>
         finish(
           kind === 'editor'
-            ? editorOutput({ allow: false, reason: `El candado falló por dentro (${reasonOf(error)}); me niego.` })
+            ? editorOutput(client, { allow: false, reason: `El candado falló por dentro (${reasonOf(error)}); me niego.` })
             : { stdout: '', stderr: reasonOf(error), exitCode: 1 },
         ),
     );
@@ -817,19 +861,21 @@ export function superviseHook(
 
 /** The whole hook: read the kind, decide, answer. Any internal failure is a refusal, never a pass. */
 export async function runHook(kind: HookKind, options: RunHookOptions): Promise<HookResult> {
+  const client = options.client ?? 'claude';
   const deadlineMs = options.deadlineMs ?? (kind === 'editor' ? HOOK_DEADLINE_MS : GIT_HOOK_DEADLINE_MS);
   const git = createHookGitSession(defaultRunner(options), deadlineMs);
   try {
-    if (kind === 'editor') return await runEditor(options, git.run);
+    if (kind === 'editor') return await runEditor(options, git.run, client);
     if (kind === 'pre-commit') return await runPreCommit(options, git.run);
     return await runPrePush(options, git.run);
   } catch (error) {
-    // A lock that blows up must not let the tool through: say why and refuse.
-    const result = editorOutput({
+    // A lock that blows up must not let the tool through: say why and refuse, in this client's
+    // format so Codex never reads an exit 2 and OpenCode never reads it as a pass.
+    if (kind !== 'editor') return { stdout: '', stderr: reasonOf(error), exitCode: 1 };
+    return editorOutput(client, {
       allow: false,
       reason: `El candado falló por dentro (${reasonOf(error)}); me niego en vez de dejar pasar.`,
     });
-    return kind === 'editor' ? result : { stdout: '', stderr: result.stdout, exitCode: 1 };
   } finally {
     git.dispose();
   }
@@ -869,6 +915,17 @@ export async function installHooks(options: InstallHooksOptions): Promise<Instal
     };
   }
 
+  // §3.3: all three clients by default, one of them with `--client`. The loader is shared by Codex
+  // and OpenCode, so it is written whenever either is asked for.
+  const selected: ReadonlySet<HookClient> = new Set<HookClient>(
+    options.client === undefined ? ['claude', 'codex', 'opencode'] : [options.client],
+  );
+  const withClaude = selected.has('claude');
+  const withCodex = selected.has('codex');
+  const withOpencode = selected.has('opencode');
+  const withLoader = withCodex || withOpencode;
+
+  // --- Claude: merge our entry into .claude/settings.json, keeping everything else exactly.
   const matcher = buildHooksConfig('claude', 'node').hooks.PreToolUse[0]?.matcher ?? '';
   const ourHandler: HookHandler = {
     type: 'command',
@@ -877,36 +934,92 @@ export async function installHooks(options: InstallHooksOptions): Promise<Instal
     timeout: 30,
   };
   const ours: HooksFile = { hooks: { PreToolUse: [{ matcher, hooks: [ourHandler] }] } };
-
   const settingsPath = join(copy.root, '.claude', 'settings.json');
-  let merged: Record<string, unknown>;
-  try {
-    const existing = existsSync(settingsPath)
-      ? (JSON.parse(readFileSync(settingsPath, 'utf8')) as unknown)
-      : undefined;
-    merged = mergeHooksConfig(existing, ours);
-  } catch (error) {
-    return {
-      ok: false,
-      text: `No se puede leer .claude/settings.json sin perder lo que tiene: ${reasonOf(error)}`,
-    };
+  let mergedClaude: Record<string, unknown> | undefined;
+  if (withClaude) {
+    try {
+      const existing = existsSync(settingsPath)
+        ? (JSON.parse(readFileSync(settingsPath, 'utf8')) as unknown)
+        : undefined;
+      mergedClaude = mergeHooksConfig(existing, ours);
+    } catch (error) {
+      return {
+        ok: false,
+        text: `No se puede leer .claude/settings.json sin perder lo que tiene: ${reasonOf(error)}`,
+      };
+    }
   }
 
-  const plan = [
-    'Se escribiría, sin tocar nada más:',
-    `  .claude/settings.json (se funde con lo que ya haya)`,
-    `  ${HOOKS_PATH}/pre-commit`,
-    `  ${HOOKS_PATH}/pre-push`,
-    `  git config --local core.hooksPath ${HOOKS_PATH}`,
-    '',
-    'Usa --apply para escribirlo.',
-  ].join('\n');
+  // --- Codex: merge our entry into .codex/hooks.json, under the matcher `.*` so every tool —
+  // unknown ones with a path included — reaches the hook.
+  const codexPath = join(copy.root, '.codex', 'hooks.json');
+  const codexOurs: HooksFile = {
+    hooks: {
+      PreToolUse: [
+        {
+          matcher: '.*',
+          hooks: [
+            { type: 'command', command: CODEX_HOOK_ORDER, commandWindows: CODEX_HOOK_ORDER_WINDOWS, timeout: 30 },
+          ],
+        },
+      ],
+    },
+  };
+  let mergedCodex: Record<string, unknown> | undefined;
+  if (withCodex) {
+    try {
+      const existing = existsSync(codexPath)
+        ? (JSON.parse(readFileSync(codexPath, 'utf8')) as unknown)
+        : undefined;
+      mergedCodex = mergeHooksConfig(existing, codexOurs);
+    } catch (error) {
+      return {
+        ok: false,
+        text: `No se puede leer .codex/hooks.json sin perder lo que tiene: ${reasonOf(error)}`,
+      };
+    }
+  }
+
+  // --- OpenCode: a whole plugin file. A file there that is not ours is never overwritten, and
+  // nothing else is written either: the whole install stops and names it.
+  const pluginPath = join(copy.root, '.opencode', 'plugins', 'ai-workflows.js');
+  if (withOpencode && existsSync(pluginPath)) {
+    let existingPlugin: string;
+    try {
+      existingPlugin = readFileSync(pluginPath, 'utf8');
+    } catch (error) {
+      return { ok: false, text: `No se puede leer .opencode/plugins/ai-workflows.js: ${reasonOf(error)}` };
+    }
+    if (!isOurPlugin(existingPlugin)) {
+      return {
+        ok: false,
+        text: 'No se toca .opencode/plugins/ai-workflows.js: ese archivo no es de ai-workflows.',
+      };
+    }
+  }
+
+  const planLines = ['Se escribiría, sin tocar nada más:'];
+  if (withClaude) {
+    planLines.push('  .claude/settings.json (se funde con lo que ya haya)');
+    planLines.push(`  ${HOOKS_PATH}/pre-commit`);
+    planLines.push(`  ${HOOKS_PATH}/pre-push`);
+    planLines.push(`  git config --local core.hooksPath ${HOOKS_PATH}`);
+  }
+  if (withCodex) planLines.push('  .codex/hooks.json (se funde con lo que ya haya)');
+  if (withOpencode) planLines.push('  .opencode/plugins/ai-workflows.js');
+  if (withLoader) planLines.push(`  ${LOADER_RELATIVE}`);
+  planLines.push('', 'Usa --apply para escribirlo.');
+  const plan = planLines.join('\n');
   if (!options.apply) return { ok: true, text: plan };
 
   try {
-    mkdirSync(join(copy.root, '.claude'), { recursive: true });
-    writeFileSync(settingsPath, `${JSON.stringify(merged, null, 2)}\n`);
+    if (withClaude && mergedClaude !== undefined) {
+      mkdirSync(join(copy.root, '.claude'), { recursive: true });
+      writeFileSync(settingsPath, `${JSON.stringify(mergedClaude, null, 2)}\n`);
+    }
 
+    // The git hooks are the second layer, shared by every client: they are installed whatever
+    // client was asked for, as they were before `--client` existed.
     const hooksDir = join(copy.root, HOOKS_PATH);
     mkdirSync(hooksDir, { recursive: true });
     for (const kind of ['pre-commit', 'pre-push'] as const) {
@@ -914,14 +1027,28 @@ export async function installHooks(options: InstallHooksOptions): Promise<Instal
       writeFileSync(file, renderGitHook(kind, GIT_BIN_ARGS));
       if (process.platform !== 'win32') chmodSync(file, 0o755);
     }
-
     const set = await run(copy.root, ['config', '--local', 'core.hooksPath', HOOKS_PATH]);
     if (!set.ok) {
       return { ok: false, text: `No se pudo fijar core.hooksPath: ${set.stderr.trim()}` };
+    }
+
+    if (withCodex && mergedCodex !== undefined) {
+      mkdirSync(join(copy.root, '.codex'), { recursive: true });
+      writeFileSync(codexPath, `${JSON.stringify(mergedCodex, null, 2)}\n`);
+    }
+    if (withLoader) writeFileSync(join(copy.root, LOADER_RELATIVE), HOOK_LOADER_CJS);
+    if (withOpencode) {
+      mkdirSync(join(copy.root, '.opencode', 'plugins'), { recursive: true });
+      writeFileSync(pluginPath, OPENCODE_PLUGIN_JS);
     }
   } catch (error) {
     return { ok: false, text: `No se pudo instalar: ${reasonOf(error)}` };
   }
 
-  return { ok: true, text: 'Ganchos instalados.' };
+  return {
+    ok: true,
+    text:
+      'Ganchos instalados.' +
+      (withCodex || withOpencode ? ' En Codex interactivo, aprueba el gancho una vez en /hooks.' : ''),
+  };
 }

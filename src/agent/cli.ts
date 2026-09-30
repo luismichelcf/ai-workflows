@@ -30,6 +30,7 @@ import { recordCleanUpdate, verifyCleanUpdate } from '../recipe/validity.js';
 import { diskProjectFiles, type ChangeDeclared } from '../recipe/facts.js';
 import { pieceOfBranch, readDeclaredKind } from '../judge/pieces.js';
 import { HOOK_LOADER, HOOK_WATCHDOG_MS } from '../locks/hook-cli.js';
+import { LOADER_RELATIVE, OPENCODE_PLUGIN_HEADER, isOurCodexHandler } from '../locks/client-files.js';
 import type { Recipe } from '../recipe/types.js';
 import type { ProviderRunner } from '../blocks/definition.js';
 import {
@@ -1242,6 +1243,49 @@ async function commandDoctor(deps: AgentCliDeps): Promise<CommandOutput> {
         : 'The editor hook or the git hooks: missing. Run: ai-workflows hooks install --apply',
     );
   }
+
+  // PLAN-13-R6 §3.3: doctor reviews Codex and OpenCode too. Codex counts only with our handler
+  // under the matcher `.*` (any other matcher would hide an unknown tool from the hook) and the
+  // shared loader in place; OpenCode only with our plugin and the loader.
+  const loaderInstalled = existsSync(join(root, LOADER_RELATIVE));
+  let codexInstalled = false;
+  try {
+    const codex = JSON.parse(readFileSync(join(root, '.codex', 'hooks.json'), 'utf8')) as {
+      hooks?: { PreToolUse?: { matcher?: unknown; hooks?: unknown[] }[] };
+    };
+    const groups = codex.hooks?.PreToolUse ?? [];
+    codexInstalled =
+      loaderInstalled && groups.some((group) => group.matcher === '.*' && (group.hooks ?? []).some(isOurCodexHandler));
+  } catch {
+    codexInstalled = false;
+  }
+  lines.push(
+    codexInstalled
+      ? es
+        ? 'Codex: gancho instalado.'
+        : 'Codex: hook installed.'
+      : es
+        ? 'Codex: falta el gancho. Ejecuta: ai-workflows hooks install --apply'
+        : 'Codex: the hook is missing. Run: ai-workflows hooks install --apply',
+  );
+
+  let opencodeInstalled = false;
+  try {
+    opencodeInstalled =
+      loaderInstalled &&
+      readFileSync(join(root, '.opencode', 'plugins', 'ai-workflows.js'), 'utf8').includes(OPENCODE_PLUGIN_HEADER);
+  } catch {
+    opencodeInstalled = false;
+  }
+  lines.push(
+    opencodeInstalled
+      ? es
+        ? 'OpenCode: gancho instalado.'
+        : 'OpenCode: hook installed.'
+      : es
+        ? 'OpenCode: falta el plugin. Ejecuta: ai-workflows hooks install --apply'
+        : 'OpenCode: the plugin is missing. Run: ai-workflows hooks install --apply',
+  );
   // PLAN-13-R6 §4 test 7: a hook timeout that does not leave room over the watchdog would let the
   // tool through by timeout, so it is said and named.
   if (editorHookTimeout !== undefined && editorHookTimeout * 1000 <= HOOK_WATCHDOG_MS) {
@@ -1341,8 +1385,10 @@ export async function runAgentCli(argv: readonly string[], deps: AgentCliDeps): 
         text: 'Usage: ai-workflows <run|status|stop|pause|resume|doctor|build|review|sync|finish>',
       };
   }
-  // Every line the owner reads goes through the same terminal sanitiser, whatever command wrote it.
-  return { ok: result.ok, text: safeTerminalText(result.text) };
+  // Every line the owner reads goes through the same terminal sanitiser, whatever command wrote
+  // it. It is applied line by line so the line breaks themselves — the one-line-per-client shape
+  // of `doctor`, the steps of a status — survive instead of being flattened into a single line.
+  return { ok: result.ok, text: result.text.split('\n').map(safeTerminalText).join('\n') };
 }
 
 /** The accounts `gh` is signed in as, best effort: an unreadable answer is an empty list. */
