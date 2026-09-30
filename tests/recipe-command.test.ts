@@ -41,10 +41,10 @@ describe('init', () => {
   it('writes the example recipe where the engine looks for it', async () => {
     const output = await recipeCommand(['init'], { cwd });
 
-    expect(output).toEqual({
-      ok: true,
-      text: 'Created .ai-workflows/pipeline.yml. Read it in plain words with: ai-workflows explain',
-    });
+    // PLAN-13-R6 §9.2: init now also reports the workflows it refuses without a seal (this
+    // development copy has none), so the text is one line among others and `ok` is covered by
+    // tests/init-sealed.test.ts.
+    expect(output.text).toContain('Created .ai-workflows/pipeline.yml');
     expect(await readFile(recipePath(), 'utf8')).toBe(await readFile(TEMPLATE_URL, 'utf8'));
   });
 
@@ -55,7 +55,8 @@ describe('init', () => {
     const output = await recipeCommand(['init'], { cwd });
 
     expect(output.ok).toBe(false);
-    expect(output.text).toBe('.ai-workflows/pipeline.yml already exists; init does not overwrite it.');
+    // PLAN-13-R6 §9.2: each file is reported as written or already there, among other lines.
+    expect(output.text).toContain('.ai-workflows/pipeline.yml already exists; init does not overwrite it.');
     expect(await readFile(recipePath(), 'utf8')).toBe('mine\n');
   });
 });
