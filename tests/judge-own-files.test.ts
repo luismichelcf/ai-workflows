@@ -1905,3 +1905,48 @@ describe('fifth delta: .npmrc read the way the ini reader reads it', () => {
     });
   }
 });
+
+// Sixth delta review (PLAN-13-R6 §15): in YAML read by the judge, every map key must be a plain
+// string. A null key (`~`) and a `""` key collide when the judge reads the document, while pnpm's
+// reader keeps both (`null` and `""`), so a non-registry catalog entry could hide behind the empty
+// one. Any non-string key (null, number, boolean, timestamp) makes the file touched.
+describe('sixth delta: YAML keys must be plain strings', () => {
+  const BASE = 'packages: ["."]\ncatalog:\n  "": 1.0.0\n';
+  for (const [what, head] of [
+    ['a null key next to an empty-string key', 'packages: ["."]\ncatalog:\n  ~: github:attacker/evil\n  "": 1.0.0\n'],
+    ['the same keys in flow style', 'packages: ["."]\ncatalog: {~: "github:attacker/evil", "": 1.0.0}\n'],
+    ['a null catalog name next to an empty one', 'packages: ["."]\ncatalogs:\n  ~:\n    x: github:a/b\n  "":\n    x: 1.0.0\n'],
+    ['a number key', 'packages: ["."]\ncatalog:\n  "": 1.0.0\n  1: 2.0.0\n'],
+    ['a boolean key', 'packages: ["."]\ncatalog:\n  "": 1.0.0\n  true: 2.0.0\n'],
+  ] as const) {
+    it(`pnpm-workspace.yaml with ${what} → failure`, async () => {
+      const w = world({ 'pnpm-workspace.yaml': BASE });
+      const pr = w.pr({ 'pnpm-workspace.yaml': head });
+      const report = await w.judge();
+      expectRejectedForOwnFiles(w, pr, report);
+    });
+  }
+
+  it('control: a plain string key added to the catalog of another package → success', async () => {
+    const w = world({ 'pnpm-workspace.yaml': BASE });
+    w.pr({ 'pnpm-workspace.yaml': 'packages: ["."]\ncatalog:\n  "": 1.0.0\n  react: 18.3.0\n' });
+    await w.judge();
+    expect(states(w)).toEqual(['success']);
+  });
+});
+
+// Sixth delta review: `.npmrc` values end at any unescaped `;` or `#`, as the ini reader does.
+describe('sixth delta: .npmrc comments without a space before them', () => {
+  for (const [what, npmrc] of [
+    ['a ; with no space', 'only-built-dependencies-file=allow.json;x\n'],
+    ['a # with no space', 'only-built-dependencies-file=allow.json#x\n'],
+  ] as const) {
+    it(`.npmrc names allow.json with ${what}; allow.json edited → failure naming it`, async () => {
+      const w = world({ '.npmrc': npmrc, 'allow.json': json(['esbuild']) });
+      const head = w.pr({ 'allow.json': json(['esbuild', 'postinstall-x']) });
+      const report = await w.judge();
+      expectRejectedForOwnFiles(w, head, report);
+      expect(report.summary).toContain('allow.json');
+    });
+  }
+});
