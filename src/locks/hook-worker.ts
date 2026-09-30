@@ -9,11 +9,24 @@
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
-import { runHook, type HookKind, type HookResult, type RunHookOptions } from './hook-cli.js';
+import {
+  killPosixTree,
+  runHook,
+  type HookKind,
+  type HookResult,
+  type RunHookOptions,
+} from './hook-cli.js';
 import type { HookClient } from './install.js';
 
 /** How the child names itself on its own command line, so the module knows it is the entry. */
 const CHILD_FLAG = '--child';
+
+/**
+ * PLAN-13-R6 §15 (M-a): a `taskkill` that never returns must not hold the answer past the client's
+ * cut, so the Windows kill command is given a short limit. On POSIX the kill is a signal, a system
+ * call that cannot hang.
+ */
+const KILL_COMMAND_TIMEOUT_MS = 2_000;
 
 function reasonOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -78,7 +91,9 @@ if (process.argv[2] === CHILD_FLAG) {
  * Ends a process and its whole tree, best effort. PLAN-13-R6 §15: the deciding child may have its
  * own children (the git calls it starts), so the watchdog ends the tree, not only the child. On
  * POSIX the child is its own process group leader (`detached`) and the group is signalled; on
- * Windows `taskkill /T` walks the tree.
+ * Windows `taskkill /T` walks the tree, under a short limit so a hung command cannot hold the
+ * answer. §15 (M-b): the git the deciding child starts runs `detached`, in a group of its own, so
+ * the POSIX branch reuses the tree walk that names each descendant by pid.
  */
 function killProcessTree(pid: number | undefined): void {
   if (pid === undefined || pid <= 0) return;
@@ -87,21 +102,14 @@ function killProcessTree(pid: number | undefined): void {
       spawnSync('taskkill', ['/pid', String(pid), '/T', '/F'], {
         windowsHide: true,
         stdio: 'ignore',
+        timeout: KILL_COMMAND_TIMEOUT_MS,
       });
     } catch {
       // Best effort: a process already gone is not a reason to fail.
     }
     return;
   }
-  try {
-    process.kill(-pid, 'SIGKILL');
-  } catch {
-    try {
-      process.kill(pid, 'SIGKILL');
-    } catch {
-      // Already gone.
-    }
-  }
+  killPosixTree(pid);
 }
 
 export interface HookProcess {
@@ -162,6 +170,11 @@ export function spawnHookProcess(kind: HookKind, client: HookClient): HookProces
   return {
     result,
     cancel(): void {
+      // PLAN-13-R6 §15 (M-a): a deciding process that already closed by itself has no tree left to
+      // end. Killing by its old pid (or process group) could reach an unrelated process that now
+      // owns the number, so the tree is ended only while the child really runs: both `exitCode` and
+      // `signalCode` are `null` until it ends.
+      if (child.exitCode !== null || child.signalCode !== null) return;
       killProcessTree(child.pid);
     },
   };

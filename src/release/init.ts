@@ -19,7 +19,7 @@
 import { spawn, spawnSync, type ChildProcess, type SpawnOptions } from 'node:child_process';
 import { existsSync, realpathSync } from 'node:fs';
 import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
-import { basename, dirname, join, relative, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 
 import { parse } from 'yaml';
 
@@ -414,7 +414,12 @@ function windowsManagerScript(manager: InstallRequest['manager']): string | unde
   const candidates: string[] = [join(dirname(process.execPath), 'node_modules', manager, 'bin', entry)];
   for (const dir of (process.env['PATH'] ?? '').split(';')) {
     const trimmed = dir.trim();
-    if (trimmed.length > 0) candidates.push(join(trimmed, 'node_modules', manager, 'bin', entry));
+    // PLAN-13-R6 §15 (N2): a relative entry (`.`) is resolved against the folder init runs in,
+    // which is the project: a project carrying its own `node_modules/<manager>/bin/<entry>`
+    // would make init run that file. Only absolute entries of PATH are searched.
+    if (trimmed.length > 0 && isAbsolute(trimmed)) {
+      candidates.push(join(trimmed, 'node_modules', manager, 'bin', entry));
+    }
   }
   const execpath = process.env['npm_execpath'];
   if (typeof execpath === 'string' && execpath.length > 0 && basename(execpath).toLowerCase() === entry) {

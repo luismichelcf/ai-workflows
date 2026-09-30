@@ -57,7 +57,7 @@ function watchdogFrom(raw: string | undefined): number | undefined {
  * handle is still open. Claude Code cuts a hook that keeps running and lets the tool through, so
  * the process must not linger on a worker or on a pipe a grandchild holds.
  */
-function finishHook(result: HookResult): void {
+function finishHook(result: HookResult, afterWrite?: () => void): void {
   const write = (stream: NodeJS.WriteStream, text: string, next: () => void): void => {
     if (text.length === 0) {
       next();
@@ -66,7 +66,10 @@ function finishHook(result: HookResult): void {
     stream.write(text, next);
   };
   write(process.stdout, result.stdout, () => {
-    write(process.stderr, result.stderr, () => process.exit(result.exitCode));
+    write(process.stderr, result.stderr, () => {
+      afterWrite?.();
+      process.exit(result.exitCode);
+    });
   });
 }
 
@@ -98,8 +101,10 @@ if (command === 'hook') {
         const { spawnHookProcess } = await import('./locks/hook-worker.js');
         const running = spawnHookProcess(kind as HookKind, client);
         const result = await superviseHook(kind as HookKind, running.result, watchdogMs, client);
-        running.cancel();
-        finishHook(result);
+        // §15 (M-a): the answer goes out before the deciding process is ended, and the kill only
+        // happens while it really runs, with a bounded command on Windows. A kill command that
+        // hangs can never hold the answer past the client's cut.
+        finishHook(result, () => running.cancel());
       } else {
         const stdin = kind === 'pre-commit' ? '' : await readStdin();
         finishHook(await runHook(kind as HookKind, { projectDir, cwd: process.cwd(), stdin }));

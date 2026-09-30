@@ -6,7 +6,13 @@
 
 import { parse as parseYaml } from 'yaml';
 
-import { gitChangedPaths, gitFileAt, gitMergeBases, gitMergeTree } from '../recipe/facts.js';
+import {
+  gitChangedPaths,
+  gitFileAt,
+  gitMergeBases,
+  gitMergeTree,
+  type GitFileReading,
+} from '../recipe/facts.js';
 
 /**
  * The one list shared by the judge and `hooks install` (§2.1). Repository-relative, forward
@@ -109,6 +115,16 @@ function isPackageJson(file: string): boolean {
   return lower === 'package.json' || lower.endsWith('/package.json');
 }
 
+/**
+ * PLAN-13-R6 §15 (M-c): a workspace member's package.json is any `…/package.json` that is not the
+ * root one. Unlike the root one, a member that is added or removed has a trustworthy empty side:
+ * it is compared field by field with the missing side read as an empty object.
+ */
+function isMemberPackageJson(file: string): boolean {
+  const lower = file.toLowerCase();
+  return lower !== 'package.json' && lower.endsWith('/package.json');
+}
+
 /** The canonical engine-version files a pull request touches, whatever the case it committed. */
 export function engineVersionFilesIn(files: readonly string[]): string[] {
   const canonical = new Set(ENGINE_VERSION_FILES);
@@ -173,6 +189,10 @@ function projectPackageJson(value: unknown): string {
   }
   // PLAN-13-R6 §15 (M1): `packageManager` picks the installer through corepack.
   if (hasKey(value, 'packageManager')) out['packageManager'] = value['packageManager'];
+  // PLAN-13-R6 §15 (M-d): `workspaces` says which folders are members (whose lifecycle scripts
+  // run), and `dependenciesMeta` can allow or forbid build scripts of dependencies.
+  if (hasKey(value, 'workspaces')) out['workspaces'] = value['workspaces'];
+  if (hasKey(value, 'dependenciesMeta')) out['dependenciesMeta'] = value['dependenciesMeta'];
   collectEngineKeys(value['overrides'], 'overrides', out);
   collectEngineKeys(value['resolutions'], 'resolutions', out);
   const pnpm = value['pnpm'];
@@ -200,6 +220,11 @@ function projectWorkspace(value: unknown): string {
     'dangerouslyAllowAllBuilds',
     'onlyBuiltDependenciesFile',
     'neverBuiltDependencies',
+    // PLAN-13-R6 §15 (M-d): which folders are members, the config dependencies pnpm runs, and the
+    // allow-list of build scripts (the other spelling of the build permission).
+    'packages',
+    'configDependencies',
+    'allowBuilds',
   ] as const) {
     if (hasKey(value, key)) out[key] = value[key];
   }
@@ -300,10 +325,24 @@ function projectionOf(file: string, content: string): string | undefined {
 }
 
 /**
+ * The projection of one side of a comparison. PLAN-13-R6 §15 (M-c): a workspace member's
+ * package.json that is missing reads as an empty object, so adding it with only name and ordinary
+ * dependencies, or deleting it without lifecycle scripts, is not a change. The root package.json,
+ * the lockfiles and a member that cannot be read as its format have no trustworthy empty side:
+ * they count as touched.
+ */
+function projectionOfSide(file: string, reading: GitFileReading): string | undefined {
+  if (reading.kind === 'file') return projectionOf(file, reading.content ?? '');
+  if (reading.kind === 'missing' && isMemberPackageJson(file)) return projectPackageJson({});
+  return undefined;
+}
+
+/**
  * PLAN-13-R6 §2.2 and §15 P3: whether the engine version this pull request installs changes. The
  * comparison is fail-closed — a file that cannot be read as its format on either side, or that is
- * added or removed, counts as touched. A git failure to read a commit throws, and the judge turns
- * it into a technical error, never into a pass.
+ * added or removed (except a workspace member's package.json, which has an empty side), counts as
+ * touched. A git failure to read a commit throws, and the judge turns it into a technical error,
+ * never into a pass.
  */
 async function projectionDiffers(
   root: string,
@@ -313,10 +352,54 @@ async function projectionDiffers(
 ): Promise<boolean> {
   const before = await gitFileAt(root, a, file, ENGINE_VERSION_MAX_BYTES);
   const after = await gitFileAt(root, b, file, ENGINE_VERSION_MAX_BYTES);
-  if (before.kind !== 'file' || after.kind !== 'file') return true;
-  const one = projectionOf(file, before.content ?? '');
-  const other = projectionOf(file, after.content ?? '');
+  const one = projectionOfSide(file, before);
+  const other = projectionOfSide(file, after);
   return one === undefined || other === undefined || one !== other;
+}
+
+/** A repository path folded for comparison: forward slashes, no `./`, lower case. */
+function foldRepoPath(path: string): string {
+  return path.replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase();
+}
+
+/** The path a settings value names, normalized for comparison, or `undefined` when it names none. */
+function namedPath(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const folded = foldRepoPath(value.trim());
+  return folded.length > 0 ? folded : undefined;
+}
+
+/**
+ * PLAN-13-R6 §15 (M-d): the file the trusted side names with `onlyBuiltDependenciesFile` (in
+ * `pnpm-workspace.yaml` or in `pnpm` of `package.json`). pnpm builds only what that file lists, so
+ * it decides which dependencies run code. A git failure throws; a config that cannot be read, or
+ * that names nothing, yields no named file (the config itself is compared field by field).
+ */
+async function namedBuildFile(root: string, trusted: string): Promise<string | undefined> {
+  const workspace = await gitFileAt(root, trusted, 'pnpm-workspace.yaml', ENGINE_VERSION_MAX_BYTES);
+  if (workspace.kind === 'file') {
+    try {
+      const parsed = parseYaml(workspace.content ?? '');
+      if (isRecord(parsed)) {
+        const found = namedPath(parsed['onlyBuiltDependenciesFile']);
+        if (found !== undefined) return found;
+      }
+    } catch {
+      // Not YAML: its own projection already counts it as touched; no named file to add.
+    }
+  }
+  const packageJson = await gitFileAt(root, trusted, 'package.json', ENGINE_VERSION_MAX_BYTES);
+  if (packageJson.kind === 'file') {
+    try {
+      const parsed: unknown = JSON.parse(packageJson.content ?? '');
+      if (isRecord(parsed) && isRecord(parsed['pnpm'])) {
+        return namedPath((parsed['pnpm'] as Record<string, unknown>)['onlyBuiltDependenciesFile']);
+      }
+    } catch {
+      // Not JSON: its own projection already counts it as touched; no named file to add.
+    }
+  }
+  return undefined;
 }
 
 export interface OwnFilesScan {
@@ -372,6 +455,14 @@ export async function scanOwnFiles(
       differs = await projectionDiffers(root, trusted, merge.tree, file);
     }
     if (differs) versionTouched.push(file);
+  }
+
+  // PLAN-13-R6 §15 (M-d): the file the trusted side names as its build allow-list is one of the
+  // judge's own; a change to it is reported with its name, like any engine-version file.
+  const buildFile = await namedBuildFile(root, trusted);
+  if (buildFile !== undefined) {
+    const changed = files.find((file) => foldRepoPath(file) === buildFile);
+    if (changed !== undefined && !versionTouched.includes(changed)) versionTouched.push(changed);
   }
   return { files, conflicted: false, versionTouched };
 }

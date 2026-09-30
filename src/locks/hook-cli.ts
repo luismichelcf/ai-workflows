@@ -239,7 +239,7 @@ function posixDescendants(root: number): number[] {
  * not leave it), then the detached descendants by their own pid. A process that is already gone
  * is not a reason to fail; the signal is best effort.
  */
-function killPosixTree(pid: number): void {
+export function killPosixTree(pid: number): void {
   if (pid <= 0) return;
   const descendants = posixDescendants(pid);
   try {
