@@ -415,6 +415,10 @@ Diseño:
   `GIT_OPTIONAL_LOCKS=0`.
 - **Vigilante externo.** El hilo principal corre la decisión en un `Worker` y, a los 25 s, escribe
   el rechazo del cliente y sale. Cubre también las lecturas de disco que bloquean el hilo.
+  *(Cambiado en la construcción de los arreglos, encargo H:)* la decisión corre en un **proceso**
+  hijo, no en un `Worker`: en Linux, un hilo bloqueado en una lectura nativa (un FIFO) impide que
+  `process.exit` termine el proceso, y la CI lo midió en 40 s. El vigilante se arma antes de leer la
+  entrada y mata al hijo al vencer.
 - **Salida explícita** con `process.exit` en `hook editor`, con la respuesta ya escrita.
 - **Entrada ligera:** `hook` carga solo lo que usa (importaciones dinámicas en `bin.ts`), para que
   el arranque en frío en Windows no se coma el presupuesto. Medido en esta PC el 29-sep (v0.3.x
