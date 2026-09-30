@@ -343,8 +343,10 @@ uno. Todo se muestra primero y se escribe solo con `--apply`, como hoy.
   inesperada, contesta el rechazo **en el formato de ese cliente** (JSON con salida 0 para Codex;
   salida distinta de 0 para el plugin de OpenCode, que entonces lanza error). La orden de Codex lo
   busca desde la raíz del repositorio (`git rev-parse --show-toplevel`), no desde la carpeta de la
-  sesión; si no lo encuentra, la orden falla y **eso es justo el caso que Codex deja pasar**: se
-  declara, y `doctor` comprueba que la orden instalada resuelve desde una subcarpeta.
+  sesión. *(Corregido en la revisión del encargo B:)* la orden misma falla cerrada: solo deja
+  pasar si el cargador terminó con 0 y sin salida, o reenvía su JSON de rechazo; en cualquier otro
+  caso (sin repositorio, sin cargador, cargador que falla o muere, salida que no es ese JSON)
+  imprime ella el JSON de rechazo y sale con 0, porque Codex deja pasar cualquier otra salida.
 - Al terminar, en llano: qué se escribió y qué falta. En Codex interactivo, el dueño aprueba una
   vez el gancho en `/hooks`; Codex `exec` salta los ganchos no aprobados salvo con
   `--dangerously-bypass-hook-trust`.
