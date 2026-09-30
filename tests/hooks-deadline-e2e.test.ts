@@ -21,7 +21,12 @@ import { emptyFolder, git, removeRepositories, repository } from './git-fixtures
 //  - `bin.ts` loads only what `hook` uses: `hook editor` works with `dist/judge/cli.js`,
 //    `dist/agent/cli.js` and `dist/recipe/command.js` absent from the package (dynamic imports).
 
-afterEach(removeRepositories);
+// Runs after the stray-killing hook below (after-hooks run in reverse order). A fake `taskkill` that
+// was just killed can still hold its folder on Windows for a moment, so the removal waits first.
+afterEach(async () => {
+  await new Promise((resolve) => setTimeout(resolve, 1500));
+  removeRepositories();
+});
 
 const lines = (...rows: string[]): string => `${rows.join('\n')}\n`;
 const RECIPE = lines(
