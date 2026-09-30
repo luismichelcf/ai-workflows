@@ -177,6 +177,63 @@ describe('restoration puts back only what this run wrote last', () => {
   });
 });
 
+// PLAN-13-R6 §11 (RAMA-1, RAMA-2): the run creates a working branch (`staging`) and writes to it
+// more than once. Only a branch the run created is written; its restoration compares with the LAST
+// thing the run wrote there, deletes it only then, and reports a branch somebody else moved.
+describe('a working branch the run creates and writes to', () => {
+  it('writes files on top of its own branch, and the restoration deletes it and verifies clean', async () => {
+    const gh = fakeGitHub();
+    const sandbox = createSandbox({ port: gh.port, run: RUN });
+    await sandbox.acquire();
+    await sandbox.createBranch('staging', gh.state.mainHead);
+    const first = await sandbox.writeBranchFiles('staging', { 'docs/nota.md': 'nota\n' });
+    expect(gh.state.refs.get('refs/heads/staging')).toBe(first);
+    expect(gh.state.commits.get(first)?.parent).toBe(gh.state.mainHead);
+    const second = await sandbox.writeBranchFiles('staging', { '.ai-workflows/pipeline.yml': 'version: 1\n' });
+    expect(gh.state.commits.get(second)?.parent).toBe(first);
+    expect(gh.state.branches.has('staging')).toBe(true);
+    const result = await sandbox.restore();
+    expect(result, result.problems.join('\n')).toEqual({ ok: true, problems: [] });
+    expect(gh.state.refs.has('refs/heads/staging')).toBe(false);
+    expect(gh.state.branches.has('staging')).toBe(false);
+  });
+
+  it('never writes to a branch the run did not create', async () => {
+    const gh = fakeGitHub();
+    const sandbox = createSandbox({ port: gh.port, run: RUN });
+    await sandbox.acquire();
+    gh.state.refs.set('refs/heads/ajena', gh.state.mainHead);
+    await expect(sandbox.writeBranchFiles('ajena', { 'x.txt': 'x' })).rejects.toThrow(/ajena/);
+    expect(gh.state.refs.get('refs/heads/ajena')).toBe(gh.state.mainHead);
+  });
+
+  it('a branch somebody else moved after the last write is reported, not deleted, and the lock stays', async () => {
+    const gh = fakeGitHub();
+    const sandbox = createSandbox({ port: gh.port, run: RUN });
+    await sandbox.acquire();
+    await sandbox.createBranch('staging', gh.state.mainHead);
+    await sandbox.writeBranchFiles('staging', { 'docs/nota.md': 'nota\n' });
+    gh.state.refs.set('refs/heads/staging', 'e'.repeat(40));
+    const result = await sandbox.restore();
+    expect(result.ok).toBe(false);
+    expect(result.problems.join('\n')).toMatch(/rama staging/);
+    expect(gh.state.refs.get('refs/heads/staging')).toBe('e'.repeat(40));
+    expect(gh.state.refs.has(LOCK)).toBe(true);
+  });
+
+  it('after a crash right after moving the branch, recovery reconciles the write and ends in the snapshot', async () => {
+    const gh = fakeGitHub({ crashAfter: 'updateRef:refs/heads/staging' });
+    const sandbox = createSandbox({ port: gh.port, run: RUN });
+    await sandbox.acquire();
+    await sandbox.createBranch('staging', gh.state.mainHead);
+    await expect(sandbox.writeBranchFiles('staging', { 'docs/nota.md': 'nota\n' })).rejects.toThrow(/caída simulada/);
+    const recovered = await recoverSandbox({ port: gh.port });
+    expect(recovered.ok, recovered.problems.join('\n')).toBe(true);
+    expect(gh.state.refs.has('refs/heads/staging')).toBe(false);
+    expect(gh.state.refs.has(LOCK)).toBe(false);
+  });
+});
+
 describe('recovery of an abandoned run', () => {
   // Prefixes of the fake's labels: the harness puts its own marker in titles and messages.
   const crashes = ['createRef:' + LOCK, 'setVariable:on', 'putRuleset', 'createIssue:', 'commitToMain:'];

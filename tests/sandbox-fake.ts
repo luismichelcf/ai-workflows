@@ -73,6 +73,8 @@ export function fakeGitHub(options: { crashAfter?: string } = {}) {
       if (state.refs.has(name)) return 'exists';
       state.refs.set(name, sha);
       if (name.startsWith('refs/ai-workflows/')) state.stateRefs.add(name);
+      // Like GitHub: a new `refs/heads/…` is a branch, listed with the others.
+      if (name.startsWith('refs/heads/')) state.branches.add(name.slice('refs/heads/'.length));
       crash(`createRef:${name}`);
       return 'created';
     },
@@ -192,6 +194,7 @@ export function fakeGitHub(options: { crashAfter?: string } = {}) {
     async deleteBranch(name) {
       if (!state.branches.has(name)) throw new Error('gh: Reference does not exist (HTTP 422)');
       state.branches.delete(name);
+      state.refs.delete(`refs/heads/${name}`);
     },
     async findPullRequests(marker) {
       return [...state.prs].filter(([, pr]) => pr.marker?.includes(marker)).map(([n]) => n);

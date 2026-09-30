@@ -283,11 +283,15 @@ const checkWorkflow = (name: string, run: string) => lines(
   `      - run: ${run}`,
 );
 
-/** The judge workflows of the templates, pinned to the engine commit under test. */
-function judgeWorkflows(engineSha: string): Record<string, string> {
+/**
+ * The judge workflows of the templates, pinned to the engine commit under test. With `branches`,
+ * the judge gets that input, as `init` writes it from a recipe with working branches (R6 §1.2).
+ */
+function judgeWorkflows(engineSha: string, branches?: string): Record<string, string> {
   const read = (name: string) => readFileSync(join(ENGINE_ROOT, 'templates', name), 'utf8').replaceAll('<ENGINE_SHA>', engineSha);
   const judge = parse(read('ai-workflows.yml')) as Record<string, any>;
   judge['on']['workflow_run']['workflows'] = [...new Set([...(judge['on']['workflow_run']['workflows'] as string[]), 'todo-verde', 'fronteras'])];
+  if (branches !== undefined) judge['jobs']['judge']['steps'][0]['with']['branches'] = branches;
   const red = parse(read('ai-workflows-red-test.yml')) as Record<string, any>;
   for (const job of Object.values(red['jobs'] as Record<string, any>)) {
     job['steps'] = (job['steps'] as Record<string, any>[]).filter((step) => !/pnpm|setup-node|action-setup/.test(`${step['run'] ?? ''}${step['uses'] ?? ''}`));
@@ -333,8 +337,24 @@ const checkDone = (sha: string, name: string) =>
 
 /** The stage lines of the judge's own summary, read from the run that published the latest status. */
 function stagesOf(status: Status): Record<string, { outcome: string; reason: string }> {
+  const text = judgeRunLog(status);
+  const stages: Record<string, { outcome: string; reason: string }> = {};
+  for (const match of text.matchAll(/^.*?- ([\w-]+): (passed|rejected|waiting|technical|skipped|informative)(?: — (.*))?$/gm)) {
+    const [, stage, outcome, reason] = match;
+    if (stage !== undefined && outcome !== undefined) stages[stage] = { outcome, reason: reason ?? '' };
+  }
+  return stages;
+}
+
+/** The whole log of the run that published a status. */
+function judgeRunLog(status: Status): string {
   const id = /\/actions\/runs\/(\d+)/.exec(status.target_url ?? '')?.[1];
   if (id === undefined) throw new Error(`the status has no run: ${JSON.stringify(status)}`);
+  return runLogText(id);
+}
+
+/** The log of a run, once it ended. */
+function runLogText(id: string): string {
   // The judge publishes its verdict before its run ends, and GitHub only gives the log of an ended
   // run: wait for it (seen in the first real run).
   const deadline = Date.now() + 10 * MINUTE;
@@ -352,12 +372,7 @@ function stagesOf(status: Status): Record<string, { outcome: string; reason: str
       execFileSync(process.execPath, ['-e', 'setTimeout(() => {}, 10000)']);
     }
   }
-  const stages: Record<string, { outcome: string; reason: string }> = {};
-  for (const match of text.matchAll(/^.*?- ([\w-]+): (passed|rejected|waiting|technical|skipped|informative)(?: — (.*))?$/gm)) {
-    const [, stage, outcome, reason] = match;
-    if (stage !== undefined && outcome !== undefined) stages[stage] = { outcome, reason: reason ?? '' };
-  }
-  return stages;
+  return text;
 }
 
 const notPassing = (stages: Record<string, { outcome: string }>) =>
@@ -376,6 +391,7 @@ function prState(n: number) {
 let sandbox: Sandbox;
 let clone = '';
 let mainSha = '';
+let engineSha = '';
 let engine: BuiltEngine | undefined;
 const folders: string[] = [];
 
@@ -416,12 +432,16 @@ function completeFiles(n: number): Record<string, string> {
   };
 }
 
-/** A new issue (the piece), its branch pushed by the agents and its pull request opened by them. */
-async function openPiece(name: string, files: (n: number) => Record<string, string | null>, options: { pullRequest?: boolean; workflowByOwner?: boolean } = {}): Promise<Piece> {
+/**
+ * A new issue (the piece), its branch pushed by the agents and its pull request opened by them,
+ * into `main` or, with `base`, into another working branch (R6 §1).
+ */
+async function openPiece(name: string, files: (n: number) => Record<string, string | null>, options: { pullRequest?: boolean; workflowByOwner?: boolean; base?: string } = {}): Promise<Piece> {
   const n = await sandbox.createIssue(`suite negativa · ${name}`);
   const branch = `feat/${n}-${name}`;
-  await agentGit(clone, 'fetch', '-q', 'origin', 'main');
-  git(clone, 'switch', '-q', '-C', branch, 'origin/main');
+  const into = options.base ?? 'main';
+  await agentGit(clone, 'fetch', '-q', 'origin', into);
+  git(clone, 'switch', '-q', '-C', branch, `origin/${into}`);
   const base = git(clone, 'rev-parse', 'HEAD');
   const content = files(n);
   for (const [path, text] of Object.entries(content)) {
@@ -446,7 +466,7 @@ async function openPiece(name: string, files: (n: number) => Record<string, stri
   }
   // Without a pull request the engine opens its own (with its mark), as in CN-06.
   if (options.pullRequest === false) return { n, branch, pr: 0, head, base, files: content, mark: 0 };
-  const url = await asAgent('pr', 'create', '--repo', REPO, '--head', branch, '--base', 'main', '--title', `Suite negativa · ${name} (#${n})`, '--body', `Pieza #${n} de la suite negativa (PLAN-13-R5). Se cierra sola.`);
+  const url = await asAgent('pr', 'create', '--repo', REPO, '--head', branch, '--base', into, '--title', `Suite negativa · ${name} (#${n})`, '--body', `Pieza #${n} de la suite negativa (PLAN-13-R5). Se cierra sola.`);
   const pr = Number(url.split('/').at(-1));
   await sandbox.trackPullRequest(pr, branch);
   expect(prState(pr).author.login.replace(/^app\//, '')).toMatch(new RegExp(`^${AGENT.replace(/\[bot\]$/, '')}`));
@@ -568,6 +588,25 @@ function record(entry: Omit<CaseRecord, 'run'>): void {
   recordCase({ run: sandbox.run, ...entry });
 }
 
+/**
+ * The rehearsal's own queue lock (`candado-cola`, a copy of the real project's, not the engine)
+ * downloads the engine; in the seventh real run GitHub answered that download with a 500 and the
+ * lock stayed red, so the piece never entered the queue. A lock that failed on a GitHub server
+ * error is re-run once, as a person would, and the case says so. Any other red stays red.
+ */
+function rerunQueueLock(piece: Piece, reruns: number[]): void {
+  if (reruns.includes(piece.pr) || latest(piece.head, 'candado-cola')?.state !== 'failure') return;
+  const failed = ghJson<{ databaseId: number; conclusion: string; createdAt: string }[]>('run', 'list', '--repo', REPO, '--commit', piece.head, '--workflow', 'Candado de la cola', '--json', 'databaseId,conclusion,createdAt')
+    .filter((run) => run.conclusion === 'failure')
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
+  if (failed === undefined) return;
+  const text = gh('run', 'view', String(failed.databaseId), '--repo', REPO, '--log');
+  if (!/returned error: 5\d\d/.test(text)) throw new Error(`the rehearsal queue lock of PR #${piece.pr} failed for a reason other than a GitHub server error`);
+  gh('run', 'rerun', String(failed.databaseId), '--repo', REPO, '--failed');
+  reruns.push(piece.pr);
+  log(`the rehearsal queue lock of PR #${piece.pr} failed on a GitHub server error; re-run once`);
+}
+
 async function tryToMerge(piece: Piece): Promise<void> {
   try {
     await asAgent('pr', 'merge', String(piece.pr), '--repo', REPO, '--squash', '--auto');
@@ -604,7 +643,7 @@ beforeAll(async () => {
     .filter((name) => (process.env[name] ?? '') === '');
   if (missing.length > 0) throw new Error(`the real run needs ${missing.join(', ')}; it never skips`);
 
-  const engineSha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: ENGINE_ROOT, encoding: 'utf8' }).trim();
+  engineSha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: ENGINE_ROOT, encoding: 'utf8' }).trim();
   gh('api', `repos/${ENGINE_REPO}/commits/${engineSha}`); // push the branch under test first
 
   sandbox = await attachSandbox({ port: createGhSandboxPort(REPO), run: inject('sandboxRun') });
@@ -1126,23 +1165,9 @@ describe.sequential('the negative suite on GitHub (PLAN-13-R5 §2)', () => {
     }
     for (const piece of pieces) await settled(piece.head, ['success']);
     for (const piece of pieces) await asAgent('pr', 'merge', String(piece.pr), '--repo', REPO, '--squash', '--auto');
-    // The rehearsal's own queue lock (`candado-cola`, a copy of the real project's, not the engine)
-    // downloads the engine; in the seventh real run GitHub answered that download with a 500 and the
-    // lock stayed red, so the piece never entered the queue. A lock that failed on a GitHub server
-    // error is re-run once, as a person would, and the report says so. Any other red stays red.
+    // The rehearsal's own queue lock may fail on a GitHub server error: see `rerunQueueLock`.
     const reruns: number[] = [];
-    const rerunIfServerError = (piece: Piece): void => {
-      if (reruns.includes(piece.pr) || latest(piece.head, 'candado-cola')?.state !== 'failure') return;
-      const failed = ghJson<{ databaseId: number; conclusion: string; createdAt: string }[]>('run', 'list', '--repo', REPO, '--commit', piece.head, '--workflow', 'Candado de la cola', '--json', 'databaseId,conclusion,createdAt')
-        .filter((run) => run.conclusion === 'failure')
-        .sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
-      if (failed === undefined) return;
-      const text = gh('run', 'view', String(failed.databaseId), '--repo', REPO, '--log');
-      if (!/returned error: 5\d\d/.test(text)) throw new Error(`the rehearsal queue lock of PR #${piece.pr} failed for a reason other than a GitHub server error`);
-      gh('run', 'rerun', String(failed.databaseId), '--repo', REPO, '--failed');
-      reruns.push(piece.pr);
-      log(`COLA-6: the rehearsal queue lock of PR #${piece.pr} failed on a GitHub server error; re-run once`);
-    };
+    const rerunIfServerError = (piece: Piece): void => rerunQueueLock(piece, reruns);
     const noted: number[] = [];
     try {
       for (const piece of pieces) {
@@ -1189,6 +1214,537 @@ describe.sequential('the negative suite on GitHub (PLAN-13-R5 §2)', () => {
     expect(notPassing(passed.stages)).toEqual([]);
     record({ id: 'CN-05b', attempt: 'Cerrar una pieza visible sin la aprobación del dueño', stoppedBy: ['juez'], negative: 'frenado', positive: 'pasó', evidence: [prUrl(visible.pr), runUrl(passed.status)], owner: { button: true } });
   }, 35 * MINUTE);
+});
+
+// ---------------------------------------------------------------------------------------------
+// PLAN-13-R6 §11 (R29): the real evidence of slice 6. Only the cases that touch what slice 6 adds,
+// with the same harness, pieces and records as the cases above. `AI_WORKFLOWS_SUITE_SLICE=6 pnpm
+// test:github:report` runs only these (their names start with «R29:»); the report then refers to
+// the report of 29-sep for the rest of the suite. None of them needs the owner's Approve button.
+
+const RUN_URL = (id: number | string) => `https://github.com/${REPO}/actions/runs/${id}`;
+
+interface JudgeRun { id: number; event: string; status: string; conclusion: string | null; head_sha: string; html_url: string }
+interface JobInfo { started_at: string | null; completed_at: string | null; steps?: { name: string; status: string; conclusion: string | null }[] }
+
+/** The newest runs of the judge workflow (one page is plenty inside one case). */
+function newestJudgeRuns(): JudgeRun[] {
+  return ghJson<{ workflow_runs: JudgeRun[] }>('api', `repos/${REPO}/actions/workflows/ai-workflows.yml/runs?per_page=100`).workflow_runs;
+}
+
+/** The id of the newest run of the judge: run ids only grow, so it marks "from here on". */
+function lastJudgeRunId(): number {
+  return Math.max(0, ...newestJudgeRuns().map((run) => run.id));
+}
+
+/** The runs of the judge created after a known run id. */
+function judgeRunsAfter(afterId: number): JudgeRun[] {
+  const runs = newestJudgeRuns();
+  const after = runs.filter((run) => run.id > afterId);
+  if (after.length === runs.length && runs.length >= 100) throw new Error(`more than 100 judge runs after ${afterId}: the case cannot tell them apart`);
+  return after;
+}
+
+function judgeRun(id: number): JudgeRun {
+  return ghJson<JudgeRun>('api', `repos/${REPO}/actions/runs/${id}`);
+}
+
+function jobsOf(id: number): JobInfo[] {
+  return ghJson<{ jobs: JobInfo[] }>('api', `repos/${REPO}/actions/runs/${id}/jobs?filter=all&per_page=100`).jobs;
+}
+
+/** A run «started» when one of its steps really ran; a run that waited in its group and was replaced has none. */
+const ranSteps = (jobs: readonly JobInfo[]): boolean =>
+  jobs.some((job) => (job.steps ?? []).some((step) => step.status === 'in_progress' || step.conclusion === 'success' || step.conclusion === 'failure'));
+
+/** Waits until no run of the judge created after `afterId` is still queued or running. */
+async function judgeIdle(afterId: number): Promise<void> {
+  await waitFor('the judge runs to end', () => (judgeRunsAfter(afterId).every((run) => run.status === 'completed') ? true : undefined), 20 * MINUTE, 15_000);
+}
+
+/** Waits until a piece armed in the queue is merged, noting the merge for the harness whatever happens. */
+async function mergedThroughQueue(piece: Piece, reruns: number[]): Promise<void> {
+  let fatal: unknown;
+  try {
+    await waitFor(`PR #${piece.pr} merged`, () => {
+      try {
+        const state = prState(piece.pr).state;
+        if (state === 'CLOSED') throw new Error(`PR #${piece.pr} was closed without merging`);
+        if (state === 'MERGED') return true;
+        rerunQueueLock(piece, reruns);
+        return undefined;
+      } catch (error) {
+        if (error instanceof Error && /closed without merging|other than a GitHub server error/.test(error.message)) {
+          fatal = error;
+          return true;
+        }
+        throw error;
+      }
+    }, 60 * MINUTE, 30_000);
+  } finally {
+    if (prState(piece.pr).state === 'MERGED') await sandbox.noteMerged(piece.pr);
+  }
+  if (fatal !== undefined) throw fatal;
+}
+
+/** Where a pull request stands with the queue: merged, still in it, or out of it and open. */
+function queueState(n: number): { state: string; inQueue: boolean; autoMerge: boolean } {
+  const [owner, name] = REPO.split('/');
+  const pr = ghJson<{ state: string; mergeQueueEntry: unknown; autoMergeRequest: unknown }>('api', 'graphql', '-f',
+    `query=query { repository(owner: "${owner}", name: "${name}") { pullRequest(number: ${n}) { state mergeQueueEntry { id } autoMergeRequest { enabledAt } } } }`,
+    '--jq', '.data.repository.pullRequest');
+  return { state: pr.state, inQueue: pr.mergeQueueEntry !== null, autoMerge: pr.autoMergeRequest !== null };
+}
+
+interface RedTestRun { checkRunId: number; status: string; conclusion: string | null; app: string; runId?: number; path?: string }
+
+/**
+ * Every check-run named `ai-workflows/red-test` on a SHA, with the workflow file it came from,
+ * read the way the judge's chain reads it (R6 §7): check suite → Actions run → workflow → path.
+ */
+function redTestRuns(sha: string): RedTestRun[] {
+  const pages = ghJson<{ check_runs: { id: number; name: string; status: string; conclusion: string | null; app: { slug: string } | null; check_suite: { id: number } | null }[] }[]>(
+    'api', `repos/${REPO}/commits/${sha}/check-runs?check_name=${encodeURIComponent('ai-workflows/red-test')}&filter=all&per_page=100`, '--paginate', '--slurp');
+  return pages.flatMap((page) => page.check_runs).filter((run) => run.name === 'ai-workflows/red-test').map((run) => {
+    const suite = run.check_suite?.id;
+    const actionRuns = suite === undefined ? [] : ghJson<{ workflow_runs: { id: number; workflow_id: number }[] }>('api', `repos/${REPO}/actions/runs?check_suite_id=${suite}`).workflow_runs;
+    const actionRun = actionRuns.length === 1 ? actionRuns[0] : undefined;
+    const path = actionRun === undefined ? undefined : ghJson<{ path: string }>('api', `repos/${REPO}/actions/workflows/${actionRun.workflow_id}`).path;
+    return {
+      checkRunId: run.id,
+      status: run.status,
+      conclusion: run.conclusion,
+      app: run.app?.slug ?? '',
+      ...(actionRun === undefined ? {} : { runId: actionRun.id }),
+      ...(path === undefined ? {} : { path }),
+    };
+  });
+}
+
+/** A workflow of the pull request that imitates the red test: its job is named like the official one. */
+const IMPOSTOR_RED_TEST = lines(
+  'name: ai-workflows red-test',
+  'on:',
+  '  pull_request:',
+  'permissions: { contents: read }',
+  'jobs:',
+  '  red-test:',
+  '    name: ai-workflows/red-test',
+  '    runs-on: ubuntu-latest',
+  '    steps:',
+  '      - run: sleep 180',
+);
+const IMPOSTOR_OTHER_NAME = '.github/workflows/prueba-roja-propia.yml';
+const IMPOSTOR_SUFFIXED = '.github/workflows/ai-workflows-red-test.yml@falso.yml';
+
+/** A test that already passes on main: the official red test must fail it. */
+const weakTest = (n: number) => lines('import assert from "node:assert/strict";', `export const cases = { "la pieza ${n} existe": () => assert.ok(true) };`);
+
+const CLAUDE_SETTINGS = (withHook: boolean) => `${JSON.stringify({
+  hooks: withHook
+    ? { PreToolUse: [{ matcher: 'Write|Edit|MultiEdit|NotebookEdit', hooks: [{ type: 'command', command: 'node', args: ['node_modules/ai-workflows/dist/bin.js', 'hook', 'editor'] }] }] }
+    : {},
+}, null, 2)}\n`;
+const PROJECT_MANIFEST = (engine: string, leftPad: string) => `${JSON.stringify({ name: 'ensayo', private: true, devDependencies: { 'ai-workflows': engine, 'left-pad': leftPad } }, null, 2)}\n`;
+
+/** The judge workflow alone, with or without the `branches` input. */
+function judgeWorkflow(branches?: string): string {
+  const text = judgeWorkflows(engineSha, branches)[WORKFLOW];
+  if (text === undefined) throw new Error('the judge workflow is missing from the templates');
+  return text;
+}
+
+/** The working branches of R6 §1.1, as the recipe of main and of staging declare them in RAMA. */
+const BRANCHES_BLOCK = lines('branches:', '  into: [staging, main]', '  promotions:', '    - { from: staging, to: main }');
+const STAGING_SECTION = lines('', '## Prueba en staging', '', 'Se prueba en staging antes de pasar a main.');
+
+/** The recipe of staging: one stage more than main's, which only a pull request into staging must meet. */
+function stagingRecipe(): string {
+  const recipe = RECIPE();
+  const merge = "    after: approval\n    phase: merge\n";
+  if (!recipe.includes(merge)) throw new Error('the suite recipe changed: cannot add the stage of staging');
+  return `${recipe.replace(merge, lines(
+    '    after: solo-staging',
+    '    phase: merge',
+  )).replace('  - id: merge\n', lines(
+    '  - id: solo-staging',
+    '    summary: "El plan dice cómo se prueba en staging"',
+    '    after: approval',
+    '    nature: structure',
+    '    applies-if: { kind-any: [behavior] }',
+    '    gate:',
+    '      uses: ai-workflows/spec-structure@1',
+    '      with: { file: "docs/plans/PLAN-{piece}.md", sections: ["Prueba en staging"] }',
+    '    server: recompute',
+    '  - id: merge',
+  ))}${BRANCHES_BLOCK}`;
+}
+
+describe.sequential('the evidence of slice 6 on GitHub (PLAN-13-R6 §11, R29)', () => {
+  it('R29: SV-04s+: removing the editor hook or changing the engine version is refused; the owner attestation passes; an unrelated dependency passes alone', async () => {
+    await sandbox.writeMainFiles({
+      '.claude/settings.json': CLAUDE_SETTINGS(true),
+      'package.json': PROJECT_MANIFEST('1.0.0', '1.3.0'),
+    }, `suite negativa ${sandbox.run}: el gancho del editor y la versión del motor en main (R29)`);
+    const papers = (n: number) => ({ [`docs/plans/PLAN-${n}.md`]: planOf(n, 'papeles') });
+
+    const hook = await openPiece('sin-gancho', (n) => ({ ...papers(n), '.claude/settings.json': CLAUDE_SETTINGS(false) }));
+    const hookRefused = await settled(hook.head, ['failure']);
+    expect(hookRefused.description).toContain(`/approve-judge-change ${hook.head.slice(0, 16)}`);
+    expect(judgeRunLog(hookRefused)).toContain('.claude/settings.json');
+
+    const version = await openPiece('otra-version', (n) => ({ ...papers(n), 'package.json': PROJECT_MANIFEST('1.0.1', '1.3.0') }));
+    const versionRefused = await settled(version.head, ['failure']);
+    expect(versionRefused.description).toContain(`/approve-judge-change ${version.head.slice(0, 16)}`);
+    expect(judgeRunLog(versionRefused)).toContain('package.json');
+    await tryToMerge(version);
+    await stillOpen(version);
+
+    const unrelated = await openPiece('otra-dependencia', (n) => ({ ...papers(n), 'package.json': PROJECT_MANIFEST('1.0.0', '1.3.1') }));
+    const unrelatedPassed = await settled(unrelated.head, ['success', 'failure', 'error']);
+    expect(unrelatedPassed.state, unrelatedPassed.description).toBe('success');
+
+    // The owner's attestation for this head, written with the owner's account (R22), as in SV-04s.
+    await tryToMerge(hook);
+    await stillOpen(hook);
+    gh('pr', 'comment', String(hook.pr), '--repo', REPO, '--body', `/approve-judge-change ${hook.head.slice(0, 16)}`);
+    const accepted = await waitFor('the judge after the attestation', () => (latest(hook.head)?.state === 'success' ? latest(hook.head) : undefined));
+    record({
+      id: 'SV-04s+',
+      attempt: 'Un PR quita el gancho del editor de .claude/settings.json y otro cambia la versión del motor en package.json, sin la orden del dueño. Control: con la orden del dueño para esa versión el primero pasa, y un PR que solo sube otra dependencia pasa sin orden',
+      stoppedBy: ['juez'],
+      negative: 'frenado',
+      positive: 'pasó',
+      evidence: [prUrl(hook.pr), runUrl(hookRefused), runUrl(accepted), prUrl(version.pr), runUrl(versionRefused), prUrl(unrelated.pr), runUrl(unrelatedPassed)],
+      owner: { ordersBySuite: ['/approve-judge-change'] },
+    });
+  }, 45 * MINUTE);
+
+  it('R29: BOT-1: a comment of the agents app with a link on a pull request starts no judgement; the same comment by a person does', async () => {
+    const caseStart = lastJudgeRunId();
+    const piece = await openPiece('comentario-robot', (n) => ({ [`docs/plans/PLAN-${n}.md`]: planOf(n, 'papeles') }));
+    await settled(piece.head, ['success']);
+    await judgeIdle(caseStart);
+    const count = statuses(piece.head).length;
+    const body = `Vista previa lista: https://example.com/vista-${sandbox.run}`;
+
+    const beforeBot = lastJudgeRunId();
+    const bot = JSON.parse(await asAgent('api', '-X', 'POST', `repos/${REPO}/issues/${piece.pr}/comments`, '-f', `body=${body}`)) as { user: { type: string } };
+    expect(bot.user.type).toBe('Bot');
+    await sleep(2 * MINUTE);
+    await judgeIdle(beforeBot);
+    const botRuns = judgeRunsAfter(beforeBot).filter((run) => run.event === 'issue_comment');
+    for (const run of botRuns) expect(ranSteps(jobsOf(run.id)), `judge run ${run.id} after the app comment ran its job`).toBe(false);
+    expect(statuses(piece.head)).toHaveLength(count);
+
+    // Positive control: the same comment by a person (the owner's account, R22) wakes the judge.
+    const beforeOwner = lastJudgeRunId();
+    gh('api', '-X', 'POST', `repos/${REPO}/issues/${piece.pr}/comments`, '-f', `body=${body}`);
+    const ownerRun = await waitFor('the judge run of the person comment', () => judgeRunsAfter(beforeOwner).find((run) => run.event === 'issue_comment' && run.status === 'completed'), 10 * MINUTE);
+    expect(ranSteps(jobsOf(ownerRun.id))).toBe(true);
+    expect(ownerRun.conclusion).toBe('success');
+    await waitFor('a new judgement on the head', () => (statuses(piece.head).length > count ? true : undefined));
+    record({
+      id: 'BOT-1',
+      attempt: `La aplicación de los agentes comenta en un PR con una dirección, como lo hacen Vercel o Supabase: ${botRuns.length === 0 ? 'GitHub no creó ninguna corrida del juez' : `GitHub creó ${botRuns.length} corrida(s) del juez sin ningún paso corrido`}, y no apareció ningún estado nuevo. Control: el mismo comentario de una persona sí despierta al juez`,
+      stoppedBy: ['juez'],
+      negative: 'frenado',
+      positive: 'pasó',
+      evidence: [prUrl(piece.pr), ownerRun.html_url],
+    });
+  }, 30 * MINUTE);
+
+  it('R29: B-T6: a verdict deleted from the issue and its judge run cancelled leave «juzgando» on the head, never the old green', async () => {
+    const piece = await openPiece('veredicto-borrado', completeFiles);
+    await builderEvent(piece);
+    let green: Status | undefined;
+    let caught: { runId: number; status: Status } | undefined;
+    // The run is cancelled between its «juzgando» and its verdict; a run that is quicker than the
+    // cancellation is not the case, and the attempt is made again with a new verdict.
+    for (let attempt = 1; attempt <= 4 && caught === undefined; attempt += 1) {
+      const comment = await verdict(piece, piece.head);
+      const passed = await judged(piece, ['success', 'failure', 'error']);
+      expect(passed.status.state, JSON.stringify(passed.stages)).toBe('success');
+      green ??= passed.status;
+      const mark = statuses(piece.head).length;
+      await asAgent('api', '-X', 'DELETE', `repos/${REPO}/issues/comments/${comment}`);
+      const seen = await waitFor('the first status after the verdict was deleted', () => {
+        const all = statuses(piece.head);
+        if (all.length <= mark) return undefined;
+        return all.find((status) => status.context === 'ai-workflows');
+      }, 10 * MINUTE, 2_000);
+      if (seen.state !== 'pending' || seen.description !== 'juzgando') {
+        log(`B-T6 attempt ${attempt}: the first new status was ${seen.state} «${seen.description}», not «juzgando»`);
+        continue;
+      }
+      const runId = Number(/\/actions\/runs\/(\d+)/.exec(seen.target_url ?? '')?.[1] ?? 0);
+      expect(judgeRun(runId).event).toBe('issue_comment');
+      try {
+        gh('run', 'cancel', String(runId), '--repo', REPO);
+      } catch (error) {
+        log(`B-T6 attempt ${attempt}: cancel refused: ${String((error as { stderr?: string }).stderr ?? error).trim()}`);
+        continue;
+      }
+      const ended = await waitFor('the cancelled run', () => {
+        const run = judgeRun(runId);
+        return run.status === 'completed' ? run : undefined;
+      }, 10 * MINUTE, 5_000);
+      await sleep(MINUTE);
+      const newest = latest(piece.head);
+      if (ended.conclusion !== 'cancelled' || newest?.target_url !== seen.target_url || newest.state !== 'pending') {
+        log(`B-T6 attempt ${attempt}: the run ended ${ended.conclusion} and the head shows ${newest?.state} «${newest?.description}»`);
+        continue;
+      }
+      caught = { runId, status: newest };
+    }
+    if (caught === undefined || green === undefined) throw new Error('no attempt cancelled the run of the deleted verdict between its «juzgando» and its verdict');
+    expect(caught.status.state).toBe('pending');
+    expect(latest(piece.head)?.state).not.toBe('success');
+    record({
+      id: 'B-T6',
+      attempt: 'Se borra el veredicto que dio el verde y la corrida del juez que eso dispara se cancela a mano antes de terminar: la cabeza queda en «juzgando», no en el verde viejo',
+      stoppedBy: ['juez'],
+      negative: 'frenado',
+      positive: 'pasó',
+      evidence: [prUrl(piece.pr), runUrl(green), RUN_URL(caught.runId)],
+    });
+  }, 60 * MINUTE);
+
+  it('R29: CN-14: an impostor red-test workflow never makes the red test count; the same piece with a real red test passes', async () => {
+    // Control first: a complete piece with a real red test. Its official run is also where the
+    // chain of R6 §7 is checked against GitHub before relying on it.
+    const control = await openPiece('roja-real', completeFiles);
+    await builderEvent(control);
+    await verdict(control, control.head);
+    const official = await waitFor('the official red test of the control', () => redTestRuns(control.head).find((run) => run.path === RED_WORKFLOW && run.status === 'completed'));
+    const actionRun = ghJson<{ pull_requests: { number: number; base?: { ref?: string; sha?: string } }[] }>('api', `repos/${REPO}/actions/runs/${official.runId ?? 0}`);
+    const listed = actionRun.pull_requests.find((pr) => pr.number === control.pr);
+    log(`CN-14: pull_requests of the red-test run ${official.runId}: ${JSON.stringify(actionRun.pull_requests.map((pr) => ({ number: pr.number, base: pr.base })))}`);
+    if (listed === undefined || listed.base?.ref !== 'main' || !/^[0-9a-f]{40}$/.test(listed.base.sha ?? '')) {
+      const reason = `GitHub no dio en la corrida oficial de la prueba roja lo que usa la cadena del juez: número ${listed === undefined ? 'ausente' : String(listed.number)}, base.ref ${listed?.base?.ref ?? 'ausente'}, base.sha ${listed?.base?.sha ?? 'ausente'}; hay que rediseñar la cadena antes de seguir`;
+      record({ id: 'CN-14', attempt: 'Comprobar que la corrida de la prueba roja trae el PR y su base', stoppedBy: [], negative: 'error', positive: 'no-aplica', evidence: [prUrl(control.pr), RUN_URL(official.runId ?? 0)], partial: reason });
+      throw new Error(reason);
+    }
+    const passed = await judged(control, ['success', 'failure', 'error']);
+    expect(passed.status.state, JSON.stringify(passed.stages)).toBe('success');
+
+    // The attack: the same piece with a test that already passes on main, plus two impostors.
+    const attack = await openPiece('roja-impostora', (n) => ({
+      ...completeFiles(n),
+      [`tests/suite/p${n}.test.mjs`]: weakTest(n),
+      [IMPOSTOR_OTHER_NAME]: IMPOSTOR_RED_TEST,
+      [IMPOSTOR_SUFFIXED]: IMPOSTOR_RED_TEST,
+    }), { workflowByOwner: true });
+    await builderEvent(attack);
+    await verdict(attack, attack.head);
+    const officialAttack = await waitFor('the official red test of the attack', () => redTestRuns(attack.head).find((run) => run.path === RED_WORKFLOW && run.status === 'completed'));
+    expect(officialAttack.conclusion).toBe('failure');
+    const impostor = await waitFor('the impostor red test', () => redTestRuns(attack.head).find((run) => run.path === IMPOSTOR_OTHER_NAME && run.status === 'completed'), 20 * MINUTE);
+    expect(impostor.conclusion).toBe('success');
+    // Whether GitHub runs the file whose name carries the official one plus «@falso.yml» is noted.
+    await sleep(2 * MINUTE);
+    const all = redTestRuns(attack.head);
+    const suffixed = all.filter((run) => run.path === IMPOSTOR_SUFFIXED);
+    log(`CN-14: check-runs named ai-workflows/red-test on the attack: ${JSON.stringify(all.map((run) => ({ path: run.path, app: run.app, conclusion: run.conclusion })))}`);
+
+    // The judge again, by hand, once every impostor ended (R22: the owner's account).
+    attack.mark = statuses(attack.head).length;
+    gh('workflow', 'run', 'ai-workflows.yml', '--repo', REPO, '--ref', 'main', '-f', `pr=${attack.pr}`);
+    const refused = await judged(attack, ['failure', 'pending', 'error'], ['red-test']);
+    expect(refused.status.state).not.toBe('success');
+    expect(notPassing(refused.stages)).toEqual(['red-test']);
+    await tryToMerge(attack);
+    await stillOpen(attack);
+    const ranSuffixed = suffixed.length === 0
+      ? 'GitHub no ejecutó el archivo con el nombre del oficial más «@falso.yml»'
+      : `GitHub sí ejecutó el archivo con el nombre del oficial más «@falso.yml» (${suffixed.map((run) => run.conclusion ?? run.status).join(', ')}) y tampoco contó`;
+    record({
+      id: 'CN-14',
+      attempt: `Un PR trae su propia prueba roja con el mismo nombre de trabajo que la oficial, que termina en verde, y una prueba que ya pasa sin el cambio. GitHub no dejó subir el cambio a los agentes; la suite lo subió con la cuenta del dueño (R22). ${ranSuffixed}. Antes se comprobó que la corrida oficial trae el PR y su base`,
+      stoppedBy: ['github', 'juez'],
+      negative: 'frenado',
+      positive: 'pasó',
+      evidence: [prUrl(control.pr), runUrl(passed.status), prUrl(attack.pr), RUN_URL(impostor.runId ?? 0), runUrl(refused.status)],
+      owner: { pushesBySuite: true },
+    });
+  }, 60 * MINUTE);
+
+  it('R29: A-T3: a queue group with three required checks is judged by runs in line, never two at once, and merges; a run cancelled by hand in «Juzgar» is noted', async () => {
+    const caseStart = lastJudgeRunId();
+    const piece = await openPiece('cola-en-fila', completeFiles);
+    await builderEvent(piece);
+    await verdict(piece, piece.head);
+    const green = await judged(piece, ['success', 'failure', 'error']);
+    expect(green.status.state, JSON.stringify(green.stages)).toBe('success');
+    await judgeIdle(caseStart);
+
+    // The group: the merge_group event plus the end of red-test, todo-verde and fronteras.
+    const reruns: number[] = [];
+    const armed = lastJudgeRunId();
+    await asAgent('pr', 'merge', String(piece.pr), '--repo', REPO, '--squash', '--auto');
+    await mergedThroughQueue(piece, reruns);
+    await sleep(3 * MINUTE);
+    await judgeIdle(armed);
+    const groupRuns = judgeRunsAfter(armed).filter((run) => run.event === 'merge_group' || run.event === 'workflow_run');
+    const groups = new Set(groupRuns.filter((run) => run.event === 'merge_group').map((run) => run.head_sha));
+    expect(groups.size, `the queue made ${groups.size} groups; the runs cannot be told apart`).toBe(1);
+    const analysed = groupRuns.map((run) => {
+      const jobs = jobsOf(run.id);
+      const starts = jobs.map((job) => job.started_at).filter((at): at is string => at !== null).sort();
+      const ends = jobs.map((job) => job.completed_at).filter((at): at is string => at !== null).sort();
+      return { run, started: ranSteps(jobs), start: starts[0] ?? '', end: ends.at(-1) ?? '' };
+    });
+    log(`A-T3: ${JSON.stringify(analysed.map((item) => ({ id: item.run.id, event: item.run.event, conclusion: item.run.conclusion, started: item.started, start: item.start, end: item.end })))}`);
+    for (const item of analysed) {
+      if (item.run.conclusion === 'cancelled') expect(item.started, `judge run ${item.run.id} was cancelled after it started`).toBe(false);
+      if (item.started) expect(item.run.conclusion, `judge run ${item.run.id}`).toBe('success');
+    }
+    const ran = analysed.filter((item) => item.started).sort((a, b) => a.start.localeCompare(b.start));
+    expect(ran.length).toBeGreaterThan(0);
+    for (let index = 1; index < ran.length; index += 1) {
+      const before = ran[index - 1];
+      const after = ran[index];
+      if (before === undefined || after === undefined) continue;
+      expect(after.start >= before.end, `judge runs ${before.run.id} and ${after.run.id} of the group overlap`).toBe(true);
+    }
+
+    // The probe (§5): a run of another group is cancelled by hand while it is in «Juzgar», and the
+    // status left on that group is noted. The moment «Juzgar» starts is read from a run above.
+    let offset = 60;
+    const sample = ran[0];
+    if (sample !== undefined) {
+      const text = runLogText(String(sample.run.id));
+      const at = /(\d{4}-\d\d-\d\dT[\d:.]+Z).*dist\/bin\.js" judge/.exec(text)?.[1];
+      // GitHub writes seven decimals; a date is read with three.
+      const when = at === undefined ? Number.NaN : Date.parse(at.replace(/\.(\d{3})\d*Z$/, '.$1Z'));
+      if (Number.isFinite(when) && sample.start !== '') offset = Math.max(5, Math.round((when - Date.parse(sample.start)) / 1000));
+    }
+    const probePiece = await openPiece('cola-sonda', (n) => ({ [`docs/plans/PLAN-${n}.md`]: planOf(n, 'papeles') }));
+    await settled(probePiece.head, ['success']);
+    await judgeIdle(caseStart);
+    const probeStart = lastJudgeRunId();
+    await asAgent('pr', 'merge', String(probePiece.pr), '--repo', REPO, '--squash', '--auto');
+    let probe: { runId: number; groupSha: string; state: string; description: string } | undefined;
+    const tried = new Set<number>();
+    try {
+      for (let attempt = 1; attempt <= 3 && probe === undefined; attempt += 1) {
+        const target = await waitFor('a run of the probe group in progress', () => judgeRunsAfter(probeStart)
+          .filter((run) => (run.event === 'merge_group' || run.event === 'workflow_run') && run.status === 'in_progress' && !tried.has(run.id))[0], 20 * MINUTE, 3_000);
+        tried.add(target.id);
+        const job = await waitFor('its job to start', () => jobsOf(target.id).find((item) => item.started_at !== null), 5 * MINUTE, 2_000);
+        const due = Date.parse(job.started_at ?? '') + (offset + 3 * attempt) * 1000;
+        await sleep(Math.max(0, due - Date.now()));
+        try {
+          gh('run', 'cancel', String(target.id), '--repo', REPO);
+        } catch (error) {
+          log(`A-T3 probe attempt ${attempt}: cancel refused: ${String((error as { stderr?: string }).stderr ?? error).trim()}`);
+          continue;
+        }
+        const ended = await waitFor('the cancelled probe run', () => {
+          const run = judgeRun(target.id);
+          return run.status === 'completed' ? run : undefined;
+        }, 10 * MINUTE, 5_000);
+        const text = runLogText(String(target.id));
+        const inJudge = /dist\/bin\.js" judge/.test(text) && !/- [\w-]+: (passed|rejected|waiting|technical|skipped|informative)/.test(text);
+        log(`A-T3 probe attempt ${attempt}: run ${target.id} ended ${ended.conclusion}; in «Juzgar» when cancelled: ${inJudge}`);
+        if (ended.conclusion !== 'cancelled' || !inJudge) continue;
+        await sleep(MINUTE);
+        const groupSha = judgeRunsAfter(probeStart).find((run) => run.event === 'merge_group')?.head_sha ?? '';
+        const left = groupSha === '' ? undefined : latest(groupSha);
+        probe = { runId: target.id, groupSha, state: left?.state ?? 'ninguno', description: left?.description ?? '' };
+      }
+    } finally {
+      // The probe piece ends merged or out of the queue; either way the harness knows about it.
+      const end = await waitFor('the probe piece out of the queue', () => {
+        const state = queueState(probePiece.pr);
+        if (state.state !== 'OPEN' || !state.inQueue) return state;
+        rerunQueueLock(probePiece, reruns);
+        return undefined;
+      }, 45 * MINUTE, 20_000).catch(() => undefined);
+      if (end?.state === 'MERGED') await sandbox.noteMerged(probePiece.pr);
+      else if (end?.state === 'OPEN' && end.autoMerge) await asAgent('pr', 'merge', String(probePiece.pr), '--repo', REPO, '--disable-auto').catch(() => undefined);
+    }
+    const probeText = probe === undefined
+      ? 'la sonda no alcanzó a cancelar una corrida dentro de «Juzgar»'
+      : `sonda: una corrida de otro grupo cancelada a mano dentro de «Juzgar» dejó en ese grupo el estado ${probe.state}${probe.description === '' ? '' : ` («${probe.description}»)`}`;
+    record({
+      id: 'A-T3',
+      attempt: `Un grupo de la cola con tres checks exigidos que terminan casi juntos, más el evento de la cola: ${groupRuns.length} corridas del juez, ${ran.length} empezaron, ninguna empezada terminó cancelada, nunca dos a la vez, y el grupo se fusionó. ${probeText}`,
+      stoppedBy: [],
+      negative: 'frenado',
+      positive: 'no-aplica',
+      result: 'pasó',
+      evidence: [prUrl(piece.pr), ...ran.map((item) => item.run.html_url), prUrl(probePiece.pr), ...(probe === undefined ? [] : [RUN_URL(probe.runId)])],
+      ...(probe === undefined ? { partial: 'la sonda de cancelación a mano no alcanzó a cancelar una corrida del juez dentro de «Juzgar» en tres intentos' } : {}),
+    });
+  }, 120 * MINUTE);
+
+  it('R29: RAMA-1 and RAMA-2: a pull request into staging is judged with the recipe of staging; a promotion to main only by the engine files', async () => {
+    const mainRecipe = `${RECIPE()}${BRANCHES_BLOCK}`;
+    const head = await sandbox.writeMainFiles({
+      [WORKFLOW]: judgeWorkflow('staging, main'),
+      '.ai-workflows/pipeline.yml': mainRecipe,
+    }, `suite negativa ${sandbox.run}: ramas de trabajo staging y main (R29)`);
+    try {
+      await sandbox.createBranch('staging', head);
+
+      // RAMA-2, without touching the engine files: a promotion is not a piece and passes.
+      const quiet = await sandbox.writeBranchFiles('staging', { [`docs/staging-${sandbox.run}.md`]: 'Una nota que solo está en staging.\n' });
+      const url = await asAgent('pr', 'create', '--repo', REPO, '--head', 'staging', '--base', 'main', '--title', `Suite negativa · pase de staging a main ${sandbox.run}`, '--body', 'Pase de prueba (PLAN-13-R6 §11). Se cierra solo.');
+      const promotion = Number(url.split('/').at(-1));
+      // Its head branch is the run's own working branch: the harness removes it by its own journal
+      // entry (never as the branch of this pull request), so a moved staging is reported, not lost.
+      await sandbox.trackPullRequest(promotion, '');
+      const clean = await settled(quiet, ['success', 'failure', 'error']);
+      expect(clean.state, clean.description).toBe('success');
+
+      // RAMA-2, touching the recipe: staging gets its own recipe, so the promotion now changes it.
+      const withRecipe = await sandbox.writeBranchFiles('staging', { '.ai-workflows/pipeline.yml': stagingRecipe() });
+      const touched = await settled(withRecipe, ['failure', 'error']);
+      expect(touched.state, touched.description).toBe('failure');
+      expect(touched.description).toContain(`/approve-judge-change ${withRecipe.slice(0, 16)}`);
+      expect(prState(promotion).state).toBe('OPEN');
+      gh('pr', 'comment', String(promotion), '--repo', REPO, '--body', `/approve-judge-change ${withRecipe.slice(0, 16)}`);
+      const attested = await waitFor('the promotion after the attestation', () => (latest(withRecipe)?.state === 'success' ? latest(withRecipe) : undefined));
+
+      // RAMA-1: a piece into staging is judged stage by stage with staging's recipe, whose stage
+      // `solo-staging` main's recipe does not have. Nothing into staging is ever merged here.
+      const piece = await openPiece('hacia-staging', completeFiles, { base: 'staging' });
+      await builderEvent(piece);
+      await verdict(piece, piece.head);
+      const refused = await judged(piece, ['failure']);
+      expect(notPassing(refused.stages)).toEqual(['solo-staging']);
+      await change(piece, { [`docs/plans/PLAN-${piece.n}.md`]: `${planOf(piece.n, 'comportamiento')}${STAGING_SECTION}` }, 'el plan dice cómo se prueba en staging');
+      await verdict(piece, piece.head);
+      const fixed = await judged(piece, ['success', 'failure', 'error']);
+      expect(fixed.status.state, JSON.stringify(fixed.stages)).toBe('success');
+      expect(fixed.stages['solo-staging']?.outcome).toBe('passed');
+
+      record({
+        id: 'RAMA-1',
+        attempt: 'Una pieza entra a staging sin cumplir la etapa que solo existe en la receta de staging',
+        stoppedBy: ['juez'],
+        negative: 'frenado',
+        positive: 'pasó',
+        evidence: [prUrl(piece.pr), runUrl(refused.status), runUrl(fixed.status)],
+      });
+      record({
+        id: 'RAMA-2',
+        attempt: 'Un pase de staging a main que cambia la receta, sin la orden del dueño. Control: el mismo pase sin tocar los archivos del motor pasa sin buscar pieza, y con la orden del dueño para esa versión también pasa',
+        stoppedBy: ['juez'],
+        negative: 'frenado',
+        positive: 'pasó',
+        evidence: [prUrl(promotion), runUrl(clean), runUrl(touched), runUrl(attested)],
+        owner: { ordersBySuite: ['/approve-judge-change'] },
+      });
+    } finally {
+      // Main goes back to the recipe and the judge without working branches, for whatever runs next.
+      await sandbox.writeMainFiles({
+        [WORKFLOW]: judgeWorkflow(),
+        '.ai-workflows/pipeline.yml': RECIPE(),
+      }, `suite negativa ${sandbox.run}: main vuelve sin ramas de trabajo (R29)`);
+    }
+  }, 75 * MINUTE);
 });
 
 void ALL_STAGES;

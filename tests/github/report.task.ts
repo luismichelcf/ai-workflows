@@ -4,7 +4,7 @@ import { join } from 'node:path';
 
 import { expect, it } from 'vitest';
 
-import { SUITE_MANIFEST, readCaseRecords, renderSuiteReport, type CaseRecord, type SuiteJoinedRun } from './report.js';
+import { SUITE_MANIFEST, readCaseRecords, renderSuiteReport, type CaseRecord, type SuiteJoinedRun, type SuiteScope } from './report.js';
 
 // PLAN-13-R5 §3.1: `pnpm test:github:report` runs the whole GitHub suite once (the four files, one
 // lock, one run), takes ITS exit code, and always writes the report — also when the suite failed —
@@ -16,6 +16,10 @@ import { SUITE_MANIFEST, readCaseRecords, renderSuiteReport, type CaseRecord, ty
 // the cases that one left without a record. With AI_WORKFLOWS_SUITE_JOIN=<earlier .jsonl> the task
 // runs only the retaken cases (AI_WORKFLOWS_SUITE_RETAKE) and declares the earlier run to the
 // report; without it, it does exactly what it did before.
+//
+// R29 (PLAN-13-R6 §11): with AI_WORKFLOWS_SUITE_SLICE=6 the task runs only the cases of slice 6
+// (and the clean-up of its run) and writes docs/reports/evidencia-rebanada-6-<date>.md, which says
+// which cases come from this run and refers to the report of 29-sep for the rest of the suite.
 
 const ROOT = join(import.meta.dirname, '..', '..');
 const REPOSITORY = process.env['AI_WORKFLOWS_GITHUB_TEST_REPO'] ?? '';
@@ -69,6 +73,31 @@ function prepareJoin(file: string): Join {
   };
 }
 
+// R29: the report that holds the evidence of every case the slice run does not repeat.
+const EARLIER_REPORT = 'docs/reports/suite-negativa-2026-09-29.md';
+
+interface Slice {
+  readonly scope: SuiteScope;
+  readonly testPattern: string;
+  readonly files: readonly string[];
+}
+
+function prepareSlice(value: string): Slice {
+  if (value !== '6') throw new Error(`AI_WORKFLOWS_SUITE_SLICE solo admite 6 (R29); vale "${value}".`);
+  if (!existsSync(join(ROOT, EARLIER_REPORT))) throw new Error(`Falta el informe anterior ${EARLIER_REPORT}, al que remite la evidencia de la rebanada 6.`);
+  const entries = SUITE_MANIFEST.filter((entry) => entry.slice === 6);
+  const tests: string[] = [];
+  for (const entry of entries) {
+    if (entry.test === undefined) throw new Error(`El caso "${entry.id}" de la rebanada 6 no dice qué prueba correr (falta "test" en el manifiesto).`);
+    if (!tests.includes(entry.test)) tests.push(entry.test);
+  }
+  return {
+    scope: { slice: 6, earlierReport: EARLIER_REPORT },
+    testPattern: tests.join('|'),
+    files: [...new Set(entries.map((entry) => `tests/github/${entry.file}.github.test.ts`))],
+  };
+}
+
 it('runs the GitHub suite and writes its report', () => {
   expect(REPOSITORY, 'set AI_WORKFLOWS_GITHUB_TEST_REPO=<owner>/<repo>').toMatch(/^[\w.-]+\/[\w.-]+$/);
   const records = join(ROOT, '.test-build', 'suite-negativa.jsonl');
@@ -78,10 +107,17 @@ it('runs the GitHub suite and writes its report', () => {
   const joinFile = process.env['AI_WORKFLOWS_SUITE_JOIN'];
   const joining = joinFile !== undefined && joinFile.length > 0;
   const joinRun = joining ? prepareJoin(joinFile) : undefined;
+  const sliceValue = process.env['AI_WORKFLOWS_SUITE_SLICE'];
+  const slice = sliceValue !== undefined && sliceValue.length > 0 ? prepareSlice(sliceValue) : undefined;
 
   const args = ['run', '--config', 'vitest.github.config.ts'];
-  if (joinRun?.testPattern !== undefined) args.push('-t', joinRun.testPattern);
-  if (joinRun !== undefined) args.push(...joinRun.files);
+  // A retake (R23) runs exactly its cases; otherwise the slice (R29) runs all of its own.
+  if (joinRun !== undefined) {
+    if (joinRun.testPattern !== undefined) args.push('-t', joinRun.testPattern);
+    args.push(...joinRun.files);
+  } else if (slice !== undefined) {
+    args.push('-t', slice.testPattern, ...slice.files);
+  }
 
   const suite = spawnSync(process.execPath, [join(ROOT, 'node_modules', 'vitest', 'vitest.mjs'), ...args], {
     cwd: ROOT,
@@ -93,7 +129,8 @@ it('runs the GitHub suite and writes its report', () => {
   const engineSha = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: ROOT, encoding: 'utf8' }).stdout.trim();
   const date = new Date().toISOString().slice(0, 10);
   mkdirSync(join(ROOT, 'docs', 'reports'), { recursive: true });
-  const file = join(ROOT, 'docs', 'reports', `suite-negativa-${date}.md`);
+  const name = slice === undefined ? `suite-negativa-${date}.md` : `evidencia-rebanada-${slice.scope.slice}-${date}.md`;
+  const file = join(ROOT, 'docs', 'reports', name);
   // Always a report, never silence (§3.1): a record file that cannot be read, or a record that the
   // report refuses, still leaves a report that says so in its first line.
   let text: string;
@@ -115,6 +152,7 @@ it('runs the GitHub suite and writes its report', () => {
       repository: REPOSITORY,
       testsPassed,
       ...(joinRun === undefined ? {} : { runs: [{ ...joinRun.run, cases: earlierCases }] }),
+      ...(slice === undefined ? {} : { scope: slice.scope }),
     });
     text = report.text;
     complete = report.complete;
@@ -122,5 +160,5 @@ it('runs the GitHub suite and writes its report', () => {
     text = `# Falló: el registro de la corrida no se pudo convertir en informe (${error instanceof Error ? error.message : String(error)}).\n`;
   }
   writeFileSync(file, `${text}\n`, 'utf8');
-  process.stdout.write(`\ninforme: docs/reports/suite-negativa-${date}.md (${complete ? 'completo' : 'no completo'})\n`);
+  process.stdout.write(`\ninforme: docs/reports/${name} (${complete ? 'completo' : 'no completo'})\n`);
 }, 8 * HOUR);
