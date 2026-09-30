@@ -38,6 +38,17 @@ async function readStdin(): Promise<string> {
 }
 
 /**
+ * §15 P6: the watchdog of `hook editor`, shortened for the tests by
+ * `AI_WORKFLOWS_HOOK_WATCHDOG_MS`. Only a positive whole number of milliseconds counts; anything
+ * else leaves the default. Read here and nowhere else.
+ */
+function watchdogFrom(raw: string | undefined): number | undefined {
+  if (raw === undefined || raw.trim() === '') return undefined;
+  const value = Number(raw);
+  return Number.isInteger(value) && value > 0 ? value : undefined;
+}
+
+/**
  * Writes the answer and ends the process explicitly, with the streams flushed first, whatever
  * handle is still open. Claude Code cuts a hook that keeps running and lets the tool through, so
  * the process must not linger on a worker or on a pipe a grandchild holds.
@@ -74,17 +85,19 @@ if (command === 'hook') {
       // where the command runs, which is the repository git itself uses. Codex and OpenCode do not
       // hand it over at all: their root is read from `cwd` with git (§3.2).
       const projectDir = process.env.AI_WORKFLOWS_PROJECT_DIR ?? process.cwd();
-      const stdin = kind === 'pre-commit' ? '' : await readStdin();
       if (kind === 'editor') {
-        // §4: the decision runs on a worker thread and the watchdog of the main thread answers if
-        // that thread blocks. The worker gets only plain options (no runner functions).
-        const { runHookInWorker } = await import('./locks/hook-worker.js');
-        const options = client === 'claude'
-          ? { projectDir, cwd: process.cwd(), stdin }
-          : { client, cwd: process.cwd(), stdin };
-        const work = runHookInWorker(kind as HookKind, options);
-        finishHook(await superviseHook(kind as HookKind, work, HOOK_WATCHDOG_MS, client));
+        // §4 and §15 P6: the watchdog is armed as soon as the hook starts. The decision runs in a
+        // separate process that owns the stdin read, so a client that never closes stdin, or a disk
+        // read that blocks the deciding thread, still gets an answer; the deciding process is ended
+        // before exiting so nothing is left behind.
+        const watchdogMs = watchdogFrom(process.env.AI_WORKFLOWS_HOOK_WATCHDOG_MS) ?? HOOK_WATCHDOG_MS;
+        const { spawnHookProcess } = await import('./locks/hook-worker.js');
+        const running = spawnHookProcess(kind as HookKind, client);
+        const result = await superviseHook(kind as HookKind, running.result, watchdogMs, client);
+        running.cancel();
+        finishHook(result);
       } else {
+        const stdin = kind === 'pre-commit' ? '' : await readStdin();
         finishHook(await runHook(kind as HookKind, { projectDir, cwd: process.cwd(), stdin }));
       }
     }

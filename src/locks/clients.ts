@@ -21,6 +21,12 @@ export interface ClientOutput {
  */
 const PATH_LIKE_KEYS: readonly string[] = ['path', 'filePath', 'file_path', 'paths', 'patchText'];
 
+/**
+ * §15: read-only tools that carry a path but never write. They are known, so the rule for an
+ * unknown tool with a path must not catch them.
+ */
+const CODEX_READ_ONLY_TOOLS: readonly string[] = ['view_image'];
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
@@ -72,6 +78,9 @@ function parseCodex(stdin: string): HookInput | { readonly error: string } {
     const record = isRecord(toolInput) ? toolInput : undefined;
     return { toolName: 'apply_patch', toolInput: { command: record?.command }, cwd };
   }
+  if (CODEX_READ_ONLY_TOOLS.includes(tool)) {
+    return { toolName: tool, toolInput, cwd };
+  }
   if (carriesPath(toolInput)) {
     return { error: `la herramienta desconocida "${tool}" trae una ruta y el candado no sabe qué escribiría` };
   }
@@ -109,6 +118,7 @@ function parseOpencode(stdin: string): HookInput | { readonly error: string } {
     case 'bash':
       return { toolName: 'Bash', toolInput: { command: record?.command }, cwd };
     case 'read':
+    case 'list':
       return { toolName: 'Read', toolInput: args, cwd };
     case 'glob':
       return { toolName: 'Glob', toolInput: args, cwd };

@@ -30,7 +30,12 @@ import { recordCleanUpdate, verifyCleanUpdate } from '../recipe/validity.js';
 import { diskProjectFiles, type ChangeDeclared } from '../recipe/facts.js';
 import { pieceOfBranch, readDeclaredKind } from '../judge/pieces.js';
 import { HOOK_LOADER, HOOK_WATCHDOG_MS } from '../locks/hook-cli.js';
-import { LOADER_RELATIVE, OPENCODE_PLUGIN_HEADER, isOurCodexHandler } from '../locks/client-files.js';
+import {
+  CODEX_HOOK_ORDER,
+  CODEX_HOOK_ORDER_WINDOWS,
+  LOADER_RELATIVE,
+  OPENCODE_PLUGIN_HEADER,
+} from '../locks/client-files.js';
 import type { Recipe } from '../recipe/types.js';
 import type { ProviderRunner } from '../blocks/definition.js';
 import {
@@ -315,6 +320,16 @@ async function gitTop(root: string): Promise<string | undefined> {
 async function resolveBaseRef(root: string, principal: string): Promise<string> {
   const remote = `origin/${principal}`;
   return (await gitOk(root, ['rev-parse', '--verify', `${remote}^{commit}`])) ? remote : principal;
+}
+
+/**
+ * PLAN-13-R6 §1.1 and R34: the branch a piece is measured against locally is the first of
+ * `branches.into` — where its pull request will go — not the repository's principal branch. A
+ * recipe without working branches keeps the principal, exactly as before.
+ */
+function targetBranch(recipe: Recipe, principal: string): string {
+  const into = recipe.branches?.into;
+  return into !== undefined && into.length > 0 ? (into[0] as string) : principal;
 }
 
 /** The principal branch of the repository; `main` when GitHub is not there to say. */
@@ -731,7 +746,9 @@ async function commandRun(args: readonly string[], deps: AgentCliDeps): Promise<
 
   const principal = await principalOf(edges.github);
   if (!principal.ok) return { ok: false, text: principal.text };
-  const baseRef = await resolveBaseRef(root, principal.branch);
+  // R34: with working branches the piece is measured against `into[0]`, the branch its pull request
+  // will target, not against the principal.
+  const baseRef = await resolveBaseRef(root, targetBranch(recipe, principal.branch));
   const runId = randomUUID();
 
   let compiled;
@@ -927,13 +944,16 @@ async function commandSync(args: readonly string[], deps: AgentCliDeps): Promise
   const perform = async (): Promise<CommandOutput> => {
     const principal = await principalOf(edges.github);
     if (!principal.ok) return { ok: false, text: principal.text };
+    // R34: with working branches, a "Update branch" merge is validated against `origin/<into[0]>`,
+    // the branch the piece targets, which is fetched first.
+    const target = targetBranch(recipe, principal.branch);
     try {
       await gitText(root, ['fetch', 'origin', branch]);
-      await gitText(root, ['fetch', 'origin', principal.branch]);
+      await gitText(root, ['fetch', 'origin', target]);
     } catch (error) {
       return { ok: false, text: safeTerminalText(reasonOf(error)) };
     }
-    const baseRef = `origin/${principal.branch}`;
+    const baseRef = `origin/${target}`;
     const remoteTip = await gitText(root, ['rev-parse', `origin/${branch}`]);
     const localHead = await gitText(root, ['rev-parse', 'HEAD']);
     if (remoteTip === localHead) {
@@ -1243,19 +1263,51 @@ async function commandDoctor(deps: AgentCliDeps): Promise<CommandOutput> {
         : 'The editor hook or the git hooks: missing. Run: ai-workflows hooks install --apply',
     );
   }
+  // §15: `.claude/settings.local.json` wins over `settings.json` and can switch every hook off.
+  try {
+    const local = JSON.parse(readFileSync(join(root, '.claude', 'settings.local.json'), 'utf8')) as {
+      disableAllHooks?: unknown;
+    };
+    if (local.disableAllHooks === true) {
+      lines.push(
+        es
+          ? 'Aviso: .claude/settings.local.json tiene disableAllHooks en true: apaga todos los ganchos.'
+          : 'Warning: .claude/settings.local.json has disableAllHooks true: it switches every hook off.',
+      );
+    }
+  } catch {
+    // No local settings file (or an unreadable one): nothing to say here.
+  }
 
-  // PLAN-13-R6 §3.3: doctor reviews Codex and OpenCode too. Codex counts only with our handler
-  // under the matcher `.*` (any other matcher would hide an unknown tool from the hook) and the
-  // shared loader in place; OpenCode only with our plugin and the loader.
+  // PLAN-13-R6 §3.3 and §15: doctor reviews Codex and OpenCode too. Codex counts only with OUR
+  // current handler under the matcher `.*` (any other matcher would hide an unknown tool, and an
+  // older or edited order is not the one that is installed) and the shared loader in place;
+  // OpenCode only with our plugin and the loader.
   const loaderInstalled = existsSync(join(root, LOADER_RELATIVE));
   let codexInstalled = false;
+  let codexTimeout: number | undefined;
   try {
     const codex = JSON.parse(readFileSync(join(root, '.codex', 'hooks.json'), 'utf8')) as {
-      hooks?: { PreToolUse?: { matcher?: unknown; hooks?: unknown[] }[] };
+      hooks?: {
+        PreToolUse?: {
+          matcher?: unknown;
+          hooks?: { command?: unknown; commandWindows?: unknown; timeout?: unknown }[];
+        }[];
+      };
     };
     const groups = codex.hooks?.PreToolUse ?? [];
-    codexInstalled =
-      loaderInstalled && groups.some((group) => group.matcher === '.*' && (group.hooks ?? []).some(isOurCodexHandler));
+    let foundOurs = false;
+    for (const group of groups) {
+      if (group.matcher !== '.*') continue;
+      for (const handler of group.hooks ?? []) {
+        if (handler.command !== CODEX_HOOK_ORDER || handler.commandWindows !== CODEX_HOOK_ORDER_WINDOWS) continue;
+        foundOurs = true;
+        if (typeof handler.timeout === 'number' && Number.isInteger(handler.timeout) && handler.timeout > 0) {
+          codexTimeout = handler.timeout;
+        }
+      }
+    }
+    codexInstalled = loaderInstalled && foundOurs;
   } catch {
     codexInstalled = false;
   }
@@ -1265,9 +1317,20 @@ async function commandDoctor(deps: AgentCliDeps): Promise<CommandOutput> {
         ? 'Codex: gancho instalado.'
         : 'Codex: hook installed.'
       : es
-        ? 'Codex: falta el gancho. Ejecuta: ai-workflows hooks install --apply'
-        : 'Codex: the hook is missing. Run: ai-workflows hooks install --apply',
+        ? 'Codex: falta el gancho o está alterado. Ejecuta: ai-workflows hooks install --apply'
+        : 'Codex: the hook is missing or altered. Run: ai-workflows hooks install --apply',
   );
+  // §15: the Codex entry carries its own timeout (30 s as installed). At 25 s or less it does not
+  // leave room over the engine's watchdog, so Codex could let a tool through by timeout; it is said.
+  if (codexTimeout !== undefined && codexTimeout * 1000 <= HOOK_WATCHDOG_MS) {
+    lines.push(
+      es
+        ? `Aviso: el tiempo del gancho de Codex (${codexTimeout} s) no supera el vigilante ` +
+          `(${HOOK_WATCHDOG_MS / 1000} s): Codex podría dejar pasar una herramienta por tiempo.`
+        : `Warning: the Codex hook's timeout (${codexTimeout} s) does not exceed the watchdog ` +
+          `(${HOOK_WATCHDOG_MS / 1000} s): Codex could let a tool through by timeout.`,
+    );
+  }
 
   let opencodeInstalled = false;
   try {
