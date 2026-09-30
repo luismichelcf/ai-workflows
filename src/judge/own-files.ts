@@ -6,7 +6,7 @@
 
 import { parse as parseYaml } from 'yaml';
 
-import { gitFileAt } from '../recipe/facts.js';
+import { gitChangedPaths, gitFileAt, gitMergeBases, gitMergeTree } from '../recipe/facts.js';
 
 /**
  * The one list shared by the judge and `hooks install` (§2.1). Repository-relative, forward
@@ -28,7 +28,12 @@ export const ENGINE_PROTECTED_PATHS: readonly string[] = [
   '.opencode/opencode.json',
   '.opencode/opencode.jsonc',
   '.opencode/plugins/',
+  '.opencode/plugin/',
+  '.opencode/tool/',
+  '.opencode/tools/',
   '.pnpmfile.cjs',
+  '.npmrc',
+  '.yarnrc.yml',
   '.github/workflows/ai-workflows-red-test.yml',
   '.github/workflows/ai-workflows-review-signal.yml',
 ];
@@ -61,6 +66,12 @@ const DEPENDENCY_SECTIONS = [
   'optionalDependencies',
   'peerDependencies',
 ] as const;
+
+/**
+ * PLAN-13-R6 §15 and R32: the scripts that run when dependencies are installed. Changing any of
+ * them needs the owner's attestation, because one can rewrite the engine on the agents' machine.
+ */
+const LIFECYCLE_SCRIPTS = ['preinstall', 'install', 'postinstall', 'prepare'] as const;
 
 /** The lockfiles that decide which engine is installed, read with their own cap (§2.2). */
 export const ENGINE_VERSION_FILES: readonly string[] = [
@@ -115,7 +126,9 @@ function collectEngineKeys(section: unknown, prefix: string, out: Record<string,
 function collectEnginePackages(section: unknown, prefix: string, out: Record<string, unknown>): void {
   if (!isRecord(section)) return;
   for (const [key, entry] of Object.entries(section)) {
-    if (key.toLowerCase().startsWith('ai-workflows@')) out[`${prefix}.${key}`] = entry;
+    // PLAN-13-R6 §15/R32: an older pnpm lockfile names the package key with a leading slash
+    // (`/ai-workflows@1.0.0`); it counts exactly like `ai-workflows@1.0.0`.
+    if (key.replace(/^\/+/, '').toLowerCase().startsWith('ai-workflows@')) out[`${prefix}.${key}`] = entry;
   }
 }
 
@@ -128,22 +141,33 @@ function projectPackageJson(value: unknown): string {
       out[`${section}.ai-workflows`] = (value[section] as Record<string, unknown>)['ai-workflows'];
     }
   }
+  const scripts = value['scripts'];
+  if (isRecord(scripts)) {
+    for (const name of LIFECYCLE_SCRIPTS) {
+      if (hasKey(scripts, name)) out[`scripts.${name}`] = scripts[name];
+    }
+  }
   collectEngineKeys(value['overrides'], 'overrides', out);
   collectEngineKeys(value['resolutions'], 'resolutions', out);
   const pnpm = value['pnpm'];
   if (isRecord(pnpm)) {
     collectEngineKeys(pnpm['overrides'], 'pnpm.overrides', out);
     collectEngineKeys(pnpm['patchedDependencies'], 'pnpm.patchedDependencies', out);
+    if (hasKey(pnpm, 'onlyBuiltDependencies')) out['pnpm.onlyBuiltDependencies'] = pnpm['onlyBuiltDependencies'];
   }
   return canonical(out);
 }
 
-/** The projection of pnpm-workspace.yaml: its overrides, its patches and its engine catalogs. */
+/** The projection of pnpm-workspace.yaml: its overrides, its patches, its installer and catalogs. */
 function projectWorkspace(value: unknown): string {
   if (!isRecord(value)) throw new Error('pnpm-workspace.yaml is not an object');
   const out: Record<string, unknown> = {};
   collectEngineKeys(value['overrides'], 'overrides', out);
   collectEngineKeys(value['patchedDependencies'], 'patchedDependencies', out);
+  // PLAN-13-R6 §15/R32: the build allow-list and a custom pnpmfile run when dependencies install.
+  for (const key of ['onlyBuiltDependencies', 'pnpmfile'] as const) {
+    if (hasKey(value, key)) out[key] = value[key];
+  }
   if (hasKey(value['catalog'], 'ai-workflows')) {
     out['catalog.ai-workflows'] = (value['catalog'] as Record<string, unknown>)['ai-workflows'];
   }
@@ -240,28 +264,78 @@ function projectionOf(file: string, content: string): string | undefined {
 }
 
 /**
- * PLAN-13-R6 §2.2: which of the engine-version files a pull request touches actually change which
- * engine is installed, comparing the merge base with the head. Fail-closed: a file that cannot be
- * read as its format on either side, or that is added or removed, counts as touched. A git failure
- * to read a commit throws, and the judge turns it into a technical error, never into a pass.
+ * PLAN-13-R6 §2.2 and §15 P3: whether the engine version this pull request installs changes. The
+ * comparison is fail-closed — a file that cannot be read as its format on either side, or that is
+ * added or removed, counts as touched. A git failure to read a commit throws, and the judge turns
+ * it into a technical error, never into a pass.
  */
-export async function touchedEngineVersionFiles(
+async function projectionDiffers(
   root: string,
-  mergeBase: string,
+  a: string,
+  b: string,
+  file: string,
+): Promise<boolean> {
+  const before = await gitFileAt(root, a, file, ENGINE_VERSION_MAX_BYTES);
+  const after = await gitFileAt(root, b, file, ENGINE_VERSION_MAX_BYTES);
+  if (before.kind !== 'file' || after.kind !== 'file') return true;
+  const one = projectionOf(file, before.content ?? '');
+  const other = projectionOf(file, after.content ?? '');
+  return one === undefined || other === undefined || one !== other;
+}
+
+export interface OwnFilesScan {
+  /** Every path that truly lands when `head` is merged into the trusted tip, sorted. */
+  readonly files: readonly string[];
+  /**
+   * The merge GitHub would perform conflicts. It counts as touching the judge's own files, never as
+   * a pass (PLAN-13-R6 §15 P3).
+   */
+  readonly conflicted: boolean;
+  /** The engine-version files whose projection changes on what truly lands. */
+  readonly versionTouched: readonly string[];
+}
+
+/**
+ * PLAN-13-R6 §15 P3 (criss-cross merges): the judge's own files and the engine version are measured
+ * on what really lands. With several merge bases (`git merge-base --all`), a single base can hide a
+ * change, so every changed path is the union of the diffs against all of them, plus the diff of the
+ * merge tree (`git merge-tree`, the merge GitHub performs) against the trusted tip. The engine
+ * version is compared against every merge base and against that merge tree. A conflicting merge
+ * tree is reported as `conflicted`, which the caller treats as touched. A git failure throws.
+ */
+export async function scanOwnFiles(
+  root: string,
+  trusted: string,
   head: string,
-  files: readonly string[],
-): Promise<string[]> {
-  const touched: string[] = [];
-  for (const file of engineVersionFilesIn(files)) {
-    const base = await gitFileAt(root, mergeBase, file, ENGINE_VERSION_MAX_BYTES);
-    const atHead = await gitFileAt(root, head, file, ENGINE_VERSION_MAX_BYTES);
-    if (base.kind !== 'file' || atHead.kind !== 'file') {
-      touched.push(file);
-      continue;
-    }
-    const before = projectionOf(file, base.content ?? '');
-    const after = projectionOf(file, atHead.content ?? '');
-    if (before === undefined || after === undefined || before !== after) touched.push(file);
+): Promise<OwnFilesScan> {
+  const bases = await gitMergeBases(root, trusted, head);
+  const landing = new Set<string>();
+  for (const base of bases) {
+    for (const path of await gitChangedPaths(root, base, head)) landing.add(path);
   }
-  return touched;
+
+  const merge = await gitMergeTree(root, trusted, head);
+  if (merge.conflicted) {
+    return { files: [...landing].sort(), conflicted: true, versionTouched: [] };
+  }
+  if (merge.tree !== undefined) {
+    for (const path of await gitChangedPaths(root, trusted, merge.tree)) landing.add(path);
+  }
+  const files = [...landing].sort();
+
+  const versionTouched: string[] = [];
+  for (const file of engineVersionFilesIn(files)) {
+    let differs = false;
+    for (const base of bases) {
+      if (await projectionDiffers(root, base, head, file)) {
+        differs = true;
+        break;
+      }
+    }
+    if (!differs && merge.tree !== undefined) {
+      differs = await projectionDiffers(root, trusted, merge.tree, file);
+    }
+    if (differs) versionTouched.push(file);
+  }
+  return { files, conflicted: false, versionTouched };
 }

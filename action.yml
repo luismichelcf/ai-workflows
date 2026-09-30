@@ -221,8 +221,19 @@ runs:
               # PLAN-13-R6 §1.2: un PR que sale de las ramas de trabajo (o se cierra) no publica
               # «juzgando»: el juez decide si quedan otros PRs abiertos con esa cabeza y los
               # rejuzga. Cualquier otro evento hacia fuera de la lista no juzga ni publica.
+              # Con el interruptor apagado (`off`, o sin valor) tampoco se sigue: nada que juzgar.
               case "$pr_action" in
                 closed|edited)
+                  case "$mode" in
+                    ''|off)
+                      continue='false'
+                      publish='false'
+                      sha=''
+                      decided='true'
+                      emit
+                      exit 0
+                      ;;
+                  esac
                   continue='true'
                   publish='false'
                   sha=''
@@ -236,8 +247,12 @@ runs:
             sha="$(jq -r '.pull_request.head.sha // empty' "$GITHUB_EVENT_PATH")"
             if [ "$pr_action" = 'closed' ]; then
               # Un PR cerrado deja de contar: no se publica «juzgando»; el juez rejuzga a los demás
-              # con esa misma cabeza y, si no queda ninguno, no publica nada.
-              continue='true'
+              # con esa misma cabeza y, si no queda ninguno, no publica nada. Con el interruptor
+              # apagado (`off`, o sin valor) no se sigue.
+              case "$mode" in
+                ''|off) continue='false' ;;
+                *) continue='true' ;;
+              esac
               publish='false'
               sha=''
               decided='true'

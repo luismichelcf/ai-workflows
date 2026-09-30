@@ -360,8 +360,9 @@ export async function gitFileAt(
   maxBytes: number,
 ): Promise<GitFileReading> {
   requireProjectPath(path);
-  // The commit must exist: a git failure to resolve it is an error, never an absent file.
-  await runGit(root, ['rev-parse', '--verify', `${sha}^{commit}`]);
+  // The commit (or the merge tree of §15 P3) must exist: a git failure to resolve it is an error,
+  // never an absent file.
+  await runGit(root, ['rev-parse', '--verify', `${sha}^{tree}`]);
   if (!(await pathInTree(root, sha, path))) return { kind: 'missing' };
   const spec = `${sha}:${path}`;
   const size = Number.parseInt(text(await runGit(root, ['cat-file', '-s', spec])), 10);
@@ -438,6 +439,49 @@ export async function gitIsAncestor(
     return true;
   } catch (error) {
     if (error instanceof GitCommandError && error.exitCode === 1) return false;
+    throw error;
+  }
+}
+
+/**
+ * PLAN-13-R6 §15 P3: every merge base of two commits (`git merge-base --all`). With a criss-cross
+ * history git can pick one that hides a change; the judge compares against all of them.
+ */
+export async function gitMergeBases(root: string, a: string, b: string): Promise<string[]> {
+  const raw = await runGit(root, ['merge-base', '--all', a, b]);
+  return raw
+    .toString('utf8')
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+}
+
+/** The paths that change from one commit-ish to another, once each, sorted, without renames. */
+export async function gitChangedPaths(root: string, from: string, to: string): Promise<string[]> {
+  const raw = await runGit(root, ['diff', '--name-only', '-z', '--no-renames', from, to]);
+  const paths = raw.toString('utf8').split('\0').filter((path) => path.length > 0);
+  return [...new Set(paths)].sort();
+}
+
+export interface MergeTreeReading {
+  /** The merge conflicts: it counts as touched, never as a pass (PLAN-13-R6 §15 P3). */
+  readonly conflicted: boolean;
+  /** The tree of the merge, when it does not conflict. */
+  readonly tree?: string;
+}
+
+/**
+ * PLAN-13-R6 §15 P3: the tree of the merge GitHub would perform when the head lands on the trusted
+ * tip (`git merge-tree --write-tree`), or that it conflicts. A git failure other than the clean
+ * "conflicts" exit code throws, because a failure to tell is not an answer.
+ */
+export async function gitMergeTree(root: string, tip: string, head: string): Promise<MergeTreeReading> {
+  try {
+    const raw = await runGit(root, ['merge-tree', '--write-tree', tip, head]);
+    const tree = text(raw).split('\n')[0]?.trim();
+    return tree === undefined || tree.length === 0 ? { conflicted: false } : { conflicted: false, tree };
+  } catch (error) {
+    if (error instanceof GitCommandError && error.exitCode === 1) return { conflicted: true };
     throw error;
   }
 }
