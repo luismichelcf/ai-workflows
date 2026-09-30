@@ -281,10 +281,12 @@ function hasForbiddenKeyDeep(value: unknown, forbidden: string): boolean {
 }
 
 /**
- * PLAN-13-R6 §15 (fifth delta): whether a YAML node is one the installer's reader and the judge read
- * the same way — a map, a sequence or a scalar, with scalar keys and no anchor, alias or explicit
- * tag. Anything else (an anchor, an alias, a non-scalar key, a merge key) is an advanced feature, so
- * the document is touched without being interpreted.
+ * PLAN-13-R6 §15 (fifth and sixth delta): whether a YAML node is one the installer's reader and the
+ * judge read the same way — a map, a sequence or a scalar, with string keys and no anchor, alias or
+ * explicit tag. Anything else (an anchor, an alias, a non-scalar key, a key whose value is not a
+ * string — a null, number, boolean or date — a merge key) is an advanced feature, so the document is
+ * touched without being interpreted. A non-string key would collapse onto the empty string when the
+ * judge reads it, hiding a key the installer still sees.
  */
 function isPlainYamlNode(node: unknown): boolean {
   if (node === null || node === undefined) return true;
@@ -294,6 +296,7 @@ function isPlainYamlNode(node: unknown): boolean {
     if (node.anchor !== undefined || node.tag !== undefined) return false;
     for (const item of node.items) {
       if (!isScalar(item.key)) return false;
+      if (typeof item.key.value !== 'string') return false;
       if (item.key.anchor !== undefined || item.key.tag !== undefined) return false;
       if (item.key.value === '<<') return false;
       if (!isPlainYamlNode(item.value)) return false;
@@ -600,43 +603,55 @@ function normalizeRepoPath(value: unknown): string | undefined {
   return stack.join('/').toLowerCase();
 }
 
-/** A value with one layer of matching quotes removed, the way npm reads an .npmrc value. */
-function unquoted(value: string): string {
-  if (value.length >= 2) {
-    const first = value[0];
-    if ((first === '"' || first === "'") && value[value.length - 1] === first) {
-      return value.slice(1, -1);
-    }
-  }
-  return value;
-}
-
 /**
- * PLAN-13-R6 §15 (fifth delta): an .npmrc value with its inline comment cut, the way the `ini`
- * reader reads it — ` ; …` or ` # …` ends the value. A `;` or `#` inside a quoted value is kept, so
- * a quoted path is not truncated.
+ * PLAN-13-R6 §15 (fifth and sixth delta): an .npmrc key or value read exactly as the `ini` reader
+ * reads it. The whole string is trimmed. An entirely double-quoted value is decoded as JSON; an
+ * entirely single-quoted one has its quotes removed. Otherwise it ends at the first `;` or `#` that
+ * is not escaped — with no need for a blank before it — while `\;`, `\#` and `\\` stand for a
+ * literal `;`, `#` and `\` and any other backslash is kept as it is.
  */
 function iniValue(raw: string): string {
-  let quote: string | undefined;
-  for (let i = 0; i < raw.length; i += 1) {
-    const ch = raw.charAt(i);
-    if (quote !== undefined) {
-      if (ch === quote) quote = undefined;
-      continue;
+  const value = (raw ?? '').trim();
+  if (value.length >= 2) {
+    const first = value.charAt(0);
+    if (first === value.charAt(value.length - 1)) {
+      if (first === '"') {
+        try {
+          const parsed: unknown = JSON.parse(value);
+          if (typeof parsed === 'string') return parsed;
+        } catch {
+          // Not JSON: keep the value as written.
+        }
+        return value;
+      }
+      if (first === "'") return value.slice(1, -1);
     }
-    if (ch === '"' || ch === "'") {
-      quote = ch;
-      continue;
-    }
-    if ((ch === ';' || ch === '#') && i > 0 && /\s/.test(raw.charAt(i - 1))) return raw.slice(0, i);
   }
-  return raw;
+  let escaped = false;
+  let out = '';
+  for (let i = 0; i < value.length; i += 1) {
+    const ch = value.charAt(i);
+    if (escaped) {
+      out += ch === ';' || ch === '#' || ch === '\\' ? ch : `\\${ch}`;
+      escaped = false;
+      continue;
+    }
+    if (ch === ';' || ch === '#') break;
+    if (ch === '\\') {
+      escaped = true;
+      continue;
+    }
+    out += ch;
+  }
+  if (escaped) out += '\\';
+  return out.trim();
 }
 
 /**
  * Every value of `only-built-dependencies-file` in an .npmrc (§15 fourth and fifth delta): the
- * installer reads each occurrence, so each names a file of the judge's own. A key in double or
- * single quotes is unquoted before it is compared, and an inline comment ends the value.
+ * installer reads each occurrence, so each names a file of the judge's own. The key and the value
+ * are both read as the `ini` reader reads them — quotes removed and an inline comment ends the
+ * value.
  */
 function npmrcBuildFiles(content: string): string[] {
   const found: string[] = [];
@@ -645,8 +660,8 @@ function npmrcBuildFiles(content: string): string[] {
     if (line.length === 0 || line.startsWith('#') || line.startsWith(';')) continue;
     const at = line.indexOf('=');
     if (at < 0) continue;
-    if (unquoted(line.slice(0, at).trim()) !== 'only-built-dependencies-file') continue;
-    found.push(unquoted(iniValue(line.slice(at + 1)).trim()));
+    if (iniValue(line.slice(0, at)) !== 'only-built-dependencies-file') continue;
+    found.push(iniValue(line.slice(at + 1)));
   }
   return found;
 }
