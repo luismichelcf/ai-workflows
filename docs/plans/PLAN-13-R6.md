@@ -945,3 +945,17 @@ cabeza, así que con dos PRs de la misma cabeza hacia ramas distintas la cadena 
 disparó (se mide en CN-14); la protección de `from` en un pase no la comprueba ninguna orden (el
 README pide exigir el juez en las dos ramas); cualquier `User` que comente con `/` despierta al juez
 (falla cerrado; cuesta minutos); sin `node` en el PATH, la orden de Codex no puede rechazar.
+
+**Segunda y tercera revisión del delta (30-sep).** Tras los arreglos de la parvada, dos revisores más
+(uno por delta, R25) hallaron más vías de instalación y detalles del gancho; se arreglaron con su
+prueba. La tercera mostró que proteger los manifiestos con una lista de claves peligrosas no se
+cierra nunca (otro formato de manifiesto, otra opción del instalador). **Decisión del orquestador
+para aplicar R32:** en los manifiestos de paquetes (`package.json`, `package.yaml`, `package.json5`,
+a cualquier profundidad) y en `pnpm-workspace.yaml` se invierte la regla: todo cambio cuenta como
+tocado **salvo** una lista corta de cambios inofensivos (las entradas de dependencias que no son el
+motor, `name` que no sea el motor, `version`, `description`, `keywords`, `author`, `contributors`,
+`license`, `repository`, `homepage`, `bugs`, `private`, los scripts que no corren al instalar, y en
+`pnpm-workspace.yaml` las entradas de catálogo que no son el motor). Un miembro nuevo o borrado se
+compara contra vacío con la misma regla. `binding.gyp` a cualquier profundidad cuenta como tocado.
+`init` nunca busca el gestor en la carpeta del proyecto ni lanza uno por nombre sin ruta absoluta; y
+la orden de matar el árbol del gancho se lanza sin esperarla, para no gastar el margen de 30 s.
