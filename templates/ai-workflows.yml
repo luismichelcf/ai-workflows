@@ -53,13 +53,15 @@ jobs:
   judge:
     name: Juez de ai-workflows
     # En un comentario de un PR solo se juzga si trae una orden (`/…`), o si el comentario se editó
-    # o borró (el visto bueno pudo retirarse). En un issue que NO es un PR, se juzga si la acción no
-    # es `created` (editar o borrar un veredicto debe reevaluar) o si el comentario nuevo lleva la
-    # marca `ai-workflows:event`; un comentario nuevo sin la marca no dispara nada; así, la pieza del
+    # o borró (el visto bueno pudo retirarse); un comentario de un robot nunca despierta al juez
+    # (PLAN-13-R6 §8). En un issue que NO es un PR, se juzga si la acción no es `created` (editar o
+    # borrar un veredicto debe reevaluar) o si el comentario nuevo lleva la marca
+    # `ai-workflows:event`; un comentario nuevo sin la marca no dispara nada; así, la pieza del
     # issue (su número) se rejuzga cuando aparece un evento de constructor o de veredicto.
     if: >-
       github.event_name != 'issue_comment'
       || (github.event.issue.pull_request
+        && github.event.comment.user.type != 'Bot'
         && (contains(github.event.comment.body, '/') || github.event.action != 'created'))
       || (!github.event.issue.pull_request
         && (contains(github.event.comment.body, 'ai-workflows:event') || github.event.action != 'created'))
@@ -72,8 +74,10 @@ jobs:
       checks: read # leer los check-runs de `require-check`
       actions: read # comprobar que una corrida que dice ser el juez existe y es su workflow
       statuses: write # publicar el `pending` y el veredicto del juez
-    # Una corrida por PR (o por SHA del grupo), y la nueva cancela la vieja: reduce las corridas que
-    # se cruzan. Un verde viejo sobre el mismo SHA solo sobrevive si no arranca ninguna posterior.
+    # Una corrida por PR (o por SHA del grupo), y la nueva cancela la vieja, salvo en un grupo de
+    # la cola (PLAN-13-R6 §5): ahí las corridas se ponen en fila en vez de cancelarse, porque una
+    # corrida cancelada no debe publicar nada y eso no se ha comprobado en GitHub. En un mismo grupo
+    # corre a lo sumo una a la vez y la que espera es sustituida por la más nueva, que relee todo.
     concurrency:
       group: >-
         ai-workflows-${{
@@ -83,7 +87,7 @@ jobs:
           || github.event.merge_group.head_sha
           || github.event.workflow_run.head_sha
         }}
-      cancel-in-progress: true
+      cancel-in-progress: ${{ !(github.event_name == 'merge_group' || (github.event_name == 'workflow_run' && github.event.workflow_run.event == 'merge_group')) }}
     steps:
       # Ningún checkout aquí: la acción lo hace solo de la rama principal, dentro de sí misma.
       - uses: luismichelcf/ai-workflows@<ENGINE_SHA>

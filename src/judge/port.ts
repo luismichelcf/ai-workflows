@@ -56,10 +56,29 @@ export interface CheckRunSummary {
    * placed by id is only ever tolerated when it is the single run of that name.
    */
   readonly id?: number;
+  /**
+   * PLAN-13-R6 §7: the `check_suite.id` of the check-run, so a red-test check-run can be tied to
+   * the Actions run it came from. Absent when the check-run does not carry it.
+   */
+  readonly checkSuiteId?: number;
   readonly status: string;
   readonly conclusion: string | null;
   readonly app: string;
   readonly url: string | null;
+}
+
+/** One Actions run of a check suite, as `checkSuiteRuns` reads it (PLAN-13-R6 §7). */
+export interface ActionsRunSummary {
+  readonly id: number;
+  readonly headSha: string;
+  readonly event: string;
+  readonly workflowId: number;
+  readonly path: string;
+  readonly pullRequests: readonly {
+    readonly number: number;
+    readonly baseRef: string;
+    readonly baseSha: string;
+  }[];
 }
 
 /** One commit status, as `require-check` reads it. */
@@ -93,6 +112,18 @@ export interface JudgeGitHub {
   /** Every review of a pull request, in submission order. */
   reviews(n: number): Promise<PullRequestReview[]>;
   checkRuns(sha: string, name: string): Promise<CheckRunSummary[]>;
+  /**
+   * PLAN-13-R6 §7: the Actions runs of one check suite
+   * (`GET …/actions/runs?check_suite_id=`). Throws when the list cannot be confirmed.
+   */
+  checkSuiteRuns(checkSuiteId: number): Promise<ActionsRunSummary[]>;
+  /**
+   * PLAN-13-R6 §7: every job of every attempt of one Actions run
+   * (`GET …/actions/runs/{id}/jobs?filter=all`), with the check-run each job points to.
+   */
+  workflowRunJobs(runId: number): Promise<{ id: number; checkRunUrl: string }[]>;
+  /** PLAN-13-R6 §7: the workflow file a run belongs to, by its numeric id. */
+  workflowById(workflowId: number): Promise<{ path: string }>;
   /** Newest first, by `created_at`. */
   statuses(sha: string): Promise<CommitStatus[]>;
   workflowRun(id: number): Promise<{ path: string; event: string; headBranch?: string } | undefined>;
@@ -582,8 +613,18 @@ export function createJudgeGitHub(options: JudgeGitHubOptions): JudgeGitHub {
             throw new Error(`gh returned a check run named ${checkName} with a conclusion that is not text.`);
           }
           const url = textField(runItem, 'html_url');
+          const rawSuite = recordField(runItem, 'check_suite')?.['id'];
+          if (
+            rawSuite !== undefined
+            && rawSuite !== null
+            && (typeof rawSuite !== 'number' || !Number.isInteger(rawSuite) || rawSuite <= 0)
+          ) {
+            throw new Error(`gh returned a check run named ${checkName} with a check suite id that is not a positive integer.`);
+          }
+          const checkSuiteId = typeof rawSuite === 'number' ? rawSuite : undefined;
           runs.push({
             ...(id === undefined ? {} : { id }),
+            ...(checkSuiteId === undefined ? {} : { checkSuiteId }),
             status,
             conclusion: typeof conclusion === 'string' ? conclusion : null,
             app,
@@ -599,6 +640,104 @@ export function createJudgeGitHub(options: JudgeGitHubOptions): JudgeGitHub {
         );
       }
       return runs;
+    },
+
+    async checkSuiteRuns(checkSuiteId: number): Promise<ActionsRunSummary[]> {
+      const parsed = ensureOk(
+        await run([
+          'api',
+          `${base}/actions/runs?check_suite_id=${String(checkSuiteId)}`,
+          '--paginate',
+          '--slurp',
+        ]),
+        `the runs of check suite ${String(checkSuiteId)}`,
+      );
+      if (!Array.isArray(parsed)) {
+        throw new Error(`gh did not return a list of pages for the runs of check suite ${String(checkSuiteId)}.`);
+      }
+      const result: ActionsRunSummary[] = [];
+      for (const page of parsed) {
+        const pageRuns = arrayField(page, 'workflow_runs');
+        if (pageRuns === undefined) continue;
+        for (const item of pageRuns) {
+          const id = isRecord(item) ? item['id'] : undefined;
+          const headSha = textField(item, 'head_sha');
+          const event = textField(item, 'event');
+          const workflowId = isRecord(item) ? item['workflow_id'] : undefined;
+          const path = textField(item, 'path');
+          if (
+            typeof id !== 'number'
+            || !Number.isInteger(id)
+            || headSha === undefined
+            || event === undefined
+            || typeof workflowId !== 'number'
+            || !Number.isInteger(workflowId)
+            || path === undefined
+          ) {
+            throw new Error(`gh returned a run of check suite ${String(checkSuiteId)} without its id, head, event, workflow or path.`);
+          }
+          const rawPulls = arrayField(item, 'pull_requests') ?? [];
+          const pullRequests: ActionsRunSummary['pullRequests'][number][] = [];
+          for (const pull of rawPulls) {
+            const number = isRecord(pull) ? pull['number'] : undefined;
+            const base = recordField(pull, 'base');
+            const baseRef = base === undefined ? undefined : textField(base, 'ref');
+            const baseSha = base === undefined ? undefined : textField(base, 'sha');
+            if (
+              typeof number !== 'number'
+              || !Number.isInteger(number)
+              || baseRef === undefined
+              || baseSha === undefined
+            ) {
+              throw new Error(`gh returned a pull request of a run of check suite ${String(checkSuiteId)} without its number, base ref or base sha.`);
+            }
+            pullRequests.push({ number, baseRef, baseSha });
+          }
+          result.push({ id, headSha, event, workflowId, path, pullRequests });
+        }
+      }
+      return result;
+    },
+
+    async workflowRunJobs(runId: number): Promise<{ id: number; checkRunUrl: string }[]> {
+      const parsed = ensureOk(
+        await run([
+          'api',
+          `${base}/actions/runs/${String(runId)}/jobs?filter=all`,
+          '--paginate',
+          '--slurp',
+        ]),
+        `the jobs of run ${String(runId)}`,
+      );
+      if (!Array.isArray(parsed)) {
+        throw new Error(`gh did not return a list of pages for the jobs of run ${String(runId)}.`);
+      }
+      const result: { id: number; checkRunUrl: string }[] = [];
+      for (const page of parsed) {
+        const pageJobs = arrayField(page, 'jobs');
+        if (pageJobs === undefined) continue;
+        for (const item of pageJobs) {
+          const id = isRecord(item) ? item['id'] : undefined;
+          const checkRunUrl = textField(item, 'check_run_url');
+          if (typeof id !== 'number' || !Number.isInteger(id) || checkRunUrl === undefined) {
+            throw new Error(`gh returned a job of run ${String(runId)} without its id or check-run url.`);
+          }
+          result.push({ id, checkRunUrl });
+        }
+      }
+      return result;
+    },
+
+    async workflowById(workflowId: number): Promise<{ path: string }> {
+      const parsed = ensureOk(
+        await run(['api', `${base}/actions/workflows/${String(workflowId)}`]),
+        `workflow ${String(workflowId)}`,
+      );
+      const path = textField(parsed, 'path');
+      if (path === undefined) {
+        throw new Error(`gh did not report the path of workflow ${String(workflowId)}.`);
+      }
+      return { path };
     },
 
     async statuses(sha: string): Promise<CommitStatus[]> {
