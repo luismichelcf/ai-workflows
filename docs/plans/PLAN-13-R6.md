@@ -892,3 +892,52 @@ frase del cambio de destino fuera de `into` precisa «sin otros PRs con esa cabe
 ## 14. Decisiones del dueño que aplica esta rebanada
 
 R24–R31 de PLAN-13 §2, anotadas en el mismo PR.
+
+## 15. Arreglos de la parvada (30-sep)
+
+La parvada completa (R25: correctitud, dos de seguridad, contrato, pruebas con 108 mutantes) revisó
+el cambio entero. Cada arreglo lleva su prueba roja. Decisiones del dueño que salieron de ella:
+R32, R33 y R34.
+
+**Bloqueantes:**
+- **P1. El juicio desde el issue no aplicaba «un veredicto por SHA, el peor»** ni la comparación de
+  la entrada `branches` con la receta: con dos PRs de la misma cabeza ganaba el último veredicto. Se
+  agrupan los PRs por cabeza; por cada cabeza se juzgan **todos** los PRs abiertos con ella hacia
+  `into` (de otra pieza y pases incluidos) y se publica el peor una sola vez; si la entrada y la
+  receta no coinciden, error con el motivo en cada cabeza (§1.2, §6).
+- **P2. La relectura de la punta rompía con dos PRs hacia la misma rama:** al cambiar la punta, se
+  actualizan todos los juicios de esa rama a la vez, y «volvió a cambiar» se cuenta por rama (§1.2).
+- **P3. Mezclas cruzadas:** con varias bases de mezcla, los archivos propios y la versión del motor
+  se miden sobre **lo que de verdad entra**: la unión de los cambios contra todas las bases de mezcla
+  y del árbol de mezcla (`git merge-tree`) contra la punta de confianza. Un conflicto cuenta como
+  tocado (§2).
+- **P4. El sello no funcionaba al empujar la etiqueta** (sin rama `main` local) y una etiqueta
+  llamada `main` podía engañarlo: el sello exige una referencia completa (`refs/remotes/origin/…` o
+  `refs/heads/…`) y la publicación pasa `refs/remotes/origin/<principal>`. El ensayo acepta el SHA
+  revisado como entrada (§9.1, §9.3).
+- **P5. La orden de Codex no tenía reloj propio:** git con 3 s y el cargador con lo que queda hasta
+  27 s; al vencer, rechazo con salida 0 (§3.3, §4).
+- **P6. El gancho leía la entrada antes de armar el vigilante:** el vigilante se arma al arrancar y
+  la lectura de la entrada queda dentro de su plazo (§4).
+
+**Menores aplicados:** archivos propios de R32 (y `.opencode/plugin/`, `.opencode/tool/`,
+`.opencode/tools/`, y claves del bloqueo con `/` inicial); `closed` y `edited` hacia fuera respetan el
+modo apagado; motivo de «no coinciden las ramas» en el idioma de la receta; el plugin de OpenCode
+busca el cargador en la raíz del repositorio; herramientas de solo lectura conocidas (`list` de
+OpenCode, `view_image` de Codex) pasan; reinstalar reemplaza la entrada vieja de Codex y `doctor`
+compara con lo que instala, avisa un tiempo de Codex de 25 s o menos y `disableAllHooks`; el
+cargador de OpenCode no rotula un rechazo del motor como falla; `hooks install` nombra lo que
+escribió y el límite de Codex `exec`; la publicación con permisos mínimos por trabajo, sin llave
+guardada en el checkout, notas con `pnpm dlx … init` y la prueba del contenido del paquete antes
+de empaquetar; `init` rechaza correr desde una subcarpeta, instala los ganchos aunque los workflows
+ya existan, habla en el idioma de la receta, lanza el instalador sin consola intermedia, dice la
+orden exacta de `AI_WORKFLOWS_MODE` y que los archivos se guardan en una rama de pieza, falla si la
+plantilla no trae dónde escribir `branches`, cita el valor de `branches` e informa bien un rollback
+fallido; `explain` en inglés dice «or»; R34 (la parte local mide contra `into[0]`); pruebas para los
+mutantes que sobrevivieron; README, comentarios de las plantillas y §12 del plan al día.
+
+**Declarados (§12.1):** R33; las corridas de la prueba roja listan todos los PRs abiertos con esa
+cabeza, así que con dos PRs de la misma cabeza hacia ramas distintas la cadena no distingue cuál la
+disparó (se mide en CN-14); la protección de `from` en un pase no la comprueba ninguna orden (el
+README pide exigir el juez en las dos ramas); cualquier `User` que comente con `/` despierta al juez
+(falla cerrado; cuesta minutos); sin `node` en el PATH, la orden de Codex no puede rechazar.
