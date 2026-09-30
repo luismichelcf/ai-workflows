@@ -6,7 +6,8 @@
 // parent relays the request, watches the clock and exits cleanly even while the child is stuck on
 // the read. This module is both the child entry and the helper the main thread uses to start it.
 
-import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
+import { dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
@@ -22,11 +23,12 @@ import type { HookClient } from './install.js';
 const CHILD_FLAG = '--child';
 
 /**
- * PLAN-13-R6 §15 (M-a): a `taskkill` that never returns must not hold the answer past the client's
- * cut, so the Windows kill command is given a short limit. On POSIX the kill is a signal, a system
- * call that cannot hang.
+ * PLAN-13-R6 §15 (third delta): the kill command is started detached and never waited for to
+ * finish. The hook keeps its own process alive only for this short, bounded window, so the command
+ * is really dispatched before the answer closes; a `taskkill` that hangs is cut here and can never
+ * hold the answer past the client's cut (the window stays far below the client's 30 s).
  */
-const KILL_COMMAND_TIMEOUT_MS = 2_000;
+const KILL_DISPATCH_GRACE_MS = 750;
 
 function reasonOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -91,32 +93,59 @@ if (process.argv[2] === CHILD_FLAG) {
  * Ends a process and its whole tree, best effort. PLAN-13-R6 §15: the deciding child may have its
  * own children (the git calls it starts), so the watchdog ends the tree, not only the child. On
  * POSIX the child is its own process group leader (`detached`) and the group is signalled; on
- * Windows `taskkill /T` walks the tree, under a short limit so a hung command cannot hold the
- * answer. §15 (M-b): the git the deciding child starts runs `detached`, in a group of its own, so
- * the POSIX branch reuses the tree walk that names each descendant by pid.
+ * Windows `taskkill /T` walks the tree. §15 (M-b): the git the deciding child starts runs
+ * `detached`, in a group of its own, so the POSIX branch reuses the tree walk that names each
+ * descendant by pid.
+ *
+ * PLAN-13-R6 §15 (third delta): the Windows kill command is started detached, does not inherit the
+ * client's pipes, and is never waited for to finish. The returned promise resolves when the command
+ * exits or after a short grace, whichever comes first, so a `taskkill` that hangs cannot hold the
+ * answer past the client's cut.
  */
-function killProcessTree(pid: number | undefined): void {
-  if (pid === undefined || pid <= 0) return;
+function killProcessTree(pid: number | undefined): Promise<void> {
+  if (pid === undefined || pid <= 0) return Promise.resolve();
   if (process.platform === 'win32') {
-    try {
-      spawnSync('taskkill', ['/pid', String(pid), '/T', '/F'], {
-        windowsHide: true,
-        stdio: 'ignore',
-        timeout: KILL_COMMAND_TIMEOUT_MS,
-      });
-    } catch {
-      // Best effort: a process already gone is not a reason to fail.
-    }
-    return;
+    return new Promise<void>((resolve) => {
+      let settled = false;
+      const settle = (): void => {
+        if (settled) return;
+        settled = true;
+        resolve();
+      };
+      let killer: ChildProcess;
+      try {
+        killer = spawn('taskkill', ['/pid', String(pid), '/T', '/F'], {
+          windowsHide: true,
+          stdio: 'ignore',
+          detached: true,
+          // A cwd of its own: a process that inherits the project folder as its working directory
+          // keeps a handle on it, which would delay a later removal of that folder.
+          cwd: dirname(process.execPath),
+        });
+      } catch {
+        // Best effort: a process already gone is not a reason to fail.
+        settle();
+        return;
+      }
+      const timer = setTimeout(settle, KILL_DISPATCH_GRACE_MS);
+      const done = (): void => {
+        clearTimeout(timer);
+        settle();
+      };
+      killer.on('exit', done);
+      killer.on('error', done);
+      killer.unref();
+    });
   }
   killPosixTree(pid);
+  return Promise.resolve();
 }
 
 export interface HookProcess {
   /** The answer of the deciding process, or a rejection when it could not be read. */
   readonly result: Promise<HookResult>;
   /** Ends the deciding process if it is still running; safe to call more than once. */
-  cancel(): void;
+  cancel(): Promise<void>;
 }
 
 /**
@@ -169,13 +198,13 @@ export function spawnHookProcess(kind: HookKind, client: HookClient): HookProces
   });
   return {
     result,
-    cancel(): void {
+    cancel(): Promise<void> {
       // PLAN-13-R6 §15 (M-a): a deciding process that already closed by itself has no tree left to
       // end. Killing by its old pid (or process group) could reach an unrelated process that now
       // owns the number, so the tree is ended only while the child really runs: both `exitCode` and
       // `signalCode` are `null` until it ends.
-      if (child.exitCode !== null || child.signalCode !== null) return;
-      killProcessTree(child.pid);
+      if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+      return killProcessTree(child.pid);
     },
   };
 }

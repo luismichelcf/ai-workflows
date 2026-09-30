@@ -19,7 +19,7 @@
 import { spawn, spawnSync, type ChildProcess, type SpawnOptions } from 'node:child_process';
 import { existsSync, realpathSync } from 'node:fs';
 import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
-import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 import { parse } from 'yaml';
 
@@ -355,7 +355,11 @@ function defaultInstall(spawnProcess: SpawnProcess | undefined): RunPackageInsta
         settled = true;
         resolve(result);
       };
-      const { command, args } = managerCommand(request.manager);
+      const launched = managerCommand(request.manager, request.cwd);
+      if (!launched.ok) {
+        finish({ ok: false, reason: launched.reason });
+        return;
+      }
       const launchOptions: SpawnOptions = {
         cwd: request.cwd,
         windowsHide: true,
@@ -364,7 +368,7 @@ function defaultInstall(spawnProcess: SpawnProcess | undefined): RunPackageInsta
       };
       let child: ChildProcess;
       try {
-        child = launch(command, args, launchOptions);
+        child = launch(launched.command, launched.args, launchOptions);
       } catch (error) {
         finish({ ok: false, reason: reasonOf(error) });
         return;
@@ -381,13 +385,44 @@ function defaultInstall(spawnProcess: SpawnProcess | undefined): RunPackageInsta
     });
 }
 
-/** The command that starts `manager install`, with the JS entry point on Windows (§15). */
-function managerCommand(manager: InstallRequest['manager']): { command: string; args: string[] } {
+type ManagerLaunch =
+  | { readonly ok: true; readonly command: string; readonly args: string[] }
+  | { readonly ok: false; readonly reason: string };
+
+/** Whether `path` lies inside `folder` (case-insensitively on Windows). */
+function isInside(folder: string, path: string): boolean {
+  const base = resolve(folder);
+  const target = resolve(path);
   if (process.platform === 'win32') {
-    const script = windowsManagerScript(manager);
-    if (script !== undefined) return { command: process.execPath, args: [script, 'install'] };
+    const lowerBase = base.toLowerCase();
+    const lowerTarget = target.toLowerCase();
+    return lowerTarget === lowerBase || lowerTarget.startsWith(`${lowerBase}${sep}`);
   }
-  return { command: manager, args: ['install'] };
+  return target === base || target.startsWith(`${base}${sep}`);
+}
+
+/**
+ * PLAN-13-R6 §15 (third delta): the command that starts `manager install`, never a bare name and
+ * never a file of the project. On Windows it is `node <the detected manager's absolute JS entry>`;
+ * on POSIX it is `<absolute folder of PATH>/<manager>`. Without one, nothing is started and the
+ * reason names the manager, so init fails honestly instead of running something else.
+ */
+function managerCommand(manager: InstallRequest['manager'], cwd: string): ManagerLaunch {
+  if (process.platform === 'win32') {
+    const script = windowsManagerScript(manager, cwd);
+    if (script === undefined) {
+      return {
+        ok: false,
+        reason: `no encontré el punto de entrada de ${manager} (${MANAGER_ENTRY[manager]}) fuera del proyecto`,
+      };
+    }
+    return { ok: true, command: process.execPath, args: [script, 'install'] };
+  }
+  const program = posixManagerProgram(manager, cwd);
+  if (program === undefined) {
+    return { ok: false, reason: `no encontré ${manager} en una carpeta absoluta del PATH` };
+  }
+  return { ok: true, command: program, args: ['install'] };
 }
 
 /**
@@ -408,7 +443,7 @@ const MANAGER_ENTRY: Readonly<Record<InstallRequest['manager'], string>> = {
  * an npm project. When nothing is found, `undefined` lets the caller fail honestly naming the
  * manager, never start another one.
  */
-function windowsManagerScript(manager: InstallRequest['manager']): string | undefined {
+function windowsManagerScript(manager: InstallRequest['manager'], cwd: string): string | undefined {
   const entry = MANAGER_ENTRY[manager];
   // npm is also where Node's installer puts it, next to the running `node`.
   const candidates: string[] = [join(dirname(process.execPath), 'node_modules', manager, 'bin', entry)];
@@ -426,6 +461,23 @@ function windowsManagerScript(manager: InstallRequest['manager']): string | unde
     candidates.unshift(execpath);
   }
   for (const candidate of candidates) {
+    // PLAN-13-R6 §15 (third delta): only an absolute entry, and never one of the project. A bare
+    // name and a file under `cwd` are what would run the wrong program.
+    if (isAbsolute(candidate) && !isInside(cwd, candidate) && existsSync(candidate)) return candidate;
+  }
+  return undefined;
+}
+
+/**
+ * PLAN-13-R6 §15 (third delta): on POSIX the manager runs only by an absolute path,
+ * `<an absolute folder of PATH>/<manager>`. A relative entry (`.`, `tools`) would be resolved
+ * against the project, so it is skipped; without an absolute program, init fails honestly.
+ */
+function posixManagerProgram(manager: InstallRequest['manager'], cwd: string): string | undefined {
+  for (const dir of (process.env['PATH'] ?? '').split(delimiter)) {
+    const trimmed = dir.trim();
+    if (trimmed.length === 0 || !isAbsolute(trimmed) || isInside(cwd, trimmed)) continue;
+    const candidate = join(trimmed, manager);
     if (existsSync(candidate)) return candidate;
   }
   return undefined;

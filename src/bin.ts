@@ -57,7 +57,7 @@ function watchdogFrom(raw: string | undefined): number | undefined {
  * handle is still open. Claude Code cuts a hook that keeps running and lets the tool through, so
  * the process must not linger on a worker or on a pipe a grandchild holds.
  */
-function finishHook(result: HookResult, afterWrite?: () => void): void {
+function finishHook(result: HookResult, afterWrite?: () => void | Promise<void>): void {
   const write = (stream: NodeJS.WriteStream, text: string, next: () => void): void => {
     if (text.length === 0) {
       next();
@@ -67,8 +67,15 @@ function finishHook(result: HookResult, afterWrite?: () => void): void {
   };
   write(process.stdout, result.stdout, () => {
     write(process.stderr, result.stderr, () => {
-      afterWrite?.();
-      process.exit(result.exitCode);
+      // The cleanup of the deciding process may take a bounded moment (the kill command is
+      // dispatched and never waited for to finish); the answer is already written, so this only
+      // delays the explicit exit, never the answer the client reads.
+      const after = afterWrite?.();
+      if (after instanceof Promise) {
+        void after.then(() => process.exit(result.exitCode));
+      } else {
+        process.exit(result.exitCode);
+      }
     });
   });
 }
@@ -101,8 +108,9 @@ if (command === 'hook') {
         const { spawnHookProcess } = await import('./locks/hook-worker.js');
         const running = spawnHookProcess(kind as HookKind, client);
         const result = await superviseHook(kind as HookKind, running.result, watchdogMs, client);
-        // §15 (M-a): the answer goes out before the deciding process is ended, and the kill only
-        // happens while it really runs, with a bounded command on Windows. A kill command that
+        // §15 (M-a and third delta): the answer goes out before the deciding process is ended; the
+        // kill only happens while it really runs, and its command is started without being waited
+        // for (a detached process that does not inherit the client's pipes), so a kill command that
         // hangs can never hold the answer past the client's cut.
         finishHook(result, () => running.cancel());
       } else {

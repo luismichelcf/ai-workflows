@@ -3,6 +3,11 @@
 // line that says which engine is installed. Plus the engine version, compared field by field, so a
 // pull request that changes many ordinary things in package.json is judged on the few keys that
 // decide which package lands in `node_modules/ai-workflows`.
+//
+// PLAN-13-R6 §15 (third delta, last paragraph): protecting the manifests with a list of dangerous
+// keys never closes — another manifest format, another installer option. The rule is inverted: in a
+// package manifest (`package.json`, `package.yaml`, `package.json5`, at any depth) and in
+// `pnpm-workspace.yaml`, every change is touched except a short list of harmless ones.
 
 import { parse as parseYaml } from 'yaml';
 
@@ -68,6 +73,9 @@ export function isEngineProtectedPath(path: string): boolean {
  */
 const ENGINE_KEY = /(^|>)ai-workflows(@|$)/;
 
+/** The engine package name, exactly: only this `name` is dangerous (§15 third delta). */
+const ENGINE_NAME = 'ai-workflows';
+
 /** The sections of a package.json or an importer that install the dependency named by their key. */
 const DEPENDENCY_SECTIONS = [
   'dependencies',
@@ -75,6 +83,7 @@ const DEPENDENCY_SECTIONS = [
   'optionalDependencies',
   'peerDependencies',
 ] as const;
+const DEPENDENCY_SECTION_SET = new Set<string>(DEPENDENCY_SECTIONS);
 
 /**
  * PLAN-13-R6 §15 and R32: the scripts that run when dependencies are installed. Changing any of
@@ -93,6 +102,71 @@ const LIFECYCLE_SCRIPTS = [
   'prepublish',
   'dependencies',
 ] as const;
+const LIFECYCLE_SCRIPT_SET = new Set<string>(LIFECYCLE_SCRIPTS);
+
+/**
+ * PLAN-13-R6 §15 (third delta): the package.json fields that are harmless whatever they hold. Every
+ * other field — and every field this list does not name, like `main`, `exports`, `bin`, `type`,
+ * `overrides` or `pnpm` — is part of what decides which packages run on install.
+ */
+const HARMLESS_FIELDS = [
+  'version',
+  'description',
+  'keywords',
+  'author',
+  'contributors',
+  'license',
+  'repository',
+  'homepage',
+  'bugs',
+  'private',
+] as const;
+const HARMLESS_FIELD_SET = new Set<string>(HARMLESS_FIELDS);
+
+/** A manifest format, by file name, at any depth (§15 third delta). */
+type ManifestKind = 'json' | 'yaml' | 'json5';
+
+/** The last path segment, lower case: a manifest is named wherever it lives. */
+function baseName(file: string): string {
+  const lower = file.toLowerCase();
+  const at = lower.lastIndexOf('/');
+  return at < 0 ? lower : lower.slice(at + 1);
+}
+
+/** The kind of package manifest `file` is, in any folder, or `undefined` for any other file. */
+function manifestKindOf(file: string): ManifestKind | undefined {
+  switch (baseName(file)) {
+    case 'package.json':
+      return 'json';
+    case 'package.yaml':
+      return 'yaml';
+    case 'package.json5':
+      return 'json5';
+    default:
+      return undefined;
+  }
+}
+
+/** The root `package.json`, whose added or removed side has no trustworthy empty (§15 M-c). */
+function isRootPackageJson(file: string): boolean {
+  return file.toLowerCase() === 'package.json';
+}
+
+/**
+ * PLAN-13-R6 §15 (M-c, third delta): a package manifest of a workspace member is any manifest that
+ * is not the root `package.json`; added or removed, its missing side reads as an empty manifest.
+ */
+function isMemberManifest(file: string): boolean {
+  return manifestKindOf(file) !== undefined && !isRootPackageJson(file);
+}
+
+/**
+ * PLAN-13-R6 §15 (third delta): `binding.gyp`, at any depth, is touched whenever it changes: npm
+ * runs `node-gyp rebuild` on install when a package has one and no install script.
+ */
+function isBindingGyp(file: string): boolean {
+  return baseName(file) === 'binding.gyp';
+}
 
 /** The lockfiles that decide which engine is installed, read with their own cap (§2.2). */
 export const ENGINE_VERSION_FILES: readonly string[] = [
@@ -107,28 +181,17 @@ export const ENGINE_VERSION_FILES: readonly string[] = [
 export const ENGINE_VERSION_MAX_BYTES = 50 * 1024 * 1024;
 
 /**
- * PLAN-13-R6 §15 (B3): a package.json anywhere — the root or a workspace member — carries the
- * lifecycle scripts that run on install, so it is compared field by field like the root one.
+ * The engine-version files a pull request touches: any package manifest at any depth, any
+ * `binding.gyp`, and the canonical lockfiles, whatever the case it committed (§15 third delta).
  */
-function isPackageJson(file: string): boolean {
-  const lower = file.toLowerCase();
-  return lower === 'package.json' || lower.endsWith('/package.json');
-}
-
-/**
- * PLAN-13-R6 §15 (M-c): a workspace member's package.json is any `…/package.json` that is not the
- * root one. Unlike the root one, a member that is added or removed has a trustworthy empty side:
- * it is compared field by field with the missing side read as an empty object.
- */
-function isMemberPackageJson(file: string): boolean {
-  const lower = file.toLowerCase();
-  return lower !== 'package.json' && lower.endsWith('/package.json');
-}
-
-/** The canonical engine-version files a pull request touches, whatever the case it committed. */
 export function engineVersionFilesIn(files: readonly string[]): string[] {
   const canonical = new Set(ENGINE_VERSION_FILES);
-  return files.filter((file) => isPackageJson(file) || canonical.has(file.toLowerCase()));
+  return files.filter(
+    (file) =>
+      manifestKindOf(file) !== undefined ||
+      isBindingGyp(file) ||
+      canonical.has(file.toLowerCase()),
+  );
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -172,71 +235,83 @@ function collectEnginePackages(section: unknown, prefix: string, out: Record<str
   }
 }
 
-/** The projection of package.json: only the keys that decide which engine is installed. */
-function projectPackageJson(value: unknown): string {
-  if (!isRecord(value)) throw new Error('package.json is not an object');
+/**
+ * The projection of a package manifest (§15 third delta): the manifest with its harmless parts
+ * removed, so any change anywhere else counts as touched — an unknown key as much as a known one.
+ * The harmless parts are: the dependency entries that do not name the engine; `name` when it is not
+ * the engine; the fixed list of descriptive fields; and every script that does not run on install.
+ */
+function sanitizeManifest(value: unknown): string {
+  if (!isRecord(value)) throw new Error('package manifest is not an object');
   const out: Record<string, unknown> = {};
-  for (const section of DEPENDENCY_SECTIONS) {
-    if (hasKey(value[section], 'ai-workflows')) {
-      out[`${section}.ai-workflows`] = (value[section] as Record<string, unknown>)['ai-workflows'];
+  for (const [key, entry] of Object.entries(value)) {
+    if (DEPENDENCY_SECTION_SET.has(key)) {
+      if (!isRecord(entry)) {
+        out[key] = entry;
+        continue;
+      }
+      const kept: Record<string, unknown> = {};
+      for (const [name, spec] of Object.entries(entry)) {
+        if (ENGINE_KEY.test(name)) kept[name] = spec;
+      }
+      if (Object.keys(kept).length > 0) out[key] = kept;
+      continue;
     }
-  }
-  const scripts = value['scripts'];
-  if (isRecord(scripts)) {
-    for (const name of LIFECYCLE_SCRIPTS) {
-      if (hasKey(scripts, name)) out[`scripts.${name}`] = scripts[name];
+    if (key === 'name') {
+      if (typeof entry !== 'string' || entry.toLowerCase() === ENGINE_NAME) out[key] = entry;
+      continue;
     }
-  }
-  // PLAN-13-R6 §15 (M1): `packageManager` picks the installer through corepack.
-  if (hasKey(value, 'packageManager')) out['packageManager'] = value['packageManager'];
-  // PLAN-13-R6 §15 (M-d): `workspaces` says which folders are members (whose lifecycle scripts
-  // run), and `dependenciesMeta` can allow or forbid build scripts of dependencies.
-  if (hasKey(value, 'workspaces')) out['workspaces'] = value['workspaces'];
-  if (hasKey(value, 'dependenciesMeta')) out['dependenciesMeta'] = value['dependenciesMeta'];
-  collectEngineKeys(value['overrides'], 'overrides', out);
-  collectEngineKeys(value['resolutions'], 'resolutions', out);
-  const pnpm = value['pnpm'];
-  if (isRecord(pnpm)) {
-    collectEngineKeys(pnpm['overrides'], 'pnpm.overrides', out);
-    collectEngineKeys(pnpm['patchedDependencies'], 'pnpm.patchedDependencies', out);
-    if (hasKey(pnpm, 'onlyBuiltDependencies')) out['pnpm.onlyBuiltDependencies'] = pnpm['onlyBuiltDependencies'];
-    // PLAN-13-R6 §15 (M1): another build allow-list a pnpm install would read.
-    if (hasKey(pnpm, 'onlyBuiltDependenciesFile')) out['pnpm.onlyBuiltDependenciesFile'] = pnpm['onlyBuiltDependenciesFile'];
+    if (key === 'scripts') {
+      if (!isRecord(entry)) {
+        out[key] = entry;
+        continue;
+      }
+      const kept: Record<string, unknown> = {};
+      for (const [name, script] of Object.entries(entry)) {
+        if (LIFECYCLE_SCRIPT_SET.has(name)) kept[name] = script;
+      }
+      if (Object.keys(kept).length > 0) out[key] = kept;
+      continue;
+    }
+    if (HARMLESS_FIELD_SET.has(key)) continue;
+    out[key] = entry;
   }
   return canonical(out);
 }
 
-/** The projection of pnpm-workspace.yaml: its overrides, its patches, its installer and catalogs. */
-function projectWorkspace(value: unknown): string {
+/** The engine-keyed entries of a catalog, or `undefined` when nothing is left. */
+function engineEntriesOnly(section: unknown): unknown {
+  if (!isRecord(section)) return section;
+  const kept: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(section)) {
+    if (ENGINE_KEY.test(key)) kept[key] = entry;
+  }
+  return Object.keys(kept).length > 0 ? kept : undefined;
+}
+
+/**
+ * The projection of pnpm-workspace.yaml (§15 third delta): everything is kept except the catalog
+ * entries of packages that are not the engine. An unknown key — `scriptShell`, `packageExtensions`,
+ * whatever pnpm adds next — is kept, so it is touched.
+ */
+function sanitizeWorkspace(value: unknown): string {
   if (!isRecord(value)) throw new Error('pnpm-workspace.yaml is not an object');
-  const out: Record<string, unknown> = {};
-  collectEngineKeys(value['overrides'], 'overrides', out);
-  collectEngineKeys(value['patchedDependencies'], 'patchedDependencies', out);
-  // PLAN-13-R6 §15/R32: the build allow-list and a custom pnpmfile run when dependencies install.
-  // M1 of the delta review adds the rest of the pnpm workspace knobs that decide what runs.
-  for (const key of [
-    'onlyBuiltDependencies',
-    'pnpmfile',
-    'dangerouslyAllowAllBuilds',
-    'onlyBuiltDependenciesFile',
-    'neverBuiltDependencies',
-    // PLAN-13-R6 §15 (M-d): which folders are members, the config dependencies pnpm runs, and the
-    // allow-list of build scripts (the other spelling of the build permission).
-    'packages',
-    'configDependencies',
-    'allowBuilds',
-  ] as const) {
-    if (hasKey(value, key)) out[key] = value[key];
+  const out: Record<string, unknown> = { ...value };
+  if (hasKey(out, 'catalog')) {
+    const kept = engineEntriesOnly(out['catalog']);
+    if (kept === undefined) delete out['catalog'];
+    else out['catalog'] = kept;
   }
-  if (hasKey(value['catalog'], 'ai-workflows')) {
-    out['catalog.ai-workflows'] = (value['catalog'] as Record<string, unknown>)['ai-workflows'];
-  }
-  const catalogs = value['catalogs'];
-  if (isRecord(catalogs)) {
-    for (const [name, catalog] of Object.entries(catalogs)) {
-      if (hasKey(catalog, 'ai-workflows')) {
-        out[`catalogs.${name}.ai-workflows`] = (catalog as Record<string, unknown>)['ai-workflows'];
+  if (hasKey(out, 'catalogs')) {
+    const catalogs = out['catalogs'];
+    if (isRecord(catalogs)) {
+      const kept: Record<string, unknown> = {};
+      for (const [name, catalog] of Object.entries(catalogs)) {
+        const entries = engineEntriesOnly(catalog);
+        if (entries !== undefined) kept[name] = entries;
       }
+      if (Object.keys(kept).length > 0) out['catalogs'] = kept;
+      else delete out['catalogs'];
     }
   }
   return canonical(out);
@@ -312,11 +387,15 @@ function yarnEngineBlocks(content: string): string[] {
 /** The projection of a version file, or `undefined` when it cannot be read as its format. */
 function projectionOf(file: string, content: string): string | undefined {
   try {
-    // PLAN-13-R6 §15 (B3): any package.json of the workspace, root or member, projects the same.
-    if (isPackageJson(file)) return projectPackageJson(JSON.parse(content));
+    const kind = manifestKindOf(file);
+    if (kind === 'json') return sanitizeManifest(JSON.parse(content));
+    if (kind === 'yaml') return sanitizeManifest(parseYaml(content));
+    // §15 (third delta): package.json5 and binding.gyp have no reader here, so they are touched
+    // whenever they change (a harmless field included), never read as a pass.
+    if (kind === 'json5' || isBindingGyp(file)) return undefined;
     if (file === 'package-lock.json') return projectPackageLock(JSON.parse(content));
     if (file === 'yarn.lock') return canonical(yarnEngineBlocks(content));
-    if (file === 'pnpm-workspace.yaml') return projectWorkspace(parseYaml(content));
+    if (file === 'pnpm-workspace.yaml') return sanitizeWorkspace(parseYaml(content));
     if (file === 'pnpm-lock.yaml') return projectPnpmLock(parseYaml(content));
     return undefined;
   } catch {
@@ -325,15 +404,15 @@ function projectionOf(file: string, content: string): string | undefined {
 }
 
 /**
- * The projection of one side of a comparison. PLAN-13-R6 §15 (M-c): a workspace member's
- * package.json that is missing reads as an empty object, so adding it with only name and ordinary
- * dependencies, or deleting it without lifecycle scripts, is not a change. The root package.json,
- * the lockfiles and a member that cannot be read as its format have no trustworthy empty side:
- * they count as touched.
+ * The projection of one side of a comparison. PLAN-13-R6 §15 (M-c, third delta): a workspace
+ * member's manifest — `package.json` or `package.yaml` — that is missing reads as an empty
+ * manifest, so adding it with only name and ordinary dependencies, or deleting it without lifecycle
+ * scripts, is not a change. The root package.json, package.json5, binding.gyp, the lockfiles and a
+ * member that cannot be read as its format have no trustworthy empty side: they count as touched.
  */
 function projectionOfSide(file: string, reading: GitFileReading): string | undefined {
   if (reading.kind === 'file') return projectionOf(file, reading.content ?? '');
-  if (reading.kind === 'missing' && isMemberPackageJson(file)) return projectPackageJson({});
+  if (reading.kind === 'missing' && isMemberManifest(file)) return projectionOf(file, '{}');
   return undefined;
 }
 
@@ -362,44 +441,85 @@ function foldRepoPath(path: string): string {
   return path.replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase();
 }
 
-/** The path a settings value names, normalized for comparison, or `undefined` when it names none. */
-function namedPath(value: unknown): string | undefined {
+/**
+ * A path a settings value names, normalized to the repository: forward slashes, no `.` or `..`
+ * segments, lower case. `undefined` when it names nothing, or when it leaves the repository (an
+ * absolute path or one that pops above its root), so such a value is ignored (§15 third delta).
+ */
+function normalizeRepoPath(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined;
-  const folded = foldRepoPath(value.trim());
-  return folded.length > 0 ? folded : undefined;
+  const folded = value.trim().replace(/\\/g, '/');
+  if (folded.length === 0) return undefined;
+  if (folded.startsWith('/') || /^[A-Za-z]:/.test(folded)) return undefined;
+  const stack: string[] = [];
+  for (const part of folded.split('/')) {
+    if (part === '' || part === '.') continue;
+    if (part === '..') {
+      if (stack.length === 0) return undefined;
+      stack.pop();
+      continue;
+    }
+    stack.push(part);
+  }
+  if (stack.length === 0) return undefined;
+  return stack.join('/').toLowerCase();
+}
+
+/** The value of `only-built-dependencies-file` in an .npmrc, or `undefined` when it names none. */
+function npmrcBuildFile(content: string): unknown {
+  for (const raw of content.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (line.length === 0 || line.startsWith('#') || line.startsWith(';')) continue;
+    const at = line.indexOf('=');
+    if (at < 0) continue;
+    if (line.slice(0, at).trim() !== 'only-built-dependencies-file') continue;
+    return line.slice(at + 1).trim();
+  }
+  return undefined;
 }
 
 /**
- * PLAN-13-R6 §15 (M-d): the file the trusted side names with `onlyBuiltDependenciesFile` (in
- * `pnpm-workspace.yaml` or in `pnpm` of `package.json`). pnpm builds only what that file lists, so
- * it decides which dependencies run code. A git failure throws; a config that cannot be read, or
- * that names nothing, yields no named file (the config itself is compared field by field).
+ * PLAN-13-R6 §15 (M-d, third delta): the files the trusted side names as its build allow-list, from
+ * every setting that can name one — `onlyBuiltDependenciesFile` in `pnpm-workspace.yaml`,
+ * `pnpm.onlyBuiltDependenciesFile` in `package.json` and `only-built-dependencies-file` in
+ * `.npmrc`. pnpm builds only what those files list, so each decides which dependencies run code.
+ * A git failure throws; a config that cannot be read, or that names nothing, contributes nothing
+ * (the config itself is compared field by field). Every value is normalized, and one that leaves
+ * the repository is ignored.
  */
-async function namedBuildFile(root: string, trusted: string): Promise<string | undefined> {
+async function namedBuildFiles(root: string, trusted: string): Promise<string[]> {
+  const found = new Set<string>();
+  const add = (value: unknown): void => {
+    const path = normalizeRepoPath(value);
+    if (path !== undefined) found.add(path);
+  };
+
   const workspace = await gitFileAt(root, trusted, 'pnpm-workspace.yaml', ENGINE_VERSION_MAX_BYTES);
   if (workspace.kind === 'file') {
     try {
       const parsed = parseYaml(workspace.content ?? '');
-      if (isRecord(parsed)) {
-        const found = namedPath(parsed['onlyBuiltDependenciesFile']);
-        if (found !== undefined) return found;
-      }
+      if (isRecord(parsed)) add(parsed['onlyBuiltDependenciesFile']);
     } catch {
       // Not YAML: its own projection already counts it as touched; no named file to add.
     }
   }
+
   const packageJson = await gitFileAt(root, trusted, 'package.json', ENGINE_VERSION_MAX_BYTES);
   if (packageJson.kind === 'file') {
     try {
       const parsed: unknown = JSON.parse(packageJson.content ?? '');
       if (isRecord(parsed) && isRecord(parsed['pnpm'])) {
-        return namedPath((parsed['pnpm'] as Record<string, unknown>)['onlyBuiltDependenciesFile']);
+        add((parsed['pnpm'] as Record<string, unknown>)['onlyBuiltDependenciesFile']);
       }
     } catch {
       // Not JSON: its own projection already counts it as touched; no named file to add.
     }
   }
-  return undefined;
+
+  const npmrc = await gitFileAt(root, trusted, '.npmrc', ENGINE_VERSION_MAX_BYTES);
+  if (npmrc.kind === 'file') add(npmrcBuildFile(npmrc.content ?? ''));
+
+  return [...found];
 }
 
 export interface OwnFilesScan {
@@ -457,10 +577,10 @@ export async function scanOwnFiles(
     if (differs) versionTouched.push(file);
   }
 
-  // PLAN-13-R6 §15 (M-d): the file the trusted side names as its build allow-list is one of the
-  // judge's own; a change to it is reported with its name, like any engine-version file.
-  const buildFile = await namedBuildFile(root, trusted);
-  if (buildFile !== undefined) {
+  // PLAN-13-R6 §15 (M-d, third delta): every file the trusted side names as its build allow-list —
+  // from `pnpm-workspace.yaml`, `pnpm` of `package.json` or `.npmrc` — is one of the judge's own; a
+  // change to it is reported with its name, like any engine-version file.
+  for (const buildFile of await namedBuildFiles(root, trusted)) {
     const changed = files.find((file) => foldRepoPath(file) === buildFile);
     if (changed !== undefined && !versionTouched.includes(changed)) versionTouched.push(changed);
   }
