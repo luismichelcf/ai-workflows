@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
@@ -243,7 +243,9 @@ async function loadPlugin(root: string): Promise<PluginFn> {
   pluginCopies += 1;
   const copy = join(root, '.opencode', 'plugins', `ai-workflows-${pluginCopies}.mjs`);
   writeFileSync(copy, source);
-  const module = (await import(pathToFileURL(copy).href)) as Record<string, unknown>;
+  // The long form of the path: on the GitHub Windows runner the temp folder is an 8.3 short name
+  // (`RUNNER~1`), and the test runner's module loader cannot open a URL with an encoded `~`.
+  const module = (await import(pathToFileURL(realpathSync.native(copy)).href)) as Record<string, unknown>;
   const exported = Object.values(module);
   // OpenCode calls every export of a plugin file as a plugin: there must be exactly one.
   expect(exported).toHaveLength(1);
