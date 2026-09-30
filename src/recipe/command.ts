@@ -1,13 +1,13 @@
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
-import { dirname, isAbsolute, join } from 'node:path';
+import { readFile } from 'node:fs/promises';
+import { isAbsolute, join } from 'node:path';
 
 import type { CommandOutput } from '../cli.js';
+import { RECIPE_USAGE, runInit, type RecipeCommandOptions } from '../release/init.js';
 import { checkRecipe } from './blocks.js';
 import { explainRecipe } from './explain.js';
 import { safeTerminalText } from '../safe-text.js';
 
 const DEFAULT_RECIPE = '.ai-workflows/pipeline.yml';
-const USAGE = 'Usage: ai-workflows <validate|explain|init> [file]';
 
 function errorReason(error: unknown): string {
   return safeTerminalText(error instanceof Error ? error.message : String(error));
@@ -16,31 +16,6 @@ function errorReason(error: unknown): string {
 function errorCode(error: unknown): string | undefined {
   if (typeof error !== 'object' || error === null || !('code' in error)) return undefined;
   return String(error.code);
-}
-
-async function initialize(cwd: string): Promise<CommandOutput> {
-  const path = join(cwd, DEFAULT_RECIPE);
-  try {
-    // src/recipe and dist/recipe share this depth relative to the package template.
-    const template = await readFile(
-      new URL('../../templates/pipeline.yml', import.meta.url),
-      'utf8',
-    );
-    await mkdir(dirname(path), { recursive: true });
-    await writeFile(path, template, { flag: 'wx' });
-    return {
-      ok: true,
-      text: `Created ${DEFAULT_RECIPE}. Read it in plain words with: ai-workflows explain`,
-    };
-  } catch (error) {
-    if (errorCode(error) === 'EEXIST') {
-      return {
-        ok: false,
-        text: `${DEFAULT_RECIPE} already exists; init does not overwrite it.`,
-      };
-    }
-    return { ok: false, text: `${DEFAULT_RECIPE}: ${errorReason(error)}` };
-  }
 }
 
 async function readRecipe(
@@ -81,12 +56,12 @@ async function readRecipe(
 
 export async function recipeCommand(
   argv: readonly string[],
-  options: { cwd: string },
+  options: RecipeCommandOptions,
 ): Promise<CommandOutput> {
   const [action, filename, ...extra] = argv;
-  if (extra.length > 0) return { ok: false, text: USAGE };
-  if (action === 'init' && filename === undefined) return initialize(options.cwd);
-  if (action !== 'validate' && action !== 'explain') return { ok: false, text: USAGE };
+  if (action === 'init') return runInit(argv.slice(1), options);
+  if (extra.length > 0) return { ok: false, text: RECIPE_USAGE };
+  if (action !== 'validate' && action !== 'explain') return { ok: false, text: RECIPE_USAGE };
 
   // Diagnostics show the same separator on Windows and Linux.
   const file = (filename ?? DEFAULT_RECIPE).replace(/\\/g, '/');

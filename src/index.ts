@@ -224,6 +224,8 @@ export type { Recipe, RecipeStage, RecipeCondition, RecipeError, RecipePieces } 
 export type { BlockManifest, InputSpec, ValidWhile, ServerMode } from './blocks/manifest.js';
 export {
   parseHookInput,
+  parseClientInput,
+  renderClientOutput,
   decideToolUse,
   renderHookOutput,
   handleHook,

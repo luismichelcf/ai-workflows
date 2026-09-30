@@ -1,28 +1,42 @@
 name: release
 
-# Publishes a built package as a GitHub Release asset when a version tag is pushed.
-# Projects install it by URL: nothing runs during their install (pnpm 10 refuses build scripts
-# from git dependencies), and every version stays immutable.
+# PLAN-13-R6 §9.3: publishes a sealed package as a GitHub Release asset when a version tag is
+# pushed, and can rehearse the whole thing by hand (`workflow_dispatch` with `dry-run`). Every
+# action is pinned by the SHA of its version: a tag can move, a commit cannot. Projects install it
+# by URL: nothing runs during their install, and every published version stays immutable.
 
 on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: Build and keep the package without publishing the release.
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
 
 jobs:
-  release:
-    runs-on: ubuntu-latest
+  # The gate runs where the users run it. Publishing waits for it.
+  check:
+    name: Gate
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           version: 10
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: pnpm
@@ -30,25 +44,62 @@ jobs:
       - name: Install
         run: pnpm install --frozen-lockfile
 
-      - name: Check the tag matches the package version
-        run: |
-          expected="v$(node -p "require('./package.json').version")"
-          if [ "$GITHUB_REF_NAME" != "$expected" ]; then
-            echo "Tag $GITHUB_REF_NAME does not match package.json version $expected" >&2
-            exit 1
-          fi
-
       - name: Typecheck and test
         run: pnpm check
+
+  release:
+    name: Seal and publish
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      # Full history: the seal walks main's first-parent history to find the merge that brought the
+      # reviewed commit in, and compares the two trees.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      # Seal HEAD (the tag's commit on a release, the reviewed commit on a dry-run) after checking
+      # it is the tag's commit, an ancestor of main, and its tree equals the merge that contains it.
+      - name: Seal the reviewed commit
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          RELEASE_TAG: ${{ github.event_name == 'push' && github.ref_name || '' }}
+        run: |
+          if [ -n "$RELEASE_TAG" ]; then
+            node scripts/seal.mjs --main "$DEFAULT_BRANCH" --tag "$RELEASE_TAG"
+          else
+            node scripts/seal.mjs --main "$DEFAULT_BRANCH"
+          fi
 
       - name: Pack
         run: pnpm pack
 
+      # What the dry-run leaves to rehearse: the package and the schema the recipes point at.
+      - name: Keep the package as an artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ai-workflows-package
+          path: |
+            *.tgz
+            schema/recipe.schema.json
+
       - name: Publish the release
+        if: ${{ github.event_name == 'push' }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           version="$(node -p "require('./package.json').version")"
-          gh release create "$GITHUB_REF_NAME" "ai-workflows-${version}.tgz" \
+          gh release create "$GITHUB_REF_NAME" "ai-workflows-${version}.tgz" schema/recipe.schema.json \
             --title "$GITHUB_REF_NAME" \
             --notes "Install: \`pnpm add https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/ai-workflows-${version}.tgz\`"

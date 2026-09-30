@@ -2,11 +2,16 @@
 
 import { isRecord } from './shared.js';
 
-export type HookClient = 'claude' | 'codex';
+export type HookClient = 'claude' | 'codex' | 'opencode';
 
 export interface HookHandler {
   readonly type: 'command';
   readonly command: string;
+  /**
+   * PLAN-13-R6 §3.3: Codex runs a different order under cmd.exe and Windows PowerShell than under
+   * `sh`, so its entry carries both. The one it does not run is kept verbatim on a reinstall.
+   */
+  readonly commandWindows?: string;
   /**
    * PLAN-13-R5 §1.5: the direct form (no shell, same on every system) names the engine as the
    * arguments of `node`. Our entry is recognized by `command` AND `args`, so a foreign hook that
@@ -34,8 +39,10 @@ export function buildHooksConfig(client: HookClient, command: string): HooksFile
   // Bash, PowerShell and Monitor ride along so the sign-off rule can see shell commands; the hook
   // lets them through itself when they carry no sign-off (see editor.ts). Monitor runs a shell
   // command like Bash, so it carries the same `command` text.
+  // PLAN-13-R6 §3.2: in Codex the hook must receive every tool, so an unknown tool carrying a
+  // path reaches the rule that refuses it. The installed matcher is therefore `.*`.
   const matcher =
-    client === 'claude' ? 'Write|Edit|MultiEdit|NotebookEdit|Bash|PowerShell|Monitor' : 'apply_patch|Bash';
+    client === 'claude' ? 'Write|Edit|MultiEdit|NotebookEdit|Bash|PowerShell|Monitor' : '.*';
 
   return {
     hooks: {
@@ -132,6 +139,7 @@ function copyOurGroups(groups: readonly HookGroup[], timeout: number | undefined
       return {
         type: handler.type,
         command: handler.command,
+        ...(handler.commandWindows === undefined ? {} : { commandWindows: handler.commandWindows }),
         ...(handler.args === undefined ? {} : { args: [...handler.args] }),
         ...(kept === undefined ? {} : { timeout: kept }),
       };
