@@ -583,3 +583,127 @@ describe('PLAN-13-R6 §1.2, §1.5: the red test of a PR into a working branch', 
     expect(result.summary).toMatch(/No se prueba: la rama destino es «staging», no main/);
   });
 });
+
+describe('PLAN-13-R6 §1.2, §1.5: guards of the red test into a working branch', () => {
+  // Every path where the tip of a working branch or its recipe cannot be trusted ends red with the
+  // motive; none of them falls back to main's tip or recipe. The piece used here (a bonus that
+  // goes from 800 to 1000 with its test) would pass against either tip under either recipe, so a
+  // fallback would show up as a green run.
+  const BRANCHED = RECIPE.replace('locale: es\n', 'locale: es\nbranches:\n  into: [staging, main]\n');
+  const BONUS_PIECE = { 'src/bonus.mjs': BONUS(1000), 'tests/bonus.test.mjs': BONUS_TEST };
+
+  /** Staging one commit ahead of main, with `stagingRecipe` there (or none when `undefined`). */
+  function withStaging(mainRecipe: string, stagingRecipe: string | undefined) {
+    const p = project({ '.ai-workflows/pipeline.yml': mainRecipe });
+    git(p.root, 'switch', '-q', '-c', 'staging', p.main);
+    write(p.root, 'src/rate.mjs', 'export const rate = () => 3;\n');
+    if (stagingRecipe === undefined) git(p.root, 'rm', '-q', '.ai-workflows/pipeline.yml');
+    else write(p.root, '.ai-workflows/pipeline.yml', stagingRecipe);
+    const staging = commit(p.root, 'staging moves ahead of main');
+    git(p.root, 'switch', '-q', 'main');
+    p.github.heads['staging'] = staging;
+    return { p, staging };
+  }
+
+  function bonusIntoStaging(mainRecipe: string, stagingRecipe: string | undefined) {
+    const { p, staging } = withStaging(mainRecipe, stagingRecipe);
+    const head = p.pr(7, 'feat/13-bono', BONUS_PIECE, staging);
+    p.checkout(head);
+    return { p, staging, event: p.pullRequestEvent(7, { sha: staging, ref: 'staging' }) };
+  }
+
+  it('control: the same piece into staging passes when its tip and recipe are readable', async () => {
+    const { p, event } = bonusIntoStaging(BRANCHED, BRANCHED);
+    const result = await runRedTestCheck(event, p.deps());
+    expect(result, result.summary).toEqual({ ok: true, summary: expect.stringMatching(/red-test: pasó/) });
+  });
+
+  it('(a) the tip of staging cannot be read: red, naming the unreadable tip of staging', async () => {
+    const { p, event } = bonusIntoStaging(BRANCHED, BRANCHED);
+    p.github.branchHead = async (name: string) => {
+      if (name === 'main') return p.github.mainHead;
+      throw new Error('API caída');
+    };
+    const result = await runRedTestCheck(event, p.deps());
+    expect(result.ok).toBe(false);
+    expect(result.summary).toMatch(/No se pudo leer la punta de staging: API caída/);
+  });
+
+  it('(a) the tip of staging is an unknown commit: red, naming that tip', async () => {
+    const { p, event } = bonusIntoStaging(BRANCHED, BRANCHED);
+    const unknown = 'f'.repeat(40);
+    p.github.heads['staging'] = unknown;
+    const result = await runRedTestCheck(event, p.deps());
+    expect(result.ok).toBe(false);
+    expect(result.summary).toContain(`No hay receta legible en ${unknown}`);
+  });
+
+  it('(b) the tip of staging has no recipe: red with the motive, never main\'s recipe', async () => {
+    const { p, staging, event } = bonusIntoStaging(BRANCHED, undefined);
+    const result = await runRedTestCheck(event, p.deps());
+    expect(result.ok).toBe(false);
+    expect(result.summary).toContain(`No hay receta legible en ${staging}:.ai-workflows/pipeline.yml`);
+    expect(result.summary).not.toMatch(/red-test: pasó/);
+  });
+
+  it('(b) the tip of staging has an invalid recipe: red with the motive, never main\'s recipe', async () => {
+    const { p, staging, event } = bonusIntoStaging(BRANCHED, 'version: 1\nlocale: es\nstages: nada\n');
+    const result = await runRedTestCheck(event, p.deps());
+    expect(result.ok).toBe(false);
+    expect(result.summary).toContain(`La receta de ${staging} no es válida`);
+    expect(result.summary).not.toMatch(/red-test: pasó/);
+  });
+
+  it('(c) the list of working branches comes from main only: staging cannot add develop', async () => {
+    const stagingRecipe = RECIPE.replace('locale: es\n', 'locale: es\nbranches:\n  into: [staging, develop]\n');
+    const { p, staging } = withStaging(BRANCHED.replace('[staging, main]', '[main, staging]'), stagingRecipe);
+    // develop is the same commit as staging, so its tip also declares itself a working branch.
+    p.github.heads['develop'] = staging;
+    const head = p.pr(7, 'feat/13-bono', BONUS_PIECE, staging);
+    p.checkout(head);
+
+    const result = await runRedTestCheck(p.pullRequestEvent(7, { sha: staging, ref: 'develop' }), p.deps());
+
+    expect(result.ok).toBe(false);
+    expect(result.summary).toMatch(/No se prueba: la rama destino es «develop»/);
+    expect(result.summary).not.toMatch(/red-test: pasó/);
+  });
+
+  it('(d) a merge group never tests a queued PR into staging, even with staging in main\'s list', async () => {
+    const { p, staging } = withStaging(BRANCHED, BRANCHED);
+    p.pr(7, 'feat/13-bono', BONUS_PIECE, staging);
+    const pullRequest = p.github.pullRequest;
+    p.github.pullRequest = async (n: number) => ({ ...(await pullRequest(n)), baseRef: 'staging' });
+    git(p.root, 'switch', '-q', '--detach', staging);
+    git(p.root, 'merge', '-q', '--no-ff', '--no-edit', 'pr-7');
+    const g1 = git(p.root, 'rev-parse', 'HEAD');
+    git(p.root, 'switch', '-q', 'main');
+    p.github.queue = [{ position: 1, headSha: g1, baseSha: staging, prNumber: 7 }];
+    p.checkout(g1);
+
+    const result = await runRedTestCheck(
+      { eventName: 'merge_group', event: { merge_group: { head_sha: g1, base_sha: staging } }, root: p.root, repository: 'duena/proyecto' },
+      p.deps(),
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.summary).toMatch(/No se prueba: la rama destino es «staging», no main/);
+  });
+
+  it('(e) the tips of the working branches cannot be fetched: red with the motive', async () => {
+    const { p, event } = bonusIntoStaging(BRANCHED, BRANCHED);
+    let calls = 0;
+    const deps = {
+      ...p.deps(),
+      fetchObjects: async () => {
+        calls += 1;
+        // The first fetch brings the PR's commits; the second, the tips of the working branches.
+        if (calls > 1) throw new Error('red caída');
+      },
+    };
+    const result = await runRedTestCheck(event, deps);
+    expect(calls).toBe(2);
+    expect(result.ok).toBe(false);
+    expect(result.summary).toMatch(/No se pudieron traer los commits a juzgar: red caída/);
+  });
+});
