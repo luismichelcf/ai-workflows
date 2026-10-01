@@ -6,7 +6,7 @@ import { afterAll, describe, expect, it } from 'vitest';
 
 import { DEFAULT_BANNED_TERMS, findBannedTerms } from '../src/messages.js';
 
-import { SUITE_MANIFEST, readCaseRecords, renderSuiteReport, type CaseRecord } from './github/report.js';
+import { SUITE_MANIFEST, earlierRunCases, readCaseRecords, renderSuiteReport, type CaseRecord } from './github/report.js';
 
 // PLAN-13-R5 §3: the report of the negative suite on real GitHub. It may only say "complete" when
 // every case of the fixed manifest ran in THIS run, every attempt was stopped, every positive
@@ -489,6 +489,112 @@ describe('a report that joins two runs (R23)', () => {
     expect(renderSuiteReport(records, metaWith(cases, { testsPassed: false })).complete).toBe(false);
     const failedCleanup = records.map((record) => (record.id === 'LIMPIEZA' && record.run === RUN ? { ...record, result: 'falló' as const } : record));
     expect(renderSuiteReport(failedCleanup, metaWith(cases)).complete).toBe(false);
+  });
+});
+
+// R35 (owner decision, 1-oct): the evidence of slice 6 joins the run r-939cf951 (six of seven cases
+// recorded, B-T6 partial) with a short final run of only A-T3. The first line and each run declare
+// it; the retaken case comes only from the final run; the clean-up that counts is the final one;
+// B-T6 stays partial, so the report never says «Completo».
+describe('the evidence of slice 6 joins two runs (R35)', () => {
+  const EARLIER = 'r-939cf951';
+  const FINAL = RUN;
+  const FROM_EARLIER = ['SV-04s+', 'CN-14', 'RAMA-1', 'RAMA-2', 'BOT-1', 'B-T6'];
+  const RETAKE = ['A-T3'];
+  const B_T6_PARTIAL = 'el juez terminó antes de la cancelación; la cabeza mostró el veredicto nuevo, nunca el verde viejo';
+  const SLICE_META = { ...META, scope: { slice: 6 as const, earlierReport: 'docs/reports/suite-negativa-2026-09-29.md' } };
+  // The shape of r-939cf951: every slice-6 case but A-T3, B-T6 partial, its own clean-up passed.
+  const earlierRecords = (): CaseRecord[] => [...FROM_EARLIER, 'LIMPIEZA'].map((id, index) => ({
+    ...good(id, 200 + index),
+    run: EARLIER,
+    ...(id === 'B-T6' ? { positive: 'no-aplica' as const, partial: B_T6_PARTIAL } : {}),
+  }));
+  const finalRecords = (): CaseRecord[] => ['A-T3', 'LIMPIEZA'].map((id, index) => ({ ...good(id, 300 + index), run: FINAL }));
+  const joinedMeta = (earlier: readonly CaseRecord[], final: readonly CaseRecord[], over: Partial<{ testsPassed: boolean }> = {}) => ({
+    ...SLICE_META,
+    runs: [{ run: EARLIER, engineSha: 'b'.repeat(40), testsPassed: false, cases: earlierRunCases(earlier, final, RETAKE) }],
+    ...over,
+  });
+  const render = (earlier: readonly CaseRecord[], final: readonly CaseRecord[], over: Partial<{ testsPassed: boolean }> = {}) =>
+    renderSuiteReport([...earlier, ...final], joinedMeta(earlier, final, over));
+  const tableRow = (text: string, id: string) => text.split('\n').find((line) => line.startsWith(`| ${id} |`)) ?? '';
+
+  it('the earlier run gives SV-04s+, CN-14, RAMA-1, RAMA-2, BOT-1 and B-T6; never A-T3 nor its clean-up', () => {
+    expect(earlierRunCases(earlierRecords(), finalRecords(), RETAKE).sort()).toEqual([...FROM_EARLIER].sort());
+  });
+
+  it('the table takes those cases from r-939cf951 and A-T3 from the final run', () => {
+    const text = render(earlierRecords(), finalRecords()).text;
+    FROM_EARLIER.forEach((id, index) => expect(tableRow(text, id), id).toContain(link(300 + index)));
+    expect(tableRow(text, 'A-T3')).toContain(link(400));
+  });
+
+  it('declares both runs in its first line, citing R35, and keeps B-T6 partial instead of saying «Completo»', () => {
+    const report = render(earlierRecords(), finalRecords());
+    expect(report.complete).toBe(false);
+    const heading = firstLine(report.text);
+    expect(heading).toMatch(/^# Incompleto/);
+    expect(heading).not.toMatch(/Completo/);
+    for (const text of [EARLIER, FINAL, 'R35', 'casos parciales: B-T6']) expect(heading, text).toContain(text);
+    expect(heading).not.toContain('R23');
+    expect(report.text).toContain(`B-T6 (parcial): ${B_T6_PARTIAL}`);
+    expect(report.text).toContain('Falta: B-T6.');
+  });
+
+  it('declares each run with its engine, the cases it gives, its tests and its own clean-up', () => {
+    const text = render(earlierRecords(), finalRecords()).text;
+    const earlierRow = text.split('\n').find((line) => line.startsWith(`Corrida anterior: ${EARLIER}`)) ?? '';
+    for (const part of ['b'.repeat(40), 'pruebas: no en verde', 'limpieza: pasó', ...FROM_EARLIER]) expect(earlierRow, part).toContain(part);
+    expect(earlierRow).not.toContain('A-T3');
+    const finalRow = text.split('\n').find((line) => line.startsWith(`Corrida final: ${FINAL}`)) ?? '';
+    for (const part of [META.engineSha, 'pruebas: en verde', 'limpieza: pasó', 'A-T3']) expect(finalRow, part).toContain(part);
+    for (const id of FROM_EARLIER) expect(finalRow, id).not.toMatch(new RegExp(`\\b${id.replace('+', '\\+')}(?![\\w+-])`));
+    const scope = text.split('\n').find((line) => line.startsWith('Alcance:')) ?? '';
+    expect(scope).toContain('R35');
+    expect(scope).toContain('docs/reports/suite-negativa-2026-09-29.md');
+  });
+
+  it('without B-T6 partial the same join is complete, declaring both runs and R35', () => {
+    const earlier = earlierRecords().map((record) => (record.id === 'B-T6' ? good('B-T6', 205) : record)).map((record) => ({ ...record, run: EARLIER }));
+    const report = render(earlier, finalRecords());
+    expect(report.complete).toBe(true);
+    const heading = firstLine(report.text);
+    expect(heading).toMatch(/^# Completo para la evidencia de la rebanada 6/);
+    for (const text of [EARLIER, FINAL, 'R35']) expect(heading, text).toContain(text);
+  });
+
+  it('a record of A-T3 in the earlier file does not count: without the final one, A-T3 is missing', () => {
+    const earlier = [...earlierRecords(), { ...good('A-T3', 299), run: EARLIER }];
+    const final = finalRecords().filter((record) => record.id !== 'A-T3');
+    expect(earlierRunCases(earlier, final, RETAKE)).not.toContain('A-T3');
+    const report = render(earlier, final);
+    expect(report.complete).toBe(false);
+    expect(firstLine(report.text)).toMatch(/faltan casos del manifiesto: A-T3/);
+    expect(tableRow(report.text, 'A-T3')).toBe('');
+  });
+
+  it('a record of A-T3 in the earlier file does not count: the final one is the one shown', () => {
+    const earlier = [...earlierRecords(), { ...good('A-T3', 299), run: EARLIER }];
+    const text = render(earlier, finalRecords()).text;
+    expect(tableRow(text, 'A-T3')).toContain(link(400));
+    expect(tableRow(text, 'A-T3')).not.toContain(link(399));
+    expect(text.split('\n').find((line) => line.includes('no cuentan')) ?? '').toContain('A-T3');
+  });
+
+  it('the clean-up that counts is the final run\'s', () => {
+    const failedFinal = finalRecords().map((record) => (record.id === 'LIMPIEZA' ? { ...record, result: 'falló' as const } : record));
+    const report = render(earlierRecords().map((record) => (record.id === 'B-T6' ? { ...good('B-T6', 205), run: EARLIER } : record)), failedFinal);
+    expect(report.complete).toBe(false);
+    expect(firstLine(report.text)).toContain('LIMPIEZA');
+    const missing = render(earlierRecords(), finalRecords().filter((record) => record.id !== 'LIMPIEZA'));
+    expect(firstLine(missing.text)).toMatch(/faltan casos del manifiesto: LIMPIEZA/);
+    expect(tableRow(missing.text, 'LIMPIEZA')).toBe('');
+  });
+
+  it('the final run failing its tests → «Falló», still declaring both runs', () => {
+    const heading = firstLine(render(earlierRecords(), finalRecords(), { testsPassed: false }).text);
+    expect(heading).toMatch(/^# Falló/);
+    for (const text of [EARLIER, FINAL, 'R35']) expect(heading, text).toContain(text);
   });
 });
 

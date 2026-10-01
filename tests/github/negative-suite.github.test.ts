@@ -1697,18 +1697,35 @@ describe.sequential('the evidence of slice 6 on GitHub (PLAN-13-R6 §11, R29)', 
       const when = at === undefined ? Number.NaN : Date.parse(at.replace(/\.(\d{3})\d*Z$/, '.$1Z'));
       if (Number.isFinite(when) && sample.start !== '') offset = Math.max(5, Math.round((when - Date.parse(sample.start)) / 1000));
     }
-    const probePiece = await openPiece('cola-sonda', (n) => ({ [`docs/plans/PLAN-${n}.md`]: planOf(n, 'papeles') }));
-    await settled(probePiece.head, ['success']);
-    await judgeIdle(caseStart);
-    const probeStart = lastJudgeRunId();
-    await asAgent('pr', 'merge', String(probePiece.pr), '--repo', REPO, '--squash', '--auto');
+    //
+    // R35: the main property above is the case; the probe never fails it. In the run r-939cf951 the
+    // probe missed «Juzgar» twice and then no run of its group came, and `waitFor` threw: the case
+    // recorded nothing. Now any failure of the probe (a wait that times out, a refused cancel, a run
+    // outside «Juzgar») is a miss with its reason, and the case is recorded with the main property
+    // and a `partial` that names why the probe could not land, like B-T6. Every step is named in
+    // our own words: a raw error goes to the log, never into the public record.
+    let probePiece: Piece | undefined;
     let probe: { runId: number; groupSha: string; state: string; description: string } | undefined;
-    const tried = new Set<number>();
+    const tried: number[] = [];
+    const misses: string[] = [];
+    let step = 'abrir la pieza de la sonda';
+    let cleanupError: unknown;
     try {
+      const opened = await openPiece('cola-sonda', (n) => ({ [`docs/plans/PLAN-${n}.md`]: planOf(n, 'papeles') }));
+      probePiece = opened;
+      step = 'esperar el verde de la pieza de la sonda';
+      await settled(opened.head, ['success']);
+      step = 'esperar a que el juez quedara quieto antes de la sonda';
+      await judgeIdle(caseStart);
+      const probeStart = lastJudgeRunId();
+      step = 'poner la pieza de la sonda en la cola';
+      await asAgent('pr', 'merge', String(opened.pr), '--repo', REPO, '--squash', '--auto');
       for (let attempt = 1; attempt <= 3 && probe === undefined; attempt += 1) {
+        step = `ver una corrida del juez en curso del grupo de la sonda (intento ${attempt})`;
         const target = await waitFor('a run of the probe group in progress', () => judgeRunsAfter(probeStart)
-          .filter((run) => (run.event === 'merge_group' || run.event === 'workflow_run') && run.status === 'in_progress' && !tried.has(run.id))[0], 20 * MINUTE, 3_000);
-        tried.add(target.id);
+          .filter((run) => (run.event === 'merge_group' || run.event === 'workflow_run') && run.status === 'in_progress' && !tried.includes(run.id))[0], 20 * MINUTE, 3_000);
+        tried.push(target.id);
+        step = `ver empezar el trabajo de la corrida ${target.id} (intento ${attempt})`;
         const job = await waitFor('its job to start', () => jobsOf(target.id).find((item) => item.started_at !== null), 5 * MINUTE, 2_000);
         const due = Date.parse(job.started_at ?? '') + (offset + 3 * attempt) * 1000;
         await sleep(Math.max(0, due - Date.now()));
@@ -1716,31 +1733,53 @@ describe.sequential('the evidence of slice 6 on GitHub (PLAN-13-R6 §11, R29)', 
           gh('run', 'cancel', String(target.id), '--repo', REPO);
         } catch (error) {
           log(`A-T3 probe attempt ${attempt}: cancel refused: ${String((error as { stderr?: string }).stderr ?? error).trim()}`);
+          misses.push(`intento ${attempt}: GitHub no aceptó cancelar la corrida ${target.id}`);
           continue;
         }
+        step = `ver terminar la corrida cancelada ${target.id} (intento ${attempt})`;
         const ended = await waitFor('the cancelled probe run', () => {
           const run = judgeRun(target.id);
           return run.status === 'completed' ? run : undefined;
         }, 10 * MINUTE, 5_000);
+        step = `leer el registro de la corrida ${target.id} (intento ${attempt})`;
         const text = runLogText(String(target.id));
         const inJudge = /dist\/bin\.js" judge/.test(text) && !/- [\w-]+: (passed|rejected|waiting|technical|skipped|informative)/.test(text);
         log(`A-T3 probe attempt ${attempt}: run ${target.id} ended ${ended.conclusion}; in «Juzgar» when cancelled: ${inJudge}`);
-        if (ended.conclusion !== 'cancelled' || !inJudge) continue;
+        if (ended.conclusion !== 'cancelled') {
+          misses.push(`intento ${attempt}: la corrida ${target.id} terminó antes de la cancelación (${ended.conclusion ?? 'sin conclusión'})`);
+          continue;
+        }
+        if (!inJudge) {
+          misses.push(`intento ${attempt}: la corrida ${target.id} quedó cancelada fuera de «Juzgar»`);
+          continue;
+        }
         await sleep(MINUTE);
+        step = `leer el estado que dejó la corrida cancelada ${target.id} (intento ${attempt})`;
         const groupSha = judgeRunsAfter(probeStart).find((run) => run.event === 'merge_group')?.head_sha ?? '';
         const left = groupSha === '' ? undefined : latest(groupSha);
         probe = { runId: target.id, groupSha, state: left?.state ?? 'ninguno', description: left?.description ?? '' };
       }
+    } catch (error) {
+      log(`A-T3 probe: could not ${step}: ${error instanceof Error ? error.message : String(error)}`);
+      misses.push(`no se pudo ${step}`);
     } finally {
-      // The probe piece ends merged or out of the queue; either way the harness knows about it.
-      const end = await waitFor('the probe piece out of the queue', () => {
-        const state = queueState(probePiece.pr);
-        if (state.state !== 'OPEN' || !state.inQueue) return state;
-        rerunQueueLock(probePiece, reruns);
-        return undefined;
-      }, 45 * MINUTE, 20_000).catch(() => undefined);
-      if (end?.state === 'MERGED') await sandbox.noteMerged(probePiece.pr);
-      else if (end?.state === 'OPEN' && end.autoMerge) await asAgent('pr', 'merge', String(probePiece.pr), '--repo', REPO, '--disable-auto').catch(() => undefined);
+      // The probe piece ends merged or out of the queue; either way the harness knows about it. A
+      // failure here is not the probe's: it is kept and thrown after the case is recorded.
+      if (probePiece !== undefined) {
+        const opened = probePiece;
+        try {
+          const end = await waitFor('the probe piece out of the queue', () => {
+            const state = queueState(opened.pr);
+            if (state.state !== 'OPEN' || !state.inQueue) return state;
+            rerunQueueLock(opened, reruns);
+            return undefined;
+          }, 45 * MINUTE, 20_000).catch(() => undefined);
+          if (end?.state === 'MERGED') await sandbox.noteMerged(opened.pr);
+          else if (end?.state === 'OPEN' && end.autoMerge) await asAgent('pr', 'merge', String(opened.pr), '--repo', REPO, '--disable-auto').catch(() => undefined);
+        } catch (error) {
+          cleanupError = error;
+        }
+      }
     }
     const probeText = probe === undefined
       ? 'la sonda no alcanzó a cancelar una corrida dentro de «Juzgar»'
@@ -1752,9 +1791,17 @@ describe.sequential('the evidence of slice 6 on GitHub (PLAN-13-R6 §11, R29)', 
       negative: 'frenado',
       positive: 'no-aplica',
       result: 'pasó',
-      evidence: [prUrl(piece.pr), ...ran.map((item) => item.run.html_url), prUrl(probePiece.pr), ...(probe === undefined ? [] : [RUN_URL(probe.runId)])],
-      ...(probe === undefined ? { partial: 'la sonda de cancelación a mano no alcanzó a cancelar una corrida del juez dentro de «Juzgar» en tres intentos' } : {}),
+      evidence: [
+        prUrl(piece.pr),
+        ...ran.map((item) => item.run.html_url),
+        ...(probePiece === undefined ? [] : [prUrl(probePiece.pr)]),
+        ...tried.map((id) => RUN_URL(id)),
+      ],
+      ...(probe === undefined
+        ? { partial: `la sonda de cancelación a mano no alcanzó a cancelar una corrida del juez dentro de «Juzgar»: ${misses.length === 0 ? 'sin intentos' : misses.join('; ')}` }
+        : {}),
     });
+    if (cleanupError !== undefined) throw cleanupError;
   }, 120 * MINUTE);
 
   it('R29: RAMA-1 and RAMA-2: a pull request into staging is judged with the recipe of staging; a promotion to main only by the engine files', async () => {

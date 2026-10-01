@@ -4,7 +4,7 @@ import { join } from 'node:path';
 
 import { expect, it } from 'vitest';
 
-import { SUITE_MANIFEST, readCaseRecords, renderSuiteReport, type CaseRecord, type SuiteJoinedRun, type SuiteScope } from './report.js';
+import { SUITE_MANIFEST, earlierRunCases, readCaseRecords, renderSuiteReport, type CaseRecord, type SuiteJoinedRun, type SuiteScope } from './report.js';
 
 // PLAN-13-R5 §3.1: `pnpm test:github:report` runs the whole GitHub suite once (the four files, one
 // lock, one run), takes ITS exit code, and always writes the report — also when the suite failed —
@@ -20,6 +20,10 @@ import { SUITE_MANIFEST, readCaseRecords, renderSuiteReport, type CaseRecord, ty
 // R29 (PLAN-13-R6 §11): with AI_WORKFLOWS_SUITE_SLICE=6 the task runs only the cases of slice 6
 // (and the clean-up of its run) and writes docs/reports/evidencia-rebanada-6-<date>.md, which says
 // which cases come from this run and refers to the report of 29-sep for the rest of the suite.
+//
+// R35 (owner decision, 1-oct): both together. AI_WORKFLOWS_SUITE_SLICE=6 with
+// AI_WORKFLOWS_SUITE_JOIN=<the earlier slice run> and AI_WORKFLOWS_SUITE_RETAKE=A-T3 runs only A-T3
+// (and the clean-up) and writes the evidence of slice 6 joining the two runs.
 
 const ROOT = join(import.meta.dirname, '..', '..');
 const REPOSITORY = process.env['AI_WORKFLOWS_GITHUB_TEST_REPO'] ?? '';
@@ -34,6 +38,7 @@ function envList(name: string): string[] {
 
 interface Join {
   readonly earlierRecords: readonly CaseRecord[];
+  readonly retake: readonly string[];
   readonly run: Omit<SuiteJoinedRun, 'cases'>;
   readonly testPattern: string | undefined;
   readonly files: readonly string[];
@@ -67,6 +72,7 @@ function prepareJoin(file: string): Join {
   }
   return {
     earlierRecords,
+    retake,
     run: { run: runId, engineSha, testsPassed: false },
     testPattern: testFilters.length === 0 ? undefined : testFilters.join('|'),
     files: [...files],
@@ -109,6 +115,17 @@ it('runs the GitHub suite and writes its report', () => {
   const joinRun = joining ? prepareJoin(joinFile) : undefined;
   const sliceValue = process.env['AI_WORKFLOWS_SUITE_SLICE'];
   const slice = sliceValue !== undefined && sliceValue.length > 0 ? prepareSlice(sliceValue) : undefined;
+  // R35: the evidence of slice 6 may join an earlier slice run with a short final run of the cases
+  // it retakes. Those cases must be of slice 6, and there must be some: without them the final run
+  // would run the whole suite.
+  if (slice !== undefined && joinRun !== undefined) {
+    if (joinRun.retake.length === 0) throw new Error('Para juntar dos corridas de la rebanada 6 (R35) falta AI_WORKFLOWS_SUITE_RETAKE con los casos a rehacer.');
+    for (const id of joinRun.retake) {
+      if (SUITE_MANIFEST.find((entry) => entry.id === id)?.slice !== slice.scope.slice) {
+        throw new Error(`El caso a rehacer "${id}" no es de la rebanada ${slice.scope.slice}.`);
+      }
+    }
+  }
 
   const args = ['run', '--config', 'vitest.github.config.ts'];
   // A retake (R23) runs exactly its cases; otherwise the slice (R29) runs all of its own.
@@ -139,12 +156,9 @@ it('runs the GitHub suite and writes its report', () => {
     const finalRecords = existsSync(records) ? readCaseRecords(records) : [];
     const run = finalRecords.find((record) => record.id === 'LIMPIEZA')?.run ?? finalRecords[0]?.run ?? 'sin-corrida';
     const read = joinRun === undefined ? finalRecords : [...joinRun.earlierRecords, ...finalRecords];
-    // R23: the earlier run gives the cases whose records the final run did NOT produce: its own ids,
-    // minus the clean-up and minus every id the final run recorded. RETAKE only decides what runs.
-    const finalIds = new Set(finalRecords.map((record) => record.id));
-    const earlierCases = [...new Set(joinRun?.earlierRecords.map((record) => record.id) ?? [])].filter(
-      (id) => id !== 'LIMPIEZA' && !finalIds.has(id),
-    );
+    // R23 and R35: the earlier run gives the cases whose records the final run did NOT produce, never
+    // its clean-up and never a retaken case (those come only from the final run's real records).
+    const earlierCases = joinRun === undefined ? [] : earlierRunCases(joinRun.earlierRecords, finalRecords, joinRun.retake);
     const report = renderSuiteReport(read, {
       run,
       date,

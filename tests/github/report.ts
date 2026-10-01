@@ -458,6 +458,30 @@ function droppedRecordText(entry: SuiteManifestEntry, record: CaseRecord): strin
   return `${escapeReportText(record.id)} (${escapeReportText(record.negative)}, ${detail})`;
 }
 
+/**
+ * R23 and R35: the cases an earlier run gives when it is joined with a final run. They are its own
+ * ids minus the clean-up (the one that counts is the final run's), minus every id the final run
+ * recorded, and minus every retaken case: a retaken case comes only from the final run's real
+ * records, so an earlier record of it never counts, even when the final run left it without one.
+ */
+export function earlierRunCases(earlier: readonly CaseRecord[], final: readonly CaseRecord[], retake: readonly string[]): string[] {
+  const finalIds = new Set(final.map((record) => record.id));
+  return unique(earlier.map((record) => record.id)).filter(
+    (id) => id !== 'LIMPIEZA' && !finalIds.has(id) && !retake.includes(id),
+  );
+}
+
+/**
+ * The owner decision that joins runs: R23 for the suite, R35 for the evidence of slice 6.
+ */
+function joinDecision(scope: SuiteScope | undefined): string {
+  return scope === undefined ? 'R23' : 'R35';
+}
+
+function joinNames(runs: readonly string[]): string {
+  return runs.join(', ').replace(/, ([^,]*)$/, ' y $1');
+}
+
 export function renderSuiteReport(records: readonly CaseRecord[], meta: SuiteReportMeta): SuiteReport {
   // The header reaches the public report too: it goes through the same audit as every record.
   auditText('la corrida', 'run', meta.run);
@@ -593,11 +617,12 @@ export function renderSuiteReport(records: readonly CaseRecord[], meta: SuiteRep
 
   const lines: string[] = [];
   const scopeText = meta.scope === undefined ? '' : ` para la evidencia de la rebanada ${meta.scope.slice} (R29)`;
+  const decision = joinDecision(meta.scope);
+  const names = joinNames([...joinedRuns.map((run) => run.run), meta.run]);
   if (complete) {
     if (joinedRuns.length > 0) {
-      const names = [...joinedRuns.map((run) => run.run), meta.run].join(', ').replace(/, ([^,]*)$/, ' y $1');
       lines.push(
-        `# Completo${scopeText}: ${manifest.length} casos en ${joinedRuns.length + 1} corridas juntadas por decisión del dueño (R23): ${names}; cada intento frenado y cada control positivo en verde.`,
+        `# Completo${scopeText}: ${manifest.length} casos en ${joinedRuns.length + 1} corridas juntadas por decisión del dueño (${decision}): ${names}; cada intento frenado y cada control positivo en verde.`,
       );
     } else {
       lines.push(`# Completo${scopeText}: ${manifest.length} casos, todos en la corrida ${meta.run}, cada intento frenado y cada control positivo en verde.`);
@@ -607,15 +632,21 @@ export function renderSuiteReport(records: readonly CaseRecord[], meta: SuiteRep
     if (!meta.testsPassed) reasons.push('las pruebas de la corrida no terminaron en verde');
     for (const problem of problems) reasons.push(`${problem.reason}: ${problem.ids.join(', ')}`);
     const heading = meta.testsPassed ? 'Incompleto' : 'Falló';
-    lines.push(`# ${heading}: ${reasons.join('; ')}.`);
+    // R23 and R35: the first line declares the joined runs whatever the outcome.
+    const joinedText = joinedRuns.length === 0
+      ? ''
+      : ` ${manifest.length} casos en ${joinedRuns.length + 1} corridas juntadas por decisión del dueño (${decision}): ${names}.`;
+    lines.push(`# ${heading}${scopeText}: ${reasons.join('; ')}.${joinedText}`);
   }
 
   if (meta.scope !== undefined) {
     // R29: the report says which cases come from this run and where the rest of the suite is; it
-    // never claims a case it did not run.
+    // never claims a case it did not run. R35: joined, it is the report, not one run, that gives them.
     const own = manifest.map((entry) => entry.id).filter((id) => id !== 'LIMPIEZA');
     lines.push(
-      `Alcance: esta corrida da solo la evidencia de la rebanada ${meta.scope.slice} (R29): ${own.join(', ')}, más su limpieza. No repitió los demás casos de la suite: su evidencia es el informe ${meta.scope.earlierReport}, que esta corrida no cambia.`,
+      joinedRuns.length === 0
+        ? `Alcance: esta corrida da solo la evidencia de la rebanada ${meta.scope.slice} (R29): ${own.join(', ')}, más su limpieza. No repitió los demás casos de la suite: su evidencia es el informe ${meta.scope.earlierReport}, que esta corrida no cambia.`
+        : `Alcance: este informe da solo la evidencia de la rebanada ${meta.scope.slice} (R29), juntando ${joinedRuns.length + 1} corridas (${decision}): ${own.join(', ')}, más la limpieza de la corrida final. No repitió los demás casos de la suite: su evidencia es el informe ${meta.scope.earlierReport}, que este informe no cambia.`,
     );
   }
   lines.push(`Corrida: ${meta.run}`);
@@ -638,6 +669,17 @@ export function renderSuiteReport(records: readonly CaseRecord[], meta: SuiteRep
         `Registros de ${run.run} que no cuentan (los rehízo la corrida final o no se aportan): ${items.join(', ')}.`,
       );
     }
+  }
+  if (joinedRuns.length > 0) {
+    // R23 and R35: the final run is declared like the earlier ones; its clean-up is the one that counts.
+    const cleanup = records.find((record) => record.run === meta.run && record.id === 'LIMPIEZA');
+    const cleanupText = cleanup?.result === 'pasó' ? 'pasó' : cleanup?.result === 'falló' ? 'falló' : 'sin registro';
+    const cases = manifest.map((entry) => entry.id).filter(
+      (id) => id !== 'LIMPIEZA' && records.some((record) => record.run === meta.run && record.id === id),
+    );
+    lines.push(
+      `Corrida final: ${meta.run} (motor ${meta.engineSha}; pruebas: ${meta.testsPassed ? 'en verde' : 'no en verde'}; limpieza: ${cleanupText}, la que cuenta) aporta: ${cases.length === 0 ? 'nada' : cases.join(', ')}.`,
+    );
   }
   lines.push(`Fecha: ${meta.date}`);
   lines.push(`Motor: ${meta.engineSha}`);
