@@ -651,25 +651,24 @@ Rebanadas 1 → 2 → 3 → 4 en orden; 5 puede empezar tras 3; 6 tras 4 y 5; 7 
 
 ## 12. Pendientes que no bloquean
 
-- Qué proyecto de base de datos de prueba usar (gratuito o del plan Pro), según límites vigentes
-  al abrir la rebanada 6.
 - Resueltos al construir la rebanada 2 ([PLAN-13-R2](PLAN-13-R2.md)): vigencia por omisión
   (R14), vocabulario cerrado de tipos y carriles (R15), nombres en español (R16), las reglas de
   `validate` de RC-08 más el orden de fases y la validación contra manifiestos, y `{tests}` como
   argumentos sin consola.
-- **Pasan a la rebanada 6 por R26** ([PLAN-13-R6](PLAN-13-R6.md)): los ganchos para Codex y
-  OpenCode, la configuración de los ganchos y la versión del motor como archivos propios, la
-  corrida del juez cancelada en un grupo de la cola, el gancho sin tiempo si git se cuelga y el
-  verde viejo tras un juicio desde el issue que se cae; también `init` con los workflows del juez y
-  el sello de la versión.
+- **Resueltos en la rebanada 6 por R26** ([PLAN-13-R6](PLAN-13-R6.md)): los ganchos para Codex y
+  OpenCode (§3), la configuración de los ganchos y la versión del motor como archivos propios (§2),
+  la corrida del juez en un grupo de la cola, ahora en fila (§5), el gancho que contesta antes de su
+  tiempo aunque git se cuelgue (§4) y el juicio desde el issue que retira el verde antes de juzgar
+  (§6); también `init` con los workflows del juez y el sello de la versión (§9). Lo que la rebanada
+  6 deja declarado como límite está en [PLAN-13-R6](PLAN-13-R6.md) §12.1.
 - Siguen abiertos:
   - Resueltos en la rebanada 3 ([PLAN-13-R3](PLAN-13-R3.md)): toda etapa `pre-merge` lleva
     `server:` (validado con los manifiestos); el juez no corre bloques del proyecto; R19.
   - **De la rebanada 3, sin bloquear:** con una cola de más de 5 PRs, una entrada que GitHub aún
     no armó hace esperar a todo el grupo (del lado seguro; se comprueba en la rebanada 5); el motivo
     publicado cuando la lista de la cola nunca se completa podría llevar el último detalle; `init`
-    que escriba los workflows del juez y el sellado del SHA del motor en el paquete (rebanada 6); la
-    atestación `/approve-judge-change` acepta un código de 7 caracteres, que alguien con permiso de
+    que escriba los workflows del juez y el sellado del SHA del motor en el paquete (resuelto en la
+    rebanada 6, [PLAN-13-R6](PLAN-13-R6.md) §9); la atestación `/approve-judge-change` acepta un código de 7 caracteres, que alguien con permiso de
     empujar podría igualar fabricando un commit (resuelto en la rebanada 4: R20, 16 caracteres);
     las notas del rastro salían como `::error::` (resuelto en la rebanada 4: `::warning::`).
   - Resueltos en la rebanada 4 ([PLAN-13-R4](PLAN-13-R4.md)): `required: false` y `retry`; el
@@ -678,15 +677,9 @@ Rebanadas 1 → 2 → 3 → 4 en orden; 5 puede empezar tras 3; 6 tras 4 y 5; 7 
   - Resueltos en la rebanada 5 ([PLAN-13-R5](PLAN-13-R5.md)): CN-07 (ganchos del editor y de git
     conectados a la receta); la cola de más de 5 PRs se ensaya en GitHub real (COLA-6); el juez
     despierta con el botón «Approve» y con los eventos del issue; R22.
-  - **De la rebanada 5, a proponer al dueño:** ganchos para Codex (`.codex/hooks.json`) y OpenCode;
-    que el juez trate como archivos propios `.claude/settings.json` y la versión del motor de
-    `package.json` (hoy un PR puede quitar el gancho del editor sin la atestación del dueño);
-    que una corrida del juez cancelada a mitad de juicio en un grupo de la cola no deje «no pudo
-    decidir» (hoy falla cerrado: el grupo sale de la cola y la pieza se vuelve a encolar); que el
-    gancho del editor no se quede sin tiempo si git se cuelga (git espera hasta 60 s por llamada y el
-    gancho tiene 30 s: Claude Code lo saltaría; el juez sigue frenando en el PR); y que un juicio
-    desde el issue que se cae tras borrar un veredicto no deje el verde viejo en la cabeza del PR (la
-    cola lo vuelve a juzgar; sin cola quedaría).
+  - Los propuestos al cerrar la rebanada 5 (ganchos de Codex y OpenCode, archivos propios, corrida
+    cancelada en la cola, gancho sin tiempo y verde viejo tras el juicio desde el issue) los decidió
+    el dueño en R26 y se resolvieron en la rebanada 6 (arriba).
   - **De la rebanada 4, sin bloquear:** CN-07 (ganchos del editor conectados a la receta) pasa a la
     rebanada 5; `cleanup` no libera zonas (nadie las reserva aún); sin `agent-account`, un aviso al
     dueño puede repetirse tras una caída (la conciliación solo reconoce comentarios de la

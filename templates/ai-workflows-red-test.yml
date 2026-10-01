@@ -1,20 +1,27 @@
-# El job sin privilegios `ai-workflows/red-test` (PLAN-13-R3 §5 y §6). Corre con `pull_request` y
-# `merge_group`, no con `pull_request_target`: a diferencia del juez, ESTA corrida ejecuta código
-# del PR (las pruebas que el PR trae), y por eso su YAML sale del propio PR y no tiene permiso de
-# publicar estados: su `statuses` no está en la lista de permisos y su token no puede escribir uno.
-# Lo que garantiza el aislamiento son los permisos, no la confianza en la rama.
+# The unprivileged `ai-workflows/red-test` job (PLAN-13-R3 §5 and §6). It runs on `pull_request`
+# and `merge_group`, not on `pull_request_target`: unlike the judge, THIS run executes the pull
+# request's code (the tests it brings), so its YAML comes from the pull request itself and it has
+# no permission to publish statuses: `statuses` is not in its permission list and its token cannot
+# write one. The isolation comes from the permissions, not from trusting the branch.
 #
-# Este workflow NO hace checkout del YAML del juez: la acción de ai-workflows solo comprueba la
-# prueba roja; el veredicto lo publica el workflow `ai-workflows` con su propio estado.
+# This workflow does NOT check out the judge's YAML: the ai-workflows action only checks the red
+# test; the `ai-workflows` workflow publishes the verdict with its own status. The judge counts
+# this check only when it can tie that exact check run to a job of THIS file, as it exists on the
+# trusted base, run for this pull request and its current base (PLAN-13-R6 §7): a job with the
+# same name in another workflow never counts.
 #
-# Sustituye <ENGINE_SHA> por el SHA de la versión fijada del motor. Los pasos de instalación del
-# proyecto son un ejemplo: ajústalos a tu gestor de paquetes y a tu comando de pruebas.
+# A pull request into a working branch of the recipe (`branches.into`) is tested against that
+# branch's tip, with that branch's recipe (PLAN-13-R6 §1.2).
+#
+# `init` pins the engine action by its sealed SHA (where the template says <ENGINE_SHA>). The
+# project's install steps are an example: adjust them to your package manager and test command.
 
 name: ai-workflows red-test
 
 on:
-  # `edited` vuelve a correr la prueba roja cuando un PR cambia su rama destino (§3.1): sin él, un
-  # PR retargetado a la principal conservaría el resultado de la rama a la que apuntaba antes.
+  # `edited` runs the red test again when a pull request changes its target branch (§3.1): without
+  # it, a pull request retargeted to another branch would keep the result of the branch it pointed
+  # to before.
   pull_request:
     types: [opened, synchronize, reopened, edited]
   merge_group:
@@ -23,27 +30,28 @@ on:
 permissions: {}
 
 jobs:
-  # Este es el nombre del check exigido: el juez lo busca como `ai-workflows/red-test`.
+  # This is the name of the required check: the judge looks for it as `ai-workflows/red-test`.
   red-test:
     name: ai-workflows/red-test
     runs-on: ubuntu-latest
     timeout-minutes: 60
-    # Sin `statuses: write` a propósito: aunque este job lo pidiera, su token no puede publicar
-    # estados. Es la garantía de SV-09 frente a un PR que intentara darse por aprobado.
+    # No `statuses: write` on purpose: even if this job asked for it, its token cannot publish
+    # statuses. It is the guarantee of SV-09 against a pull request that tried to approve itself.
     permissions:
       contents: read
       pull-requests: read
     steps:
-      # Se revisa la cabeza del PR (o el SHA del grupo en la cola), con la historia completa y sin
-      # conservar el token para que los procesos de prueba no lo hereden por la configuración de git.
+      # The pull request's head (or the group SHA in the queue) is checked out, with its full
+      # history and without keeping the token, so the test processes do not inherit it through the
+      # git configuration.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
           fetch-depth: 0
           persist-credentials: false
 
-      # EJEMPLO a ajustar: los pasos con los que tu proyecto instala sus dependencias. La prueba
-      # roja corre contra la base usando las dependencias de la cabeza, así que deben instalarse.
+      # EXAMPLE to adjust: the steps your project installs its dependencies with. The red test runs
+      # against the base using the head's dependencies, so they must be installed.
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           version: 10
@@ -52,7 +60,7 @@ jobs:
           node-version: 22
       - run: pnpm install --frozen-lockfile
 
-      # La acción solo comprueba la prueba roja; no publica estados (no tiene permiso para ello).
+      # The action only checks the red test; it publishes no status (it has no permission to).
       - uses: luismichelcf/ai-workflows@<ENGINE_SHA>
         with:
           task: red-test

@@ -4,8 +4,9 @@ A deterministic stage engine for coding agents. A pipeline is a list of stages; 
 only when its **gate** — a predicate written in code — says so. The agent cannot skip a stage,
 because nothing asks the agent whether it complied.
 
-The engine is project-agnostic. Each repository brings its own `pipeline.config.ts` with its
-stages, gates, lanes and models. Nothing about any particular project lives in here.
+The engine is project-agnostic. Each repository brings its own recipe,
+`.ai-workflows/pipeline.yml`, with its stages, gates, kinds and lanes, plus any blocks of its own.
+Nothing about any particular project lives in here.
 
 ## Why
 
@@ -26,38 +27,78 @@ Every gate declares the nature of its check, and never promises more:
 
 ## Install
 
-Each version is published as a built package attached to its GitHub Release. Install it by URL;
-nothing runs during your install:
+Requires Node 20 or later and git. From the root of the project's repository, one command:
 
 ```sh
-pnpm add https://github.com/luismichelcf/ai-workflows/releases/download/v0.3.0/ai-workflows-0.3.0.tgz
+pnpm dlx https://github.com/luismichelcf/ai-workflows/releases/download/v1.0.0/ai-workflows-1.0.0.tgz init
 ```
 
-Requires Node 20 or later. Installing straight from the git repository is not supported: the
-package has to be compiled first, and pnpm 10 refuses build scripts from git dependencies.
+`init` runs straight from the sealed package, without installing it first, and then, in order:
+
+1. **Installs the engine in the project** as a dev dependency pointing at the package of its own
+   version, with the package manager its lock file names (`pnpm`, `npm` or `yarn`; `pnpm` when
+   there is none). The manager is started by its absolute path, from the `PATH` folders outside
+   the project, and without a shell. If the project already depends on another version of
+   `ai-workflows`, `init` does not change it, says so and installs no hooks, because they would load
+   that other engine. If the install fails, `init` stops with the reason.
+2. **Writes what is missing, never overwriting**, and reports each file as created or already
+   there: the example recipe (with the schema address of this version) and the judge's three
+   workflows (judge, red test, review signal), each with its engine action pinned as
+   `luismichelcf/ai-workflows@<sealed sha> # v1.0.0` and, in the judge, the `branches` input taken
+   from the recipe. The three workflows are all or nothing: if one exists, none is written and the
+   existing one is named; if writing one fails, none is left behind.
+3. **Installs the hooks** of the three clients, as `hooks install --apply` does (below), only when
+   step 1 left `node_modules/ai-workflows` carrying this same seal.
+
+It ends with what it cannot do for you, in the recipe's language: adjust the install and test
+steps of the red-test workflow to your project, add your required-check workflows to the judge's
+`workflow_run` list, and the exact `gh variable set AI_WORKFLOWS_MODE` commands for `advisory` or
+`off`. Turning the judge `on` and requiring its status is always a separate step of the owner.
+Commit the files in a piece branch, not on the main branch. `init` refuses to run from a subfolder
+of a repository.
+
+- `init --judge-only` writes only the three workflows, taking `branches` from the recipe that
+  already exists. It touches neither `package.json`, nor the lock file, nor the hooks: it is how a
+  project that keeps an older engine as its dependency installs the v1 judge. The judge on GitHub
+  never uses the project's dependency; it uses the action pinned by SHA.
+- `init --package <path or address>` installs from that package instead of the release address,
+  after checking that its seal is the same as the running `init`'s (otherwise it touches nothing).
+  It serves to install without network and to rehearse a package before it is published.
+
+**The seal.** A published package carries `engine.json` at its root: `{"version": "1.0.0", "sha":
+"<40 hex>"}`, the commit the version was built from. `init` pins the workflows to that SHA. A
+development copy has no seal: there `init` writes only the example recipe, never a workflow with a
+placeholder or `HEAD`, and says why.
+
+You can also add the engine by hand (`pnpm add <release address>`): nothing runs during your
+install. Installing straight from the git repository is not supported: the package has to be
+compiled first, and pnpm 10 refuses build scripts from git dependencies. The engine is not on npm
+(the name is taken there); every version is a GitHub Release asset.
 
 ## Status
 
-Slices 1 to 4 are done: `engine`, `gates`, `providers` and `locks`. A piece's progress can live in
-memory (`createMemoryStore`) or on GitHub (`createGitStore` over `createGitHubStatePort`), so a run
+Version 1.0.0 closes [PLAN-13](docs/plans/PLAN-13.md) slices 1 to 6: the recipe, the blocks, the
+judge on GitHub, the final stages, the negative suite against real GitHub and, in slice 6
+([PLAN-13-R6](docs/plans/PLAN-13-R6.md)), working branches and promotions, the engine's own files,
+hooks for Codex and OpenCode, `init` and the sealed release. A piece's progress can live in memory
+(`createMemoryStore`) or on GitHub (`createGitStore` over `createGitHubStatePort`), so a run
 survives its session and another terminal sees it.
 
-Version 1 (in progress, [PLAN-13](docs/plans/PLAN-13.md); its slice 5 tries every attempt to get
-around the process on real GitHub, see below) moves a project's process into a short
-recipe, `.ai-workflows/pipeline.yml`, that the owner can read without programming:
+The recipe is short enough for the owner to read without programming:
 
 ```sh
-ai-workflows init       # writes an example recipe
+ai-workflows init       # see Install
 ai-workflows validate   # rejects with file:line:column and the reason
 ai-workflows explain    # the whole recipe in plain words, in the recipe's language
 ```
 
 The recipe is strict YAML 1.2: duplicate keys, anchors, aliases, tags and unknown keys are
-rejected, and `NO` stays text. Its JSON Schema (`schema/recipe.schema.json`) is the same object
-`validate` enforces, so the editor and the engine agree. A stage's `applies-if` is a structured
-condition (`touches-any`, `touches-none`, `kind-any`, `kind-none`, `lane-any`), never an
-expression; a stage that does not apply is recorded as skipped with its reason, and
-`status <piece>` lists it that way. The server check, the judge, is described below.
+rejected, and `NO` stays text. Its JSON Schema (`schema/recipe.schema.json`, also published with
+each release) is the same object `validate` enforces, so the editor and the engine agree. A
+stage's `applies-if` is a structured condition (`touches-any`, `touches-none`, `kind-any`,
+`kind-none`, `lane-any`), never an expression; a stage that does not apply is recorded as skipped
+with its reason, and `status <piece>` lists it that way. The server check, the judge, is
+described below.
 
 ## Blocks
 
@@ -76,7 +117,7 @@ declares the natures it may claim, the validity rules it accepts and its typed i
 | `command` | A project command within a time limit; optionally reads a Vitest run | recompute |
 | `scope-reconcile` | Records when the real files raise the kind (and so the lane) above what was declared | recompute |
 
-The final stages (slice 4, [PLAN-13-R4](docs/plans/PLAN-13-R4.md)):
+The final stages ([PLAN-13-R4](docs/plans/PLAN-13-R4.md)):
 
 | Block | Checks | Nature |
 |---|---|---|
@@ -85,7 +126,7 @@ The final stages (slice 4, [PLAN-13-R4](docs/plans/PLAN-13-R4.md)):
 | `approval-comment` | The same with a comment `/<command> <code>`, for projects whose agents publish with the owner's own account | attest + recompute |
 | `preview-deployment` | The newest deployment of this exact commit in an environment is successful, with an `https` address matching a pattern | recompute |
 | `browser-qa` | The project's browser suite, run against that preview with a fresh environment, writes one passing report per criterion of the plan | recompute |
-| `github-merge` | Pushes the judged commit, opens the pull request once, arms auto-merge on that exact head (or joins the merge queue) and watches it to the end | recompute |
+| `github-merge` | Pushes the judged commit, opens the pull request once (into the first branch of `branches.into`, the main branch without that section), arms auto-merge on that exact head (or joins the merge queue) and watches it to the end | recompute |
 | `post-merge` | Named checks and a deployment of the merge commit are green | recompute |
 | `cleanup` | Deletes the remote branch at the merged head; the folder and local branch are retired by `finish` after `done` | recompute |
 
@@ -147,35 +188,18 @@ model is still the builder (PLAN-13 R18).
 
 Next to the agent the engine guides and stops every stage, but anyone can open a pull request from
 the web or merge from another machine. The judge is a status check on GitHub that re-checks every
-stage before merging, with the recipe of the main branch, on the pull request and in the merge
-queue. Design: [PLAN-13-R3](docs/plans/PLAN-13-R3.md).
+stage before merging, on the pull request and in the merge queue. Design:
+[PLAN-13-R3](docs/plans/PLAN-13-R3.md), extended in [PLAN-13-R6](docs/plans/PLAN-13-R6.md).
 
-**Install.** Copy `templates/ai-workflows.yml`, `templates/ai-workflows-red-test.yml` and
+**Install.** `init` writes its three workflows (see Install). By hand: copy
+`templates/ai-workflows.yml`, `templates/ai-workflows-red-test.yml` and
 `templates/ai-workflows-review-signal.yml` into `.github/workflows/`, replace `<ENGINE_SHA>` with
-the full commit SHA of the engine version you use (never a tag: the judge refuses to run unpinned),
-adjust the install steps of the red-test workflow to your project, and add to
-`workflow_run.workflows` of the judge the workflows that produce the checks your recipe requires.
-Then turn it on with the repository variable and, after that, require the `ai-workflows` status in
-the branch ruleset.
-
-**What wakes it again.** Besides the pull request's own events, two things judge a pull request
-again without anyone asking ([PLAN-13-R5](docs/plans/PLAN-13-R5.md) §2.6):
-
-- *The owner's "Approve".* A `pull_request_review` would run the pull request's own YAML, so it is
-  not a judge trigger. The review signal workflow listens to it instead, with no permissions and no
-  steps that read the pull request, and the judge follows it through `workflow_run` (whose YAML is
-  always the main branch's). The judge checks the signal's repository, path and event, takes the
-  pull request number from it only as a hint, re-reads the pull request and judges its live head.
-  A pull request can rewrite the signal and that version runs, but it gains nothing a pull request
-  of the same repository does not already have: at worst the judge is not woken (the pull request
-  keeps waiting) or a status is imitated (the accepted limit R13, reported as a trace). The signal
-  is one of the judge's own files: a pull request that changes it needs `/approve-judge-change`.
-  From a fork GitHub gives no pull request number: the next event or `workflow_dispatch` judges it.
-- *A builder or verdict event on the piece's issue.* A new comment carrying the event mark, or any
-  edit or deletion of a comment on an issue, makes the judge read the recipe of the main branch and
-  judge every open pull request into the main branch whose branch names that piece, each on its own
-  head, with the same guarantees before publishing as any other run. Editing any issue comment
-  therefore costs a short run; one that finds no piece ends without publishing.
+the full commit SHA of the engine version you use (never a tag: the judge refuses to run
+unpinned) and, with working branches, add the `branches` input (below). Either way, adjust the
+install steps of the red-test workflow to your project and add to `workflow_run.workflows` of the
+judge the workflows that produce the checks your recipe requires. Then set the repository
+variable to `advisory`, and, when the owner decides, to `on` and require the `ai-workflows` status
+in the branch ruleset of every branch that receives pieces.
 
 **Where a stage is checked.** Every pre-merge stage says it with `server:`, within what its block
 allows, and `validate` enforces it:
@@ -183,7 +207,7 @@ allows, and `validate` enforces it:
 | `server:` | What the judge does |
 |---|---|
 | `recompute` | Runs the block's server check again on the pull request's files, read from git objects (spec structure, benchmark sources without reachability, scope) |
-| `require-check: <name>` | Requires that check — a check run or a commit status — green on the judged SHA (the pull request head, or the merge group SHA in the queue) |
+| `require-check: <name>` | Requires that check green on the judged SHA (the pull request head, or the merge group SHA in the queue). For the engine's red test, `ai-workflows/red-test`, only a check run tied to the official workflow counts (below); for any other name, the newest check run or commit status with that name, from any app |
 | `attestation` | Looks for the authenticated event: the owner's review or comment on the pull request (`approval-review`, `approval-comment`), or the verdicts published on the piece's issue (`independent-review`, `sandboxed-review`) |
 | `local-only` | Only for post-merge stages or `required: false`: checked next to the agent only |
 
@@ -193,19 +217,163 @@ piece's plan declares its kind (`declared-kind`). A branch without a piece is re
 declared kind is the piece's word; paths still raise it.
 
 **Provenance.** The judge runs with `pull_request_target` and `merge_group` (plus
-`issue_comment`, `workflow_run` and `workflow_dispatch` to judge again), checks out only the
-live head of the main branch, and reads the pull request as git objects: it never checks out or
-runs its code, and it never reads the state refs, the store or the providers. It refuses to judge
-when its workflow does not come from the main branch (or, in the queue, from the queue branch), and
-publishes nothing for a pull request into another branch. A pull request that touches
-`.ai-workflows/`, the judge's workflow or the red-test workflow is rejected unless the recipe's
-`owner` comments `/approve-judge-change <sha>` for that exact head.
+`issue_comment`, `workflow_run` and `workflow_dispatch` to judge again), checks out only trusted
+branches, and reads the pull request as git objects: it never checks out or runs its code, and it
+never reads the state refs, the store or the providers. It refuses to judge when its workflow
+does not come from the main branch (or, in the queue, from the queue branch).
 
-**The red test.** The `ai-workflows/red-test` check runs in its own workflow, with
-`pull_request` and `merge_group`, read-only permissions and no secrets: each piece's new or
-changed tests must fail by their assertion against its base (in the queue, the base of its own
-entry) and pass against the head, with the dependencies installed from the head. It runs the pull
-request's code, so it deserves the trust of any test suite check, not more.
+### Working branches and promotions
+
+A project whose daily work enters a branch other than the main one (say `staging`) declares it in
+the recipe:
+
+```yaml
+branches:
+  into: [staging, main]            # receive pieces; the engine opens its PR into the first
+  promotions:                      # moves from one branch to another: they are not pieces
+    - { from: staging, to: main }
+```
+
+`into` is a non-empty list of plain branch names without repeats (no wildcards, no `refs/`);
+without the section, only the main branch receives pieces. Both ends of a promotion must be in
+`into`, and `from` cannot be `to`. `validate` rejects anything else with file:line:column, and
+`explain` says it in plain words.
+
+How the judge uses it:
+
+- **The judge's YAML and the list come from the main branch.** `pull_request_target` always runs
+  the main branch's workflow, and the `branches` list is read from the main branch's recipe, never
+  from the target's: a branch cannot declare itself judged. The decide step needs the list before
+  the engine is built, so `init` writes it into the judge workflow as the `branches` input; the
+  judge compares that input with the main branch's recipe and publishes an error («the judge
+  workflow and the recipe do not declare the same branches») when they differ. Changing
+  `branches.into` therefore means editing both files, which are the judge's own: that pull request
+  needs the owner's attestation. A pull request into a branch outside the input gets no status.
+- **The trusted base is the tip of the target branch.** A pull request into `staging` is judged
+  with the recipe on the tip of `staging` and against its merge base with it: what will hold after
+  merging. If that recipe is missing or invalid the verdict is technical, with the reason; the judge
+  never falls back to the main branch's. Right before publishing, the judge reads the tip of each
+  target branch again: if it moved, every pull request into that branch is judged again once with
+  the new tip; if it moves again, the run publishes an error with the reason.
+- **A promotion is not a piece.** A pull request whose head is the `from` of a declared pair, whose
+  base is its `to`, and which comes from the same repository is judged only by the engine's own
+  files (below): untouched, or attested by the owner for this head, it passes; touched without
+  the attestation, it fails. From a fork, or without a declared pair, it is judged as a piece (and
+  fails when its branch names none).
+- **One verdict per SHA, the worst.** A status lives on a commit, not on a pull request. When
+  several open pull requests share a head (one into `staging` and one into `main`, or a promotion
+  and a piece), every run judges all of them, each with its own trusted base, and publishes the
+  worst verdict (`failure` > `error` > `pending` > `success`) with the description of the worst.
+  The judge listens to `closed`: when a pull request stops counting (closed, or retargeted outside
+  `into`), the others with that head are judged again; when none is left, nothing is published,
+  not even «juzgando».
+- **The red test** of a pull request into a working branch runs against that branch's tip, with
+  that branch's recipe.
+- **The merge queue is judged only on the main branch.** A `merge_group` of another branch runs
+  the YAML of the group's commit, whose provenance cannot be pinned the same way: it gets no status.
+- **Protections.** `verifyProtections` (exported by the package) checks every branch of `into`.
+  The judge has to be required on both ends of a promotion: no command checks the protection of
+  `from`.
+- **Next to the agent** (PLAN-13 R34), `run`, `sync` and the facts of each piece measure it
+  against `into[0]`, the branch its pull request will enter.
+
+### The judge's own files
+
+A pull request that touches one of the judge's own files is rejected unless the recipe's `owner`
+comments `/approve-judge-change <code>` with at least the first 16 characters of that exact head
+(PLAN-13 R20). The owner copies the text the judge shows. What counts:
+
+- **By path:** `.ai-workflows/**`, the judge's workflow, the paths of the input `also-protect`,
+  and a fixed list that lives in the engine and is shared with `hooks install`, so the two never
+  drift apart: `.claude/settings.json` and `.claude/settings.local.json`; `.codex/hooks.json` and
+  `.codex/config.toml`; `opencode.json`, `opencode.jsonc`, `.opencode/opencode.json`,
+  `.opencode/opencode.jsonc` and the folders `.opencode/plugins/`, `plugin/`, `tool/` and
+  `tools/`; `.pnpmfile.cjs`, `.npmrc`, `.yarnrc`, `.yarnrc.yml`, `.yarn/releases/` and
+  `.yarn/plugins/`; the red-test and review-signal workflows. Also `binding.gyp` at any depth and the
+  build allow-list file that `.npmrc` names (read the way the `ini` reader reads it). Paths compare
+  without case: on Windows a pull request that adds `.Claude/settings.json` overwrites the real one.
+- **Package manifests by an allowlist of harmless changes.** In `package.json`, `package.yaml` and
+  `package.json5` at any depth, and in `pnpm-workspace.yaml`, every change counts as touched
+  **except**: dependency entries that do not name the engine and whose value is a registry range
+  or version, a plain tag, or starts with `workspace:` or `catalog:`; `name` (other than the
+  engine's), `version`, `description`, `keywords`, `author`, `contributors`, `license`,
+  `repository`, `homepage`, `bugs`, `private`; scripts that do not run on install; and, in
+  `pnpm-workspace.yaml`, catalog entries that are not the engine. A dependency taken from a file,
+  link, git, a tarball, an address or an alias is touched, and so are the install-time scripts
+  (`preinstall`, `install`, `postinstall`, `prepare` and the rest npm and pnpm run around an
+  install), overrides, `packageManager`, workspaces and every other field (PLAN-13 R32). A member
+  manifest that is added or deleted is compared against an empty one with the same rule.
+- **Advanced YAML counts as touched.** A `package.yaml`, `pnpm-workspace.yaml` or `pnpm-lock.yaml`
+  that uses any advanced feature of the format (directives, anchors or aliases, tags, keys that are
+  not plain text, merge keys, more than one document, or that does not parse) counts as touched
+  without being interpreted, because the judge and the installer could read it differently. A
+  `__proto__` key anywhere counts as touched too.
+- **The engine version.** In the lock files (`pnpm-lock.yaml`, `package-lock.json`, `yarn.lock`)
+  only the entries that decide what lands in `node_modules/ai-workflows` are compared — the key
+  `ai-workflows`, whatever its value, in each importer, package, snapshot, override and patch rule
+  — as sorted projections, so reformatting or reordering does not count. The engine's name compares
+  without case. An alias under another key installs elsewhere and does not count.
+- **Measured on what really enters.** Changes are taken against every merge base and against the
+  merge tree on the trusted tip, so a later engine upgrade on the base does not mark an old pull
+  request, and a conflict counts as touched. An unreadable file, one that is added or deleted, or a
+  lock file over 50 MB counts as touched (a rejection that the attestation lifts, not a technical
+  error); a failing git read is technical. No limit ever turns into a pass.
+
+The published status keeps its short note with the attestation order; the list of what was touched
+goes to the run's log.
+
+### The red test
+
+The `ai-workflows/red-test` check runs in its own workflow, with `pull_request` and
+`merge_group`, read-only permissions and no secrets: each piece's new or changed tests must fail by
+their assertion against its base (in the queue, the base of its own entry) and pass against the
+head, with the dependencies installed from the head. It runs the pull request's code, so it
+deserves the trust of any test suite check, not more.
+
+A pull request could add a workflow of its own with a job named `ai-workflows/red-test` that just
+turns green. So the judge counts a check run with that name only when it can tie that exact check
+run to the official workflow ([PLAN-13-R6](docs/plans/PLAN-13-R6.md) §7): the check run belongs to
+the GitHub Actions app; its check suite has exactly one Actions run, on the judged SHA; one of that
+run's jobs points at that check run; the run's workflow path, read from the workflow itself and
+never trimmed, is exactly the red-test workflow and that file exists on the trusted base; and the
+run is for this pull request and its current base (`base.ref` the branch being judged, `base.sha`
+its tip or an ancestor of it) or, in the queue, for the group's SHA. The newest check run that
+passes the chain counts; the others are ignored and logged. A chain that cannot be read means
+"not yet" (pending), never green. A commit status with that name no longer counts. A pull request
+from a fork carries no pull request list in its run, so its red test waits with the reason.
+
+### What wakes it again
+
+Besides the pull request's own events, these judge a pull request again without anyone asking
+([PLAN-13-R5](docs/plans/PLAN-13-R5.md) §2.6, PLAN-13-R6 §6 and §8):
+
+- *The owner's "Approve".* A `pull_request_review` would run the pull request's own YAML, so it is
+  not a judge trigger. The review signal workflow listens to it instead, with no permissions and no
+  steps that read the pull request, and the judge follows it through `workflow_run` (whose YAML is
+  always the main branch's). The judge checks the signal's repository, path and event, takes the
+  pull request number from it only as a hint, reads the pull request again and judges its live head
+  with the recipe of its target branch. A pull request can rewrite the signal and that version
+  runs, but it gains nothing a pull request of the same repository does not already have: at worst
+  the judge is not woken (the pull request keeps waiting) or a status is imitated (the accepted
+  limit R13, reported as a trace). The signal is one of the judge's own files. From a fork GitHub
+  gives no pull request number: the next event or `workflow_dispatch` judges it.
+- *A builder or verdict event on the piece's issue.* A new comment carrying the event mark, or any
+  edit or deletion of a comment on an issue, makes the judge read the recipe of the main branch and
+  judge every open pull request into a branch of `into` whose branch names that piece, together
+  with every other open pull request that shares its head (one verdict per SHA, the worst). Before
+  judging, it publishes `pending` «juzgando» on each of those heads (unless a newer official run
+  already published there), so a run that dies afterwards leaves «juzgando», never the old green.
+  Each pull request is judged on its own: an error in one publishes `error` there and the run goes
+  on. Editing any issue comment therefore costs a short run; one that finds no piece ends without
+  publishing.
+- *Comments on a pull request* wake the judge only when they carry a command (`/…`) or were edited
+  or deleted, and never when their author is an account of type `Bot`: the links Vercel, Supabase
+  or the agents' app leave would otherwise each start a run. The owner's orders come from a `User`.
+
+**The merge queue.** In a merge group the judge publishes only its verdict, never «juzgando», and
+its runs for one group wait in line instead of cancelling each other: GitHub runs at most one per
+group at a time and keeps at most one waiting, replaced by the newest, which never started and so
+publishes nothing. The run that does start re-reads everything.
 
 **The switch.** The repository variable `AI_WORKFLOWS_MODE`: `off` (or unset) publishes green
 "motor apagado" without installing anything; `advisory` publishes green and the real verdict in
@@ -214,15 +382,48 @@ request is judged on its own, so one that fails technically does not block the o
 
 **Statuses.** passed → success, rejected → failure, waiting (for a check or the owner) → pending,
 technical → error, with the stage that decided in the description and the detail in the run
-summary. A run first replaces any earlier green with pending; before publishing it re-reads the
-pull request's head and the main branch, and stays quiet if a newer run already published.
+summary. Outside the queue a run first replaces any earlier green with pending; before publishing
+it re-reads the pull request's head and its target branch, and stays quiet if a newer run already
+published.
 
-**Limits.** Any workflow in the repository can publish a status or a check with the judge's name
-(accepted, PLAN-13 R13): the judge reports such statuses and check runs on the pull request, but
-one that copies the link of a real judge run is not detected. A required check produced by an app
-outside Actions does not trigger the judge again; the next event or `workflow_dispatch` does. If
-GitHub's status API or Actions are down, nothing can be published, not even the green of `off`.
-An approval whose commit GitHub no longer delivers after a force push has to be given again.
+### When something fails
+
+- A required read that fails, a recipe that does not validate on the trusted base, or a branch tip
+  that keeps moving publishes `error` with the reason, never a pass. A run cancelled by hand
+  publishes nothing more: on a pull request its «juzgando» stays; in a merge queue group an earlier
+  verdict of the same group SHA may stay (see Limits).
+- If the judge cannot read the recipe after three attempts when a verdict on an issue is edited or
+  deleted, it publishes `pending` «no pude leer la receta» on the head of **every** open pull request
+  into the branches of its `branches` input: wider than the piece, but on the safe side (wait,
+  never merge). Each of them leaves that state with its next event (a push, a comment, a check that
+  ends) or, by hand, with `gh workflow run ai-workflows.yml -f pr=<number>`.
+- If GitHub's status API or Actions are down, nothing can be published, not even the green of
+  `off`.
+
+### Limits
+
+- Any workflow in the repository can publish a status or a check with the judge's name (accepted,
+  PLAN-13 R13): the judge reports such statuses and check runs on the pull request, but one that
+  copies the link of a real judge run is not detected. The same holds for a project's own required
+  checks: a pull request can add a workflow with a job of the same name.
+- The judge job installs its own dependencies on every run, pinned by their integrity in the
+  lock file, from the action pinned by SHA, with their install scripts off and no key during the
+  build (PLAN-13 R33). The remaining risk, a compromised build tool on the registry, is accepted
+  for v1; a later version ships the judge already compiled.
+- A required check produced by an app outside Actions does not trigger the judge again; the next
+  event or `workflow_dispatch` does. Any `User` comment with a `/` wakes the judge (it fails
+  closed; it costs minutes).
+- If GitHub will not list the open pull requests after a verdict is deleted (three attempts), the
+  old green may stay on the head.
+- A change that entered a working branch while the judge was `off` or `advisory` reaches the
+  promotion without a judgement per piece.
+- Without a merge queue, the red test counts against the base the pull request was last updated
+  from, even if the target branch moved since (as it always did on the main branch). With two open
+  pull requests of the same head into different branches, the red-test chain cannot tell which one
+  started the run.
+- In a merge queue group, a run cancelled by hand while judging leaves in place an earlier verdict
+  of the same group SHA (measured on GitHub, 1-oct-2026).
+- An approval whose commit GitHub no longer delivers after a force push has to be given again.
 
 ## Next to the agent: the command line
 
@@ -240,7 +441,8 @@ ai-workflows doctor
 `run`, `build`, `review` and `sync` refuse an invalid recipe or a piece that is not the one of the
 current branch before touching anything. `build` and `review` run the coding CLI, observe its real
 identity and publish a builder or verdict event on the piece's issue; `independent-review` reads
-them. Progress lives in `refs/ai-workflows/*` of `origin` with a 15-minute lease.
+them. Progress lives in `refs/ai-workflows/*` of `origin` with a 15-minute lease. With working
+branches, each piece is measured against `into[0]`.
 
 **The agents' own GitHub identity (R21).** Declare `agent-account: "<app-slug>[bot]"` in the recipe
 and everything the engine does on GitHub is done as a GitHub App, so the pull request is not the
@@ -280,43 +482,84 @@ hooks:
 ```
 
 ```sh
-ai-workflows hooks install           # shows what it would write
-ai-workflows hooks install --apply   # writes it
+ai-workflows hooks install                                 # shows what it would write
+ai-workflows hooks install --apply                         # writes it, for the three clients
+ai-workflows hooks install --client claude|codex|opencode --apply   # only one client
 ```
 
-`--apply` adds a `PreToolUse` hook to `.claude/settings.json` (keeping everything else in the
-file) and git hooks in `.ai-workflows/githooks/`, and points the repository's local
-`core.hooksPath` there; it refuses a `core.hooksPath` of another tool, an invalid recipe or one
-without `pieces:`, and writes no path of the machine. The Claude hook runs in direct form (`node`
-with arguments, no shell), through a one-line loader that loads
-`node_modules/ai-workflows/dist/bin.js`; if the engine is missing, broken or answers anything but
-an answer, the loader exits 2 and Claude Code blocks the tool. `doctor` says whether the hooks are
-installed.
+`--apply` writes, keeping everything else in each file, and then names every path it wrote:
 
-What they decide ([PLAN-13-R5](docs/plans/PLAN-13-R5.md) §1): every file is judged with the
-working copy that holds it (its branch and its recipe), not the folder the session started in. A
-branch that names a piece may write anything; an excluded branch is free to write and never merges;
-any other branch, or a detached head, only the paper folders; the repository's own git folder
-counts as the project. With a recipe that cannot be read only `.ai-workflows/` may change, and
-nothing may publish on GitHub from the shell. Always, in any branch: no command or file may carry
-an order only the owner writes (the `approval-comment` commands of the recipe and
-`/approve-judge-change`), and no command may approve a pull request. A git that does not answer, a
-request whose paths cannot be read, or an internal error is a refusal, never a pass.
+- **Claude Code:** a `PreToolUse` hook in `.claude/settings.json`, for the write and shell tools,
+  run in direct form (`node` with arguments, no shell) through a one-line loader that loads
+  `node_modules/ai-workflows/dist/bin.js`; if the engine is missing, broken or answers anything but
+  an answer, the loader exits 2 and Claude Code blocks the tool.
+- **Codex:** a `PreToolUse` handler in `.codex/hooks.json` for every tool (pattern `.*`), with a
+  30-second timeout and its order in two forms (`command` and `commandWindows`). Reinstalling
+  replaces an old handler of the engine and never touches the others.
+- **OpenCode:** a whole plugin, `.opencode/plugins/ai-workflows.js`, recognized by a fixed header
+  and never merged.
+- **A loader on file,** `.ai-workflows/hook.cjs`, shared by Codex and OpenCode and found from the
+  repository root (`git rev-parse --show-toplevel`), since neither client says where the project
+  is.
+- **Git hooks** in `.ai-workflows/githooks/`, with the repository's local `core.hooksPath` pointing
+  there.
 
-**Limits.** The hooks are help, level A: `--no-verify`, the shell, MCP tools, another machine or a
-false branch name get past them; the judge is the layer that holds (a pull request whose branch
-names no piece, or a piece without its evidence, is refused). If `node` itself is missing, the
-hook runs past its 30 seconds, or the process dies by a signal (out of memory), Claude Code lets
-the tool through. The shell rule does not parse the shell: it refuses, on the whole normalized
-text, a command that names `gh`, a review and anything shaped like an approval (and, with a broken
-recipe, a command that names `gh` and anything that publishes text on GitHub). It may refuse an
-innocent chain (run the commands separately) and it stops a command written directly, in any number
-of lines, with quotes, redirections, substitutions or `bash -c`; it does not stop one disguised on
-purpose (an expansion that splits a word, globs, PowerShell concatenation, an encoded command piped
-to a shell, a script file, a `gh` alias, another program such as `node -e` or `curl`). A shell
-command over 64 KB is refused unread. Claude Code runs project hooks
-only in a folder it trusts. Codex and OpenCode are not covered yet: their builders are covered by
-the git hooks and the judge.
+It refuses a `core.hooksPath` of another tool, an invalid recipe or one without `pieces:`, and
+writes no path of the machine. Every file it writes is on the judge's list of own files. In
+interactive Codex the owner approves the hook once in `/hooks`. `doctor` checks the three clients:
+a missing or altered handler, a Codex timeout of 25 seconds or less, and `disableAllHooks` in
+`.claude/settings.local.json`.
+
+What they decide ([PLAN-13-R5](docs/plans/PLAN-13-R5.md) §1), the same logic for the three clients
+behind one translator each: every file is judged with the working copy that holds it (its branch
+and its recipe), not the folder the session started in. A branch that names a piece may write
+anything; an excluded branch is free to write and never merges; any other branch, or a detached
+head, only the paper folders; the repository's own git folder counts as the project. With a recipe
+that cannot be read only `.ai-workflows/` may change, and nothing may publish on GitHub from the
+shell. Always, in any branch: no command or file may carry an order only the owner writes (the
+`approval-comment` commands of the recipe and `/approve-judge-change`), and no command may approve
+a pull request. In Codex and OpenCode, an unknown tool whose input carries something shaped like a
+path is refused (known read-only tools pass). A git that does not answer, a request whose paths
+cannot be read, or an internal error is a refusal, never a pass. Each client gets its refusal in
+the form it honours: Claude Code an exit 2, Codex the JSON deny on standard output with exit 0,
+OpenCode an error thrown by the plugin.
+
+**On time.** A client that cuts a hook lets the tool through, so the editor hook answers before
+its deadline even when git hangs: git calls share a budget of 20 seconds (10 at most each), run
+with prompts and optional locks off, and are killed with their process tree when the time is up;
+the decision runs in a child process under a watchdog, armed before the input is read, that writes
+the refusal and exits at 25 seconds. Claude Code and Codex cut the hook at 30. The Codex order has
+its own clock too (about 3 seconds for git and the rest up to about 27 for the loader, then a
+refusal), and the OpenCode plugin throws when its process hangs, fails or cannot start. Git hooks
+have 60 seconds.
+
+**Limits, measured on Windows on 29-sep-2026.** The hooks are help, level A: `--no-verify`, the
+shell, MCP tools, another machine or a false branch name get past them; the judge is the layer that
+holds (a pull request whose branch names no piece, or a piece without its evidence, is refused).
+
+- **Codex 0.159.0** ignores a deny given with exit 2 (the write went through, openai/codex#27833)
+  and honours the JSON deny with exit 0 ("Command blocked by PreToolUse hook"); the engine always
+  answers that way. `codex exec` skips hooks that were never approved, silently, unless it runs
+  with `--dangerously-bypass-hook-trust`. Codex itself calls hooks a useful guardrail, not a
+  complete boundary: a hook that fails or hangs lets the tool through, and nested calls of Code
+  Mode run without hooks. Without `node` on the `PATH` the order cannot run, so it cannot deny.
+- **OpenCode 1.18.30** blocks a tool when the plugin throws, and a subagent's (`task`) calls go
+  through the plugin and are blocked too. If OpenCode does not load the plugin, nothing stops.
+- **Writes through the shell** are not checked against the folder rule in any client (Codex often
+  writes with the shell rather than its edit tool): the hook does not interpret the shell. Only the
+  rule about the owner's orders and approvals reads it.
+- If `node` itself is missing, the hook runs past its client's timeout, or the process dies by a
+  signal (out of memory), the client lets the tool through. Claude Code runs project hooks only in
+  a folder it trusts.
+
+The shell rule does not parse the shell: it refuses, on the whole normalized text, a command that
+names `gh`, a review and anything shaped like an approval (and, with a broken recipe, a command
+that names `gh` and anything that publishes text on GitHub). It may refuse an innocent chain (run
+the commands separately) and it stops a command written directly, in any number of lines, with
+quotes, redirections, substitutions or `bash -c`; it does not stop one disguised on purpose (an
+expansion that splits a word, globs, PowerShell concatenation, an encoded command piped to a
+shell, a script file, a `gh` alias, another program such as `node -e` or `curl`). A shell command
+over 64 KB is refused unread.
 
 ## Where progress lives on GitHub
 
@@ -347,26 +590,46 @@ await runCommand(argv, { config, store, describeChange, leaseMs: 15 * 60_000 });
 
 ## The negative suite on GitHub
 
-The attempts to get around the process (CN-01…CN-13, the server cases SV-01…SV-09, RC-06, RC-09)
-are tried against a real test repository with the agents' app, the real merge queue and the judge
-pinned to the commit under test ([PLAN-13-R5](docs/plans/PLAN-13-R5.md) §2). They need
-credentials, a person for the "Approve" button and Actions minutes, so the public CI never runs
-them:
+The attempts to get around the process (CN-01…CN-14, the server cases SV-01…SV-09 and SV-04s+,
+RC-06, RC-09, and the slice 6 cases RAMA-1, RAMA-2, A-T3, B-T6 and BOT-1) are tried against a real
+test repository with the agents' app, the real merge queue and the judge pinned to the commit under
+test ([PLAN-13-R5](docs/plans/PLAN-13-R5.md) §2, [PLAN-13-R6](docs/plans/PLAN-13-R6.md) §11). They
+need credentials, a person for the "Approve" button and Actions minutes, so the public CI never
+runs them:
 
 ```sh
 pnpm test:github            # the four files under tests/github/, one after another
-pnpm test:github:report     # the same, then the report in docs/reports/suite-negativa-<date>.md
+pnpm test:github:report     # the same, then the report in docs/reports/
 pnpm test:github:recover    # reconciles and releases the lock of an abandoned run
 ```
 
 with `AI_WORKFLOWS_GITHUB_TEST_REPO`, `AI_WORKFLOWS_APP_ID`, `AI_WORKFLOWS_APP_KEY_FILE` and
-`AI_WORKFLOWS_AGENT_ACCOUNT`. Every change to the test repository goes through one harness
-(`tests/github/sandbox.ts`): one lock per run whose commit carries the snapshot and the journal,
-the intention written before each change, a restoration that puts back only what the run itself
-wrote last and never someone else's change, and a final check that keeps the lock when anything is
-left. The report says «Completo» only when every case of the fixed manifest ran in that run, every
-attempt was stopped, every positive control passed and the clean-up was verified; it names what
-the owner did by hand and what the suite wrote with the owner's account (PLAN-13 R22).
+`AI_WORKFLOWS_AGENT_ACCOUNT`; `AI_WORKFLOWS_SUITE_SLICE=6` runs only the slice 6 cases. Every
+change to the test repository goes through one harness (`tests/github/sandbox.ts`): one lock per
+run whose commit carries the snapshot and the journal, the intention written before each change, a
+restoration that puts back only what the run itself wrote last and never someone else's change,
+and a final check that keeps the lock when anything is left. A report says «Completo» only when
+every case of its manifest ran, every attempt was stopped, every positive control passed and the
+clean-up was verified; it names what the owner did by hand and what the suite wrote with the
+owner's account (PLAN-13 R22). The reports are `docs/reports/suite-negativa-2026-09-29.md` (slices
+1 to 5) and `docs/reports/evidencia-rebanada-6-2026-10-01.md` (slice 6).
+
+## Releases
+
+Merging is not a release. A version is a GitHub Release of this repository whose assets are the
+built package (`ai-workflows-<version>.tgz`, with its `engine.json` seal) and `recipe.schema.json`:
+
+1. The slice's pull request merges with a merge commit (never squash or rebase), with CI green on
+   Linux and Windows, the review finished, and the branch up to date with `main`.
+2. The release workflow is rehearsed by hand (`workflow_dispatch` with `dry-run` and the reviewed
+   commit): it seals and packs without publishing, and `init --package` is tried in an empty
+   repository.
+3. The tag `v<version of package.json>` is created on the reviewed head commit. The release
+   workflow, with every action pinned by SHA and write permission only in the job that publishes,
+   runs the gate on Linux and Windows and seals only if the tagged commit is an ancestor of the
+   remote `main` and its tree equals the tree of the merge commit that brought it in.
+4. Releases of this repository are immutable and a ruleset protects the `v*` tags: a published
+   version never changes, and a fix ships as a new version (`v1.0.1`).
 
 ## What it does not promise
 
@@ -382,7 +645,11 @@ the owner did by hand and what the suite wrote with the owner's account (PLAN-13
 - `gh` decides where the state goes: `GH_HOST`, `GH_TOKEN` and the logged-in account all apply.
   A rate limit is reported as a failure; the store does not wait for `Retry-After`.
 - Every write adds a commit to its ref, and journals and effect tables are rewritten whole.
-- The editor hooks are help, not a guarantee: they do not see MCP tools, and a determined agent
-  can still reach the same result by other means. The server check is the mandatory layer. The
-  hook settings (`.claude/settings.json`) and the engine version in `package.json` are not files
-  of the judge: a pull request can change them without the owner's attestation.
+- The editor hooks are help, not a guarantee: they do not see MCP tools or writes through the
+  shell, and a determined agent can still reach the same result by other means. The server check
+  is the mandatory layer; the files that install or switch off the hooks, and the engine version,
+  are the judge's own files.
+
+## License
+
+[MIT](LICENSE).

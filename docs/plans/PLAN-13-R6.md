@@ -820,12 +820,41 @@ A. Donde dos toquen el mismo archivo (`judge.ts`: C, D y E), se integran en ese 
 - Un cambio que entró a una rama de `into` con el juez apagado o en consulta llega en el pase sin
   juicio por pieza (§1.3).
 - La cola nativa solo en la principal (§1.6).
-- Los ganchos de Codex y OpenCode, nivel A con lo medido en §3.5.
-- La instalación del motor en el job del juez, según lo que decida §10.5.
+- Los ganchos de Codex y OpenCode, nivel A con lo medido en esta PC (§3.1, §3.5): Codex 0.159.0
+  en Windows ignora el rechazo con salida 2 y respeta el JSON de rechazo con salida 0; `codex exec`
+  salta en silencio los ganchos no aprobados salvo con `--dangerously-bypass-hook-trust`; escribir
+  por la consola no pasa por la regla de carpetas en ningún cliente; OpenCode 1.18.30 bloquea
+  también las escrituras de un subagente, y si no carga el plugin no hay freno.
+- Sin `node` en el PATH, la orden de Codex no corre y no puede rechazar: Codex deja pasar.
+- La instalación del motor en el job del juez (§10.5): se acepta y se declara para v1.0.0 (R33).
+  Las dependencias van fijadas por su huella en el archivo de bloqueo, desde la acción fijada por
+  SHA, sin sus propios instaladores y sin la llave al compilar; queda el riesgo de una herramienta
+  de compilación comprometida en el registro.
 - Si GitHub no deja leer la lista de PRs tras borrar un veredicto (tres intentos), el verde viejo
   puede quedar (§6).
 - La prueba roja de un PR sin cola cuenta contra la base desde la que el PR se actualizó por última
   vez, aunque la rama destino haya avanzado después (§7, como hoy en la principal).
+- Las corridas de la prueba roja listan todos los PRs abiertos con esa cabeza: con dos PRs de la
+  misma cabeza hacia ramas distintas, la cadena no distingue cuál la disparó (§7).
+- Ninguna orden comprueba la protección de `from` en un pase: el README pide exigir el juez en las
+  dos ramas (§1.3).
+- Cualquier cuenta `User` que comente con `/` en un PR despierta al juez (§8): falla del lado
+  seguro y cuesta minutos.
+- **B-T6 quedó parcial en GitHub real.** En todos los intentos de las corridas reales, el juez
+  publicó su veredicto antes de que llegara la cancelación a mano, así que no se vio en GitHub una
+  corrida cancelada entre «juzgando» y su veredicto; la cabeza mostró el veredicto nuevo y nunca
+  volvió al verde viejo. El orden de §6 queda probado por las pruebas locales (§6, pruebas 1 a 3).
+- **Una corrida de un grupo de la cola cancelada a mano dentro de «Juzgar» no publica nada:** queda
+  el veredicto anterior del mismo SHA de grupo (A-T3, corrida r-6637ad5d: quedó `success`). Confirma
+  la suposición de §5 sobre «Cerrar con error» (no corre al cancelar). Ese veredicto es del mismo
+  SHA, no uno ajeno.
+- **Residuos de instalación que declararon las revisiones del delta (§17) y no se cerraron,** nivel
+  A porque el juez en GitHub no instala nada del PR:
+  - el archivo de parche de una dependencia que no es el motor y que tiene permiso de compilar no es
+    archivo propio: un PR puede cambiarlo sin atestación y ese parche corre al instalar en la PC de
+    los agentes (cambiar qué dependencias se parchean o pueden compilar sí es archivo propio);
+  - valores YAML con forma de fecha o de número pueden leerse distinto en el juez (YAML 1.2) y en
+    el instalador; la diferencia falla del lado seguro.
 
 ## 13. Bitácora de revisión
 
@@ -978,3 +1007,94 @@ inofensivo solo si es un rango o versión del registro escrito con los caractere
 etiqueta sin puntos ni barras, o empieza con `workspace:` o `catalog:`; un `.tgz`, `.tar` o
 `.tar.gz`, o un valor que empieza con `\` o `~/`, cuenta como tocado. `.npmrc` se lee como el lector
 `ini` (comentarios en línea, comillas y claves entre comillas).
+
+## 16. Desviaciones durante la construcción
+
+Decididas por el orquestador al verificar cada parte; ninguna cambia lo que decidió el dueño.
+
+- **Encargos en carriles paralelos**, cada uno en su carpeta y con sus pruebas rojas commiteadas
+  antes: A, B (con B2) y F en un carril, en ese orden porque B espera a A; C, D y E en otro,
+  integrados en ese orden porque comparten `judge.ts`. Tras la parvada, I (`init` y publicación), G
+  (juez) y H (ganchos) en paralelo; después K a Q en serie, uno por revisión del delta; los casos
+  reales de la suite en su propio carril, en paralelo con P y Q; y R tras la primera corrida real.
+  La J nombra la carpeta de trabajo de los arreglos tardíos, no un encargo. Todos los construyó
+  DeepSeek V4.1 Flash `high` (R17); el orquestador corrió la puerta antes de integrar cada uno.
+- **B2:** la revisión del encargo B halló que la orden de Codex instalada no fallaba cerrada por su
+  cuenta. Se escribió su roja y B2 la arregló (§3.3 anotado).
+- **La decisión del gancho pasó de un hilo (`Worker`) a un proceso hijo** (encargo H): en Linux, un
+  hilo bloqueado en una lectura nativa (un FIFO) impide que `process.exit` termine el proceso, y la
+  CI lo midió en 40 s. El vigilante se arma antes de leer la entrada y mata al hijo al vencer (§4
+  anotado). La CI de Linux también pidió matar a los nietos desprendidos de git.
+- **El ejecutor Windows de GitHub** usa una carpeta temporal con nombre corto (8.3): el plugin de
+  OpenCode se carga por su ruta larga y la raíz del proyecto se compara por ruta larga. La limpieza
+  de una prueba espera a que Windows suelte la carpeta de su cerrador falso.
+- **Lo medido de Codex y OpenCode** en el paso cero (§3.1, 29-sep) quedó como diseño y como texto
+  del README: Codex 0.159.0 en Windows ignora el rechazo con salida 2 y respeta el JSON con salida
+  0; `codex exec` salta los ganchos no aprobados salvo con `--dangerously-bypass-hook-trust` (y
+  `hooks install` lo dice al terminar); escribir por la consola no pasa por la regla de carpetas en
+  ningún cliente; OpenCode 1.18.30 bloquea también las escrituras de un subagente (`task`).
+- **`node_modules` vaciado (30-sep):** retirar una carpeta de trabajo auxiliar que aún tenía su
+  enlace a `node_modules` borró, siguiendo el enlace, los de la carpeta principal. Se restauraron con
+  `pnpm install --frozen-lockfile`; desde entonces cada enlace se borra (sin recorrerlo) antes de
+  retirar su carpeta.
+- **Primera corrida real, r-9d7412bc (30-sep):** pasaron SV-04s+ y CN-14; no pasaron RAMA-1 (con
+  RAMA-2, que corre en el mismo caso), BOT-1, B-T6 ni A-T3. Hallazgos:
+  - **del motor:** la prueba roja oficial se negaba a probar un PR hacia `staging` («la rama
+    destino es staging, no main»), así que ninguna pieza de comportamiento podía entrar a una rama
+    de trabajo. El encargo R la extiende: la lista `into` sale de la receta de la principal, y un PR
+    hacia una rama de `into` se prueba contra la punta de esa rama y con su receta; fuera de `into`
+    sigue sin probarse y nombra la rama. Sus guardas tienen prueba: punta o receta ilegibles, lista
+    solo de la principal, cola sin cambios y traída fallida;
+  - **de la suite:** BOT-1 contaba todos los estados de la cabeza, y los otros checks del ensayo
+    también publican (pasó de 10 a 12 sin ninguna corrida del juez con pasos): ahora cuenta solo los
+    del juez. B-T6 vigilaba todos los estados cada 2 s y cancelaba tarde (4 de 4 intentos): ahora una
+    llamada barata cada medio segundo y la cancelación al instante. A-T3 se cayó porque el candado
+    de la cola del ensayo no pudo descargar el motor que nombraba `package.json`: el caso que cambia
+    la versión del motor usa ahora una versión publicada (v0.2.1) y `main` vuelve a como estaba
+    antes de los casos siguientes.
+- **Segunda corrida real, r-939cf951 (1-oct, motor con R):** seis de los siete casos quedaron
+  registrados: SV-04s+, CN-14 (GitHub sí ejecutó el archivo `…@falso.yml` y no contó), RAMA-1,
+  RAMA-2 y BOT-1 pasaron, y B-T6 quedó parcial (en seis intentos la cancelación nunca llegó antes
+  del veredicto y la cabeza nunca volvió al verde viejo). A-T3 cumplió lo principal, pero su sonda
+  no alcanzó «Juzgar» dos veces, después no llegó ninguna corrida de su grupo y la espera cortó el
+  caso sin registrarlo. Arreglo de la suite: cualquier fallo de la sonda queda como parcial con su
+  motivo, sin tumbar el caso.
+- **Corrida corta final, r-6637ad5d (1-oct), solo A-T3:** cuatro disparos del juez, dos empezaron,
+  ninguna empezada terminó cancelada, nunca dos a la vez, y el grupo se fusionó. La sonda canceló una
+  corrida dentro de «Juzgar» al segundo intento y el grupo conservó el `success` anterior (§12.1). La
+  limpieza cerró sola. Un intento previo, r-51af6c99, se cayó a los cuatro minutos porque el proceso
+  de las pruebas terminó de golpe, y no registró ningún caso.
+- **El informe junta dos corridas (R35):** `docs/reports/evidencia-rebanada-6-2026-10-01.md` toma
+  seis casos de r-939cf951 y A-T3 de r-6637ad5d, lo declara en su primera línea y por corrida, y
+  dice «Incompleto» porque B-T6 es parcial. Remite al informe de la rebanada 5 para el resto.
+
+## 17. Revisión de la parvada
+
+**Ronda 1** (parvada completa, R25: correctitud, dos de seguridad con la lista de §10, contrato del
+motor, pruebas con 108 mutantes), sobre el cambio entero. Bloqueantes P1 a P6 (§15), cada uno con
+su prueba roja: P1 a P3 y R32 en el encargo G, P4 en el I, P5, P6 y R34 en el H. Decisiones del
+dueño que salieron de ella: R32, R33 y R34. El punto 5 de §10 (la instalación en el job del juez)
+se aceptó y declaró (R33); lo demás aceptado está en §12.1.
+
+**Revisiones del delta** (un revisor cada una, R25, porque todas tocan la frontera de seguridad):
+1. Encargo K: la punta que cambió se trae antes de preguntar si la cabeza ya entró; el error de
+   ramas también en las cabezas hacia ramas extra de la entrada; cada gestor con su punto de entrada
+   en Windows; más scripts y archivos de instalación protegidos; la puerta de la publicación revisa
+   el mismo commit que sella; tope del vigilante y `ps` con plazo.
+2. Encargo L: el árbol del proceso que decide se mata solo si sigue vivo y después de responder; un
+   manifiesto de un miembro añadido o borrado se compara contra vacío; más ajustes de instalación
+   protegidos; `init` busca el gestor solo en carpetas absolutas del PATH.
+3. Encargo M: proteger los manifiestos con una lista de claves peligrosas no se cierra nunca.
+   **Decisión del orquestador para aplicar R32:** lista de cambios inofensivos (§15); `binding.gyp`
+   tocado; el gestor solo por ruta absoluta fuera del proyecto; la orden de matar el árbol se lanza
+   sin esperarla.
+4. Encargo N: claves de mezcla y `__proto__` cuentan como tocadas; una dependencia que no viene del
+   registro no es inofensiva; el nombre del motor sin distinguir mayúsculas; la salida del gancho no
+   pierde su código.
+5. Encargo O: cualquier función avanzada de YAML cuenta como tocada; versiones del registro
+   estrictas; `.npmrc` como el lector `ini`; la salida del gancho aguanta un flujo roto.
+6. Encargo P: una clave YAML que no es texto cuenta como tocada; comentarios de `.npmrc` sin espacio.
+7. Encargo Q: comillas simples y retornos de carro sueltos de `.npmrc`, como los lee `ini`.
+
+**Las dos últimas revisiones** (un revisor cada una, tras Q y tras R con los arreglos de las
+corridas reales): **sin bloqueantes**. Los residuos que declararon quedan en §12.1.
