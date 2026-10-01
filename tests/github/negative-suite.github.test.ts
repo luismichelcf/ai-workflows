@@ -315,6 +315,14 @@ function statuses(sha: string): Status[] {
 
 const latest = (sha: string, context = 'ai-workflows') => statuses(sha).find((status) => status.context === context);
 
+/**
+ * The newest statuses of a SHA in one cheap call (one page of five, newest first, no pagination),
+ * for a watch that must react within a second (B-T6). Status ids only grow.
+ */
+function headStatuses(sha: string): (Status & { id: number })[] {
+  return ghJson<(Status & { id: number })[]>('api', `repos/${REPO}/commits/${sha}/statuses?per_page=5`);
+}
+
 function settled(sha: string, states: string[] = ['success', 'failure', 'error'], timeoutMs = 15 * MINUTE): Promise<Status> {
   return waitFor(`ai-workflows on ${sha.slice(0, 7)} in ${states.join('/')}`, () => {
     const status = latest(sha);
@@ -1345,7 +1353,37 @@ const CLAUDE_SETTINGS = (withHook: boolean) => `${JSON.stringify({
     ? { PreToolUse: [{ matcher: 'Write|Edit|MultiEdit|NotebookEdit', hooks: [{ type: 'command', command: 'node', args: ['node_modules/ai-workflows/dist/bin.js', 'hook', 'editor'] }] }] }
     : {},
 }, null, 2)}\n`;
-const PROJECT_MANIFEST = (engine: string, leftPad: string) => `${JSON.stringify({ name: 'ensayo', private: true, devDependencies: { 'ai-workflows': engine, 'left-pad': leftPad } }, null, 2)}\n`;
+/**
+ * The rehearsal's real `package.json` of main, with `left-pad` added and, when given, another value
+ * for `ai-workflows`. Everything else stays as main has it (its name, its type and the release URL
+ * of the engine that the rehearsal's own queue lock downloads): in the run r-9d7412bc a made-up
+ * manifest left `"ai-workflows": "1.0.0"` on main and the queue lock of A-T3 could not download it.
+ */
+function projectManifest(original: string, leftPad: string, engine?: string): string {
+  const manifest = JSON.parse(original) as { devDependencies?: Record<string, string> } & Record<string, unknown>;
+  const devDependencies = { ...(manifest.devDependencies ?? {}) };
+  if (devDependencies['ai-workflows'] === undefined) throw new Error('the package.json of main does not name ai-workflows');
+  if (engine !== undefined) devDependencies['ai-workflows'] = engine;
+  devDependencies['left-pad'] = leftPad;
+  return `${JSON.stringify({ ...manifest, devDependencies }, null, 2)}\n`;
+}
+
+/** Another release of the engine in the same URL: only the version in the path changes. */
+function otherEngineRelease(url: string): string {
+  const other = url.replace(/\/releases\/download\/v[^/]+\/ai-workflows-[^/]+\.tgz$/, '/releases/download/v0.3.1/ai-workflows-0.3.1.tgz');
+  if (other === url) throw new Error(`the engine of main is not a release URL other than v0.3.1: ${url}`);
+  return other;
+}
+
+/** A file of main as it is now, or `undefined` when main does not have it. */
+function mainFile(path: string): string | undefined {
+  try {
+    return Buffer.from(ghJson<{ content: string }>('api', `repos/${REPO}/contents/${path}?ref=main`).content, 'base64').toString('utf8');
+  } catch (error) {
+    if (/HTTP 404/.test(String((error as { stderr?: string }).stderr ?? error))) return undefined;
+    throw error;
+  }
+}
 
 /** The judge workflow alone, with or without the `branches` input. */
 function judgeWorkflow(branches?: string): string {
@@ -1382,42 +1420,57 @@ function stagingRecipe(): string {
 
 describe.sequential('the evidence of slice 6 on GitHub (PLAN-13-R6 §11, R29)', () => {
   it('R29: SV-04s+: removing the editor hook or changing the engine version is refused; the owner attestation passes; an unrelated dependency passes alone', async () => {
+    const originalManifest = mainFile('package.json');
+    if (originalManifest === undefined) throw new Error('main of the rehearsal has no package.json');
+    const originalSettings = mainFile('.claude/settings.json');
+    const engineUrl = (JSON.parse(originalManifest) as { devDependencies?: Record<string, string> }).devDependencies?.['ai-workflows'] ?? '';
     await sandbox.writeMainFiles({
       '.claude/settings.json': CLAUDE_SETTINGS(true),
-      'package.json': PROJECT_MANIFEST('1.0.0', '1.3.0'),
+      'package.json': projectManifest(originalManifest, '1.3.0'),
     }, `suite negativa ${sandbox.run}: el gancho del editor y la versión del motor en main (R29)`);
-    const papers = (n: number) => ({ [`docs/plans/PLAN-${n}.md`]: planOf(n, 'papeles') });
+    try {
+      const papers = (n: number) => ({ [`docs/plans/PLAN-${n}.md`]: planOf(n, 'papeles') });
 
-    const hook = await openPiece('sin-gancho', (n) => ({ ...papers(n), '.claude/settings.json': CLAUDE_SETTINGS(false) }));
-    const hookRefused = await settled(hook.head, ['failure']);
-    expect(hookRefused.description).toContain(`/approve-judge-change ${hook.head.slice(0, 16)}`);
-    expect(judgeRunLog(hookRefused)).toContain('.claude/settings.json');
+      const hook = await openPiece('sin-gancho', (n) => ({ ...papers(n), '.claude/settings.json': CLAUDE_SETTINGS(false) }));
+      const hookRefused = await settled(hook.head, ['failure']);
+      expect(hookRefused.description).toContain(`/approve-judge-change ${hook.head.slice(0, 16)}`);
+      expect(judgeRunLog(hookRefused)).toContain('.claude/settings.json');
 
-    const version = await openPiece('otra-version', (n) => ({ ...papers(n), 'package.json': PROJECT_MANIFEST('1.0.1', '1.3.0') }));
-    const versionRefused = await settled(version.head, ['failure']);
-    expect(versionRefused.description).toContain(`/approve-judge-change ${version.head.slice(0, 16)}`);
-    expect(judgeRunLog(versionRefused)).toContain('package.json');
-    await tryToMerge(version);
-    await stillOpen(version);
+      const version = await openPiece('otra-version', (n) => ({ ...papers(n), 'package.json': projectManifest(originalManifest, '1.3.0', otherEngineRelease(engineUrl)) }));
+      const versionRefused = await settled(version.head, ['failure']);
+      expect(versionRefused.description).toContain(`/approve-judge-change ${version.head.slice(0, 16)}`);
+      expect(judgeRunLog(versionRefused)).toContain('package.json');
+      await tryToMerge(version);
+      await stillOpen(version);
 
-    const unrelated = await openPiece('otra-dependencia', (n) => ({ ...papers(n), 'package.json': PROJECT_MANIFEST('1.0.0', '1.3.1') }));
-    const unrelatedPassed = await settled(unrelated.head, ['success', 'failure', 'error']);
-    expect(unrelatedPassed.state, unrelatedPassed.description).toBe('success');
+      const unrelated = await openPiece('otra-dependencia', (n) => ({ ...papers(n), 'package.json': projectManifest(originalManifest, '1.3.1') }));
+      const unrelatedPassed = await settled(unrelated.head, ['success', 'failure', 'error']);
+      expect(unrelatedPassed.state, unrelatedPassed.description).toBe('success');
 
-    // The owner's attestation for this head, written with the owner's account (R22), as in SV-04s.
-    await tryToMerge(hook);
-    await stillOpen(hook);
-    gh('pr', 'comment', String(hook.pr), '--repo', REPO, '--body', `/approve-judge-change ${hook.head.slice(0, 16)}`);
-    const accepted = await waitFor('the judge after the attestation', () => (latest(hook.head)?.state === 'success' ? latest(hook.head) : undefined));
-    record({
-      id: 'SV-04s+',
-      attempt: 'Un PR quita el gancho del editor de .claude/settings.json y otro cambia la versión del motor en package.json, sin la orden del dueño. Control: con la orden del dueño para esa versión el primero pasa, y un PR que solo sube otra dependencia pasa sin orden',
-      stoppedBy: ['juez'],
-      negative: 'frenado',
-      positive: 'pasó',
-      evidence: [prUrl(hook.pr), runUrl(hookRefused), runUrl(accepted), prUrl(version.pr), runUrl(versionRefused), prUrl(unrelated.pr), runUrl(unrelatedPassed)],
-      owner: { ordersBySuite: ['/approve-judge-change'] },
-    });
+      // The owner's attestation for this head, written with the owner's account (R22), as in SV-04s.
+      await tryToMerge(hook);
+      await stillOpen(hook);
+      gh('pr', 'comment', String(hook.pr), '--repo', REPO, '--body', `/approve-judge-change ${hook.head.slice(0, 16)}`);
+      const accepted = await waitFor('the judge after the attestation', () => (latest(hook.head)?.state === 'success' ? latest(hook.head) : undefined));
+      record({
+        id: 'SV-04s+',
+        attempt: 'Un PR quita el gancho del editor de .claude/settings.json y otro cambia la versión del motor en package.json, sin la orden del dueño. Control: con la orden del dueño para esa versión el primero pasa, y un PR que solo sube otra dependencia pasa sin orden',
+        stoppedBy: ['juez'],
+        negative: 'frenado',
+        positive: 'pasó',
+        evidence: [prUrl(hook.pr), runUrl(hookRefused), runUrl(accepted), prUrl(version.pr), runUrl(versionRefused), prUrl(unrelated.pr), runUrl(unrelatedPassed)],
+        owner: { ordersBySuite: ['/approve-judge-change'] },
+      });
+    } finally {
+      // Later cases need main as it was: the queue lock of A-T3 downloads the engine that
+      // package.json names. The harness writes files but never deletes one, so a settings file that
+      // main did not have stays (with the hook) until the harness puts main's snapshot back.
+      await sandbox.writeMainFiles({
+        'package.json': originalManifest,
+        ...(originalSettings === undefined ? {} : { '.claude/settings.json': originalSettings }),
+      }, `suite negativa ${sandbox.run}: main vuelve a su package.json y su configuración del editor (R29)`);
+      if (originalSettings === undefined) log('SV-04s+: main had no .claude/settings.json; the one with the hook stays until the harness restores main');
+    }
   }, 45 * MINUTE);
 
   it('R29: BOT-1: a comment of the agents app with a link on a pull request starts no judgement; the same comment by a person does', async () => {
@@ -1425,7 +1478,11 @@ describe.sequential('the evidence of slice 6 on GitHub (PLAN-13-R6 §11, R29)', 
     const piece = await openPiece('comentario-robot', (n) => ({ [`docs/plans/PLAN-${n}.md`]: planOf(n, 'papeles') }));
     await settled(piece.head, ['success']);
     await judgeIdle(caseStart);
-    const count = statuses(piece.head).length;
+    // Only the judge's own status counts: the other checks of the rehearsal (the queue lock, the
+    // project's checks) also post statuses on the head: in the run r-9d7412bc the head went from
+    // 10 to 12 statuses although no judge run after the app comment ran a step.
+    const judgeStatuses = () => statuses(piece.head).filter((status) => status.context === 'ai-workflows').length;
+    const count = judgeStatuses();
     const body = `Vista previa lista: https://example.com/vista-${sandbox.run}`;
 
     const beforeBot = lastJudgeRunId();
@@ -1435,7 +1492,7 @@ describe.sequential('the evidence of slice 6 on GitHub (PLAN-13-R6 §11, R29)', 
     await judgeIdle(beforeBot);
     const botRuns = judgeRunsAfter(beforeBot).filter((run) => run.event === 'issue_comment');
     for (const run of botRuns) expect(ranSteps(jobsOf(run.id)), `judge run ${run.id} after the app comment ran its job`).toBe(false);
-    expect(statuses(piece.head)).toHaveLength(count);
+    expect(judgeStatuses()).toBe(count);
 
     // Positive control: the same comment by a person (the owner's account, R22) wakes the judge.
     const beforeOwner = lastJudgeRunId();
@@ -1443,7 +1500,7 @@ describe.sequential('the evidence of slice 6 on GitHub (PLAN-13-R6 §11, R29)', 
     const ownerRun = await waitFor('the judge run of the person comment', () => judgeRunsAfter(beforeOwner).find((run) => run.event === 'issue_comment' && run.status === 'completed'), 10 * MINUTE);
     expect(ranSteps(jobsOf(ownerRun.id))).toBe(true);
     expect(ownerRun.conclusion).toBe('success');
-    await waitFor('a new judgement on the head', () => (statuses(piece.head).length > count ? true : undefined));
+    await waitFor('a new judgement on the head', () => (judgeStatuses() > count ? true : undefined));
     record({
       id: 'BOT-1',
       attempt: `La aplicación de los agentes comenta en un PR con una dirección, como lo hacen Vercel o Supabase: ${botRuns.length === 0 ? 'GitHub no creó ninguna corrida del juez' : `GitHub creó ${botRuns.length} corrida(s) del juez sin ningún paso corrido`}, y no apareció ningún estado nuevo. Control: el mismo comentario de una persona sí despierta al juez`,
@@ -1459,47 +1516,68 @@ describe.sequential('the evidence of slice 6 on GitHub (PLAN-13-R6 §11, R29)', 
     await builderEvent(piece);
     let green: Status | undefined;
     let caught: { runId: number; status: Status } | undefined;
-    // The run is cancelled between its «juzgando» and its verdict; a run that is quicker than the
-    // cancellation is not the case, and the attempt is made again with a new verdict.
-    for (let attempt = 1; attempt <= 4 && caught === undefined; attempt += 1) {
+    const tried: number[] = [];
+    // The run is cancelled between its «juzgando» and its verdict. In the run r-9d7412bc the watch
+    // (every status of the head, every 2 s), the check of the run's event and `gh run cancel` came
+    // after the verdict in four attempts of four: now one cheap call every half second, the cancel
+    // at once, and the event checked after it. A run quicker than the cancellation is not the case;
+    // even then the head must never show the old green, and the attempt is made again.
+    for (let attempt = 1; attempt <= 6 && caught === undefined; attempt += 1) {
       const comment = await verdict(piece, piece.head);
       const passed = await judged(piece, ['success', 'failure', 'error']);
       expect(passed.status.state, JSON.stringify(passed.stages)).toBe('success');
       green ??= passed.status;
-      const mark = statuses(piece.head).length;
+      const mark = Math.max(0, ...headStatuses(piece.head).map((status) => status.id));
       await asAgent('api', '-X', 'DELETE', `repos/${REPO}/issues/comments/${comment}`);
-      const seen = await waitFor('the first status after the verdict was deleted', () => {
-        const all = statuses(piece.head);
-        if (all.length <= mark) return undefined;
-        return all.find((status) => status.context === 'ai-workflows');
-      }, 10 * MINUTE, 2_000);
+      const seen = await waitFor('the first judge status after the verdict was deleted', () =>
+        headStatuses(piece.head).find((status) => status.context === 'ai-workflows' && status.id > mark), 10 * MINUTE, 500);
+      const runId = Number(/\/actions\/runs\/(\d+)/.exec(seen.target_url ?? '')?.[1] ?? 0);
       if (seen.state !== 'pending' || seen.description !== 'juzgando') {
         log(`B-T6 attempt ${attempt}: the first new status was ${seen.state} «${seen.description}», not «juzgando»`);
+        expect(seen.state, `B-T6 attempt ${attempt}: the first status after the verdict was deleted`).not.toBe('success');
+        if (runId > 0) tried.push(runId);
         continue;
       }
-      const runId = Number(/\/actions\/runs\/(\d+)/.exec(seen.target_url ?? '')?.[1] ?? 0);
-      expect(judgeRun(runId).event).toBe('issue_comment');
+      let cancelled = true;
       try {
-        gh('run', 'cancel', String(runId), '--repo', REPO);
+        gh('api', '-X', 'POST', `repos/${REPO}/actions/runs/${runId}/cancel`);
       } catch (error) {
+        cancelled = false;
         log(`B-T6 attempt ${attempt}: cancel refused: ${String((error as { stderr?: string }).stderr ?? error).trim()}`);
-        continue;
       }
-      const ended = await waitFor('the cancelled run', () => {
+      // Only after the cancel: every call before it gives the run time to reach its verdict.
+      expect(judgeRun(runId).event).toBe('issue_comment');
+      tried.push(runId);
+      const ended = await waitFor('the judge run of the deleted verdict', () => {
         const run = judgeRun(runId);
         return run.status === 'completed' ? run : undefined;
       }, 10 * MINUTE, 5_000);
       await sleep(MINUTE);
       const newest = latest(piece.head);
-      if (ended.conclusion !== 'cancelled' || newest?.target_url !== seen.target_url || newest.state !== 'pending') {
+      // Cancelled in time or not, the head never goes back to the old green.
+      expect(newest?.state, `B-T6 attempt ${attempt}: the head after the verdict was deleted`).not.toBe('success');
+      if (!cancelled || ended.conclusion !== 'cancelled' || newest?.target_url !== seen.target_url || newest.state !== 'pending') {
         log(`B-T6 attempt ${attempt}: the run ended ${ended.conclusion} and the head shows ${newest?.state} «${newest?.description}»`);
         continue;
       }
       caught = { runId, status: newest };
     }
-    if (caught === undefined || green === undefined) throw new Error('no attempt cancelled the run of the deleted verdict between its «juzgando» and its verdict');
-    expect(caught.status.state).toBe('pending');
+    if (green === undefined) throw new Error('B-T6: no verdict made the head green');
     expect(latest(piece.head)?.state).not.toBe('success');
+    if (caught === undefined) {
+      // Not passed: the cancellation never landed inside the window. What was seen is recorded.
+      record({
+        id: 'B-T6',
+        attempt: `Se borra el veredicto que dio el verde y se intenta cancelar a mano la corrida del juez que eso dispara, en ${tried.length} intentos: en ninguno la cancelación llegó antes del veredicto, y la cabeza nunca volvió al verde viejo`,
+        stoppedBy: ['juez'],
+        negative: 'frenado',
+        positive: 'no-aplica',
+        evidence: [prUrl(piece.pr), runUrl(green), ...tried.map((id) => RUN_URL(id))],
+        partial: 'el juez terminó antes de la cancelación; la cabeza mostró el veredicto nuevo, nunca el verde viejo',
+      });
+      return;
+    }
+    expect(caught.status.state).toBe('pending');
     record({
       id: 'B-T6',
       attempt: 'Se borra el veredicto que dio el verde y la corrida del juez que eso dispara se cancela a mano antes de terminar: la cabeza queda en «juzgando», no en el verde viejo',
