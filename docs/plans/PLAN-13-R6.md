@@ -1096,5 +1096,9 @@ se aceptó y declaró (R33); lo demás aceptado está en §12.1.
 6. Encargo P: una clave YAML que no es texto cuenta como tocada; comentarios de `.npmrc` sin espacio.
 7. Encargo Q: comillas simples y retornos de carro sueltos de `.npmrc`, como los lee `ini`.
 
-**Las dos últimas revisiones** (un revisor cada una, tras Q y tras R con los arreglos de las
-corridas reales): **sin bloqueantes**. Los residuos que declararon quedan en §12.1.
+**Cierre de las revisiones.** La revisión del encargo P marcó como grave cómo se leían las
+comillas simples y los retornos de carro de `.npmrc`; como ese archivo es propio y solo se lee del
+lado de confianza (lo escribe el dueño), no es alcanzable por un PR, y el orquestador lo arregló
+(encargo Q) sin pedir otra ronda. La revisión del encargo R (la prueba roja hacia ramas de
+trabajo, hallado en la corrida real) terminó **sin bloqueantes**; sus pruebas de guardia se
+añadieron. Los residuos declarados quedan en §12.1.
