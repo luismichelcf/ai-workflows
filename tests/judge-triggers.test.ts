@@ -55,7 +55,7 @@ function setup(prs: (heads: { visible: string; other: string }) => Pr[]) {
   git(root, 'switch', '-q', 'main');
   const main = git(root, 'rev-parse', 'HEAD');
   const list = prs({ visible, other });
-  const published: { sha: string; state: string }[] = [];
+  const published: { sha: string; state: string; description: string }[] = [];
   const asked: string[] = [];
   const url = 'https://github.com/duena/proyecto/actions/runs/1';
   const github: JudgeGitHub = {
@@ -83,7 +83,7 @@ function setup(prs: (heads: { visible: string; other: string }) => Pr[]) {
     workflowRun: async () => ({ path: '.github/workflows/ai-workflows.yml', event: 'workflow_run', headBranch: 'main' }),
     forcePushedHeads: async () => [],
     publishStatus: async (sha, status) => {
-      published.push({ sha, state: status.state });
+      published.push({ sha, state: status.state, description: status.description });
     },
     upsertTraceComment: async () => {},
   } as JudgeGitHub;
@@ -100,9 +100,15 @@ function setup(prs: (heads: { visible: string; other: string }) => Pr[]) {
       serverUrl: 'https://github.com',
       alsoProtect: [],
       root,
-    }, { github, fetchObjects: async () => {} });
+    }, { github, fetchObjects: async () => {}, sleep: async () => {} });
   return { visible, other, published, asked, judge };
 }
+
+// PLAN-13-R6 §6: the judgement from the issue first publishes `pending` «juzgando» on every head
+// of the piece, then the verdicts. The lists below separate the two.
+const JUZGANDO = 'juzgando';
+const pendings = (published: readonly { sha: string; description: string }[]) => published.filter((entry) => entry.description === JUZGANDO);
+const verdicts = (published: readonly { sha: string; description: string }[]) => published.filter((entry) => entry.description !== JUZGANDO);
 
 const EVENT_COMMENT = 'Veredicto de correctitud: aprobado\n\n<!-- ai-workflows:event {"type":"verdict"} -->';
 
@@ -162,7 +168,10 @@ describe('an event on the piece issue wakes the judge for that piece', () => {
       { number: 9, head: h.other, branch: 'feat/13-hacia-otra', base: 'develop' },
     ]);
     await t.judge('issue_comment', { action: 'created', issue: { number: 13 }, comment: { body: EVENT_COMMENT } });
-    expect(t.published.map((entry) => entry.sha).sort()).toEqual([t.visible, t.other].sort());
+    // R6 §6: «juzgando» on both heads of the piece before any verdict, and nothing else anywhere.
+    expect(pendings(t.published).map((entry) => entry.sha).sort()).toEqual([t.visible, t.other].sort());
+    expect(t.published.slice(0, 2).every((entry) => entry.description === JUZGANDO)).toBe(true);
+    expect(verdicts(t.published).map((entry) => entry.sha).sort()).toEqual([t.visible, t.other].sort());
   });
 
   it('a new comment on an issue without the event mark changes nothing', async () => {
@@ -176,7 +185,12 @@ describe('an event on the piece issue wakes the judge for that piece', () => {
     it(`an ${action} comment on the piece issue judges again, even without the mark`, async () => {
       const t = setup((h) => [{ number: 7, head: h.visible, branch: 'feat/13-boton' }]);
       await t.judge('issue_comment', { action, issue: { number: 13 }, comment: { body: 'ya no dice nada' } });
-      expect(t.published.map((entry) => entry.sha)).toEqual([t.visible]);
+      // R6 §6: «juzgando» first, then the verdict.
+      expect(t.published).toEqual([
+        { sha: t.visible, state: 'pending', description: JUZGANDO },
+        expect.objectContaining({ sha: t.visible }),
+      ]);
+      expect(verdicts(t.published).map((entry) => entry.sha)).toEqual([t.visible]);
     });
   }
 

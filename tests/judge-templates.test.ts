@@ -30,7 +30,9 @@ function steps(job: Record<string, any>): Record<string, any>[] {
 describe('action.yml', () => {
   it('is a composite action with the inputs of §6', () => {
     expect(ACTION['runs']?.['using']).toBe('composite');
-    expect(Object.keys(ACTION['inputs'] ?? {}).sort()).toEqual(['also-protect', 'context', 'mode', 'task', 'token']);
+    // PLAN-13-R6 §1.2 adds the input `branches` (the working branches the decide step needs
+    // before the engine is built): the list changes by design.
+    expect(Object.keys(ACTION['inputs'] ?? {}).sort()).toEqual(['also-protect', 'branches', 'context', 'mode', 'task', 'token']);
     expect(ACTION['inputs']?.['context']?.['default']).toBe('ai-workflows');
   });
 
@@ -76,6 +78,25 @@ describe('action.yml', () => {
   });
 });
 
+// PLAN-13-R6 §5: the literal of the design. A new run of a queue group waits in line (at most one
+// waiting, the newest replaces it); everywhere else the new run still cancels the old one.
+const CANCEL_IN_PROGRESS =
+  "${{ !(github.event_name == 'merge_group' || (github.event_name == 'workflow_run' && github.event.workflow_run.event == 'merge_group')) }}";
+
+// PLAN-13-R6 §8: the job condition, derived from the template before R6 plus one clause: on a
+// pull request comment, an author of type `Bot` never wakes the judge. Issue comments that are not
+// pull requests keep today's rule (the agents' app writes the verdicts there).
+const JOB_CONDITION = [
+  "github.event_name != 'issue_comment'",
+  '|| (github.event.issue.pull_request',
+  "  && github.event.comment.user.type != 'Bot'",
+  "  && (contains(github.event.comment.body, '/') || github.event.action != 'created'))",
+  '|| (!github.event.issue.pull_request',
+  "  && (contains(github.event.comment.body, 'ai-workflows:event') || github.event.action != 'created'))",
+].join(' ');
+
+const squeeze = (value: string): string => value.replace(/\s+/g, ' ').trim();
+
 describe('templates/ai-workflows.yml (the judge)', () => {
   it('listens to the five events of §3.2 and never to pull_request', () => {
     const on = JUDGE['on'] as Record<string, unknown>;
@@ -83,7 +104,9 @@ describe('templates/ai-workflows.yml (the judge)', () => {
     expect((on['workflow_dispatch'] as any)?.inputs?.pr).toBeDefined();
     expect((on['workflow_run'] as any)?.types).toEqual(['completed']);
     // edited: changing the target branch (or coming back to main) runs the judge again.
-    expect([...((on['pull_request_target'] as any)?.types ?? [])].sort()).toEqual(['edited', 'opened', 'reopened', 'synchronize']);
+    // closed (PLAN-13-R6 §1.2, §1.5 test 16): a pull request that stops counting re-judges the
+    // others with its head, so the judge listens to it; the list changes by design.
+    expect([...((on['pull_request_target'] as any)?.types ?? [])].sort()).toEqual(['closed', 'edited', 'opened', 'reopened', 'synchronize']);
     expect((on['workflow_run'] as any)?.workflows).toContain(RED['name']);
   });
 
@@ -101,7 +124,9 @@ describe('templates/ai-workflows.yml (the judge)', () => {
     });
     expect(['ai-workflows', 'ai-workflows/advisory']).not.toContain(job['name']);
     expect(Object.keys(JUDGE['jobs'])).not.toContain('ai-workflows');
-    expect(job['concurrency']?.['cancel-in-progress']).toBe(true);
+    // PLAN-13-R6 §5: in a queue group the runs wait in line instead of cancelling each other; the
+    // exact expression is pinned by the next describe. (Before R6 this was the literal `true`.)
+    expect(job['concurrency']?.['cancel-in-progress']).toBe(CANCEL_IN_PROGRESS);
   });
 
   it('uses the action pinned by a placeholder SHA, with the switch variable and the red-test workflow protected', () => {
@@ -240,5 +265,30 @@ describe('flock 4: the command says its verdict in the run log', () => {
   it('writes the summary to its standard output as well, not only to the step summary', () => {
     const cli = readFileSync(new URL('../src/judge/cli.ts', import.meta.url), 'utf8');
     expect(cli).toMatch(/process\.stdout\.write\([^)]*summary/);
+  });
+});
+
+describe('PLAN-13-R6 §5: the runs of one queue group wait in line', () => {
+  const job = () => Object.values(JUDGE['jobs'] as Record<string, Record<string, any>>)[0] as Record<string, any>;
+
+  it('cancel-in-progress is exactly the expression of the design, and there is no queue key', () => {
+    const concurrency = job()['concurrency'] as Record<string, unknown>;
+    expect(concurrency['cancel-in-progress']).toBe(CANCEL_IN_PROGRESS);
+    // `queue: max` cannot be combined with cancel-in-progress: true, and the default queue is what
+    // the design relies on (one waiting run at most, replaced by the newest).
+    expect(Object.keys(concurrency).sort()).toEqual(['cancel-in-progress', 'group']);
+  });
+
+  it('the group key still carries the SHA of the queue group, for both queue events', () => {
+    const group = String((job()['concurrency'] as Record<string, unknown>)['group']);
+    expect(group).toContain('github.event.merge_group.head_sha');
+    expect(group).toContain('github.event.workflow_run.head_sha');
+  });
+});
+
+describe('PLAN-13-R6 §8: a comment by a bot on a pull request does not wake the judge', () => {
+  it('the job condition is exactly the one of the design', () => {
+    const condition = String((JUDGE['jobs'] as Record<string, Record<string, any>>)['judge']?.['if']);
+    expect(squeeze(condition)).toBe(squeeze(JOB_CONDITION));
   });
 });

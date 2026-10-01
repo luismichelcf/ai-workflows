@@ -471,6 +471,112 @@ describe('build and review', () => {
   });
 });
 
+// ---------------------------------------------------------------------------------------------
+// R34 (PLAN-13 §2, PLAN-13-R6 §15): with working branches the local side measures each piece
+// against the branch its pull request will go to, `branches.into[0]`, not against the principal.
+// `run` computes the piece's files (and so kind, scope and applies-if) from the merge base with
+// `into[0]` (its `origin/` copy when there is one, as today with the principal), and `sync`
+// validates "Update branch" merges against `origin/<into[0]>`, fetching it first. GitHub's default
+// branch stays `main` in these fakes: the recipe is what names `staging`.
+
+const STAGING_EXTRA = ['branches: { into: [staging, main] }', 'classify:', '  de-staging: ["lib/**"]', '  de-la-pieza: ["src/**"]'];
+
+// Stage `base` applies only if the piece's files reach staging's own commit (`lib/**`) and then
+// stops the run; stage `pieza` applies only to the piece's file (`src/**`) and passes. Measured
+// against staging, the files are exactly `src/algo.ts`: `base` is skipped and `pieza` passes.
+const STAGING_STAGES = [
+  '  - id: base',
+  '    summary: "Vio lo de staging"',
+  '    nature: recompute',
+  '    applies-if: { touches-any: [de-staging] }',
+  '    gate:',
+  '      run: node base.mjs',
+  '    server: { require-check: base }',
+  '  - id: pieza',
+  '    summary: "Vio la pieza"',
+  '    after: base',
+  '    nature: recompute',
+  '    applies-if: { touches-any: [de-la-pieza] }',
+  '    gate:',
+  '      run: node pieza.mjs',
+  '    server: { require-check: pieza }',
+  ...HOLD_MERGE.map((row) => (row === '    phase: merge' ? '    after: pieza\n    phase: merge' : row)).flatMap((row) => row.split('\n')),
+];
+
+/** `main` with the recipe; `staging` one commit ahead (`lib/de-staging.ts`); the piece branched from staging changing `src/algo.ts`. */
+function stagingProject() {
+  const root = repository({
+    '.ai-workflows/pipeline.yml': RECIPE(STAGING_STAGES, STAGING_EXTRA),
+    'hold.mjs': HOLD_SCRIPT,
+    'base.mjs': "process.stdout.write(JSON.stringify({ ok: false, reason: 'midió contra main' }));\n",
+    'pieza.mjs': 'process.stdout.write(JSON.stringify({ ok: true }));\n',
+    'src/algo.ts': 'export const a = 1;\n',
+  });
+  git(root, 'switch', '-q', '-c', 'staging');
+  write(root, 'lib/de-staging.ts', 'export const s = 1;\n');
+  commit(root, 'staging avanza');
+  git(root, 'switch', '-q', '-c', BRANCH);
+  git(root, 'branch', '-q', '-D', 'piece');
+  write(root, 'src/algo.ts', 'export const a = 2;\n');
+  const head = commit(root, 'la pieza');
+  const remote = fakeRemote();
+  const github = new FakeGitHub();
+  const deps = (over: Partial<AgentCliDeps> = {}): AgentCliDeps => ({
+    cwd: root,
+    env: {},
+    github,
+    remote: github,
+    statePort: remote.port(),
+    repository: 'duena/proyecto',
+    ghAccounts: async () => [],
+    ...over,
+  });
+  return { root, head, remote, github, deps };
+}
+
+describe('R34: the local side measures a piece against into[0]', () => {
+  it('run: the piece branched from staging touches exactly its own file, not staging s commits missing from main', async () => {
+    const p = stagingProject();
+    const output = await runAgentCli(['run', PIECE], p.deps());
+    expect(output.text).not.toMatch(/midió contra main/);
+    expect(output.text).toMatch(/se detiene aquí/);
+    const journal = await createGitStore({ port: p.remote.port() }).journal(PIECE);
+    expect(journal.filter((entry) => entry.stage === 'base').map((entry) => entry.outcome)).toEqual(['skipped']);
+    expect(journal.filter((entry) => entry.stage === 'pieza').map((entry) => entry.outcome)).toEqual(['passed']);
+  });
+
+  it('sync: GitHub s "Update branch" from staging is a clean update, validated against origin/staging', async () => {
+    const p = stagingProject();
+    const origin = mkdtempSync(join(tmpdir(), 'aiw-origin-'));
+    folders.push(origin);
+    execFileSync('git', ['init', '-q', '--bare', '--initial-branch=main', origin]);
+    git(p.root, 'remote', 'add', 'origin', origin);
+    git(p.root, 'push', '-q', 'origin', 'main', 'staging', BRANCH);
+    const other = mkdtempSync(join(tmpdir(), 'aiw-other-'));
+    folders.push(other);
+    execFileSync('git', ['clone', '-q', origin, other]);
+    git(other, 'config', 'user.email', 'o@example.com');
+    git(other, 'config', 'user.name', 'Otro');
+    git(other, 'config', 'commit.gpgsign', 'false');
+    // staging moves on GitHub, and the button merges it into the piece there.
+    git(other, 'switch', '-q', 'staging');
+    write(other, 'docs/nuevo.md', 'de staging\n');
+    commit(other, 'staging avanza otra vez');
+    git(other, 'push', '-q', 'origin', 'staging');
+    git(other, 'switch', '-q', BRANCH);
+    git(other, 'merge', '-q', '--no-ff', '--no-edit', 'staging');
+    git(other, 'push', '-q', 'origin', BRANCH);
+    const target = git(other, 'rev-parse', 'HEAD');
+
+    const output = await runAgentCli(['sync', PIECE], p.deps());
+    expect(output.text).not.toMatch(/actualización limpia/);
+    expect(output.ok).toBe(true);
+    expect(git(p.root, 'rev-parse', 'HEAD')).toBe(target);
+    const journal = await createGitStore({ port: p.remote.port() }).journal(PIECE);
+    expect(journal.filter((entry) => entry.stage === '@clean-update')).toHaveLength(1);
+  });
+});
+
 describe('doctor', () => {
   it('warns when the account that approves is logged in where the agents run', async () => {
     const p = project();

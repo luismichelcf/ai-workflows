@@ -6,7 +6,7 @@ import { afterAll, describe, expect, it } from 'vitest';
 
 import { DEFAULT_BANNED_TERMS, findBannedTerms } from '../src/messages.js';
 
-import { SUITE_MANIFEST, readCaseRecords, renderSuiteReport, type CaseRecord } from './github/report.js';
+import { SUITE_MANIFEST, earlierRunCases, readCaseRecords, renderSuiteReport, type CaseRecord } from './github/report.js';
 
 // PLAN-13-R5 §3: the report of the negative suite on real GitHub. It may only say "complete" when
 // every case of the fixed manifest ran in THIS run, every attempt was stopped, every positive
@@ -64,6 +64,13 @@ describe('what the owner did and what the suite did with the owner account (R22)
       'SV-03a': { dispatches: true },
       'SV-03d': { dispatches: true },
       RECORRIDO: { button: true },
+      // PLAN-13-R6 §11 (R29): the cases of slice 6 need no Approve button.
+      'SV-04s+': { orders: ['/approve-judge-change'] },
+      'CN-14': { pushes: true, dispatches: true },
+      'RAMA-2': { orders: ['/approve-judge-change'] },
+      'A-T3': { cancels: true },
+      'B-T6': { cancels: true },
+      'BOT-1': { comments: true },
     });
   });
 
@@ -91,7 +98,15 @@ describe('what the owner did and what the suite did with the owner account (R22)
   });
 
   it('with no such change, it says so without denying the other uses of the owner account', () => {
-    const records = allGood().map((record) => (record.id === 'SV-04s' ? { ...record, owner: { ordersBySuite: ['/approve-judge-change'] } } : record));
+    // CN-14 (R29) pushes its impostor workflows with the owner account too: both go without it here.
+    const records = allGood().map((record) => {
+      if (record.id === 'SV-04s') return { ...record, owner: { ordersBySuite: ['/approve-judge-change'] } };
+      if (record.id === 'CN-14') {
+        const { owner: _owner, ...rest } = record;
+        return rest;
+      }
+      return record;
+    });
     const text = renderSuiteReport(records, META).text;
     expect(text).toContain('Ningún caso necesitó subir con la cuenta del dueño un cambio que GitHub no deja subir a los agentes.');
     expect(text).not.toContain('La suite no subió cambios con la cuenta del dueño');
@@ -170,12 +185,100 @@ describe('the manifest is fixed, not derived from what ran', () => {
   it('names the thirteen, the server cases, the recipe cases, the queue, the control and the clean-up', () => {
     const ids = SUITE_MANIFEST.map((entry) => entry.id);
     for (const id of ['CN-01', 'CN-02', 'CN-03', 'CN-03e', 'CN-04', 'CN-05b', 'CN-05c', 'CN-06', 'CN-07', 'CN-08', 'CN-09', 'CN-10', 'CN-11a', 'CN-11b', 'CN-12', 'CN-13',
-      'SV-01', 'SV-02', 'SV-03a', 'SV-03b', 'SV-03c', 'SV-03d', 'SV-04', 'SV-05', 'SV-06', 'SV-07', 'SV-08', 'SV-09', 'SV-04s', 'SV-DESTINO', 'RC-06', 'RC-09', 'COLA-6', 'RECORRIDO', 'PIEZA-COMPLETA', 'LIMPIEZA']) {
+      'SV-01', 'SV-02', 'SV-03a', 'SV-03b', 'SV-03c', 'SV-03d', 'SV-04', 'SV-05', 'SV-06', 'SV-07', 'SV-08', 'SV-09', 'SV-04s', 'SV-DESTINO', 'RC-06', 'RC-09', 'COLA-6', 'RECORRIDO', 'PIEZA-COMPLETA', 'LIMPIEZA',
+      'SV-04s+', 'CN-14', 'RAMA-1', 'RAMA-2', 'A-T3', 'B-T6', 'BOT-1']) {
       expect(ids, id).toContain(id);
     }
     expect(new Set(ids).size).toBe(ids.length);
     expect(SUITE_MANIFEST.find((entry) => entry.id === 'CN-11b')?.kind).toBe('limit');
-    for (const id of ['PIEZA-COMPLETA', 'COLA-6', 'LIMPIEZA', 'RECORRIDO', 'SV-DESTINO']) expect(SUITE_MANIFEST.find((entry) => entry.id === id)?.kind, id).toBe('check');
+    for (const id of ['PIEZA-COMPLETA', 'COLA-6', 'LIMPIEZA', 'RECORRIDO', 'SV-DESTINO', 'A-T3']) expect(SUITE_MANIFEST.find((entry) => entry.id === id)?.kind, id).toBe('check');
+  });
+});
+
+// PLAN-13-R6 §11 (R29): the evidence of slice 6 runs only the new cases. Its report says which
+// cases come from this run and refers to the report of 29-sep for the rest; it never says
+// «Completo» over cases it did not run.
+describe('the evidence of slice 6 (R29)', () => {
+  const R29 = ['SV-04s+', 'CN-14', 'RAMA-1', 'RAMA-2', 'A-T3', 'B-T6', 'BOT-1'];
+  const EARLIER_REPORT = 'docs/reports/suite-negativa-2026-09-29.md';
+  const SLICE_META = { ...META, scope: { slice: 6 as const, earlierReport: EARLIER_REPORT } };
+  const sliceRecords = (): CaseRecord[] => allGood().filter((record) => R29.includes(record.id) || record.id === 'LIMPIEZA');
+
+  it('the manifest marks exactly the R29 cases as slice 6, each with the test that runs it', () => {
+    const slice = SUITE_MANIFEST.filter((entry) => entry.slice === 6);
+    expect(slice.map((entry) => entry.id)).toEqual(R29);
+    for (const entry of slice) expect(entry.test, entry.id).toMatch(/^R29: /);
+  });
+
+  it('every R29 case and the clean-up → complete for slice 6 only, naming its cases and the earlier report', () => {
+    const report = renderSuiteReport(sliceRecords(), SLICE_META);
+    expect(report.complete).toBe(true);
+    const heading = firstLine(report.text);
+    expect(heading).toMatch(/^# Completo/);
+    expect(heading).toContain('rebanada 6');
+    expect(heading).toContain('R29');
+    expect(heading).not.toContain(`${SUITE_MANIFEST.length} casos`);
+    const scope = report.text.split('\n').find((line) => line.startsWith('Alcance:')) ?? '';
+    for (const id of R29) expect(scope, id).toContain(id);
+    expect(scope).toContain(EARLIER_REPORT);
+    expect(report.text).toContain(`Intentos: ${R29.length + 1} de ${R29.length + 1} casos`);
+  });
+
+  it('the scope line is there even when the evidence is not complete', () => {
+    const text = renderSuiteReport(sliceRecords().filter((record) => record.id !== 'B-T6'), SLICE_META).text;
+    expect(firstLine(text)).toMatch(/^# Incompleto/);
+    expect(firstLine(text)).toContain('B-T6');
+    expect(text.split('\n').find((line) => line.startsWith('Alcance:'))).toContain(EARLIER_REPORT);
+  });
+
+  it('the cases of the earlier report are not claimed: the table lists only this run', () => {
+    const text = renderSuiteReport(sliceRecords(), SLICE_META).text;
+    const table = text.slice(text.indexOf('| Caso'));
+    expect(table).toContain('| RAMA-1 |');
+    expect(table).not.toContain('| CN-01 |');
+  });
+
+  const broken: Record<string, (records: CaseRecord[]) => CaseRecord[]> = {
+    'an R29 case is missing': (records) => records.filter((record) => record.id !== 'BOT-1'),
+    'a case outside slice 6 is recorded': (records) => [...records, good('CN-01', 0)],
+    'the clean-up is missing': (records) => records.filter((record) => record.id !== 'LIMPIEZA'),
+    'the queue check has no result': (records) => records.map((record) => {
+      if (record.id !== 'A-T3') return record;
+      const { result: _result, ...rest } = record;
+      return rest;
+    }),
+    'a case is partial': (records) => records.map((record) => (record.id === 'CN-14' ? { ...record, partial: 'GitHub no dio base.sha en la corrida de la prueba roja' } : record)),
+    'an attempt ended in error': (records) => records.map((record) => (record.id === 'CN-14' ? { ...record, negative: 'error' } : record)),
+  };
+  for (const [name, change] of Object.entries(broken)) {
+    it(`${name} → not complete`, () => {
+      const report = renderSuiteReport(change(sliceRecords()), SLICE_META);
+      expect(report.complete).toBe(false);
+      expect(firstLine(report.text)).toMatch(/^# (?:Incompleto|Falló)/);
+    });
+  }
+
+  it('the same records without the scope are never a complete suite', () => {
+    expect(renderSuiteReport(sliceRecords(), META).complete).toBe(false);
+  });
+
+  it('a full run of the suite needs the R29 cases too', () => {
+    expect(renderSuiteReport(allGood().filter((record) => record.id !== 'RAMA-2'), META).complete).toBe(false);
+  });
+
+  it('names the cases where the suite cancelled judge runs by hand and wrote owner comments that are not orders', () => {
+    const text = renderSuiteReport(sliceRecords(), SLICE_META).text;
+    const cancels = text.split('\n').find((line) => line.includes('canceló a mano corridas del juez')) ?? '';
+    for (const id of ['A-T3', 'B-T6', 'R22']) expect(cancels, id).toContain(id);
+    expect(cancels).not.toContain('BOT-1');
+    const comments = text.split('\n').find((line) => line.includes('comentarios que no son órdenes')) ?? '';
+    for (const id of ['BOT-1', 'R22']) expect(comments, id).toContain(id);
+    const branches = text.split('\n').find((line) => line.includes('staging')) ?? '';
+    for (const id of ['RAMA-1', 'RAMA-2', 'R22']) expect(branches, id).toContain(id);
+  });
+
+  it('the earlier report is audited like the header', () => {
+    expect(() => renderSuiteReport(sliceRecords(), { ...META, scope: { slice: 6, earlierReport: 'C:\\Users\\alguien\\informe.md' } })).toThrow();
   });
 });
 
@@ -386,6 +489,112 @@ describe('a report that joins two runs (R23)', () => {
     expect(renderSuiteReport(records, metaWith(cases, { testsPassed: false })).complete).toBe(false);
     const failedCleanup = records.map((record) => (record.id === 'LIMPIEZA' && record.run === RUN ? { ...record, result: 'falló' as const } : record));
     expect(renderSuiteReport(failedCleanup, metaWith(cases)).complete).toBe(false);
+  });
+});
+
+// R35 (owner decision, 1-oct): the evidence of slice 6 joins the run r-939cf951 (six of seven cases
+// recorded, B-T6 partial) with a short final run of only A-T3. The first line and each run declare
+// it; the retaken case comes only from the final run; the clean-up that counts is the final one;
+// B-T6 stays partial, so the report never says «Completo».
+describe('the evidence of slice 6 joins two runs (R35)', () => {
+  const EARLIER = 'r-939cf951';
+  const FINAL = RUN;
+  const FROM_EARLIER = ['SV-04s+', 'CN-14', 'RAMA-1', 'RAMA-2', 'BOT-1', 'B-T6'];
+  const RETAKE = ['A-T3'];
+  const B_T6_PARTIAL = 'el juez terminó antes de la cancelación; la cabeza mostró el veredicto nuevo, nunca el verde viejo';
+  const SLICE_META = { ...META, scope: { slice: 6 as const, earlierReport: 'docs/reports/suite-negativa-2026-09-29.md' } };
+  // The shape of r-939cf951: every slice-6 case but A-T3, B-T6 partial, its own clean-up passed.
+  const earlierRecords = (): CaseRecord[] => [...FROM_EARLIER, 'LIMPIEZA'].map((id, index) => ({
+    ...good(id, 200 + index),
+    run: EARLIER,
+    ...(id === 'B-T6' ? { positive: 'no-aplica' as const, partial: B_T6_PARTIAL } : {}),
+  }));
+  const finalRecords = (): CaseRecord[] => ['A-T3', 'LIMPIEZA'].map((id, index) => ({ ...good(id, 300 + index), run: FINAL }));
+  const joinedMeta = (earlier: readonly CaseRecord[], final: readonly CaseRecord[], over: Partial<{ testsPassed: boolean }> = {}) => ({
+    ...SLICE_META,
+    runs: [{ run: EARLIER, engineSha: 'b'.repeat(40), testsPassed: false, cases: earlierRunCases(earlier, final, RETAKE) }],
+    ...over,
+  });
+  const render = (earlier: readonly CaseRecord[], final: readonly CaseRecord[], over: Partial<{ testsPassed: boolean }> = {}) =>
+    renderSuiteReport([...earlier, ...final], joinedMeta(earlier, final, over));
+  const tableRow = (text: string, id: string) => text.split('\n').find((line) => line.startsWith(`| ${id} |`)) ?? '';
+
+  it('the earlier run gives SV-04s+, CN-14, RAMA-1, RAMA-2, BOT-1 and B-T6; never A-T3 nor its clean-up', () => {
+    expect(earlierRunCases(earlierRecords(), finalRecords(), RETAKE).sort()).toEqual([...FROM_EARLIER].sort());
+  });
+
+  it('the table takes those cases from r-939cf951 and A-T3 from the final run', () => {
+    const text = render(earlierRecords(), finalRecords()).text;
+    FROM_EARLIER.forEach((id, index) => expect(tableRow(text, id), id).toContain(link(300 + index)));
+    expect(tableRow(text, 'A-T3')).toContain(link(400));
+  });
+
+  it('declares both runs in its first line, citing R35, and keeps B-T6 partial instead of saying «Completo»', () => {
+    const report = render(earlierRecords(), finalRecords());
+    expect(report.complete).toBe(false);
+    const heading = firstLine(report.text);
+    expect(heading).toMatch(/^# Incompleto/);
+    expect(heading).not.toMatch(/Completo/);
+    for (const text of [EARLIER, FINAL, 'R35', 'casos parciales: B-T6']) expect(heading, text).toContain(text);
+    expect(heading).not.toContain('R23');
+    expect(report.text).toContain(`B-T6 (parcial): ${B_T6_PARTIAL}`);
+    expect(report.text).toContain('Falta: B-T6.');
+  });
+
+  it('declares each run with its engine, the cases it gives, its tests and its own clean-up', () => {
+    const text = render(earlierRecords(), finalRecords()).text;
+    const earlierRow = text.split('\n').find((line) => line.startsWith(`Corrida anterior: ${EARLIER}`)) ?? '';
+    for (const part of ['b'.repeat(40), 'pruebas: no en verde', 'limpieza: pasó', ...FROM_EARLIER]) expect(earlierRow, part).toContain(part);
+    expect(earlierRow).not.toContain('A-T3');
+    const finalRow = text.split('\n').find((line) => line.startsWith(`Corrida final: ${FINAL}`)) ?? '';
+    for (const part of [META.engineSha, 'pruebas: en verde', 'limpieza: pasó', 'A-T3']) expect(finalRow, part).toContain(part);
+    for (const id of FROM_EARLIER) expect(finalRow, id).not.toMatch(new RegExp(`\\b${id.replace('+', '\\+')}(?![\\w+-])`));
+    const scope = text.split('\n').find((line) => line.startsWith('Alcance:')) ?? '';
+    expect(scope).toContain('R35');
+    expect(scope).toContain('docs/reports/suite-negativa-2026-09-29.md');
+  });
+
+  it('without B-T6 partial the same join is complete, declaring both runs and R35', () => {
+    const earlier = earlierRecords().map((record) => (record.id === 'B-T6' ? good('B-T6', 205) : record)).map((record) => ({ ...record, run: EARLIER }));
+    const report = render(earlier, finalRecords());
+    expect(report.complete).toBe(true);
+    const heading = firstLine(report.text);
+    expect(heading).toMatch(/^# Completo para la evidencia de la rebanada 6/);
+    for (const text of [EARLIER, FINAL, 'R35']) expect(heading, text).toContain(text);
+  });
+
+  it('a record of A-T3 in the earlier file does not count: without the final one, A-T3 is missing', () => {
+    const earlier = [...earlierRecords(), { ...good('A-T3', 299), run: EARLIER }];
+    const final = finalRecords().filter((record) => record.id !== 'A-T3');
+    expect(earlierRunCases(earlier, final, RETAKE)).not.toContain('A-T3');
+    const report = render(earlier, final);
+    expect(report.complete).toBe(false);
+    expect(firstLine(report.text)).toMatch(/faltan casos del manifiesto: A-T3/);
+    expect(tableRow(report.text, 'A-T3')).toBe('');
+  });
+
+  it('a record of A-T3 in the earlier file does not count: the final one is the one shown', () => {
+    const earlier = [...earlierRecords(), { ...good('A-T3', 299), run: EARLIER }];
+    const text = render(earlier, finalRecords()).text;
+    expect(tableRow(text, 'A-T3')).toContain(link(400));
+    expect(tableRow(text, 'A-T3')).not.toContain(link(399));
+    expect(text.split('\n').find((line) => line.includes('no cuentan')) ?? '').toContain('A-T3');
+  });
+
+  it('the clean-up that counts is the final run\'s', () => {
+    const failedFinal = finalRecords().map((record) => (record.id === 'LIMPIEZA' ? { ...record, result: 'falló' as const } : record));
+    const report = render(earlierRecords().map((record) => (record.id === 'B-T6' ? { ...good('B-T6', 205), run: EARLIER } : record)), failedFinal);
+    expect(report.complete).toBe(false);
+    expect(firstLine(report.text)).toContain('LIMPIEZA');
+    const missing = render(earlierRecords(), finalRecords().filter((record) => record.id !== 'LIMPIEZA'));
+    expect(firstLine(missing.text)).toMatch(/faltan casos del manifiesto: LIMPIEZA/);
+    expect(tableRow(missing.text, 'LIMPIEZA')).toBe('');
+  });
+
+  it('the final run failing its tests → «Falló», still declaring both runs', () => {
+    const heading = firstLine(render(earlierRecords(), finalRecords(), { testsPassed: false }).text);
+    expect(heading).toMatch(/^# Falló/);
+    for (const text of [EARLIER, FINAL, 'R35']) expect(heading, text).toContain(text);
   });
 });
 

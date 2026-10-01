@@ -21,6 +21,32 @@ export const JUDGE_EVENTS: readonly string[] = [
 /** The two names the judge publishes under, and the ones an imitator would copy. */
 export const JUDGE_CONTEXTS: readonly string[] = ['ai-workflows', 'ai-workflows/advisory'];
 
+/** PLAN-13-R6 §7: the engine's red test. Only a check-run tied to its official run counts. */
+export const RED_TEST_CONTEXT = 'ai-workflows/red-test';
+
+/** PLAN-13-R6 §7: the exact path of the official red-test workflow, taken from the workflow itself. */
+const RED_TEST_WORKFLOW_PATH = '.github/workflows/ai-workflows-red-test.yml';
+
+/**
+ * PLAN-13-R6 §7: what the red test is judged against, so a check-run can be tied to the official
+ * run of this pull request and its current base. `isAncestorOfBase` and `existsInBase` are the two
+ * questions answered by git over the trusted tree (external edge); a failure there waits.
+ */
+export interface CheckOrigin {
+  /** What the judged SHA is: the head of a pull request, or the SHA of a queue group. */
+  readonly event: 'pull_request' | 'merge_group';
+  /** The pull request being judged. */
+  readonly pr: number;
+  /** The branch the pull request is judged against. */
+  readonly baseRef: string;
+  /** The trusted tip of that branch. */
+  readonly baseSha: string;
+  /** Whether `sha` is the tip of the base or an ancestor of it. */
+  isAncestorOfBase(sha: string): Promise<boolean>;
+  /** Whether the file is in the trusted tree of the base. */
+  existsInBase(path: string): Promise<boolean>;
+}
+
 export interface CheckOutcome {
   readonly outcome: 'passed' | 'waiting' | 'rejected' | 'technical';
   readonly reason?: string;
@@ -90,24 +116,35 @@ function conclusionOf(run: CheckRunSummary): string {
 }
 
 /**
- * PLAN-13-R3 §3.4: the exact check `name` over `sha`. The most recent check-run of that name
- * decides, exactly as the most recent commit status of that context does: a pull request
- * retargeted from another branch keeps an old red-test run on its head, and that older failure
- * must not outvote the run of the current attempt. Anything still running waits; anything
- * finished that is not `success` rejects; unreadable is technical. When a check-run and a
- * status share the name, both must be green. The judge never runs a suite.
+ * PLAN-13-R3 §3.4 and PLAN-13-R6 §7: the exact check `name` over `sha`. For the engine's red test
+ * (`ai-workflows/red-test`) a check-run counts only when that concrete check-run is tied to a job
+ * of the official red-test workflow, run for this pull request and its current base; commit
+ * statuses of that name never count. For any other (project) check the rule of R3 §3.4 stands: the
+ * most recent check-run or status of that name, of any application. Anything still running waits;
+ * anything finished that is not `success` rejects; unreadable is technical. The judge never runs a
+ * suite.
  */
 export async function requireCheck(
   github: JudgeGitHub,
   sha: string,
   name: string,
   locale: string,
+  origin?: CheckOrigin,
 ): Promise<CheckOutcome> {
   const spanish = isSpanish(locale);
   let runs: CheckRunSummary[];
-  let statuses: CommitStatus[];
   try {
     runs = await github.checkRuns(sha, name);
+  } catch (error) {
+    return { outcome: 'technical', reason: reasonOf(error) };
+  }
+
+  if (name === RED_TEST_CONTEXT) {
+    return redTestOutcome(github, sha, runs, origin, spanish);
+  }
+
+  let statuses: CommitStatus[];
+  try {
     statuses = (await github.statuses(sha)).filter((status) => status.context === name);
   } catch (error) {
     return { outcome: 'technical', reason: reasonOf(error) };
@@ -171,7 +208,172 @@ export async function requireCheck(
   // The newest run is green; if an older attempt of the same name ended otherwise, the judge says
   // which one it replaced. It is a trace (R13), never a change of the verdict.
   const note = replacedAttemptNote(runs, latestRun, name, spanish);
-  return note === undefined ? { outcome: 'passed' } : { outcome: 'passed', note };
+  // PLAN-13-R6 §7: the run log says where the check that counted came from (the application, or a
+  // commit status). It is a trace, never a change of the verdict.
+  const originNote = projectOriginNote(name, latestRun, latest, spanish);
+  const combined = [note, originNote].filter((entry): entry is string => entry !== undefined);
+  return combined.length === 0 ? { outcome: 'passed' } : { outcome: 'passed', note: combined.join(' ') };
+}
+
+/** PLAN-13-R6 §7: the note that says which application published the project check that counted. */
+function projectOriginNote(
+  name: string,
+  latestRun: CheckRunSummary | undefined,
+  latest: CommitStatus | undefined,
+  spanish: boolean,
+): string | undefined {
+  if (latestRun !== undefined && (latest === undefined || latestRun.status === 'completed')) {
+    return spanish
+      ? `${name}: el check vino de la aplicación ${latestRun.app}`
+      : `${name}: the check came from the application ${latestRun.app}`;
+  }
+  if (latest !== undefined) {
+    return spanish
+      ? `${name}: contó un estado de commit`
+      : `${name}: a commit status counted`;
+  }
+  return undefined;
+}
+
+/** PLAN-13-R6 §7: one red-test check-run as it walked the chain, or why it could not be tied. */
+type RedChainResult =
+  | { readonly ok: true; readonly inProgress: boolean; readonly conclusion: string | null }
+  | { readonly ok: false; readonly fork: boolean };
+
+/**
+ * PLAN-13-R6 §7: whether one red-test check-run is tied to a job of the official red-test
+ * workflow, run for this pull request and its current base. A read that fails throws, so the
+ * caller turns it into a wait; a check-run that simply does not pass the chain returns `ok: false`.
+ */
+async function redTestRunPasses(
+  github: JudgeGitHub,
+  run: CheckRunSummary,
+  sha: string,
+  origin: CheckOrigin,
+): Promise<RedChainResult> {
+  if (run.app !== 'github-actions') return { ok: false, fork: false };
+  if (run.id === undefined || run.checkSuiteId === undefined) return { ok: false, fork: false };
+
+  const suiteRuns = await github.checkSuiteRuns(run.checkSuiteId);
+  if (suiteRuns.length !== 1) return { ok: false, fork: false };
+  const actionsRun = suiteRuns[0] as (typeof suiteRuns)[number];
+  if (actionsRun.headSha !== sha) return { ok: false, fork: false };
+
+  const jobs = await github.workflowRunJobs(actionsRun.id);
+  const wanted = `/check-runs/${String(run.id)}`;
+  if (!jobs.some((job) => job.checkRunUrl.endsWith(wanted))) return { ok: false, fork: false };
+
+  const workflow = await github.workflowById(actionsRun.workflowId);
+  if (workflow.path !== RED_TEST_WORKFLOW_PATH) return { ok: false, fork: false };
+  if (!(await origin.existsInBase(workflow.path))) return { ok: false, fork: false };
+
+  if (actionsRun.event !== origin.event) return { ok: false, fork: false };
+  if (origin.event === 'pull_request') {
+    const pull = actionsRun.pullRequests.find(
+      (entry) => entry.number === origin.pr && entry.baseRef === origin.baseRef,
+    );
+    if (pull === undefined) {
+      return { ok: false, fork: actionsRun.pullRequests.length === 0 };
+    }
+    // The run's base is the current tip or an ancestor of it (the base only moved forward). The
+    // question is always asked of git, so a base that cannot be read waits instead of passing.
+    if (!(await origin.isAncestorOfBase(pull.baseSha))) {
+      return { ok: false, fork: false };
+    }
+  }
+  return { ok: true, inProgress: run.status !== 'completed', conclusion: run.conclusion };
+}
+
+/**
+ * PLAN-13-R6 §7: the red test of `sha`, from the check-runs that pass the origin chain. The most
+ * recent of those decides; the ones that do not pass are ignored and named in the note. A chain
+ * that cannot be read waits, with the motive, and never turns green.
+ */
+async function redTestOutcome(
+  github: JudgeGitHub,
+  sha: string,
+  runs: readonly CheckRunSummary[],
+  origin: CheckOrigin | undefined,
+  spanish: boolean,
+): Promise<CheckOutcome> {
+  if (origin === undefined) {
+    return {
+      outcome: 'waiting',
+      reason: spanish
+        ? 'La prueba roja no se puede comprobar sin el PR y su base.'
+        : 'The red test cannot be checked without the pull request and its base.',
+    };
+  }
+
+  const ignored: number[] = [];
+  const passing: { run: CheckRunSummary; inProgress: boolean; conclusion: string | null }[] = [];
+  let fork = false;
+  for (const run of runs) {
+    let result: RedChainResult;
+    try {
+      result = await redTestRunPasses(github, run, sha, origin);
+    } catch (error) {
+      return {
+        outcome: 'waiting',
+        reason: spanish
+          ? `No se pudo leer la cadena de la prueba roja: ${reasonOf(error)}`
+          : `The red test's chain could not be read: ${reasonOf(error)}`,
+      };
+    }
+    if (result.ok) passing.push({ run, inProgress: result.inProgress, conclusion: result.conclusion });
+    else {
+      if (result.fork) fork = true;
+      if (run.id !== undefined) ignored.push(run.id);
+    }
+  }
+
+  const ignoredNote = ignored.length === 0
+    ? undefined
+    : spanish
+      ? `${RED_TEST_CONTEXT}: se ignoran check-runs sin origen oficial (ids ${ignored.join(', ')})`
+      : `${RED_TEST_CONTEXT}: check-runs without an official origin are ignored (ids ${ignored.join(', ')})`;
+
+  if (passing.length === 0) {
+    const reason = fork
+      ? spanish
+        ? 'no se puede atar la prueba roja a este PR'
+        : 'the red test cannot be tied to this PR'
+      : spanish
+        ? `El check «${RED_TEST_CONTEXT}» no se pudo atar a su corrida oficial.`
+        : `The check "${RED_TEST_CONTEXT}" could not be tied to its official run.`;
+    return ignoredNote === undefined
+      ? { outcome: 'waiting', reason }
+      : { outcome: 'waiting', reason, note: ignoredNote };
+  }
+
+  const latest = passing.reduce((best, entry) =>
+    (entry.run.id ?? -1) > (best.run.id ?? -1) ? entry : best,
+  );
+  const replaced = replacedAttemptNote(
+    passing.map((entry) => entry.run),
+    latest.run,
+    RED_TEST_CONTEXT,
+    spanish,
+  );
+  const note = [ignoredNote, replaced].filter((entry): entry is string => entry !== undefined);
+  const withNote = (outcome: CheckOutcome): CheckOutcome =>
+    note.length === 0 ? outcome : { ...outcome, note: note.join(' ') };
+
+  if (latest.inProgress) {
+    return withNote({
+      outcome: 'waiting',
+      reason: spanish ? `El check «${RED_TEST_CONTEXT}» todavía no terminó.` : `The check "${RED_TEST_CONTEXT}" has not finished yet.`,
+    });
+  }
+  if (latest.conclusion !== 'success') {
+    return withNote({
+      outcome: 'rejected',
+      reason: spanish
+        ? `El check ${RED_TEST_CONTEXT} terminó en ${latest.conclusion ?? 'sin conclusión'}.`
+        : `The check ${RED_TEST_CONTEXT} ended ${latest.conclusion ?? 'with no conclusion'}.`,
+    });
+  }
+  return withNote({ outcome: 'passed' });
 }
 
 /**

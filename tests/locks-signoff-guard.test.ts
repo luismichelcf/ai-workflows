@@ -106,7 +106,9 @@ describe('the hook is wired to the shell tools as well', () => {
     expect(buildHooksConfig('claude', 'x').hooks.PreToolUse[0]?.matcher).toBe('Write|Edit|MultiEdit|NotebookEdit|Bash|PowerShell|Monitor');
   });
 
-  it('codex: apply_patch and Bash', () => {
-    expect(buildHooksConfig('codex', 'x').hooks.PreToolUse[0]?.matcher).toBe('apply_patch|Bash');
+  // PLAN-13-R6 §3.2: in Codex the hook must receive every tool, so an unknown tool that carries a
+  // path reaches the rule that refuses it. The installed matcher is `.*` (was `apply_patch|Bash`).
+  it('codex: every tool (.*)', () => {
+    expect(buildHooksConfig('codex', 'x').hooks.PreToolUse[0]?.matcher).toBe('.*');
   });
 });

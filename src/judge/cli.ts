@@ -131,6 +131,7 @@ async function judgeCommand(): Promise<number> {
     runId: Number.isInteger(runId) ? runId : 0,
     serverUrl: env('GITHUB_SERVER_URL'),
     alsoProtect: splitList(env('AI_WORKFLOWS_ALSO_PROTECT')),
+    branches: splitList(env('AI_WORKFLOWS_BRANCHES')),
     root,
   };
 

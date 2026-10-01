@@ -341,6 +341,35 @@ export function gitProjectFiles(root: string, sha: string): ProjectFiles {
   };
 }
 
+/**
+ * PLAN-13-R6 §2.2: one file of a commit, read with a caller-chosen size cap. The lockfiles that
+ * decide which engine is installed are larger than the shared 1 MB, so they are read with their
+ * own cap. A git failure still throws (it is technical, never an answer); a path that is not in
+ * the tree and a file over the cap are answers, and the cap never turns a read into a pass.
+ */
+export interface GitFileReading {
+  readonly kind: 'file' | 'missing' | 'too-large';
+  /** Present only when `kind` is `file`. */
+  readonly content?: string;
+}
+
+export async function gitFileAt(
+  root: string,
+  sha: string,
+  path: string,
+  maxBytes: number,
+): Promise<GitFileReading> {
+  requireProjectPath(path);
+  // The commit (or the merge tree of §15 P3) must exist: a git failure to resolve it is an error,
+  // never an absent file.
+  await runGit(root, ['rev-parse', '--verify', `${sha}^{tree}`]);
+  if (!(await pathInTree(root, sha, path))) return { kind: 'missing' };
+  const spec = `${sha}:${path}`;
+  const size = Number.parseInt(text(await runGit(root, ['cat-file', '-s', spec])), 10);
+  if (!Number.isFinite(size) || size > maxBytes) return { kind: 'too-large' };
+  return { kind: 'file', content: (await runGit(root, ['cat-file', 'blob', spec])).toString('utf8') };
+}
+
 /** PLAN-13-R3 §1.3: the project files of the working tree, with the same reading rules. */
 export function diskProjectFiles(root: string): ProjectFiles {
   return {
@@ -410,6 +439,49 @@ export async function gitIsAncestor(
     return true;
   } catch (error) {
     if (error instanceof GitCommandError && error.exitCode === 1) return false;
+    throw error;
+  }
+}
+
+/**
+ * PLAN-13-R6 §15 P3: every merge base of two commits (`git merge-base --all`). With a criss-cross
+ * history git can pick one that hides a change; the judge compares against all of them.
+ */
+export async function gitMergeBases(root: string, a: string, b: string): Promise<string[]> {
+  const raw = await runGit(root, ['merge-base', '--all', a, b]);
+  return raw
+    .toString('utf8')
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+}
+
+/** The paths that change from one commit-ish to another, once each, sorted, without renames. */
+export async function gitChangedPaths(root: string, from: string, to: string): Promise<string[]> {
+  const raw = await runGit(root, ['diff', '--name-only', '-z', '--no-renames', from, to]);
+  const paths = raw.toString('utf8').split('\0').filter((path) => path.length > 0);
+  return [...new Set(paths)].sort();
+}
+
+export interface MergeTreeReading {
+  /** The merge conflicts: it counts as touched, never as a pass (PLAN-13-R6 §15 P3). */
+  readonly conflicted: boolean;
+  /** The tree of the merge, when it does not conflict. */
+  readonly tree?: string;
+}
+
+/**
+ * PLAN-13-R6 §15 P3: the tree of the merge GitHub would perform when the head lands on the trusted
+ * tip (`git merge-tree --write-tree`), or that it conflicts. A git failure other than the clean
+ * "conflicts" exit code throws, because a failure to tell is not an answer.
+ */
+export async function gitMergeTree(root: string, tip: string, head: string): Promise<MergeTreeReading> {
+  try {
+    const raw = await runGit(root, ['merge-tree', '--write-tree', tip, head]);
+    const tree = text(raw).split('\n')[0]?.trim();
+    return tree === undefined || tree.length === 0 ? { conflicted: false } : { conflicted: false, tree };
+  } catch (error) {
+    if (error instanceof GitCommandError && error.exitCode === 1) return { conflicted: true };
     throw error;
   }
 }

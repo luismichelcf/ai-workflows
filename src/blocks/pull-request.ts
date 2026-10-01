@@ -73,16 +73,16 @@ export async function currentBranch(root: string, spanish: boolean): Promise<str
   return branch;
 }
 
-/** Whether a pull request was opened by the agents, from the same repository, into the principal. */
+/** Whether a pull request was opened by the agents, from the same repository, into the target. */
 function hasProvenance(
   pr: AgentPullRequest,
   agentAccount: string | undefined,
   repository: string,
-  principal: string,
+  target: string,
 ): boolean {
   if (agentAccount !== undefined && pr.author !== agentAccount) return false;
   if (pr.headRepo !== repository) return false;
-  return pr.baseRef === principal;
+  return pr.baseRef === target;
 }
 
 /** The mark a pull request carries for one operation, or whether it carries any mark at all. */
@@ -125,7 +125,10 @@ export async function pullRequestOf(
     );
   }
 
+  // PLAN-13-R6 §1.1 (R27): the piece's pull request is opened into the first branch of `branches.into`
+  // when the recipe declares it; without the section, into the principal, exactly as before.
   const principal = await agent.github.defaultBranch();
+  const target = deps.recipe.branches?.into[0] ?? principal;
   const agentAccount = deps.recipe.agentAccount;
   const prs = await agent.github.pullRequestsOfBranch(branch);
 
@@ -135,7 +138,7 @@ export async function pullRequestOf(
     (pr) =>
       pr.state === 'MERGED'
       && pr.headSha === sha
-      && hasProvenance(pr, agentAccount, agent.repository, principal),
+      && hasProvenance(pr, agentAccount, agent.repository, target),
   );
   if (merged.length > 1) {
     throw new Error(
@@ -203,7 +206,7 @@ export async function pullRequestOf(
 
   const openOne = open[0];
   if (openOne !== undefined) {
-    if (!hasProvenance(openOne, agentAccount, agent.repository, principal)) {
+    if (!hasProvenance(openOne, agentAccount, agent.repository, target)) {
       throw new PullRequestRefused(
         spanish
           ? `Este PR lo abrió ${openOne.author} (o apunta a otra base u otro repositorio); ciérralo para que el motor abra uno propio (el dueño no puede aprobar lo suyo).`
@@ -250,7 +253,7 @@ export async function pullRequestOf(
     const body = `Refs #${piece}\n${OP_MARKER}open-pr:${branch}:${sha} -->`;
     const number = await agent.github.createDraftPullRequest({
       branch,
-      base: principal,
+      base: target,
       title,
       body,
     });

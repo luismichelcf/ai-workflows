@@ -89,7 +89,7 @@ permanente (§8.2).
 | R01 | **Todo fuera de Socialabs.** El motor, sus bloques, la receta de Socialabs y todas las pruebas se construyen fuera. Socialabs no recibe ningún cambio por esta pieza hasta el día de integrar. |
 | R02 | **La receta la escriben los agentes y la lee el dueño.** Tiene que leerse como una lista de pasos sin saber programar. Lo complejo vive en bloques del motor. |
 | R03 | **Dos campos de prueba:** el repositorio de ensayo pequeño (`socialabs-margin/ai-workflows-pruebas`) para los intentos de trampa, y una **copia privada de Socialabs** para el ensayo general, usada al final para cuidar minutos de GitHub. |
-| R04 | **Lo dormido en Socialabs no se toca.** `pipeline.config.ts`, `scripts/pipeline/`, `scripts/proceso/` y la dependencia fija a v0.3.0 se quedan como están hasta integrar. `visto-bueno.yml` y `candado-cola.yml` siguen operando igual. |
+| R04 | **Lo dormido en Socialabs no se toca.** `pipeline.config.ts`, `scripts/pipeline/`, `scripts/proceso/` y la dependencia fija a v0.3.0 se quedan como están hasta integrar. *(Actualizado el 29-sep: la frase «`visto-bueno.yml` y `candado-cola.yml` siguen operando igual» quedó sin objeto, porque ADR 0236 de Socialabs los retiró el 24-sep.)* |
 | R05 | **Genérico, para los proyectos del dueño primero**, con una receta de ejemplo para arrancar un proyecto nuevo. No se pule como producto para desconocidos en esta versión. |
 | R06 | **Corre en dos partes:** junto al agente (guía y frena cada etapa) y un check en GitHub antes de fusionar, para que los atajos ordinarios (`--no-verify`, PR desde la web, merge desde otra máquina) no se lo salten. Imitarlo a propósito es el límite aceptado en R13. |
 | R07 | **La copia de Socialabs no tiene ninguna llave de producción.** Vista previa y base de datos se prueban contra proyectos de prueba propios y vacíos, gratuitos o del plan que ya se paga. |
@@ -109,6 +109,18 @@ permanente (§8.2).
 | R21 | **Los agentes publican con su propia identidad de GitHub y el dueño aprueba con el botón «Approve»** (23-sep, tras un estudio de cómo lo hace la industria: GitHub, Copilot, Devin, Cursor, Claude, Kubernetes). Una aplicación de GitHub del dueño (gratis, sin asiento) sube, abre PRs, publica y fusiona; como el PR ya no es del dueño, GitHub le deja aprobarlo, también desde el celular, y la aprobación queda amarrada a la versión. Cierra además el hueco de que un agente con la cuenta del dueño escriba el visto bueno por él, siempre que la sesión del dueño no esté abierta en la PC de los agentes (paso de instalación, se declara). El comentario con código se conserva como respaldo y para la copia fiel de Socialabs (R10), que cambia solo al integrar. Descartados: seguir con el comentario y cambiar después (el hueco sigue abierto) y endurecer solo el comentario (no cierra el hueco principal). Detalle en [PLAN-13-R4](PLAN-13-R4.md) §1. |
 | R22 | **En el repositorio de ensayo, la suite usa la cuenta del dueño abierta en la PC** (25-sep, al diseñar la rebanada 5): para preparar y restaurar su configuración (protecciones, variable, workflows) y para escribir las órdenes del dueño que los controles positivos necesitan (`/visto-bueno`, `/approve-judge-change`). Es un simulacro en un repositorio de juguete y el informe lo declara; los «Approve» con botón siguen siendo del dueño desde fuera de la PC. Nada de esto se permite fuera del ensayo ni toca Socialabs. Descartados: que el dueño escriba esas órdenes a mano (unos 4 comentarios más durante 1–2 horas) y una segunda aplicación de GitHub para administrar el ensayo (15 minutos del dueño; más limpio, sin ganar seguridad fuera del ensayo). Detalle en [PLAN-13-R5](PLAN-13-R5.md) §2.2. **Ampliada el 26-sep** (corrida real): GitHub no deja a la aplicación de los agentes subir cambios a los flujos (no tiene ese permiso), así que en SV-04s la suite registra ese rechazo como primer candado y sube el mismo cambio con la cuenta del dueño para ensayar también el del juez; el informe lo declara. Descartado: registrar solo el rechazo de GitHub (el juez quedaría probado solo en la PC). |
 | R23 | **El informe de la suite puede juntar dos corridas** (29-sep, tras siete corridas reales): la séptima completa (33 de 35 en verde, sin fallos del motor) y una corrida corta solo de los casos que le faltaron (el recorrido final, COLA-6 y la limpieza), con un solo «Approve» del dueño. El informe lo declara en su primera línea y por corrida (su motor, los casos que aporta, sus pruebas y su propia limpieza); la limpieza que cuenta es la de la corrida corta. Todo con registros reales: nada se reconstruye a mano. Descartados: otra corrida completa (unas 3 h y media con dos «Approve», más expuesta a otro tropiezo de GitHub) y juntar la sexta con la séptima (los registros de la sexta no se conservaron). Detalle en [PLAN-13-R5](PLAN-13-R5.md) §3. |
+| R24 | **Sin copia de Socialabs** (29-sep, al cerrar la rebanada 5). La rebanada 6 deja el motor completo, hace la revisión adversarial de la frontera y publica v1.0.0. La rebanada 7, con su propio issue en Socialabs, instala **solo la parte de GitHub (el juez) en modo consulta** (`advisory`: opina, no bloquea) y se observa una o dos semanas. La parte junto al agente llega al encender, y encender sigue siendo otra decisión del dueño. Las condiciones de ADR 0219 (§7) se exigen para encender; la prueba de apagado contra las protecciones reales de Socialabs se hace entonces, con el dueño presente. Reemplaza el segundo campo de prueba de R03, R07 y los casos EG de §8.4. Descartados: juntar las dos rebanadas instalando también la parte junto al agente (necesitaría un modo consulta local que no existe) y el ensayo en la copia (más lento y con servicios de prueba). |
+| R25 | **Una revisión completa de la parvada por rebanada** (29-sep). Después, un arreglo se revisa por su delta con un solo revisor **solo si toca la frontera de seguridad** (quién autoriza, qué se ejecuta con privilegios, qué se publica como veredicto, los ganchos). Precisa la regla de AGENTS.md. Descartados: una sola revisión sin delta (en la rebanada 5 las rondas 2–6 hallaron huecos reales que entraron con arreglos) y una ronda por cada arreglo (15 rondas en la rebanada 5). |
+| R26 | **No se aplaza nada antes de Socialabs** (29-sep): los ganchos de Codex y OpenCode, que el juez trate como propios la configuración de los ganchos y la versión del motor, y los tres menores de §12 (corrida del juez cancelada en un grupo de la cola, gancho del editor sin tiempo si git se cuelga, verde viejo tras un juicio desde el issue que se cae). Descartado: dejarlos para después de integrar. |
+| R27 | **El juez revisa también los PRs hacia las ramas de trabajo que declara la receta** (29-sep), porque en Socialabs todo el trabajo diario entra a `staging` (ADR 0236) y el juez solo miraba la principal. Cada PR hacia una rama de trabajo se juzga pieza por pieza; un pase de una rama a otra (de `staging` a la principal) se juzga solo por los archivos propios del motor, porque sus piezas ya se juzgaron al entrar. Descartados: repasar cada pieza en el pase (mucho más complejo) y juzgar solo la principal (la observación no vería el trabajo diario). Detalle en [PLAN-13-R6](PLAN-13-R6.md) §1. |
+| R28 | **v1.0.0 se publica en GitHub, npm después** (29-sep). El paquete y el esquema van como archivos de la versión en este repositorio. La meta es que instalarlo sea «plug and play»: `init` deja el proyecto listo con una orden. Publicar en npm (con otro nombre, porque `ai-workflows` ya está tomado allí) queda para después de v1. Descartado para v1: npm (nombre, cuenta y presentación como producto). |
+| R29 | **Antes de publicar v1.0.0 se repiten en GitHub real solo los casos que tocan lo nuevo** (29-sep): archivos propios, cola, juicio desde el issue, check con nombre prestado y ramas de trabajo, con a lo sumo un «Approve» del dueño. El resto se remite al informe de la rebanada 5. Descartado: la suite completa (unas 3 h y media, dos «Approve»). |
+| R30 | **La receta de Socialabs se escribe en la rebanada 7** (29-sep), con su issue, contra el proceso vigente de Socialabs (ADR 0236), no contra el del 22-sep. Si le falta algo al motor, sale una v1.0.1. Descartado: escribirla ahora fuera de Socialabs (obligaría a resolver ya dudas del proceso de Socialabs). |
+| R31 | **Licencia MIT y versiones blindadas** (29-sep). El motor se publica con licencia MIT (el repositorio ya es público y sin licencia nadie más puede usarlo). En este repositorio se activan las versiones inmutables de GitHub y una regla que protege las etiquetas `v*`: una versión publicada no se cambia ni se borra, y un arreglo siempre sale como versión nueva. Descartados: seguir sin licencia y confiar solo en la regla escrita. |
+| R32 | **Los pasos que corren al instalar dependencias son archivos propios** (30-sep, tras la parvada de la rebanada 6). Cambiar los scripts de ciclo de vida del proyecto (`preinstall`, `install`, `postinstall`, `prepare`), la configuración del instalador (`.npmrc`, `.yarnrc.yml`, la ruta del pnpmfile, `onlyBuiltDependencies`) o las carpetas de plugins y herramientas de OpenCode pide la atestación del dueño, porque cualquiera de ellos puede reescribir el motor en la PC de los agentes y apagar los ganchos. Son cambios raros. Descartado: declararlo como límite de nivel A. |
+| R33 | **En v1.0.0 se acepta y se declara que el juez instala sus dependencias en cada corrida** (30-sep). Las dependencias van fijadas por su huella en el archivo de bloqueo, desde la acción fijada por SHA, y sus propios instaladores no corren; el paso de compilar no tiene la llave. El riesgo que queda (una herramienta de compilación comprometida en el registro) se declara. En una versión posterior, el juez viene ya compilado y no instala nada. Descartado para v1: compilarlo ya (más trabajo y otra ronda real antes de publicar). |
+| R34 | **Con ramas de trabajo, la parte junto al agente mide cada pieza contra la rama a la que irá su PR** (`into[0]`), no contra la principal (30-sep): `run`, `sync` y los hechos de cada pieza. Es lo que necesita un proyecto que trabaja sobre `staging` con los ganchos encendidos. En Socialabs no cambia nada durante la observación (R24). Descartado: dejarlo como límite hasta una versión posterior. |
+| R35 | **La evidencia real de la rebanada 6 junta dos corridas** (1-oct, tras la segunda corrida real): la corrida r-939cf951, con seis de siete casos registrados, y una corrida corta solo de A-T3 tras corregir su prueba, para que la sonda de cancelar a mano quede como parcial en vez de tumbar el caso. El informe lo declara en su primera línea y por corrida, como R23; B-T6 queda parcial (en los 10 intentos de las dos corridas el juez fue más rápido que la cancelación y la cabeza nunca volvió al verde viejo). Todo con registros reales. Descartado: repetir los seis casos (unas 2 h y cuarto, más expuesta a otro tropiezo de GitHub). |
 
 Decisiones de construcción tomadas por el orquestador (el dueño decide qué, el orquestador cómo):
 YAML 1.2 con esquema publicado (§3.2), condiciones estructuradas sin lenguaje de expresiones en v1
@@ -419,6 +431,10 @@ interruptor no puede ser solo «dejar de publicar». Dos llaves, coordinadas:
 
 ### 5.4 Cómo queda la protección de `main` al encender
 
+> **Nota del 29-sep:** desde ADR 0236 (24-sep) Socialabs ya no tiene cola nativa, `candado-cola` ni
+> `visto-bueno.yml`; exige `todo-verde` en `main` y en `staging`. La topología al encender se fija
+> en la rebanada 7 contra lo vigente entonces. Lo de abajo describe el Socialabs del 22-sep.
+
 **El juez se suma; no reemplaza nada.** Al encender, la protección de `main` de Socialabs exige
 `todo-verde`, `candado-cola` y el estado del juez. `visto-bueno.yml` y `candado-cola.yml` siguen
 igual. Motivo: copia fiel primero (R10) y un solo cambio a la vez; retirar `candado-cola` si el juez
@@ -545,6 +561,11 @@ crear el PR y antes de registrarlo. Cada uno con el control positivo de PLAN-997
 
 ### 8.4 Ensayo general en la copia de Socialabs
 
+> **Reemplazado por R24 (29-sep).** No hay copia. EG-00 y EG-05 se hacen al encender, contra las
+> protecciones reales de Socialabs; EG-01 se vuelve la revisión del repositorio real en la rebanada
+> 7; EG-02 y EG-04 los cubre la observación en consulta; EG-03 quedó sin objeto (ADR 0236 retiró el
+> visto bueno como candado); EG-06 pasa a la rebanada 7 (R30). Se conservan abajo como registro.
+
 - **EG-01** Antes del primer push de la copia se hace un **inventario** de disparadores (workflows,
   crons, webhooks, integraciones de GitHub como Vercel y Supabase) y de **destinos de red escritos en
   el código** (por ejemplo el origen por omisión de `sintetico-escritorio.yml` y el
@@ -601,13 +622,15 @@ comportamiento; el orquestador escribe las pruebas rojas y el constructor las po
 - [x] **4. Etapas finales genéricas:** revisión independiente, visto bueno, vista previa, QA de
       navegador, fusión, post-merge, limpieza y mensajes al dueño por plantilla. (CN-06, CN-12, CN-13)
 - [x] **5. Suite negativa completa** en `ai-workflows-pruebas` contra GitHub real, con informe.
-- [ ] **6. Ensayo general:** copia de Socialabs sin producción, servicios de prueba, receta de
-      Socialabs como copia fiel, bloques propios y EG-01…EG-06. Revisión adversarial de la
-      frontera de seguridad. Publicar v1.0.0.
-- [ ] **7. Integración (issue nuevo en Socialabs, con aprobación del dueño):** un solo PR que añade
-      `.ai-workflows/`, retira lo dormido, deja el juez instalado con `AI_WORKFLOWS_MODE=off` y **sin**
-      exigirlo en la protección de `main`, y documenta el apagado.
-      Encender es una decisión aparte del dueño.
+- [x] **6. Motor completo y v1.0.0** (R24–R29, [PLAN-13-R6](PLAN-13-R6.md)): ramas de trabajo y
+      pases, archivos propios, ganchos de Codex y OpenCode, los menores de §12, `init` completo,
+      revisión adversarial de la frontera de seguridad, evidencia real de lo nuevo y publicar
+      v1.0.0.
+- [ ] **7. Instalación en consulta (issue nuevo en Socialabs, con aprobación del dueño):** la
+      receta de Socialabs contra su proceso vigente (R30), con sus bloques y la tabla que liga cada
+      regla de su `CLAUDE.md` con su etapa; el juez instalado en `advisory` y **sin** exigirlo en la
+      protección; una o dos semanas de observación. Retirar lo dormido y encender son decisiones
+      aparte del dueño (R24).
 
 Rebanadas 1 → 2 → 3 → 4 en orden; 5 puede empezar tras 3; 6 tras 4 y 5; 7 tras 6.
 
@@ -628,20 +651,24 @@ Rebanadas 1 → 2 → 3 → 4 en orden; 5 puede empezar tras 3; 6 tras 4 y 5; 7 
 
 ## 12. Pendientes que no bloquean
 
-- Qué proyecto de base de datos de prueba usar (gratuito o del plan Pro), según límites vigentes
-  al abrir la rebanada 6.
 - Resueltos al construir la rebanada 2 ([PLAN-13-R2](PLAN-13-R2.md)): vigencia por omisión
   (R14), vocabulario cerrado de tipos y carriles (R15), nombres en español (R16), las reglas de
   `validate` de RC-08 más el orden de fases y la validación contra manifiestos, y `{tests}` como
   argumentos sin consola.
+- **Resueltos en la rebanada 6 por R26** ([PLAN-13-R6](PLAN-13-R6.md)): los ganchos para Codex y
+  OpenCode (§3), la configuración de los ganchos y la versión del motor como archivos propios (§2),
+  la corrida del juez en un grupo de la cola, ahora en fila (§5), el gancho que contesta antes de su
+  tiempo aunque git se cuelgue (§4) y el juicio desde el issue que retira el verde antes de juzgar
+  (§6); también `init` con los workflows del juez y el sello de la versión (§9). Lo que la rebanada
+  6 deja declarado como límite está en [PLAN-13-R6](PLAN-13-R6.md) §12.1.
 - Siguen abiertos:
   - Resueltos en la rebanada 3 ([PLAN-13-R3](PLAN-13-R3.md)): toda etapa `pre-merge` lleva
     `server:` (validado con los manifiestos); el juez no corre bloques del proyecto; R19.
   - **De la rebanada 3, sin bloquear:** con una cola de más de 5 PRs, una entrada que GitHub aún
     no armó hace esperar a todo el grupo (del lado seguro; se comprueba en la rebanada 5); el motivo
     publicado cuando la lista de la cola nunca se completa podría llevar el último detalle; `init`
-    que escriba los workflows del juez y el sellado del SHA del motor en el paquete (rebanada 6); la
-    atestación `/approve-judge-change` acepta un código de 7 caracteres, que alguien con permiso de
+    que escriba los workflows del juez y el sellado del SHA del motor en el paquete (resuelto en la
+    rebanada 6, [PLAN-13-R6](PLAN-13-R6.md) §9); la atestación `/approve-judge-change` acepta un código de 7 caracteres, que alguien con permiso de
     empujar podría igualar fabricando un commit (resuelto en la rebanada 4: R20, 16 caracteres);
     las notas del rastro salían como `::error::` (resuelto en la rebanada 4: `::warning::`).
   - Resueltos en la rebanada 4 ([PLAN-13-R4](PLAN-13-R4.md)): `required: false` y `retry`; el
@@ -650,15 +677,9 @@ Rebanadas 1 → 2 → 3 → 4 en orden; 5 puede empezar tras 3; 6 tras 4 y 5; 7 
   - Resueltos en la rebanada 5 ([PLAN-13-R5](PLAN-13-R5.md)): CN-07 (ganchos del editor y de git
     conectados a la receta); la cola de más de 5 PRs se ensaya en GitHub real (COLA-6); el juez
     despierta con el botón «Approve» y con los eventos del issue; R22.
-  - **De la rebanada 5, a proponer al dueño:** ganchos para Codex (`.codex/hooks.json`) y OpenCode;
-    que el juez trate como archivos propios `.claude/settings.json` y la versión del motor de
-    `package.json` (hoy un PR puede quitar el gancho del editor sin la atestación del dueño);
-    que una corrida del juez cancelada a mitad de juicio en un grupo de la cola no deje «no pudo
-    decidir» (hoy falla cerrado: el grupo sale de la cola y la pieza se vuelve a encolar); que el
-    gancho del editor no se quede sin tiempo si git se cuelga (git espera hasta 60 s por llamada y el
-    gancho tiene 30 s: Claude Code lo saltaría; el juez sigue frenando en el PR); y que un juicio
-    desde el issue que se cae tras borrar un veredicto no deje el verde viejo en la cabeza del PR (la
-    cola lo vuelve a juzgar; sin cola quedaría).
+  - Los propuestos al cerrar la rebanada 5 (ganchos de Codex y OpenCode, archivos propios, corrida
+    cancelada en la cola, gancho sin tiempo y verde viejo tras el juicio desde el issue) los decidió
+    el dueño en R26 y se resolvieron en la rebanada 6 (arriba).
   - **De la rebanada 4, sin bloquear:** CN-07 (ganchos del editor conectados a la receta) pasa a la
     rebanada 5; `cleanup` no libera zonas (nadie las reserva aún); sin `agent-account`, un aviso al
     dueño puede repetirse tras una caída (la conciliación solo reconoce comentarios de la

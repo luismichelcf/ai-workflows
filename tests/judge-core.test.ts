@@ -113,7 +113,23 @@ interface PullRequest {
   headRepo: string;
 }
 
-interface CheckRun { id?: number; status: string; conclusion: string | null; app: string; url: string | null }
+interface CheckRun { id?: number; checkSuiteId?: number; status: string; conclusion: string | null; app: string; url: string | null }
+
+// PLAN-13-R6 §7: a red-test check-run counts only through its chain — check suite, the single
+// Actions run of that suite, a job of that run pointing to the check-run, the official workflow by
+// its id, and the run tied to this pull request and its base. The fake builds that chain for every
+// red-test check-run it is given (the official one, of the PRs whose head is that SHA, or of the
+// queue group), unless a test overrides part of it.
+interface ActionsRun {
+  id: number;
+  headSha: string;
+  event: string;
+  workflowId: number;
+  path: string;
+  pullRequests: { number: number; baseRef: string; baseSha: string }[];
+}
+const RED_WORKFLOW_ID = 41;
+const IMPOSTOR_WORKFLOW_ID = 42;
 interface Status { context: string; state: string; targetUrl: string | null; createdAt: string }
 
 class FakeGitHub implements JudgeGitHub {
@@ -139,6 +155,14 @@ class FakeGitHub implements JudgeGitHub {
   /** Successive answers for the head of main: the last one repeats. */
   mainHeads: string[] = [];
   private clock = 0;
+  /** R6 §7: the Actions runs of each check suite, the jobs of each run, and the workflows by id. */
+  readonly suiteRuns = new Map<number, ActionsRun[] | Error>();
+  readonly jobsOf = new Map<number, { id: number; checkRunUrl: string }[] | Error>();
+  readonly workflowsById = new Map<number, { path: string } | Error>([
+    [RED_WORKFLOW_ID, { path: RED_WORKFLOW }],
+    [IMPOSTOR_WORKFLOW_ID, { path: '.github/workflows/impostor.yml' }],
+  ]);
+  private nextCheckRunId = 5000;
 
   constructor(readonly main: string) {
     this.mainHeads = [main];
@@ -161,8 +185,57 @@ class FakeGitHub implements JudgeGitHub {
     this.statusList.set(sha, list);
   }
 
-  setCheck(sha: string, name: string, runs: CheckRun[] | Error): void {
-    this.checks.set(`${sha} ${name}`, runs);
+  /**
+   * Sets the check-runs of a name over a SHA. For `ai-workflows/red-test` (R6 §7) each run also
+   * gets its chain: an id when it has none, its check suite, one Actions run of the official
+   * workflow for the PRs whose head is that SHA (or the queue group), and a job pointing to it.
+   * `chain` overrides fields of that Actions run.
+   */
+  setCheck(sha: string, name: string, runs: CheckRun[] | Error, chain: Partial<ActionsRun> = {}): void {
+    if (runs instanceof Error || name !== 'ai-workflows/red-test') {
+      this.checks.set(`${sha} ${name}`, runs);
+      return;
+    }
+    const chained = runs.map((run) => {
+      const id = run.id ?? (this.nextCheckRunId += 1);
+      const suite = id + 100_000;
+      const actionsRun = id + 200_000;
+      const prs = [...this.prs.values()].filter((pr) => pr.headSha === sha);
+      this.suiteRuns.set(suite, [{
+        id: actionsRun,
+        headSha: sha,
+        event: prs.length > 0 ? 'pull_request' : 'merge_group',
+        workflowId: RED_WORKFLOW_ID,
+        path: `${RED_WORKFLOW}@refs/heads/main`,
+        pullRequests: prs.map((pr) => ({ number: pr.number, baseRef: pr.baseRef, baseSha: this.main })),
+        ...chain,
+      }]);
+      this.jobsOf.set(actionsRun, [{ id: actionsRun + 1, checkRunUrl: `https://api.github.com/repos/${REPO}/check-runs/${id}` }]);
+      return { ...run, id, checkSuiteId: suite };
+    });
+    this.checks.set(`${sha} ${name}`, chained);
+  }
+
+  async checkSuiteRuns(id: number): Promise<ActionsRun[]> {
+    this.calls.push(`checkSuiteRuns ${id}`);
+    const answer = this.suiteRuns.get(id) ?? [];
+    if (answer instanceof Error) throw answer;
+    return answer;
+  }
+
+  async workflowRunJobs(id: number): Promise<{ id: number; checkRunUrl: string }[]> {
+    this.calls.push(`workflowRunJobs ${id}`);
+    const answer = this.jobsOf.get(id) ?? [];
+    if (answer instanceof Error) throw answer;
+    return answer;
+  }
+
+  async workflowById(id: number): Promise<{ path: string }> {
+    this.calls.push(`workflowById ${id}`);
+    const answer = this.workflowsById.get(id);
+    if (answer instanceof Error) throw answer;
+    if (answer === undefined) throw new Error(`HTTP 404: no workflow ${id}`);
+    return answer;
   }
 
   async defaultBranch(): Promise<string> {
@@ -295,6 +368,8 @@ function world(mainFiles: Readonly<Record<string, string>> = {}, options: { read
     'ran.mjs': MARKER,
     'app/page.tsx': 'export const page = 1;\n',
     'README.md': 'proyecto\n',
+    // R6 §7: the official red-test workflow exists in the trusted base.
+    [RED_WORKFLOW]: 'name: ai-workflows red-test\n',
     ...mainFiles,
   });
   git(root, 'switch', '-q', 'main');
@@ -1807,9 +1882,16 @@ describe('flock 4', () => {
     expect(stageOf(report, 'red-test')?.outcome).toBe('rejected');
   });
 
+  // R6 §7: a red-test check-run without an id can never be tied to its job, so this rule of order
+  // is now about the project's checks, which keep today's rule (R3 §4).
   it('several check-runs where one has no id cannot be ordered: technical', async () => {
-    const { report } = await judgedWith([runOf(undefined, 'completed', 'success'), runOf(13, 'completed', 'failure')]);
-    expect(stageOf(report, 'red-test')?.outcome).toBe('technical');
+    const w = world();
+    const head = behaviorPr(w);
+    w.green(7, head);
+    w.github.setCheck(head, 'todo-verde', [runOf(undefined, 'completed', 'success'), runOf(13, 'completed', 'failure')]);
+    w.github.pendingFromConsoleStep(head);
+    const report = await w.judge();
+    expect(stageOf(report, 'checks')?.outcome).toBe('technical');
   });
 
   it('when reading one PR of the target list fails, error is published and the trace is still collected', async () => {
@@ -1869,5 +1951,134 @@ describe('flock 5', () => {
     w.github.pendingFromConsoleStep(group);
     const report = await w.judge(groupInput(w, group));
     expect(report.notes.filter((note) => /failure/.test(note))).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// PLAN-13-R6 §7 through the judge: the chain is read for the red test of every pull request, with
+// real git answering whether the run's base is an ancestor of the trusted tip and whether the
+// official workflow exists in the trusted tree. (The unit cases are in judge-red-test-origin.)
+
+describe('PLAN-13-R6 §7: the judge ties the red test to its official run', () => {
+  it('a green red-test check-run from another workflow does not count: the stage waits and the PR stays pending', async () => {
+    const w = world();
+    const head = behaviorPr(w);
+    w.green(7, head);
+    w.github.setCheck(head, 'ai-workflows/red-test', [{ id: 60, status: 'completed', conclusion: 'success', app: 'github-actions', url: null }], {
+      workflowId: IMPOSTOR_WORKFLOW_ID,
+      path: '.github/workflows/impostor.yml',
+    });
+    w.github.pendingFromConsoleStep(head);
+    const report = await w.judge();
+    expect(stageOf(report, 'red-test')?.outcome).toBe('waiting');
+    expect(w.github.on()).toEqual([expect.objectContaining({ sha: head, state: 'pending' })]);
+  });
+
+  it('a commit status ai-workflows/red-test in success, without a check-run, does not count', async () => {
+    const w = world();
+    const head = behaviorPr(w);
+    w.green(7, head);
+    w.github.setCheck(head, 'ai-workflows/red-test', []);
+    w.github.addStatus(head, { context: 'ai-workflows/red-test', state: 'success', targetUrl: null });
+    w.github.pendingFromConsoleStep(head);
+    const report = await w.judge();
+    expect(stageOf(report, 'red-test')?.outcome).toBe('waiting');
+  });
+
+  it('the run was for an older main that is an ancestor of the live main: it counts', async () => {
+    const w = world();
+    const head = behaviorPr(w);
+    w.green(7, head);
+    git(w.root, 'switch', '-q', 'main');
+    write(w.root, 'README.md', 'main avanza\n');
+    w.github.mainHeads = [commit(w.root, 'main moves on')];
+    w.github.pendingFromConsoleStep(head);
+    const report = await w.judge();
+    expect(stageOf(report, 'red-test')?.outcome).toBe('passed');
+  });
+
+  it('the run was for a base that is not an ancestor of the live main (rewritten): the stage waits', async () => {
+    const w = world();
+    const head = behaviorPr(w);
+    w.green(7, head);
+    git(w.root, 'switch', '-q', '-c', 'reescrita', w.main);
+    write(w.root, 'README.md', 'otra historia\n');
+    const rewritten = commit(w.root, 'rewritten base');
+    git(w.root, 'switch', '-q', 'main');
+    w.github.setCheck(head, 'ai-workflows/red-test', [{ id: 61, status: 'completed', conclusion: 'success', app: 'github-actions', url: null }], {
+      pullRequests: [{ number: 7, baseRef: 'main', baseSha: rewritten }],
+    });
+    w.github.pendingFromConsoleStep(head);
+    const report = await w.judge();
+    expect(stageOf(report, 'red-test')?.outcome).toBe('waiting');
+  });
+
+  it('the official workflow does not exist in the trusted main: the stage waits', async () => {
+    const w = world();
+    const head = behaviorPr(w);
+    w.green(7, head);
+    git(w.root, 'switch', '-q', 'main');
+    git(w.root, 'rm', '-q', RED_WORKFLOW);
+    w.github.mainHeads = [commit(w.root, 'main drops the red-test workflow')];
+    w.github.pendingFromConsoleStep(head);
+    const report = await w.judge();
+    expect(stageOf(report, 'red-test')?.outcome).toBe('waiting');
+  });
+
+  it('a merge group: the red test of the group counts only from a run of the official workflow', async () => {
+    const w = world();
+    const seven = behaviorPr(w, 7, 'feat/13-a');
+    w.green(7, seven);
+    const group = mergeGroup(w, [7]);
+    w.github.setCheck(group, 'todo-verde', green());
+    w.github.setCheck(group, 'ai-workflows/red-test', green(), { workflowId: IMPOSTOR_WORKFLOW_ID, path: '.github/workflows/impostor.yml' });
+    w.github.pendingFromConsoleStep(group);
+    const report = await w.judge(groupInput(w, group));
+    expect(stageOf(report, 'red-test')?.outcome).toBe('waiting');
+    expect(w.github.on()).toEqual([expect.objectContaining({ sha: group, state: 'pending' })]);
+  });
+});
+
+// PLAN-13-R6 §15, P2 (the flock of slice 6): when the tip of main changes while judging, every
+// judgement against main is updated to the new tip at once, and «changed again» is counted per
+// branch. Before slice 6 every pull request of a group was judged again together; a group of two
+// whose main moves once (the group ahead merged, the normal case under a queue) must not be
+// ejected with «la rama principal cambió mientras se juzgaba».
+describe('flock 6 (P2): main moves once during a group of two pull requests', () => {
+  function twoPrGroup() {
+    const w = world();
+    const seven = behaviorPr(w, 7, 'feat/13-a');
+    const eight = w.pr(8, 'feat/14-b', { 'docs/plans/PLAN-14.md': lines('## En tres líneas', 'x', 'Tipo de cambio: comportamiento'), 'lib/b.ts': 'b\n' });
+    w.green(7, seven);
+    w.green(8, eight);
+    const group = mergeGroup(w, [7, 8]);
+    w.github.setCheck(group, 'todo-verde', green());
+    w.github.setCheck(group, 'ai-workflows/red-test', green());
+    return { w, group };
+  }
+
+  it('main moves once, to the group ahead: judged again, success on the group, no «cambió» error', async () => {
+    const { w, group } = twoPrGroup();
+    const ahead = (w.github.queue as { headSha: string }[])[0]?.headSha as string;
+    w.github.mainHeads = [w.main, ahead];
+    w.github.pendingFromConsoleStep(group);
+
+    await w.judge(groupInput(w, group));
+
+    expect(w.fetched).toContain(ahead);
+    expect(w.github.on().map((entry) => entry.description)).not.toContain('la rama principal cambió mientras se juzgaba');
+    expect(w.github.on()).toEqual([expect.objectContaining({ sha: group, state: 'success' })]);
+  });
+
+  // A guard: it errors today and must keep erroring.
+  it('main moves twice: error on the group, naming the principal', async () => {
+    const { w, group } = twoPrGroup();
+    const ahead = (w.github.queue as { headSha: string }[])[0]?.headSha as string;
+    w.github.mainHeads = [w.main, ahead, group];
+    w.github.pendingFromConsoleStep(group);
+
+    await w.judge(groupInput(w, group));
+
+    expect(w.github.on()).toEqual([expect.objectContaining({ sha: group, state: 'error', description: expect.stringMatching(/principal/) })]);
   });
 });

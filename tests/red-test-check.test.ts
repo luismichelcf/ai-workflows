@@ -111,8 +111,13 @@ function project(extra: Readonly<Record<string, string>> = {}) {
     async defaultBranch() {
       return 'main';
     },
-    async branchHead() {
-      return github.mainHead;
+    /** PLAN-13-R6 §1.2: the live tips of the other branches, by name. */
+    heads: {} as Record<string, string>,
+    async branchHead(name: string) {
+      if (name === 'main') return github.mainHead;
+      const tip = github.heads[name];
+      if (tip === undefined) throw new Error(`no branch ${name}`);
+      return tip;
     },
     /** Successive answers of the queue list, for a queue that shows the group late; then `queue`. */
     queueSequence: [] as Entry[][],
@@ -133,8 +138,8 @@ function project(extra: Readonly<Record<string, string>> = {}) {
     root,
     main,
     github,
-    pr(n: number, branch: string, files: Readonly<Record<string, string>>): string {
-      git(root, 'switch', '-q', '-c', `pr-${n}`, main);
+    pr(n: number, branch: string, files: Readonly<Record<string, string>>, from: string = main): string {
+      git(root, 'switch', '-q', '-c', `pr-${n}`, from);
       for (const [path, content] of Object.entries(files)) write(root, path, content);
       const head = commit(root, `PR ${n}`);
       git(root, 'switch', '-q', 'main');
@@ -145,11 +150,11 @@ function project(extra: Readonly<Record<string, string>> = {}) {
     checkout(sha: string): void {
       git(root, 'switch', '-q', '--detach', sha);
     },
-    pullRequestEvent(n: number) {
+    pullRequestEvent(n: number, base: { sha: string; ref: string } = { sha: main, ref: 'main' }) {
       const pr = prs.get(n);
       return {
         eventName: 'pull_request',
-        event: { pull_request: { number: n, head: { sha: pr?.headSha, ref: pr?.headRef }, base: { sha: main, ref: 'main' } } },
+        event: { pull_request: { number: n, head: { sha: pr?.headSha, ref: pr?.headRef }, base } },
         root,
         repository: 'duena/proyecto',
       };
@@ -435,6 +440,8 @@ describe('flock 1: red-test-check', () => {
 });
 
 describe('flock 2: red-test-check and a PR into another branch', () => {
+  // Without a `branches` section only main receives pieces (PLAN-13-R6 §1.5.9): a PR into any
+  // other branch is still not tested. With `branches.into`, see «PLAN-13-R6 §1.2» below.
   it('a PR into another branch is not tested, and the check does not pass', async () => {
     const p = project();
     const head = p.pr(7, 'feat/13-sin-pruebas', { 'src/bonus.mjs': BONUS(1000) });
@@ -482,5 +489,221 @@ describe('flock 4: a queue that lists the group late', () => {
     expect(result.ok).toBe(false);
     expect(p.github.queueReads).toBeGreaterThan(1);
     expect(p.github.queueReads).toBeLessThan(50);
+  });
+});
+
+describe('PLAN-13-R6 §1.2, §1.5: the red test of a PR into a working branch', () => {
+  // The list of branches that receive pieces comes from the recipe of main (never from the
+  // target's); a PR into one of them is tested with the live tip of that branch as its trusted
+  // base: its recipe decides the stages and its tree is where the test must be red.
+  const BRANCHED = RECIPE.replace('locale: es\n', 'locale: es\nbranches:\n  into: [staging, main]\n');
+
+  const STAGING_ONLY_STAGE = lines(
+    '  - id: solo-staging',
+    '    summary: "Una comprobación que solo exige staging"',
+    '    after: red-test',
+    '    nature: execution-record',
+    '    applies-if: { kind-any: [behavior] }',
+    '    valid-while: forever',
+    '    gate:',
+    '      uses: ai-workflows/red-test@1',
+    '      with: { command: "node runner.mjs {tests}", tests: ["checks/**/*.check.mjs"] }',
+    '    server: { require-check: ai-workflows/red-test }',
+  );
+
+  // Staging carries `src/rate.mjs`, which main does not: a test that imports it is red against
+  // the tip of staging by its assertion, but broken (by import) against main.
+  const FEE_BY_RATE = 'import { rate } from "./rate.mjs";\nexport const fee = () => rate() * 10;\n';
+  const FEE_BY_RATE_TEST = lines(
+    'import assert from "node:assert/strict";',
+    'import { rate } from "../src/rate.mjs";',
+    'import { fee } from "../src/fee.mjs";',
+    'export const cases = { "cobra por tasa": () => assert.equal(fee(), rate() * 10, `expected ${fee()} to be ${rate() * 10}`) };',
+  );
+
+  function withStaging(mainRecipe: string, stagingRecipe: string) {
+    const p = project({ '.ai-workflows/pipeline.yml': mainRecipe });
+    git(p.root, 'switch', '-q', '-c', 'staging', p.main);
+    write(p.root, 'src/rate.mjs', 'export const rate = () => 3;\n');
+    write(p.root, '.ai-workflows/pipeline.yml', stagingRecipe);
+    const staging = commit(p.root, 'staging moves ahead of main');
+    git(p.root, 'switch', '-q', 'main');
+    p.github.heads['staging'] = staging;
+    return { p, staging };
+  }
+
+  it('a PR into staging is tested against the tip of staging: red there, green on the head', async () => {
+    const { p, staging } = withStaging(BRANCHED, BRANCHED);
+    const head = p.pr(7, 'feat/13-tasa', { 'src/fee.mjs': FEE_BY_RATE, 'tests/fee.test.mjs': FEE_BY_RATE_TEST }, staging);
+    p.checkout(head);
+
+    const result = await runRedTestCheck(p.pullRequestEvent(7, { sha: staging, ref: 'staging' }), p.deps());
+
+    expect(result.summary).not.toMatch(/No se prueba/);
+    expect(result, result.summary).toEqual({ ok: true, summary: expect.stringMatching(/red-test: pasó/) });
+  });
+
+  it('a PR into a branch outside branches.into is still not tested, naming the branch', async () => {
+    const { p, staging } = withStaging(BRANCHED, BRANCHED);
+    p.github.heads['develop'] = staging;
+    const head = p.pr(7, 'feat/13-tasa', { 'src/fee.mjs': FEE_BY_RATE, 'tests/fee.test.mjs': FEE_BY_RATE_TEST }, staging);
+    p.checkout(head);
+
+    const result = await runRedTestCheck(p.pullRequestEvent(7, { sha: staging, ref: 'develop' }), p.deps());
+
+    expect(result.ok).toBe(false);
+    expect(result.summary).toMatch(/No se prueba: la rama destino es «develop»/);
+  });
+
+  it('a stage that exists only in the recipe of staging is applied to a PR into staging', async () => {
+    const stagingRecipe = BRANCHED
+      .replace('  - id: merge\n', `${STAGING_ONLY_STAGE}  - id: merge\n`)
+      .replace('    after: red-test\n    phase: merge\n', '    after: solo-staging\n    phase: merge\n');
+    const { p, staging } = withStaging(BRANCHED, stagingRecipe);
+    // The piece brings a good red test but nothing for the stage of staging.
+    const head = p.pr(7, 'feat/13-tasa', { 'src/fee.mjs': FEE_BY_RATE, 'tests/fee.test.mjs': FEE_BY_RATE_TEST }, staging);
+    p.checkout(head);
+
+    const result = await runRedTestCheck(p.pullRequestEvent(7, { sha: staging, ref: 'staging' }), p.deps());
+
+    expect(result.ok).toBe(false);
+    expect(result.summary).not.toMatch(/No se prueba/);
+    expect(result.summary).toMatch(/red-test: pasó/);
+    expect(result.summary).toMatch(/solo-staging: La pieza no trae pruebas/);
+  });
+
+  it('without a branches section only main is tested: a PR into staging is not', async () => {
+    const { p, staging } = withStaging(RECIPE, RECIPE);
+    const head = p.pr(7, 'feat/13-tasa', { 'src/fee.mjs': FEE_BY_RATE, 'tests/fee.test.mjs': FEE_BY_RATE_TEST }, staging);
+    p.checkout(head);
+
+    const result = await runRedTestCheck(p.pullRequestEvent(7, { sha: staging, ref: 'staging' }), p.deps());
+
+    expect(result.ok).toBe(false);
+    expect(result.summary).toMatch(/No se prueba: la rama destino es «staging», no main/);
+  });
+});
+
+describe('PLAN-13-R6 §1.2, §1.5: guards of the red test into a working branch', () => {
+  // Every path where the tip of a working branch or its recipe cannot be trusted ends red with the
+  // motive; none of them falls back to main's tip or recipe. The piece used here (a bonus that
+  // goes from 800 to 1000 with its test) would pass against either tip under either recipe, so a
+  // fallback would show up as a green run.
+  const BRANCHED = RECIPE.replace('locale: es\n', 'locale: es\nbranches:\n  into: [staging, main]\n');
+  const BONUS_PIECE = { 'src/bonus.mjs': BONUS(1000), 'tests/bonus.test.mjs': BONUS_TEST };
+
+  /** Staging one commit ahead of main, with `stagingRecipe` there (or none when `undefined`). */
+  function withStaging(mainRecipe: string, stagingRecipe: string | undefined) {
+    const p = project({ '.ai-workflows/pipeline.yml': mainRecipe });
+    git(p.root, 'switch', '-q', '-c', 'staging', p.main);
+    write(p.root, 'src/rate.mjs', 'export const rate = () => 3;\n');
+    if (stagingRecipe === undefined) git(p.root, 'rm', '-q', '.ai-workflows/pipeline.yml');
+    else write(p.root, '.ai-workflows/pipeline.yml', stagingRecipe);
+    const staging = commit(p.root, 'staging moves ahead of main');
+    git(p.root, 'switch', '-q', 'main');
+    p.github.heads['staging'] = staging;
+    return { p, staging };
+  }
+
+  function bonusIntoStaging(mainRecipe: string, stagingRecipe: string | undefined) {
+    const { p, staging } = withStaging(mainRecipe, stagingRecipe);
+    const head = p.pr(7, 'feat/13-bono', BONUS_PIECE, staging);
+    p.checkout(head);
+    return { p, staging, event: p.pullRequestEvent(7, { sha: staging, ref: 'staging' }) };
+  }
+
+  it('control: the same piece into staging passes when its tip and recipe are readable', async () => {
+    const { p, event } = bonusIntoStaging(BRANCHED, BRANCHED);
+    const result = await runRedTestCheck(event, p.deps());
+    expect(result, result.summary).toEqual({ ok: true, summary: expect.stringMatching(/red-test: pasó/) });
+  });
+
+  it('(a) the tip of staging cannot be read: red, naming the unreadable tip of staging', async () => {
+    const { p, event } = bonusIntoStaging(BRANCHED, BRANCHED);
+    p.github.branchHead = async (name: string) => {
+      if (name === 'main') return p.github.mainHead;
+      throw new Error('API caída');
+    };
+    const result = await runRedTestCheck(event, p.deps());
+    expect(result.ok).toBe(false);
+    expect(result.summary).toMatch(/No se pudo leer la punta de staging: API caída/);
+  });
+
+  it('(a) the tip of staging is an unknown commit: red, naming that tip', async () => {
+    const { p, event } = bonusIntoStaging(BRANCHED, BRANCHED);
+    const unknown = 'f'.repeat(40);
+    p.github.heads['staging'] = unknown;
+    const result = await runRedTestCheck(event, p.deps());
+    expect(result.ok).toBe(false);
+    expect(result.summary).toContain(`No hay receta legible en ${unknown}`);
+  });
+
+  it('(b) the tip of staging has no recipe: red with the motive, never main\'s recipe', async () => {
+    const { p, staging, event } = bonusIntoStaging(BRANCHED, undefined);
+    const result = await runRedTestCheck(event, p.deps());
+    expect(result.ok).toBe(false);
+    expect(result.summary).toContain(`No hay receta legible en ${staging}:.ai-workflows/pipeline.yml`);
+    expect(result.summary).not.toMatch(/red-test: pasó/);
+  });
+
+  it('(b) the tip of staging has an invalid recipe: red with the motive, never main\'s recipe', async () => {
+    const { p, staging, event } = bonusIntoStaging(BRANCHED, 'version: 1\nlocale: es\nstages: nada\n');
+    const result = await runRedTestCheck(event, p.deps());
+    expect(result.ok).toBe(false);
+    expect(result.summary).toContain(`La receta de ${staging} no es válida`);
+    expect(result.summary).not.toMatch(/red-test: pasó/);
+  });
+
+  it('(c) the list of working branches comes from main only: staging cannot add develop', async () => {
+    const stagingRecipe = RECIPE.replace('locale: es\n', 'locale: es\nbranches:\n  into: [staging, develop]\n');
+    const { p, staging } = withStaging(BRANCHED.replace('[staging, main]', '[main, staging]'), stagingRecipe);
+    // develop is the same commit as staging, so its tip also declares itself a working branch.
+    p.github.heads['develop'] = staging;
+    const head = p.pr(7, 'feat/13-bono', BONUS_PIECE, staging);
+    p.checkout(head);
+
+    const result = await runRedTestCheck(p.pullRequestEvent(7, { sha: staging, ref: 'develop' }), p.deps());
+
+    expect(result.ok).toBe(false);
+    expect(result.summary).toMatch(/No se prueba: la rama destino es «develop»/);
+    expect(result.summary).not.toMatch(/red-test: pasó/);
+  });
+
+  it('(d) a merge group never tests a queued PR into staging, even with staging in main\'s list', async () => {
+    const { p, staging } = withStaging(BRANCHED, BRANCHED);
+    p.pr(7, 'feat/13-bono', BONUS_PIECE, staging);
+    const pullRequest = p.github.pullRequest;
+    p.github.pullRequest = async (n: number) => ({ ...(await pullRequest(n)), baseRef: 'staging' });
+    git(p.root, 'switch', '-q', '--detach', staging);
+    git(p.root, 'merge', '-q', '--no-ff', '--no-edit', 'pr-7');
+    const g1 = git(p.root, 'rev-parse', 'HEAD');
+    git(p.root, 'switch', '-q', 'main');
+    p.github.queue = [{ position: 1, headSha: g1, baseSha: staging, prNumber: 7 }];
+    p.checkout(g1);
+
+    const result = await runRedTestCheck(
+      { eventName: 'merge_group', event: { merge_group: { head_sha: g1, base_sha: staging } }, root: p.root, repository: 'duena/proyecto' },
+      p.deps(),
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.summary).toMatch(/No se prueba: la rama destino es «staging», no main/);
+  });
+
+  it('(e) the tips of the working branches cannot be fetched: red with the motive', async () => {
+    const { p, event } = bonusIntoStaging(BRANCHED, BRANCHED);
+    let calls = 0;
+    const deps = {
+      ...p.deps(),
+      fetchObjects: async () => {
+        calls += 1;
+        // The first fetch brings the PR's commits; the second, the tips of the working branches.
+        if (calls > 1) throw new Error('red caída');
+      },
+    };
+    const result = await runRedTestCheck(event, deps);
+    expect(calls).toBe(2);
+    expect(result.ok).toBe(false);
+    expect(result.summary).toMatch(/No se pudieron traer los commits a juzgar: red caída/);
   });
 });

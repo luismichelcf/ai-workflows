@@ -30,6 +30,14 @@ pieces:                               # cómo sabe GitHub de qué pieza es cada 
     file: "docs/plans/PLAN-{piece}.md"
     line: "Tipo de cambio"
 
+# Opcional: ramas de trabajo. Sin esta sección, las piezas solo entran a la rama principal.
+# branches:
+#   into: [staging, main]             # ramas que reciben piezas; el motor abre su PR hacia la primera
+#   promotions:                       # pases de una rama a otra: no son piezas, solo se revisan
+#     - { from: staging, to: main }   # los archivos del motor; las dos ramas deben estar en into
+# Si cambias into, cambia también la entrada branches del workflow del juez: los dos son archivos
+# del juez y ese cambio necesita la atestación del dueño.
+
 labels:                               # cómo se llaman al explicar la receta
   security: "seguridad y permisos"
   visible: "lo que se ve"

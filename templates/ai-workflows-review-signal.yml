@@ -1,21 +1,23 @@
-# La señal de revisión de ai-workflows (PLAN-13-R5 §2.6). Existe solo para terminar: su único
-# trabajo es que GitHub registre una corrida del evento `pull_request_review` para que el juez,
-# que la escucha por `workflow_run`, vuelva a mirar el pull request cuando el dueño pulsa
-# «Approve» (o cuando una revisión se descarta). No da ningún poder nuevo: no trae el repositorio al
-# disco, no lee el pull request, no usa secretos ni el token de la aplicación y no lleva ninguna
-# expresión de plantilla que pudiera venir del contenido del PR. El juez nunca confía en esta
-# corrida: relee el pull request por su cuenta y lo juzga con la receta de la rama principal.
+# The ai-workflows review signal (PLAN-13-R5 §2.6). It exists only to finish: its one job is that
+# GitHub records a run of the `pull_request_review` event, so that the judge, which follows it
+# through `workflow_run`, looks at the pull request again when the owner presses "Approve" (or when
+# a review is dismissed). It grants no new power: it does not fetch the repository, does not read
+# the pull request, uses neither secrets nor the app's token, and carries no template expression
+# that could come from the pull request's content. The judge never trusts this run: it reads the
+# pull request again on its own and judges it with the recipe of its trusted base, the tip of the
+# branch it targets (the main branch, or a working branch of `branches.into`; PLAN-13-R6 §1.2).
 #
-# POR QUÉ UN WORKFLOW APARTE. Un `pull_request_review` correría el YAML del commit de mezcla del
-# pull request, no el de la rama principal; con esta señal mínima, el juez sigue corriendo siempre
-# su propio YAML (el de la rama principal), que es lo único en lo que confía.
+# WHY A SEPARATE WORKFLOW. A `pull_request_review` would run the YAML of the pull request's merge
+# commit, not the main branch's; with this minimal signal the judge always runs its own YAML (the
+# main branch's), which is the only one it trusts.
 #
-# PROTECCIÓN. El juez incluye este archivo en `also-protect`: un pull request que lo modifique sin
-# la atestación del dueño se rechaza. Aun así, un pull request del mismo repositorio puede alterar
-# esta señal y esa versión corre; no obtiene poder que no tuviera ya (puede añadir cualquier
-# workflow con `pull_request`) y el juez no se fía de la señal: solo usa su número de PR como pista
-# y relee todo. Sus dos efectos posibles son esperar (del lado seguro) o imitar un estado del juez,
-# que el rastro reporta (R13).
+# PROTECTION. The engine itself protects this file: it is on its fixed list of own files
+# (PLAN-13-R6 §2.1), so a pull request that changes it without the owner's attestation is rejected.
+# Even so, a pull request of the same repository can alter this signal and that version runs; it
+# gains no power it did not already have (it can add any workflow with `pull_request`), and the
+# judge does not trust the signal: it only uses its pull request number as a hint and reads
+# everything again. Its two possible effects are waiting (the safe side) or imitating a judge
+# status, which the trace reports (R13).
 
 name: ai-workflows review signal
 

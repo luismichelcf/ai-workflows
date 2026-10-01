@@ -2,6 +2,7 @@ import { isMap, type Node } from 'yaml';
 
 import type {
   Recipe,
+  RecipeBranches,
   RecipeCondition,
   RecipeHooks,
   RecipeMessages,
@@ -79,6 +80,17 @@ function constructHooks(node: YamlNode): RecipeHooks {
   return { papers: (yamlValue(yamlField(node, 'papers')) ?? []) as string[] };
 }
 
+function constructBranches(node: YamlNode): RecipeBranches {
+  const promotions = yamlSeq(yamlField(node, 'promotions'))?.items ?? [];
+  return {
+    into: (yamlValue(yamlField(node, 'into')) ?? []) as string[],
+    promotions: promotions.map((entry) => ({
+      from: yamlWord(yamlField(entry, 'from')),
+      to: yamlWord(yamlField(entry, 'to')),
+    })),
+  };
+}
+
 function constructMessages(node: YamlNode): RecipeMessages {
   const summary = yamlField(node, 'summary');
   const maxLength = yamlValue(yamlField(node, 'max-length'));
@@ -104,6 +116,7 @@ export function constructRecipe(root: Node): Recipe {
   const labels = yamlField(root, 'labels');
   const pieces = yamlField(root, 'pieces');
   const hooks = yamlField(root, 'hooks');
+  const branches = yamlField(root, 'branches');
   const stageNodes = yamlSeq(yamlField(root, 'stages'))?.items ?? [];
   const owner = yamlField(root, 'owner');
   const agentAccount = yamlField(root, 'agent-account');
@@ -136,5 +149,6 @@ export function constructRecipe(root: Node): Recipe {
     }),
     ...(pieces === null ? {} : { pieces: constructPieces(pieces) }),
     ...(hooks === null ? {} : { hooks: constructHooks(hooks) }),
+    ...(branches === null ? {} : { branches: constructBranches(branches) }),
   };
 }

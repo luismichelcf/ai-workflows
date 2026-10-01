@@ -1,43 +1,52 @@
-# El juez de ai-workflows (PLAN-13-R3 §3, §4 y §6). Este es el workflow que se instala en la rama
-# principal; su acción se fija por SHA (donde dice <ENGINE_SHA>) al publicar una versión.
+# The ai-workflows judge (PLAN-13-R3 §3, §4 and §6; PLAN-13-R6). This workflow lives on the main
+# branch. `init` writes it with the engine action pinned by the sealed SHA of its version (where
+# the template says <ENGINE_SHA>), never by a tag.
 #
-# POR QUÉ `pull_request_target` Y NO `pull_request`. El YAML que corre sale de la rama principal,
-# no de la rama del PR: un PR no puede reemplazar al juez que lo juzga. Es seguro porque ningún paso
-# revisa ni ejecuta el código del PR: este workflow no hace checkout y la acción solo trae la rama
-# principal y lee el PR como objetos de git.
+# WHY `pull_request_target` AND NOT `pull_request`. The YAML that runs comes from the main branch,
+# not from the pull request's branch: a pull request cannot replace the judge that judges it. It is
+# safe because no step checks out or runs the pull request's code: this workflow has no checkout,
+# and the action only fetches trusted branches (the main branch and the target working branch) and
+# reads the pull request as git objects.
 #
-# EL JOB NO SE LLAMA COMO EL ESTADO. Si se llamara `ai-workflows`, GitHub publicaría además un
-# check-run con ese nombre y su marca de «corriendo» competiría con el estado que publica el juez.
+# THE JOB IS NOT NAMED LIKE THE STATUS. If it were called `ai-workflows`, GitHub would also publish
+# a check run with that name, and its "running" mark would compete with the status the judge
+# publishes.
 #
-# EL INTERRUPTOR. Todo cuelga de la variable del repositorio `AI_WORKFLOWS_MODE`: sin valor o `off`
-# publica verde «motor apagado» y no bloquea; `advisory` publica verde y manda el veredicto real al
-# estado consultivo; `on` publica el veredicto real en la principal. El interruptor lo aplica la
-# acción, no este YAML, para que el apagado funcione incluso con el motor roto.
+# THE SWITCH. Everything hangs on the repository variable `AI_WORKFLOWS_MODE`: unset or `off`
+# publishes a green "motor apagado" and blocks nothing; `advisory` publishes green and sends the
+# real verdict to the advisory status; `on` publishes the real verdict on the main status. The
+# action applies the switch, not this YAML, so switching off works even with a broken engine.
 
 name: ai-workflows
 
 on:
-  # `edited` hace que cambiar la rama destino (o volver a la principal con el mismo SHA) dispare
-  # otra corrida: la procedencia no lo dice, porque `pull_request_target` corre el YAML de la
-  # principal sea cual sea el destino.
+  # `edited` makes a change of target branch (or a return to the main branch with the same SHA)
+  # start another run: provenance does not show it, because `pull_request_target` runs the main
+  # branch's YAML whatever the target. `closed` (PLAN-13-R6 §1.2): a pull request that stops
+  # counting makes the judge judge again the others that share its head, so the judge listens to it;
+  # on `closed`, and on `edited` out of the working branches, the action publishes no «juzgando».
   pull_request_target:
-    types: [opened, synchronize, reopened, edited]
+    types: [opened, synchronize, reopened, edited, closed]
   merge_group:
     types: [checks_requested]
-  # El visto bueno llega como comentario del PR: al crearse, editarlo o borrarlo hay que reevaluar.
+  # The owner's sign-off arrives as a pull request comment: creating, editing or deleting one must
+  # judge again.
   issue_comment:
     types: [created, edited, deleted]
-  # Se dispara al terminar los workflows que producen checks exigidos. Agrega aquí los tuyos: el de
-  # `ai-workflows/red-test` va de ejemplo. Un check de una app externa no vuelve a disparar el juez;
-  # para eso queda `workflow_dispatch` o el siguiente evento del PR.
+  # Runs when the workflows that produce required checks finish. Add yours here: the one of
+  # `ai-workflows/red-test` is the example. A check from an external app does not start the judge
+  # again; `workflow_dispatch` or the pull request's next event does.
   #
-  # `ai-workflows review signal` es el workflow mínimo que escucha las revisiones del PR (el botón
-  # «Approve»): como `pull_request_review` correría el YAML del commit de mezcla del PR, el juez no
-  # lo usa y sigue esa señal por `workflow_run`, que corre siempre con el YAML de la rama principal.
-  # La señal no se cree: solo aporta el número del PR, que el juez relee por la API.
+  # `ai-workflows review signal` is the minimal workflow that listens to the pull request's reviews
+  # (the "Approve" button): since `pull_request_review` would run the YAML of the pull request's
+  # merge commit, the judge does not use it and follows that signal through `workflow_run`, which
+  # always runs the main branch's YAML. The signal is not believed: it only gives the pull request
+  # number, which the judge reads again through the API.
   workflow_run:
     workflows: ["ai-workflows red-test", "ai-workflows review signal"]
     types: [completed]
+  # Judging a pull request by hand, by its number: for instance after the broad «no pude leer la
+  # receta» pending (PLAN-13-R6 §6), with `gh workflow run ai-workflows.yml -f pr=<number>`.
   workflow_dispatch:
     inputs:
       pr:
@@ -48,17 +57,22 @@ on:
 permissions: {}
 
 jobs:
-  # El id es `judge`, nunca `ai-workflows`: ver arriba.
+  # The id is `judge`, never `ai-workflows`: see above.
   judge:
     name: Juez de ai-workflows
-    # En un comentario de un PR solo se juzga si trae una orden (`/…`), o si el comentario se editó
-    # o borró (el visto bueno pudo retirarse). En un issue que NO es un PR, se juzga si la acción no
-    # es `created` (editar o borrar un veredicto debe reevaluar) o si el comentario nuevo lleva la
-    # marca `ai-workflows:event`; un comentario nuevo sin la marca no dispara nada; así, la pieza del
-    # issue (su número) se rejuzga cuando aparece un evento de constructor o de veredicto.
+    # On a pull request comment it judges only when the comment carries a command (`/…`) or was
+    # edited or deleted (the sign-off may have been withdrawn). A comment by an account of type
+    # `Bot` never wakes the judge (PLAN-13-R6 §8): the links that Vercel, Supabase or the agents'
+    # app leave would otherwise each start a run and cancel the one in progress; the owner's
+    # commands come from a `User`, and the attestation already requires one. On an issue that is NOT
+    # a pull request it judges when the action is not `created` (editing or deleting a verdict must
+    # judge again) or when the new comment carries the mark `ai-workflows:event`; a new comment
+    # without the mark starts nothing. That way the piece of the issue (its number) is judged again
+    # when a builder or verdict event appears.
     if: >-
       github.event_name != 'issue_comment'
       || (github.event.issue.pull_request
+        && github.event.comment.user.type != 'Bot'
         && (contains(github.event.comment.body, '/') || github.event.action != 'created'))
       || (!github.event.issue.pull_request
         && (contains(github.event.comment.body, 'ai-workflows:event') || github.event.action != 'created'))
@@ -66,13 +80,17 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: read
-      pull-requests: write # el rastro de estados imitados se escribe como comentario del PR
-      issues: read # leer los comentarios del PR (visto bueno, rastro)
-      checks: read # leer los check-runs de `require-check`
-      actions: read # comprobar que una corrida que dice ser el juez existe y es su workflow
-      statuses: write # publicar el `pending` y el veredicto del juez
-    # Una corrida por PR (o por SHA del grupo), y la nueva cancela la vieja: reduce las corridas que
-    # se cruzan. Un verde viejo sobre el mismo SHA solo sobrevive si no arranca ninguna posterior.
+      pull-requests: write # the trace of imitated statuses is written as a pull request comment
+      issues: read # read the pull request's comments (sign-off, trace)
+      checks: read # read the check runs of `require-check`
+      actions: read # check that a run claiming to be the judge exists and is its workflow, and tie the red test to its official run
+      statuses: write # publish the judge's `pending` and its verdict
+    # One run per pull request (or per merge group SHA), and the new one cancels the old one, except
+    # in a merge queue group (PLAN-13-R6 §5): there the runs wait in line instead of being
+    # cancelled. GitHub runs at most one per group at a time and keeps at most one waiting, which
+    # the newest replaces; the replaced one never started, so it publishes nothing, and the one that
+    # runs re-reads everything. A run cancelled by hand publishes nothing more: an earlier verdict of
+    # the same group SHA stays (measured, PLAN-13-R6 §12.1).
     concurrency:
       group: >-
         ai-workflows-${{
@@ -82,16 +100,23 @@ jobs:
           || github.event.merge_group.head_sha
           || github.event.workflow_run.head_sha
         }}
-      cancel-in-progress: true
+      cancel-in-progress: ${{ !(github.event_name == 'merge_group' || (github.event_name == 'workflow_run' && github.event.workflow_run.event == 'merge_group')) }}
     steps:
-      # Ningún checkout aquí: la acción lo hace solo de la rama principal, dentro de sí misma.
+      # No checkout here: the action fetches only trusted branches, inside itself.
+      #
+      # The `branches` input (PLAN-13-R6 §1.2) lists the working branches that receive pieces: the
+      # `branches.into` of the recipe. `init` writes it right after `token`, from the recipe, for
+      # example `branches: "staging, main"`; without it only the main branch is judged. The judge
+      # compares it with the recipe of the main branch and publishes an error when they differ, so
+      # changing `branches.into` in the recipe means editing this input too. Both files are the
+      # judge's own: that pull request needs the owner's `/approve-judge-change`.
       - uses: luismichelcf/ai-workflows@<ENGINE_SHA>
         with:
           task: judge
           mode: ${{ vars.AI_WORKFLOWS_MODE }}
           token: ${{ github.token }}
-          # Los workflows sin privilegios que también son archivos del juez: un PR que toque uno sin
-          # atestación del dueño se rechaza.
+          # The engine already protects these two workflows by itself (PLAN-13-R6 §2.1);
+          # `also-protect` is for a project's extra files, and listing them here changes nothing.
           also-protect: >-
             .github/workflows/ai-workflows-red-test.yml,
             .github/workflows/ai-workflows-review-signal.yml

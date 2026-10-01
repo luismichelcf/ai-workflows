@@ -29,7 +29,13 @@ import { compileRecipe, runProviderInGroup } from '../recipe/compile.js';
 import { recordCleanUpdate, verifyCleanUpdate } from '../recipe/validity.js';
 import { diskProjectFiles, type ChangeDeclared } from '../recipe/facts.js';
 import { pieceOfBranch, readDeclaredKind } from '../judge/pieces.js';
-import { HOOK_LOADER } from '../locks/hook-cli.js';
+import { HOOK_LOADER, HOOK_WATCHDOG_MS } from '../locks/hook-cli.js';
+import {
+  CODEX_HOOK_ORDER,
+  CODEX_HOOK_ORDER_WINDOWS,
+  LOADER_RELATIVE,
+  OPENCODE_PLUGIN_HEADER,
+} from '../locks/client-files.js';
 import type { Recipe } from '../recipe/types.js';
 import type { ProviderRunner } from '../blocks/definition.js';
 import {
@@ -314,6 +320,16 @@ async function gitTop(root: string): Promise<string | undefined> {
 async function resolveBaseRef(root: string, principal: string): Promise<string> {
   const remote = `origin/${principal}`;
   return (await gitOk(root, ['rev-parse', '--verify', `${remote}^{commit}`])) ? remote : principal;
+}
+
+/**
+ * PLAN-13-R6 §1.1 and R34: the branch a piece is measured against locally is the first of
+ * `branches.into` — where its pull request will go — not the repository's principal branch. A
+ * recipe without working branches keeps the principal, exactly as before.
+ */
+function targetBranch(recipe: Recipe, principal: string): string {
+  const into = recipe.branches?.into;
+  return into !== undefined && into.length > 0 ? (into[0] as string) : principal;
 }
 
 /** The principal branch of the repository; `main` when GitHub is not there to say. */
@@ -730,7 +746,9 @@ async function commandRun(args: readonly string[], deps: AgentCliDeps): Promise<
 
   const principal = await principalOf(edges.github);
   if (!principal.ok) return { ok: false, text: principal.text };
-  const baseRef = await resolveBaseRef(root, principal.branch);
+  // R34: with working branches the piece is measured against `into[0]`, the branch its pull request
+  // will target, not against the principal.
+  const baseRef = await resolveBaseRef(root, targetBranch(recipe, principal.branch));
   const runId = randomUUID();
 
   let compiled;
@@ -926,13 +944,16 @@ async function commandSync(args: readonly string[], deps: AgentCliDeps): Promise
   const perform = async (): Promise<CommandOutput> => {
     const principal = await principalOf(edges.github);
     if (!principal.ok) return { ok: false, text: principal.text };
+    // R34: with working branches, a "Update branch" merge is validated against `origin/<into[0]>`,
+    // the branch the piece targets, which is fetched first.
+    const target = targetBranch(recipe, principal.branch);
     try {
       await gitText(root, ['fetch', 'origin', branch]);
-      await gitText(root, ['fetch', 'origin', principal.branch]);
+      await gitText(root, ['fetch', 'origin', target]);
     } catch (error) {
       return { ok: false, text: safeTerminalText(reasonOf(error)) };
     }
-    const baseRef = `origin/${principal.branch}`;
+    const baseRef = `origin/${target}`;
     const remoteTip = await gitText(root, ['rev-parse', `origin/${branch}`]);
     const localHead = await gitText(root, ['rev-parse', 'HEAD']);
     if (remoteTip === localHead) {
@@ -1205,12 +1226,21 @@ async function commandDoctor(deps: AgentCliDeps): Promise<CommandOutput> {
 
   let settingsHook = false;
   let settingsUnreadable = false;
+  let editorHookTimeout: number | undefined;
   try {
     const settings = JSON.parse(readFileSync(join(root, '.claude', 'settings.json'), 'utf8')) as {
-      hooks?: { PreToolUse?: { hooks?: { command?: unknown; args?: unknown }[] }[] };
+      hooks?: { PreToolUse?: { hooks?: { command?: unknown; args?: unknown; timeout?: unknown }[] }[] };
     };
     const groups = settings.hooks?.PreToolUse ?? [];
-    settingsHook = groups.some((group) => (group.hooks ?? []).some(isOurEditorHook));
+    for (const group of groups) {
+      for (const handler of group.hooks ?? []) {
+        if (!isOurEditorHook(handler)) continue;
+        settingsHook = true;
+        if (typeof handler.timeout === 'number' && Number.isInteger(handler.timeout) && handler.timeout > 0) {
+          editorHookTimeout = handler.timeout;
+        }
+      }
+    }
   } catch {
     // A file that cannot be read is said as such, never as a missing hook: they are different
     // problems and the owner fixes them differently.
@@ -1231,6 +1261,103 @@ async function commandDoctor(deps: AgentCliDeps): Promise<CommandOutput> {
       es
         ? 'El gancho del editor o los de git: faltan. Ejecuta: ai-workflows hooks install --apply'
         : 'The editor hook or the git hooks: missing. Run: ai-workflows hooks install --apply',
+    );
+  }
+  // §15: `.claude/settings.local.json` wins over `settings.json` and can switch every hook off.
+  try {
+    const local = JSON.parse(readFileSync(join(root, '.claude', 'settings.local.json'), 'utf8')) as {
+      disableAllHooks?: unknown;
+    };
+    if (local.disableAllHooks === true) {
+      lines.push(
+        es
+          ? 'Aviso: .claude/settings.local.json tiene disableAllHooks en true: apaga todos los ganchos.'
+          : 'Warning: .claude/settings.local.json has disableAllHooks true: it switches every hook off.',
+      );
+    }
+  } catch {
+    // No local settings file (or an unreadable one): nothing to say here.
+  }
+
+  // PLAN-13-R6 §3.3 and §15: doctor reviews Codex and OpenCode too. Codex counts only with OUR
+  // current handler under the matcher `.*` (any other matcher would hide an unknown tool, and an
+  // older or edited order is not the one that is installed) and the shared loader in place;
+  // OpenCode only with our plugin and the loader.
+  const loaderInstalled = existsSync(join(root, LOADER_RELATIVE));
+  let codexInstalled = false;
+  let codexTimeout: number | undefined;
+  try {
+    const codex = JSON.parse(readFileSync(join(root, '.codex', 'hooks.json'), 'utf8')) as {
+      hooks?: {
+        PreToolUse?: {
+          matcher?: unknown;
+          hooks?: { command?: unknown; commandWindows?: unknown; timeout?: unknown }[];
+        }[];
+      };
+    };
+    const groups = codex.hooks?.PreToolUse ?? [];
+    let foundOurs = false;
+    for (const group of groups) {
+      if (group.matcher !== '.*') continue;
+      for (const handler of group.hooks ?? []) {
+        if (handler.command !== CODEX_HOOK_ORDER || handler.commandWindows !== CODEX_HOOK_ORDER_WINDOWS) continue;
+        foundOurs = true;
+        if (typeof handler.timeout === 'number' && Number.isInteger(handler.timeout) && handler.timeout > 0) {
+          codexTimeout = handler.timeout;
+        }
+      }
+    }
+    codexInstalled = loaderInstalled && foundOurs;
+  } catch {
+    codexInstalled = false;
+  }
+  lines.push(
+    codexInstalled
+      ? es
+        ? 'Codex: gancho instalado.'
+        : 'Codex: hook installed.'
+      : es
+        ? 'Codex: falta el gancho o está alterado. Ejecuta: ai-workflows hooks install --apply'
+        : 'Codex: the hook is missing or altered. Run: ai-workflows hooks install --apply',
+  );
+  // §15: the Codex entry carries its own timeout (30 s as installed). At 25 s or less it does not
+  // leave room over the engine's watchdog, so Codex could let a tool through by timeout; it is said.
+  if (codexTimeout !== undefined && codexTimeout * 1000 <= HOOK_WATCHDOG_MS) {
+    lines.push(
+      es
+        ? `Aviso: el tiempo del gancho de Codex (${codexTimeout} s) no supera el vigilante ` +
+          `(${HOOK_WATCHDOG_MS / 1000} s): Codex podría dejar pasar una herramienta por tiempo.`
+        : `Warning: the Codex hook's timeout (${codexTimeout} s) does not exceed the watchdog ` +
+          `(${HOOK_WATCHDOG_MS / 1000} s): Codex could let a tool through by timeout.`,
+    );
+  }
+
+  let opencodeInstalled = false;
+  try {
+    opencodeInstalled =
+      loaderInstalled &&
+      readFileSync(join(root, '.opencode', 'plugins', 'ai-workflows.js'), 'utf8').includes(OPENCODE_PLUGIN_HEADER);
+  } catch {
+    opencodeInstalled = false;
+  }
+  lines.push(
+    opencodeInstalled
+      ? es
+        ? 'OpenCode: gancho instalado.'
+        : 'OpenCode: hook installed.'
+      : es
+        ? 'OpenCode: falta el plugin. Ejecuta: ai-workflows hooks install --apply'
+        : 'OpenCode: the plugin is missing. Run: ai-workflows hooks install --apply',
+  );
+  // PLAN-13-R6 §4 test 7: a hook timeout that does not leave room over the watchdog would let the
+  // tool through by timeout, so it is said and named.
+  if (editorHookTimeout !== undefined && editorHookTimeout * 1000 <= HOOK_WATCHDOG_MS) {
+    lines.push(
+      es
+        ? `Aviso: el tiempo del gancho del editor (${editorHookTimeout} s) no supera el vigilante ` +
+          `(${HOOK_WATCHDOG_MS / 1000} s): el CLI podría dejar pasar una herramienta por tiempo.`
+        : `Warning: the editor hook's timeout (${editorHookTimeout} s) does not exceed the watchdog ` +
+          `(${HOOK_WATCHDOG_MS / 1000} s): the CLI could let a tool through by timeout.`,
     );
   }
 
@@ -1321,8 +1448,10 @@ export async function runAgentCli(argv: readonly string[], deps: AgentCliDeps): 
         text: 'Usage: ai-workflows <run|status|stop|pause|resume|doctor|build|review|sync|finish>',
       };
   }
-  // Every line the owner reads goes through the same terminal sanitiser, whatever command wrote it.
-  return { ok: result.ok, text: safeTerminalText(result.text) };
+  // Every line the owner reads goes through the same terminal sanitiser, whatever command wrote
+  // it. It is applied line by line so the line breaks themselves — the one-line-per-client shape
+  // of `doctor`, the steps of a status — survive instead of being flattened into a single line.
+  return { ok: result.ok, text: result.text.split('\n').map(safeTerminalText).join('\n') };
 }
 
 /** The accounts `gh` is signed in as, best effort: an unreadable answer is an empty list. */

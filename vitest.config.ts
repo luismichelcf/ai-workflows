@@ -8,7 +8,8 @@ export default defineConfig({
     // Windows one can take several seconds, so the default 5 s limit flakes. The limit still
     // bounds a hang.
     testTimeout: 30_000,
-    // tests/github/ needs credentials and runs only through `pnpm test:github`.
-    exclude: ['tests/github/**', 'node_modules/**'],
+    // tests/github/ needs credentials and runs only through `pnpm test:github`; tests/package/
+    // compiles and packs the engine and runs through vitest.package.config.ts.
+    exclude: ['tests/github/**', 'tests/package/**', 'node_modules/**'],
   },
 });

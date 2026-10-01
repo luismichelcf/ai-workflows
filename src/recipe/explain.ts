@@ -19,6 +19,10 @@ interface ExplainWords {
   readonly declaredKind: (line: string, file: string) => string;
   /** PLAN-13-R5 §1.1: where one may write while no piece is open. */
   readonly noPiece: (papers: readonly string[]) => string;
+  /** PLAN-13-R6 §1.1: the working branches that receive pieces. */
+  readonly branchesInto: (names: readonly string[]) => string;
+  /** PLAN-13-R6 §1.1: a pass from one branch to another, which is not a piece. */
+  readonly branchesPromotion: (from: string, to: string) => string;
   readonly github: Readonly<Record<GitHubMode, string>>;
   /** The attestation line of a review block that reads the piece's published verdicts. */
   readonly attestationVerdicts: string;
@@ -34,6 +38,12 @@ interface ExplainWords {
 
 function noneOf(items: readonly string[]): string {
   return `none of ${quoted(items, false).join(', ')}`;
+}
+
+/** A list joined with commas and a final conjunction, for the branches of §1.1 (§15: `or` in English). */
+function orList(items: readonly string[], conjunction: string): string {
+  if (items.length <= 1) return items[0] ?? '';
+  return `${items.slice(0, -1).join(', ')} ${conjunction} ${items[items.length - 1]}`;
 }
 
 const EXPLAIN_WORDS: Record<Language, ExplainWords> = {
@@ -71,6 +81,9 @@ const EXPLAIN_WORDS: Record<Language, ExplainWords> = {
       papers.length === 0
         ? 'Sin una pieza activa no se puede escribir en ninguna carpeta'
         : `Sin una pieza activa solo se puede escribir en: ${papers.join(', ')}`,
+    branchesInto: (names) => `Las piezas entran ${orList(names.map((name) => `a ${name}`), 'o')}.`,
+    branchesPromotion: (from, to) =>
+      `Un paso de ${from} a ${to} no es una pieza: solo se revisa que no toque los archivos del motor.`,
     github: {
       recompute: '   En GitHub: se vuelve a comprobar antes de fusionar.',
       'require-check':
@@ -128,6 +141,9 @@ const EXPLAIN_WORDS: Record<Language, ExplainWords> = {
       papers.length === 0
         ? 'Without an active piece, no folder may be written to'
         : `Without an active piece, the only folders you may write to are: ${papers.join(', ')}`,
+    branchesInto: (names) => `Pieces enter ${orList(names, 'or')}.`,
+    branchesPromotion: (from, to) =>
+      `A pass from ${from} to ${to} is not a piece: only that it does not touch the engine's files is checked.`,
     github: {
       recompute: '   On GitHub: checked again before joining the main line.',
       'require-check':
@@ -228,6 +244,13 @@ export function explainRecipe(recipe: Recipe): string {
 
   if (recipe.hooks !== undefined) {
     lines.push('', words.noPiece(recipe.hooks.papers));
+  }
+
+  if (recipe.branches !== undefined) {
+    lines.push('', words.branchesInto(recipe.branches.into));
+    for (const promotion of recipe.branches.promotions) {
+      lines.push(words.branchesPromotion(promotion.from, promotion.to));
+    }
   }
 
   for (const [index, stage] of stages.entries()) {

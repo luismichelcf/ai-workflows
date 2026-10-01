@@ -27,8 +27,8 @@ este repositorio.
 - **Ningún commit, rama, PR, issue ni cambio de configuración** en `socialabs-margin/Socialabs`
   por esta pieza hasta la rebanada 7, que abre su propio issue allá con aprobación del dueño.
   Leer su código para entenderlo está permitido.
-- Se prueba en `socialabs-margin/ai-workflows-pruebas` (intentos de trampa) y, en la rebanada 6,
-  en una copia privada de Socialabs **sin ninguna llave ni destino de producción** (R07, EG-01).
+- Se prueba en `socialabs-margin/ai-workflows-pruebas`. Ya no hay copia de Socialabs (R24): la
+  rebanada 7 instala solo el juez en modo consulta, con su propio issue allá.
 - Socialabs sigue fijado a la versión 0.3.0 del motor. No publiques 1.0.0 antes de la rebanada 6.
 
 ## Repositorio público
@@ -62,9 +62,9 @@ Fuera: documentación y configuración sin comportamiento.
 - El orquestador escribe pruebas, encargos y documentación; el constructor escribe el código. El
   orquestador revisa el diff, corre la puerta él mismo y commitea. **Ningún «todo verde» de un
   constructor cuenta**, ni un exit 0.
-- **Parvada en cada rebanada**, sobre el cambio final y antes de fusionar; sus bloqueantes se
-  resuelven y un cambio posterior se revisa por su delta. Ningún constructor se aprueba a sí mismo
-  ni delega.
+- **Una parvada completa por rebanada** (R25), sobre el cambio final y antes de fusionar; sus
+  bloqueantes se resuelven. Un arreglo posterior lo revisa un solo revisor por su delta, y solo si
+  toca la frontera de seguridad. Ningún constructor se aprueba a sí mismo ni delega.
 - El encargo al constructor lleva objetivo, sección del plan, carpeta absoluta, archivos
   autorizados, exclusiones, pruebas y estado del diff, y termina con: «Eres el constructor
   delegado; el orquestador conserva el control. No delegues este encargo ni actúes como

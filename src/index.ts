@@ -42,6 +42,7 @@ export {
   type StageOutcome as JudgeStageOutcome,
   type JudgeVerdict,
 } from './judge/judge.js';
+export { ENGINE_PROTECTED_PATHS } from './judge/own-files.js';
 export { createEngine } from './engine.js';
 export {
   launchInGroup,
@@ -223,6 +224,8 @@ export type { Recipe, RecipeStage, RecipeCondition, RecipeError, RecipePieces } 
 export type { BlockManifest, InputSpec, ValidWhile, ServerMode } from './blocks/manifest.js';
 export {
   parseHookInput,
+  parseClientInput,
+  renderClientOutput,
   decideToolUse,
   renderHookOutput,
   handleHook,
