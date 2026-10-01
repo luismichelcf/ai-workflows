@@ -622,7 +622,7 @@ comportamiento; el orquestador escribe las pruebas rojas y el constructor las po
 - [x] **4. Etapas finales genéricas:** revisión independiente, visto bueno, vista previa, QA de
       navegador, fusión, post-merge, limpieza y mensajes al dueño por plantilla. (CN-06, CN-12, CN-13)
 - [x] **5. Suite negativa completa** en `ai-workflows-pruebas` contra GitHub real, con informe.
-- [ ] **6. Motor completo y v1.0.0** (R24–R29, [PLAN-13-R6](PLAN-13-R6.md)): ramas de trabajo y
+- [x] **6. Motor completo y v1.0.0** (R24–R29, [PLAN-13-R6](PLAN-13-R6.md)): ramas de trabajo y
       pases, archivos propios, ganchos de Codex y OpenCode, los menores de §12, `init` completo,
       revisión adversarial de la frontera de seguridad, evidencia real de lo nuevo y publicar
       v1.0.0.
