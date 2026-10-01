@@ -1370,8 +1370,8 @@ function projectManifest(original: string, leftPad: string, engine?: string): st
 
 /** Another release of the engine in the same URL: only the version in the path changes. */
 function otherEngineRelease(url: string): string {
-  const other = url.replace(/\/releases\/download\/v[^/]+\/ai-workflows-[^/]+\.tgz$/, '/releases/download/v0.3.1/ai-workflows-0.3.1.tgz');
-  if (other === url) throw new Error(`the engine of main is not a release URL other than v0.3.1: ${url}`);
+  const other = url.replace(/\/releases\/download\/v[^/]+\/ai-workflows-[^/]+\.tgz$/, '/releases/download/v0.2.1/ai-workflows-0.2.1.tgz');
+  if (other === url) throw new Error(`the engine of main is not a release URL other than v0.2.1: ${url}`);
   return other;
 }
 
