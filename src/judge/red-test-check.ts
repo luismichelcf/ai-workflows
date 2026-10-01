@@ -585,6 +585,68 @@ export async function runRedTestCheck(
   }
 
   const spanish = languageOf(checked.recipe.locale) === 'es';
+  const mainRecipe = checked.recipe;
+
+  // §1.2: the working branches come from the recipe of the principal, never from the target's, so
+  // no branch can declare itself judged. Without a `branches` section only the principal receives
+  // pieces, exactly as before. §1.6: a merge group is only judged when its base is the principal.
+  const into = mainRecipe.branches?.into ?? [branch];
+  const allowed = eventName === 'merge_group' ? [branch] : into;
+
+  // §1.2: for a PR into a working branch, the base of trust is the live tip of that branch, and the
+  // recipe that decides the stages is the one at that tip. Missing or invalid there is technical
+  // with the motive; it never falls back to the principal's recipe.
+  interface BranchBase {
+    readonly trusted: string;
+    readonly recipe: Recipe;
+  }
+  const bases = new Map<string, BranchBase | { readonly failure: string }>();
+  bases.set(branch, { trusted, recipe: mainRecipe });
+
+  const extras = new Set(
+    collected.prs
+      .map((pr) => pr.baseRef)
+      .filter((name) => name !== branch && allowed.includes(name)),
+  );
+  const tips: string[] = [];
+  for (const name of extras) {
+    try {
+      const tip = await deps.github.branchHead(name);
+      bases.set(name, { trusted: tip, recipe: mainRecipe });
+      tips.push(tip);
+    } catch (error) {
+      bases.set(name, { failure: `No se pudo leer la punta de ${name}: ${reasonOf(error)}` });
+    }
+  }
+  if (tips.length > 0) {
+    try {
+      await deps.fetchObjects(tips);
+    } catch (error) {
+      return {
+        ok: false,
+        summary: renderSummary([], mainRecipe.locale, `No se pudieron traer los commits a juzgar: ${reasonOf(error)}`),
+      };
+    }
+  }
+  for (const name of extras) {
+    const prepared = bases.get(name);
+    if (prepared === undefined || 'failure' in prepared) continue;
+    const branchTrusted = prepared.trusted;
+    const branchText = await showFile(root, branchTrusted, RECIPE_PATH);
+    if (branchText === undefined) {
+      bases.set(name, { failure: `No hay receta legible en ${branchTrusted}:${RECIPE_PATH}.` });
+      continue;
+    }
+    const branchChecked = await checkRecipe(branchText, RECIPE_PATH, { root });
+    if (!branchChecked.ok) {
+      const first = branchChecked.errors[0];
+      bases.set(name, {
+        failure: `La receta de ${branchTrusted} no es válida: ${first?.message ?? 'error desconocido'}`,
+      });
+      continue;
+    }
+    bases.set(name, { trusted: branchTrusted, recipe: branchChecked.recipe });
+  }
 
   // §5: the recipe comes from the live head of the main branch, which in a merge group must be an
   // ancestor of the group's SHA. Bringing the objects first is what makes this checkable.
@@ -603,17 +665,13 @@ export async function runRedTestCheck(
     }
   }
 
-  const context: RunContext = {
-    root,
-    recipe: checked.recipe,
-    signal: new AbortController().signal,
-    environment: filteredEnvironment(),
-  };
+  const signal = new AbortController().signal;
+  const environment = filteredEnvironment();
 
   const outcomes: PrOutcome[] = [];
   let allOk = true;
   for (const pr of collected.prs) {
-    if (pr.baseRef !== branch) {
+    if (!allowed.includes(pr.baseRef)) {
       // §3.1: a pull request into another branch is not tested, and the check never passes on
       // that: it names the target branch and leaves the run red, so a retargeted PR cannot keep a
       // green that was never tested.
@@ -628,7 +686,21 @@ export async function runRedTestCheck(
       allOk = false;
       continue;
     }
-    const outcome = await checkPullRequest(context, pr, trusted);
+    const base = bases.get(pr.baseRef);
+    if (base === undefined || 'failure' in base) {
+      // §1.2: the recipe of the target branch is missing or invalid; the verdict is technical with
+      // the motive, never a fallback to the principal's recipe.
+      outcomes.push({
+        number: pr.number,
+        headRef: pr.headRef,
+        failure: base === undefined ? `No se pudo preparar la rama ${pr.baseRef}.` : base.failure,
+        stages: [],
+      });
+      allOk = false;
+      continue;
+    }
+    const context: RunContext = { root, recipe: base.recipe, signal, environment };
+    const outcome = await checkPullRequest(context, pr, base.trusted);
     outcomes.push(outcome);
     if (outcome.failure !== undefined) allOk = false;
   }
