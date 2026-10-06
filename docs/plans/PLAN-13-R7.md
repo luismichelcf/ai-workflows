@@ -2,7 +2,7 @@
 
 Diseño de la rebanada 7 de [PLAN-13](PLAN-13.md) (issue #13), con las decisiones del dueño R24,
 R30 y R36–R42. Autor: Claude Opus 5.5 (orquestador). Revisor del diseño: GPT-6 Sol `high`.
-Versión 2 · 1-oct-2026 · **Aprobado** por GPT-6 Sol `high` en 2 rondas (§13).
+Versión 3 · 6-oct-2026 · en revisión (ajuste por los cambios de Socialabs del 2 al 6-oct, R45).
 
 ## En tres líneas
 
@@ -25,7 +25,7 @@ dueño, R01):
 - la observación de dos semanas (R39) y su informe.
 
 Fuera: la parte junto al agente (llega al encender, R24); el workflow de la prueba roja (R37);
-retirar lo dormido de 0.3.0 (R40); la dependencia del motor en `package.json` (sigue en 0.3.0, R04);
+lo dormido de 0.3.0 ya lo retiró Socialabs (ADR 0286, R45);
 cambios a las protecciones (`rulesets` 20211188 y 23950317 no cambian); encender (otra decisión).
 
 ## 1. El proceso de Socialabs que copia la receta (R10, R30)
@@ -49,22 +49,25 @@ Fuente: `CLAUDE.md` de `origin/staging` y los ADR vigentes (0094, 0110, 0141, 01
 no la escribe; no se inventa la regla, §1.4 del reconocimiento): lo visual que no se distingue por
 rutas cuenta como `comportamiento` y se anota como aviso falso conocido.
 
-**Clases, con las dos estructuras de carpetas (R42).** v1.0.0 no admite llaves `{a,b}` en los
-patrones: cada ruta va por separado (receta completa en el Anexo A).
-- dinero: `lib/calc/**`, los nombres de dinero de hoy (nomina, pago, sueldo, compensacion,
-  rentabilidad, margen, costo, bolsa, dinero, cierre, cada uno como archivo y como carpeta) y las
-  carpetas `domain` de rentabilidad, pagos variables, desempeño y tiempo de la estructura nueva;
-- migraciones de base de datos (`sql`): `supabase/migrations/**` y `ramas/supabase/migrations/**`. Es
-  una clase **aparte** de permisos: ADR 0094 pide la parvada para el SQL de permisos, no para toda
-  migración, y eso no se distingue por la ruta; el informe revisa a mano el contenido de cada
-  migración marcada (§4);
-- permisos: nombres auth/login/permiso/permission/rls y `src/infrastructure/permisos/**`,
-  `src/infrastructure/auth/**`;
+**Clases (R42, ajustadas por R45).** La estructura nueva ya entró (ADR 0276, 0287): front en
+`src/features/<dominio>/` con el cálculo puro en `services/*.calc.ts`, backend propio en
+`src/api/<dominio>/`, nombres en inglés para lo nuevo. La receta reconoce lo viejo y lo nuevo (el
+Anexo A la trae completa; v1.0.0 no admite llaves `{a,b}`):
+- dinero: `lib/calc/**`, todo `src/features/*/services/*.calc.ts`, los `services` de las features de
+  dinero (closures, closure-history, compensation, payroll, profitability, pagos-variables,
+  rentabilidad, desempeno, kpi-bonus), el backend `src/api/` de closures, compensation, payroll,
+  profitability y kpi-bonus, y los nombres de dinero en español y en inglés (nomina/payroll,
+  pago/payment, sueldo/salary, compensacion/compensation, rentabilidad/profitability,
+  margen/margin, costo, bolsa/bonus, dinero, cierre/closure);
+- migraciones de base de datos (`sql`): `supabase/migrations/**` (la copia en `ramas/` se retiró);
+  clase aparte de permisos, con revisión a mano del contenido (§4);
+- permisos: nombres auth/login/permiso/permission/rls y `src/infrastructure/supabase/**` (clientes y
+  vía privilegiada);
 - producción: los workflows de producción por nombre, scripts de migrar, `supabase/functions/**`,
   `vercel.json`;
-- escritorio: `electron/**` y `electron-builder.yml` (el `CHANGELOG-escritorio.md` es papel, no
-  núcleo);
-- visible: `app/**`, `components/**`, `public/**`, `src/features/*/components/**`, `src/shared/ui/**`.
+- escritorio: `electron/**` y `electron-builder.yml`;
+- visible: `app/**`, `components/**`, `public/**`, `src/features/*/components/**`,
+  `src/shared/components/**`, `src/infrastructure/i18n/**` (textos).
 
 v1.0.0 no puede excluir rutas de una clase: un archivo de pruebas o de pantalla con un nombre de
 dinero (`historial-margen.test.ts`, `cierre/page.tsx`) cuenta como dinero aunque ADR 0094 exime
@@ -78,7 +81,7 @@ receta lleva las de su propuesta.
 **Avisos falsos conocidos durante la consulta** (no son reglas nuevas; se cuentan aparte, R41):
 papeles sin número de issue (`docs/<tema>`); ramas de arreglo urgente sin número
 (`hotfix/<nombre>`, que CLAUDE.md permite); traídas de `main` a `staging` que no salen de `main`;
-lo visual que no se distingue por rutas; archivos de pruebas o pantallas con nombres de dinero; `build-desktop-prueba.yml` contado como producción. El
+lo visual que no se distingue por rutas; archivos de pruebas o pantallas con nombres de dinero; `build-desktop-prueba.yml` contado como producción; **los pases a producción desde `release/<fecha>`** (ADR 0272), que v1.0.0 solo reconoce como pase si la rama se llama exactamente igual que en la receta, así que cada publicación aparece «sin pieza». El
 juez los marca «sin pieza» o les pide etapas que no tocan; el informe los separa y van a v1.0.1.
 
 
@@ -102,8 +105,9 @@ que incluye un pase (ADR 0238) no se puede expresar en v1.0.0: es candidata a v1
 4. Excepción en `tests/ci/disparadores-workflows.test.ts` solo para `ai-workflows.yml`, con su prueba
    roja primero (proceso de Socialabs), y el ADR (número siguiente a 0264, índice regenerado).
 5. PR a `staging` según el proceso de Socialabs (toca `.github/workflows/**`: producción → parvada
-   antes de armar la fusión, ADR 0141). Luego el pase `staging → main`: se pregunta al dueño antes
-   (ADR 0258) y el dueño lo fusiona con el botón.
+   antes de armar la fusión, ADR 0141). Llega a `main` con la siguiente publicación: se pregunta al
+   dueño antes (ADR 0258), sale de una rama `release/<fecha>` copiada de `staging` (ADR 0272) y el
+   dueño la fusiona con el botón.
 6. Con el juez en `main`, `gh variable set AI_WORKFLOWS_MODE --body advisory` en Socialabs (cambio de
    configuración aprobado en el issue). Sin la variable, el juez publica «motor apagado».
 7. Comprobación real: el siguiente PR hacia `staging` recibe `ai-workflows` en verde «modo
@@ -191,6 +195,21 @@ agent-account: "socialabs-agentes[bot]"   # la aplicación de los agentes (R21);
 classify:
   dinero:
     - "lib/calc/**"
+    - "src/features/*/services/*.calc.ts"
+    - "src/features/closures/services/**"
+    - "src/features/closure-history/services/**"
+    - "src/features/compensation/services/**"
+    - "src/features/payroll/services/**"
+    - "src/features/profitability/services/**"
+    - "src/features/pagos-variables/services/**"
+    - "src/features/rentabilidad/services/**"
+    - "src/features/desempeno/services/**"
+    - "src/features/kpi-bonus/services/**"
+    - "src/api/closures/**"
+    - "src/api/compensation/**"
+    - "src/api/payroll/**"
+    - "src/api/profitability/**"
+    - "src/api/kpi-bonus/**"
     - "**/*nomina*"
     - "**/*nomina*/**"
     - "**/*pago*"
@@ -211,13 +230,24 @@ classify:
     - "**/*dinero*/**"
     - "**/*cierre*"
     - "**/*cierre*/**"
-    - "src/features/rentabilidad/domain/**"
-    - "src/features/pagos-variables/domain/**"
-    - "src/features/desempeno/domain/**"
-    - "src/features/tiempo/domain/**"
+    - "**/*payroll*"
+    - "**/*payroll*/**"
+    - "**/*payment*"
+    - "**/*payment*/**"
+    - "**/*salary*"
+    - "**/*salary*/**"
+    - "**/*compensation*"
+    - "**/*compensation*/**"
+    - "**/*profitability*"
+    - "**/*profitability*/**"
+    - "**/*margin*"
+    - "**/*margin*/**"
+    - "**/*bonus*"
+    - "**/*bonus*/**"
+    - "**/*closure*"
+    - "**/*closure*/**"
   sql:
     - "supabase/migrations/**"
-    - "ramas/supabase/migrations/**"
   permisos:
     - "**/*auth*"
     - "**/*auth*/**"
@@ -229,8 +259,7 @@ classify:
     - "**/*permission*/**"
     - "**/*rls*"
     - "**/*rls*/**"
-    - "src/infrastructure/permisos/**"
-    - "src/infrastructure/auth/**"
+    - "src/infrastructure/supabase/**"
   produccion:
     - ".github/workflows/build-desktop*.yml"
     - ".github/workflows/database-migrations*.yml"
@@ -248,7 +277,8 @@ classify:
     - "components/**"
     - "public/**"
     - "src/features/*/components/**"
-    - "src/shared/ui/**"
+    - "src/shared/components/**"
+    - "src/infrastructure/i18n/**"
 
 kinds:
   names: [comportamiento, solo-visual, configuracion, papeles]
