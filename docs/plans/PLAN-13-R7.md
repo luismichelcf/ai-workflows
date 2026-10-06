@@ -131,8 +131,10 @@ que incluye un pase (ADR 0238) no se puede expresar en v1.0.0: es candidata a v1
 6. Con el juez en `main`, `gh variable set AI_WORKFLOWS_MODE --body advisory` en Socialabs (cambio de
    configuración aprobado en el issue). Sin la variable, el juez publica «motor apagado».
 7. Comprobación real: el siguiente PR hacia `staging` recibe `ai-workflows` en verde «modo
-   consulta» y su veredicto en `ai-workflows/advisory`; ningún `ruleset` cambia; `todo-verde`
-   sigue siendo lo único exigido.
+   consulta»; y, después de que termina «Validación de pull request», una corrida del juez por
+   `workflow_run` deja en `ai-workflows/advisory` un veredicto que no es pendiente (sin eso, la
+   corrida por `pull_request_target` llega antes de `todo-verde` y toda la tabla diría «pendiente en
+   checks»). Ningún `ruleset` cambia; `todo-verde` sigue siendo lo único exigido.
 
 **Apagado:** `gh variable set AI_WORKFLOWS_MODE --body off`, al instante y sin PR; o borrar los dos
 workflows en un PR (archivos propios: con la atestación del dueño).
@@ -179,7 +181,8 @@ al dueño de si encender.
 ## 7. Propuestas para después (no en esta rebanada)
 
 - v1.0.1 con lo que la observación confirme (prueba roja que se calla en consulta y no juzga pases;
-  papeles sin pieza; parvada en el pase; exclusiones en `classify`).
+  papeles sin pieza; parvada en el pase; exclusiones en `classify`; el filtro de comentarios del juez,
+  que despierta con cualquier `/` —una dirección web basta— y gasta minutos).
 - DRY y SOLID (R44): la siguiente pieza del motor (v1.1), después de la observación: un paso automático opcional por receta (duplicados, tamaño, fronteras; frena solo lo nuevo) y un ángulo «arquitectura» de la parvada con lista concreta.
 
 ## 13. Bitácora de revisión
@@ -214,6 +217,13 @@ stages».
 que los 45 scripts existen, son alcanzables y no importan nada fuera de la lista. No bloqueante
 aceptado: `src/features/tiempo/services/discipline.calc.ts` (medición de desempeño, no pago) queda
 entre los avisos falsos conocidos de §2.
+
+**Parvada de la instalación (Socialabs #1451, 6-oct):** correctitud y contrato del motor
+APRUEBAN; seguridad y pruebas piden endurecer la excepción de la prueba de disparadores (permisos por
+trabajo, otras formas de leer secretos, SHA exacto, contenedores, entradas, y `workflow_run` e
+`issue_comment` también reservados). Aplicado con prueba roja primero y cada candado vigilado por una
+prueba; revisión del delta por un revisor (R25). Además: la comprobación real (§3.7) exige el
+veredicto por `workflow_run` y el filtro de comentarios va a v1.0.1.
 
 ## Anexo A. La receta de Socialabs (borrador validado con v1.0.0)
 
