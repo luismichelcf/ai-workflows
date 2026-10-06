@@ -2,7 +2,7 @@
 
 Diseño de la rebanada 7 de [PLAN-13](PLAN-13.md) (issue #13), con las decisiones del dueño R24,
 R30 y R36–R42. Autor: Claude Opus 5.5 (orquestador). Revisor del diseño: GPT-6 Sol `high`.
-Versión 3 · 6-oct-2026 · en revisión (ajuste por los cambios de Socialabs del 2 al 6-oct, R45).
+Versión 4 · 6-oct-2026 · en revisión (ajuste por los cambios de Socialabs del 2 al 6-oct, R45, y la ronda 3).
 
 ## En tres líneas
 
@@ -30,8 +30,9 @@ cambios a las protecciones (`rulesets` 20211188 y 23950317 no cambian); encender
 
 ## 1. El proceso de Socialabs que copia la receta (R10, R30)
 
-Fuente: `CLAUDE.md` de `origin/staging` y los ADR vigentes (0094, 0110, 0141, 0154, 0170, 0175,
-0204, 0230, 0236–0264). Lo que el juez puede comprobar en el servidor se declara como etapa con
+Fuente: `CLAUDE.md` de `origin/staging` (leído en `79ce4dba`, 6-oct 21:27 UTC) y los ADR vigentes
+(0094, 0110, 0141, 0154, 0170, 0175, 0204, 0230, 0236–0292, en especial 0258, 0272, 0276, 0279,
+0286, 0287 y 0288). Lo que el juez puede comprobar en el servidor se declara como etapa con
 `server:`; lo que no, se declara en el ADR como «no impuesto» con su motivo.
 
 | Regla vigente | En la receta |
@@ -56,15 +57,25 @@ Anexo A la trae completa; v1.0.0 no admite llaves `{a,b}`):
 - dinero: `lib/calc/**`, todo `src/features/*/services/*.calc.ts`, los `services` de las features de
   dinero (closures, closure-history, compensation, payroll, profitability, pagos-variables,
   rentabilidad, desempeno, kpi-bonus), el backend `src/api/` de closures, compensation, payroll,
-  profitability y kpi-bonus, y los nombres de dinero en español y en inglés (nomina/payroll,
+  profitability, kpi-bonus y dashboard (calcula pagos y proyecciones), todo
+  `src/api/*/services/*.calc.ts` (donde ADR 0287 pone el cálculo nuevo), y los nombres de dinero en español y en inglés (nomina/payroll,
   pago/payment, sueldo/salary, compensacion/compensation, rentabilidad/profitability,
   margen/margin, costo, bolsa/bonus, dinero, cierre/closure);
 - migraciones de base de datos (`sql`): `supabase/migrations/**` (la copia en `ramas/` se retiró);
   clase aparte de permisos, con revisión a mano del contenido (§4);
-- permisos: nombres auth/login/permiso/permission/rls y `src/infrastructure/supabase/**` (clientes y
-  vía privilegiada);
-- producción: los workflows de producción por nombre, scripts de migrar, `supabase/functions/**`,
-  `vercel.json`;
+- permisos: nombres auth/login/permiso/permission/rls, `src/infrastructure/supabase/**` y
+  `lib/supabase/**` (clientes y vía privilegiada), `lib/server/**`, todo `src/api/*/repository/**`
+  (el acceso a datos del backend), `app/**/actions.ts`, y los servicios de `src/api` que hoy usan la
+  vía privilegiada (motor-context, compensation-reader, own-money, team-component,
+  profitability-summary, time-team; lista tomada de `79ce4dba`). Un archivo nuevo con la vía
+  privilegiada fuera de estas rutas no se detecta: v1.0.0 clasifica por rutas, no por contenido; la
+  observación lo busca a mano (§4);
+- producción: los workflows de producción por nombre, `supabase/functions/**`, `vercel.json` y los
+  scripts que esos workflows corren con lo que importan: `scripts/migrar*`, `deriva-esquema`,
+  los de publicar escritorio (clean-release, generar-config-escritorio, comprobar-salud-web,
+  atestar-release, publish-update, probar-actualizacion-mac, verificar-arranque,
+  verificar-nativos), `scripts/lib/**`, `scripts/latido/**`, `scripts/tablero/**` y
+  `scripts/staging-copia/**`;
 - escritorio: `electron/**` y `electron-builder.yml`;
 - visible: `app/**`, `components/**`, `public/**`, `src/features/*/components/**`,
   `src/shared/components/**`, `src/infrastructure/i18n/**` (textos).
@@ -73,15 +84,17 @@ v1.0.0 no puede excluir rutas de una clase: un archivo de pruebas o de pantalla 
 dinero (`historial-margen.test.ts`, `cierre/page.tsx`) cuenta como dinero aunque ADR 0094 exime
 pruebas y pantallas. Se anota como aviso falso conocido (candidato a v1.0.1).
 
-Las rutas exactas de la estructura nueva se ajustan al ADR de Omar cuando exista; mientras, la
-receta lleva las de su propuesta.
+Las rutas salen de la estructura que ya entró (ADR 0276/0287, `79ce4dba`); se vuelven a comprobar
+contra `origin/staging` justo antes de instalar.
 
 ## 2. Lo que el juez no impone y se declara
 
 **Avisos falsos conocidos durante la consulta** (no son reglas nuevas; se cuentan aparte, R41):
 papeles sin número de issue (`docs/<tema>`); ramas de arreglo urgente sin número
 (`hotfix/<nombre>`, que CLAUDE.md permite); traídas de `main` a `staging` que no salen de `main`;
-lo visual que no se distingue por rutas; archivos de pruebas o pantallas con nombres de dinero; `build-desktop-prueba.yml` contado como producción; **los pases a producción desde `release/<fecha>`** (ADR 0272), que v1.0.0 solo reconoce como pase si la rama se llama exactamente igual que en la receta, así que cada publicación aparece «sin pieza». El
+lo visual que no se distingue por rutas; archivos de pruebas o pantallas con nombres de dinero; **los textos de
+pantalla con nombre de dinero** (`src/infrastructure/i18n/locales/*/payroll.json` y similares
+cuentan como `dinero` además de `visible`, porque v1.0.0 no excluye rutas de una clase); `build-desktop-prueba.yml` contado como producción; **los pases a producción desde `release/<fecha>`** (ADR 0272), que v1.0.0 solo reconoce como pase si la rama se llama exactamente igual que en la receta, así que cada publicación aparece «sin pieza». El
 juez los marca «sin pieza» o les pide etapas que no tocan; el informe los separa y van a v1.0.1.
 
 
@@ -103,7 +116,9 @@ que incluye un pase (ADR 0238) no se puede expresar en v1.0.0: es candidata a v1
 3. En el workflow del juez, `workflow_run.workflows` nombra `"Validación de pull request"` (el
    `name:` de `pull-request-validation.yml`, único productor de `todo-verde`) y la señal de revisión.
 4. Excepción en `tests/ci/disparadores-workflows.test.ts` solo para `ai-workflows.yml`, con su prueba
-   roja primero (proceso de Socialabs), y el ADR (número siguiente a 0264, índice regenerado).
+   roja primero (proceso de Socialabs), y el ADR con un número único comprobado contra
+   `origin/staging` y `origin/main` justo antes de crearlo (hoy la última es 0292), índice
+   regenerado.
 5. PR a `staging` según el proceso de Socialabs (toca `.github/workflows/**`: producción → parvada
    antes de armar la fusión, ADR 0141). Llega a `main` con la siguiente publicación: se pregunta al
    dueño antes (ADR 0258), sale de una rama `release/<fecha>` copiada de `staging` (ADR 0272) y el
@@ -176,6 +191,13 @@ changelog fuera de escritorio; el informe como tabla por PR clasificada a mano.
 conocido (§2); los rulesets 20211188 y 23950317 se confirmaron el 1-oct en el reconocimiento (solo
 `todo-verde`, sin cola) y se vuelven a comprobar justo antes de instalar.
 
+**Ronda 3 — misma sesión (versión 3, tras R45):** REVISE, 4 bloqueantes, aceptados: dinero del
+backend nuevo (`src/api/dashboard/**` y todo `src/api/*/services/*.calc.ts`) y el acceso a datos
+privilegiado como permisos; los scripts que corren los workflows de producción (latido, tablero,
+publicar escritorio y sus ayudantes); los textos con nombre de dinero como aviso falso conocido; el
+número del ADR comprobado contra ambas ramas (la última hoy es 0292) y las fuentes de §1
+actualizadas. Receta revalidada: «valid recipe, 4 stages».
+
 ## Anexo A. La receta de Socialabs (borrador validado con v1.0.0)
 
 Vive en Socialabs (`.ai-workflows/pipeline.yml`), no en el motor (R05). Se copia aquí solo para la revisión del diseño.
@@ -210,6 +232,8 @@ classify:
     - "src/api/payroll/**"
     - "src/api/profitability/**"
     - "src/api/kpi-bonus/**"
+    - "src/api/dashboard/**"
+    - "src/api/*/services/*.calc.ts"
     - "**/*nomina*"
     - "**/*nomina*/**"
     - "**/*pago*"
@@ -260,6 +284,16 @@ classify:
     - "**/*rls*"
     - "**/*rls*/**"
     - "src/infrastructure/supabase/**"
+    - "src/api/*/repository/**"
+    - "lib/supabase/**"
+    - "lib/server/**"
+    - "src/api/closures/services/motor-context.service.ts"
+    - "src/api/compensation/services/compensation-reader.service.ts"
+    - "src/api/payroll/services/own-money.service.ts"
+    - "src/api/payroll/services/team-component.service.ts"
+    - "src/api/profitability/services/profitability-summary.service.ts"
+    - "src/api/time-team/services/time-team.service.ts"
+    - "app/**/actions.ts"
   produccion:
     - ".github/workflows/build-desktop*.yml"
     - ".github/workflows/database-migrations*.yml"
@@ -267,6 +301,19 @@ classify:
     - ".github/workflows/tablero.yml"
     - ".github/workflows/vigilar-freno-sesion.yml"
     - "scripts/migrar*"
+    - "scripts/deriva-esquema.mjs"
+    - "scripts/clean-release.mjs"
+    - "scripts/generar-config-escritorio.mjs"
+    - "scripts/comprobar-salud-web.mjs"
+    - "scripts/atestar-release.mjs"
+    - "scripts/publish-update.mjs"
+    - "scripts/probar-actualizacion-mac.mjs"
+    - "scripts/verificar-arranque.mjs"
+    - "scripts/verificar-nativos.mjs"
+    - "scripts/lib/**"
+    - "scripts/latido/**"
+    - "scripts/tablero/**"
+    - "scripts/staging-copia/**"
     - "supabase/functions/**"
     - "vercel.json"
   escritorio:
