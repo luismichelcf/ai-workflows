@@ -124,6 +124,11 @@ frenado con razón, frenado por error (y si es un aviso falso conocido de §2), 
 corridas repetidas sobre el mismo PR cuentan una sola vez, por su versión final. Las migraciones
 marcadas se revisan a mano: si tocan permisos (grants, políticas, RLS), cuentan para la parvada.
 
+La tabla lleva también el **costo en tiempo** (R43): las etapas que el motor habría pedido de estar
+encendido, cuánto habrían tardado (la prueba roja y la puerta, por los registros de las corridas; la
+parvada, por la hora de su comentario frente a la del último empuje) y cuántas vueltas extra habrían
+causado los rechazos, separando los rechazos por error.
+
 Cada viernes, en el issue de la rebanada 7, tres líneas con los conteos de la tabla y los minutos de
 Actions del juez (de la API de corridas del workflow); la tabla completa va como archivo en el
 issue. Nada se escribe en los PRs de otros. Al final: la lista de arreglos para v1.0.1 y la pregunta
@@ -151,10 +156,7 @@ al dueño de si encender.
 
 - v1.0.1 con lo que la observación confirme (prueba roja que se calla en consulta y no juzga pases;
   papeles sin pieza; parvada en el pase; exclusiones en `classify`).
-- DRY/SOLID: las reglas medibles (duplicados, tamaño, fronteras entre funcionalidades) viven en la
-  verificación de Socialabs (ADR de Omar) y el juez solo exige `todo-verde`; lo no medible, como
-  ángulo «arquitectura» de la parvada con lista concreta, se propone como cambio de receta aparte
-  después de la observación (R10).
+- DRY y SOLID (R44): la siguiente pieza del motor (v1.1), después de la observación: un paso automático opcional por receta (duplicados, tamaño, fronteras; frena solo lo nuevo) y un ángulo «arquitectura» de la parvada con lista concreta.
 
 ## 13. Bitácora de revisión
 
