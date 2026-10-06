@@ -2,7 +2,7 @@
 
 Diseño de la rebanada 7 de [PLAN-13](PLAN-13.md) (issue #13), con las decisiones del dueño R24,
 R30 y R36–R42. Autor: Claude Opus 5.5 (orquestador). Revisor del diseño: GPT-6 Sol `high`.
-Versión 5 · 6-oct-2026 · en revisión (ajuste por los cambios de Socialabs del 2 al 6-oct, R45, y las rondas 3 y 4).
+Versión 5 · 6-oct-2026 · **aprobado por Sol** (ronda 5), tras el ajuste por los cambios de Socialabs del 2 al 6-oct (R45).
 
 ## En tres líneas
 
@@ -98,7 +98,8 @@ papeles sin número de issue (`docs/<tema>`); ramas de arreglo urgente sin núme
 (`hotfix/<nombre>`, que CLAUDE.md permite); traídas de `main` a `staging` que no salen de `main`;
 lo visual que no se distingue por rutas; archivos de pruebas o pantallas con nombres de dinero; **los textos de
 pantalla con nombre de dinero** (`src/infrastructure/i18n/locales/*/payroll.json` y similares
-cuentan como `dinero` además de `visible`, porque v1.0.0 no excluye rutas de una clase); `build-desktop-prueba.yml` contado como producción; **los pases a producción desde `release/<fecha>`** (ADR 0272), que v1.0.0 solo reconoce como pase si la rama se llama exactamente igual que en la receta, así que cada publicación aparece «sin pieza». El
+cuentan como `dinero` además de `visible`, porque v1.0.0 no excluye rutas de una clase); cálculos
+del front sin montos que caen en `src/features/*/services/*.calc.ts` (`tiempo/services/discipline.calc.ts`); `build-desktop-prueba.yml` contado como producción; **los pases a producción desde `release/<fecha>`** (ADR 0272), que v1.0.0 solo reconoce como pase si la rama se llama exactamente igual que en la receta, así que cada publicación aparece «sin pieza». El
 juez los marca «sin pieza» o les pide etapas que no tocan; el informe los separa y van a v1.0.1.
 
 
@@ -208,6 +209,11 @@ rutas amplias que contaban cambios ajenos (`src/api/*/services/*.calc.ts`, `scri
 `scripts/latido/**`) se cambian por la lista exacta, seguida por sus importaciones. No bloqueante
 aceptado: §1 aclara que el cálculo nuevo va en `src/api`. Receta revalidada: «valid recipe, 4
 stages».
+
+**Ronda 5 — misma sesión (versión 5):** **APPROVE**, sin bloqueantes. Validó la receta y comprobó
+que los 45 scripts existen, son alcanzables y no importan nada fuera de la lista. No bloqueante
+aceptado: `src/features/tiempo/services/discipline.calc.ts` (medición de desempeño, no pago) queda
+entre los avisos falsos conocidos de §2.
 
 ## Anexo A. La receta de Socialabs (borrador validado con v1.0.0)
 
