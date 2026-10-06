@@ -2,7 +2,7 @@
 
 Diseño de la rebanada 7 de [PLAN-13](PLAN-13.md) (issue #13), con las decisiones del dueño R24,
 R30 y R36–R42. Autor: Claude Opus 5.5 (orquestador). Revisor del diseño: GPT-6 Sol `high`.
-Versión 4 · 6-oct-2026 · en revisión (ajuste por los cambios de Socialabs del 2 al 6-oct, R45, y la ronda 3).
+Versión 5 · 6-oct-2026 · en revisión (ajuste por los cambios de Socialabs del 2 al 6-oct, R45, y las rondas 3 y 4).
 
 ## En tres líneas
 
@@ -51,16 +51,19 @@ no la escribe; no se inventa la regla, §1.4 del reconocimiento): lo visual que 
 rutas cuenta como `comportamiento` y se anota como aviso falso conocido.
 
 **Clases (R42, ajustadas por R45).** La estructura nueva ya entró (ADR 0276, 0287): front en
-`src/features/<dominio>/` con el cálculo puro en `services/*.calc.ts`, backend propio en
-`src/api/<dominio>/`, nombres en inglés para lo nuevo. La receta reconoce lo viejo y lo nuevo (el
+`src/features/<dominio>/`, backend propio en `src/api/<dominio>/`, donde va el cálculo nuevo
+(`services/*.calc.ts`), y nombres en inglés para lo nuevo; `src/features/*/services/*.calc.ts`
+cubre el cálculo que ya vivía en el front. La receta reconoce lo viejo y lo nuevo (el
 Anexo A la trae completa; v1.0.0 no admite llaves `{a,b}`):
 - dinero: `lib/calc/**`, todo `src/features/*/services/*.calc.ts`, los `services` de las features de
   dinero (closures, closure-history, compensation, payroll, profitability, pagos-variables,
   rentabilidad, desempeno, kpi-bonus), el backend `src/api/` de closures, compensation, payroll,
-  profitability, kpi-bonus y dashboard (calcula pagos y proyecciones), todo
-  `src/api/*/services/*.calc.ts` (donde ADR 0287 pone el cálculo nuevo), y los nombres de dinero en español y en inglés (nomina/payroll,
+  profitability, kpi-bonus y dashboard (calcula pagos y proyecciones) completos, y los nombres de dinero en español y en inglés (nomina/payroll,
   pago/payment, sueldo/salary, compensacion/compensation, rentabilidad/profitability,
-  margen/margin, costo, bolsa/bonus, dinero, cierre/closure);
+  margen/margin, costo, bolsa/bonus, dinero, cierre/closure). No se usa un patrón para todo
+  `src/api/*/services/*.calc.ts`: contaría cálculos sin montos (`workload/capacity-impact.calc.ts`,
+  `discipline`); un dominio de dinero nuevo en `src/api` se agrega a la receta en su propio PR, y la
+  observación busca a mano los que falten (§4);
 - migraciones de base de datos (`sql`): `supabase/migrations/**` (la copia en `ramas/` se retiró);
   clase aparte de permisos, con revisión a mano del contenido (§4);
 - permisos: nombres auth/login/permiso/permission/rls, `src/infrastructure/supabase/**` y
@@ -70,12 +73,13 @@ Anexo A la trae completa; v1.0.0 no admite llaves `{a,b}`):
   profitability-summary, time-team; lista tomada de `79ce4dba`). Un archivo nuevo con la vía
   privilegiada fuera de estas rutas no se detecta: v1.0.0 clasifica por rutas, no por contenido; la
   observación lo busca a mano (§4);
-- producción: los workflows de producción por nombre, `supabase/functions/**`, `vercel.json` y los
-  scripts que esos workflows corren con lo que importan: `scripts/migrar*`, `deriva-esquema`,
-  los de publicar escritorio (clean-release, generar-config-escritorio, comprobar-salud-web,
-  atestar-release, publish-update, probar-actualizacion-mac, verificar-arranque,
-  verificar-nativos), `scripts/lib/**`, `scripts/latido/**`, `scripts/tablero/**` y
-  `scripts/staging-copia/**`;
+- producción: los workflows de producción por nombre, `supabase/functions/**`, `vercel.json` y,
+  archivo por archivo, los scripts que corren esos workflows y la publicación de escritorio
+  (`release:desktop`, `dist`, `electron:build` y los pasos de `docs/RELEASE.md`, incluida la de
+  Windows: construir-release-windows, preparar-nativo-windows, empaquetar-preload,
+  copiar-paginas-escritorio) junto con todo lo que importan, seguido hasta el fondo en `79ce4dba`
+  (45 archivos, Anexo A). Sin carpetas completas: `scripts/lib/adr-pr-abiertos.mjs` y el resto de
+  `latido` no corren en producción. Un script nuevo de producción se agrega en su PR;
 - escritorio: `electron/**` y `electron-builder.yml`;
 - visible: `app/**`, `components/**`, `public/**`, `src/features/*/components/**`,
   `src/shared/components/**`, `src/infrastructure/i18n/**` (textos).
@@ -198,6 +202,13 @@ publicar escritorio y sus ayudantes); los textos con nombre de dinero como aviso
 número del ADR comprobado contra ambas ramas (la última hoy es 0292) y las fuentes de §1
 actualizadas. Receta revalidada: «valid recipe, 4 stages».
 
+**Ronda 4 — misma sesión (versión 4):** REVISE, 2 bloqueantes, aceptados: la publicación de Windows
+(construir-release-windows, preparar-nativo-windows, empaquetar-preload) entra a producción; las
+rutas amplias que contaban cambios ajenos (`src/api/*/services/*.calc.ts`, `scripts/lib/**`,
+`scripts/latido/**`) se cambian por la lista exacta, seguida por sus importaciones. No bloqueante
+aceptado: §1 aclara que el cálculo nuevo va en `src/api`. Receta revalidada: «valid recipe, 4
+stages».
+
 ## Anexo A. La receta de Socialabs (borrador validado con v1.0.0)
 
 Vive en Socialabs (`.ai-workflows/pipeline.yml`), no en el motor (R05). Se copia aquí solo para la revisión del diseño.
@@ -233,7 +244,6 @@ classify:
     - "src/api/profitability/**"
     - "src/api/kpi-bonus/**"
     - "src/api/dashboard/**"
-    - "src/api/*/services/*.calc.ts"
     - "**/*nomina*"
     - "**/*nomina*/**"
     - "**/*pago*"
@@ -301,19 +311,50 @@ classify:
     - ".github/workflows/tablero.yml"
     - ".github/workflows/vigilar-freno-sesion.yml"
     - "scripts/migrar*"
-    - "scripts/deriva-esquema.mjs"
-    - "scripts/clean-release.mjs"
-    - "scripts/generar-config-escritorio.mjs"
-    - "scripts/comprobar-salud-web.mjs"
     - "scripts/atestar-release.mjs"
-    - "scripts/publish-update.mjs"
+    - "scripts/clean-release.mjs"
+    - "scripts/comprobar-salud-web.mjs"
+    - "scripts/construir-release-windows.mjs"
+    - "scripts/copiar-paginas-escritorio.mjs"
+    - "scripts/deriva-esquema.mjs"
+    - "scripts/empaquetar-preload.mjs"
+    - "scripts/generar-config-escritorio.mjs"
+    - "scripts/preparar-nativo-windows.mjs"
     - "scripts/probar-actualizacion-mac.mjs"
+    - "scripts/publish-update.mjs"
     - "scripts/verificar-arranque.mjs"
     - "scripts/verificar-nativos.mjs"
-    - "scripts/lib/**"
-    - "scripts/latido/**"
-    - "scripts/tablero/**"
-    - "scripts/staging-copia/**"
+    - "scripts/latido/lib/estado-mensajero.mjs"
+    - "scripts/latido/lib/monitor.mjs"
+    - "scripts/latido/lib/observaciones.mjs"
+    - "scripts/latido/lib/respaldo-http.mjs"
+    - "scripts/latido/lib/rpc-pg.mjs"
+    - "scripts/latido/rescatar-freno.mjs"
+    - "scripts/latido/sintetico-escritorio.mjs"
+    - "scripts/lib/avisar-slack.mjs"
+    - "scripts/lib/avisar.mjs"
+    - "scripts/lib/bitacora-instantanea.mjs"
+    - "scripts/lib/candado-rls.mjs"
+    - "scripts/lib/config-escritorio.mjs"
+    - "scripts/lib/deriva-esquema.mjs"
+    - "scripts/lib/entradas-nucleo.mjs"
+    - "scripts/lib/env-local.mjs"
+    - "scripts/lib/equivalencias-historicas.mjs"
+    - "scripts/lib/escanear-secretos.mjs"
+    - "scripts/lib/estructura-instantanea.mjs"
+    - "scripts/lib/huella-nucleo.mjs"
+    - "scripts/lib/migraciones.mjs"
+    - "scripts/lib/native-release.mjs"
+    - "scripts/lib/native-stage.mjs"
+    - "scripts/lib/plan-armado-windows.mjs"
+    - "scripts/lib/preflight-instantanea.mjs"
+    - "scripts/lib/release-gates.mjs"
+    - "scripts/lib/startup-process-cleanup.mjs"
+    - "scripts/lib/supabase-project.mjs"
+    - "scripts/lib/variantes-escritorio.mjs"
+    - "scripts/staging-copia/empaquetar.mjs"
+    - "scripts/tablero/entrada.mjs"
+    - "scripts/tablero/lib/tablero.mjs"
     - "supabase/functions/**"
     - "vercel.json"
   escritorio:
